@@ -5934,28 +5934,12 @@ fn truncate_for_display(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-/// Whether a process with `pid` exists. Signal 0 delivers nothing and only
-/// checks; a process this user may not signal still exists, so `EPERM`
-/// reads as alive. Off unix nothing is reaped, on the conservative side.
-/// Existence, not liveness, is enough here (unlike `session::is_alive`,
-/// which probes by connecting): a pid that was reused reads as alive and
-/// only leaks a file, and every wrong answer this can give errs that way.
-#[cfg(unix)]
+/// Whether a process with `pid` exists. Existence, not liveness, is enough
+/// here (unlike `session::is_alive`, which probes by connecting): a pid that
+/// was reused reads as alive and only leaks a file, and every wrong answer
+/// this can give errs that way.
 fn process_is_alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return true;
-    };
-    // SAFETY: `kill` with signal 0 only checks for the process; no signal is
-    // delivered and no memory is touched.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(unix))]
-fn process_is_alive(_pid: u32) -> bool {
-    true
+    crate::platform::process::is_pid_alive(pid)
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
@@ -6421,7 +6405,6 @@ pub fn run(
         // Saved once already when the relaunch was armed; this refresh is
         // best-effort, and a failure leaves that copy in place.
         let _ = state.save(&session_path);
-        use std::os::unix::process::CommandExt;
         // A staged release (#333) is swapped over the installed binary
         // only now, on the user's Relaunch: until this line PATH still
         // held the old version.
@@ -6442,8 +6425,18 @@ pub fn run(
         cmd.arg(app.workspace_root())
             .arg("--restore-session")
             .arg(&session_path);
-        let err = CommandExt::exec(&mut cmd);
-        eprintln!("croft self-relaunch failed: {err}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let err = CommandExt::exec(&mut cmd);
+            eprintln!("croft self-relaunch failed: {err}");
+        }
+        #[cfg(windows)]
+        {
+            if let Err(err) = cmd.spawn() {
+                eprintln!("croft self-relaunch failed: {err}");
+            }
+        }
         return Ok(());
     }
     if let Some(remote) = app.remote_launch.take() {

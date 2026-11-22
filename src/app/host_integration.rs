@@ -1656,11 +1656,7 @@ pub(crate) fn sweep_dead_view_sockets(dir: &Path) {
         let Some(pid) = crate::view_ipc::pid_of_socket(&sock_name) else {
             continue;
         };
-        // Signal 0 checks existence and permission without delivering
-        // anything; ESRCH is the only answer that means "gone".
-        let gone = pid != me
-            && unsafe { libc::kill(pid as libc::pid_t, 0) } != 0
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        let gone = pid != me && !crate::platform::process::is_pid_alive(pid);
         if gone {
             let _ = std::fs::remove_file(entry_path);
             // `bind_socket_0600` binds inside a `.s<pid>-<n>` dir and removes
@@ -1759,9 +1755,8 @@ pub(super) fn sweep_staged_stdin(dir: &Path) {
         // permission without delivering anything, and ESRCH is the only
         // answer that means gone, exactly as the socket sweep judges it.
         if let Some(holder) = crate::view_ipc::holder_of_staged(name) {
-            let alive = holder == std::process::id()
-                || unsafe { libc::kill(holder as libc::pid_t, 0) } == 0
-                || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+            let alive =
+                holder == std::process::id() || crate::platform::process::is_pid_alive(holder);
             if alive {
                 continue;
             }

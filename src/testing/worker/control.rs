@@ -11,10 +11,15 @@ impl RunControl {
     pub(super) fn cancel(&self, upto: u64) {
         self.cancelled_upto.fetch_max(upto, Ordering::SeqCst);
         if let Some(pgid) = *self.running.lock().unwrap() {
+            #[cfg(unix)]
             // SAFETY: `pgid` is the group of a child this worker spawned as
             // its own group leader, so only the test run is signalled.
             unsafe {
                 libc::killpg(pgid, libc::SIGKILL);
+            }
+            #[cfg(not(unix))]
+            if let Ok(pid) = u32::try_from(pgid) {
+                crate::platform::process::terminate_pid(pid);
             }
         }
     }
@@ -32,8 +37,15 @@ impl RunControl {
     /// between tries, so a cancel from the UI never waits on that, and the
     /// next try sees it.
     pub(super) fn spawn(&self, request: u64, cmd: &mut Command) -> Option<std::io::Result<Child>> {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        #[cfg(not(unix))]
+        {
+            crate::platform::process::detach_from_tty(cmd);
+        }
         crate::review_ops::retry_while_busy(
             || {
                 let mut running = self.running.lock().unwrap();

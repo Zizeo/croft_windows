@@ -1562,11 +1562,9 @@ pub(crate) fn node_probe_command() -> Command {
 }
 
 /// `shell -l -i -c script` with stdin `/dev/null`, stdout piped and stderr
-/// discarded, started by `setsid` in a session of its own with no
-/// controlling terminal, so the interactive shell's job control can never
-/// reach croft's tty.
+/// discarded, detached from croft's controlling terminal so the interactive
+/// shell's job control can never reach croft's tty.
 fn detached_shell(shell: &std::ffi::OsStr, script: &str) -> Command {
-    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
 
     let mut cmd = Command::new(shell);
@@ -1574,12 +1572,7 @@ fn detached_shell(shell: &std::ffi::OsStr, script: &str) -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
+    crate::platform::process::detach_from_tty(&mut cmd);
     cmd
 }
 

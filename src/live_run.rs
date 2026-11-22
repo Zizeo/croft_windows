@@ -387,17 +387,6 @@ impl Drop for ReportFile {
     }
 }
 
-/// Kill the run and everything it started (its process group, on unix).
-fn kill_group(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    if let Ok(pid) = i32::try_from(child.id()) {
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
-    let _ = child.kill();
-}
-
 /// How much of a failed run's stderr is kept for its error line.
 const STDERR_TAIL: usize = 16 * 1024;
 
@@ -423,30 +412,21 @@ fn run(job: &Job) -> Result<Report, String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    // Its own process group, so the kill below also takes down anything the
-    // script started (a server, `sleep` in a subprocess): otherwise every
-    // re-run on a pause in typing would leave another one behind.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        cmd.process_group(0);
-    }
-    let mut child = cmd
-        .spawn()
+    let mut managed = crate::platform::process::ManagedChild::spawn_in_group(&mut cmd)
         .map_err(|e| format!("Live Run: cannot start {}: {e}", job.python.display()))?;
     let mut source = job.lines.join("\n");
     source.push('\n');
     // Written from its own thread: an interpreter that never reads stdin
     // would block a large buffer's write forever, before the kill deadline
     // below even starts. A write error means it exited; stderr says why.
-    if let Some(mut stdin) = child.stdin.take() {
+    if let Some(mut stdin) = managed.child_mut().stdin.take() {
         std::thread::spawn(move || {
             let _ = stdin.write_all(source.as_bytes());
         });
     }
     // Drained while the script runs: one that writes more than a pipe
     // holds would otherwise block on stderr until the deadline killed it.
-    let stderr = child.stderr.take().map(|mut pipe| {
+    let stderr = managed.child_mut().stderr.take().map(|mut pipe| {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             use std::io::Read;
@@ -467,11 +447,10 @@ fn run(job: &Job) -> Result<Report, String> {
     });
     let deadline = Instant::now() + RUN_BUDGET + KILL_GRACE;
     loop {
-        match child.try_wait() {
+        match managed.child_mut().try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if Instant::now() >= deadline => {
-                kill_group(&mut child);
-                let _ = child.wait();
+                managed.kill_tree();
                 return Err(format!(
                     "Live Run: killed after {}s (a call ignored the interrupt)",
                     (RUN_BUDGET + KILL_GRACE).as_secs()

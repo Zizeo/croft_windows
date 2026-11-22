@@ -277,22 +277,11 @@ fn run_git(path: &Path, args: &[&str]) -> std::io::Result<String> {
 fn never_prompt(cmd: &mut Command) {
     cmd.env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::null());
-    #[cfg(unix)]
     detach_from_tty(cmd);
 }
 
-#[cfg(unix)]
 fn detach_from_tty(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    // SAFETY: `setsid` is async-signal-safe and the only call in the
-    // pre-exec hook; the forked child is never a process-group leader, so
-    // the call always succeeds.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
+    crate::platform::process::detach_from_tty(cmd);
 }
 
 /// Run a mutating git subcommand and return a human-readable summary.

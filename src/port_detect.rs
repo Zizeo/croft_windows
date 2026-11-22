@@ -20,8 +20,10 @@
 //! deduplicates against its live registry and offers the forward.
 
 use std::collections::HashSet;
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::LazyLock;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use regex::Regex;
@@ -359,6 +361,7 @@ fn scan_with_pos(text: &str) -> Vec<(usize, usize, PortHit)> {
 /// `stat`/`lstat`/`readlink`, which it otherwise calls on every mounted file
 /// system at startup and which stall on an unreachable NFS server; a TCP
 /// listener row needs none of them. `-w` drops the warnings `-b` then prints.
+#[cfg(unix)]
 const LSOF_LISTEN_ARGS: &[&str] = &["-b", "-w", "-nP", "-iTCP", "-sTCP:LISTEN"];
 
 /// The soft descriptor limit a poll helper runs under. lsof before 4.95
@@ -366,6 +369,7 @@ const LSOF_LISTEN_ARGS: &[&str] = &["-b", "-w", "-nP", "-iTCP", "-sTCP:LISTEN"];
 /// soft limit at startup, so under a raised limit, 1,048,576 on some
 /// desktops, each run spent ~0.15 s of CPU on a million `close` calls.
 /// None of the helpers holds more than a handful open (#1903).
+#[cfg(unix)]
 const PROBE_FD_LIMIT: libc::rlim_t = 1024;
 
 /// A socket-poll helper command, detached into its own session. The poll runs
@@ -380,6 +384,7 @@ const PROBE_FD_LIMIT: libc::rlim_t = 1024;
 /// The null stdin only states intent (`.output()` already gives one); the
 /// session is the fix. A pre-exec hook takes std off `posix_spawn` and onto a
 /// full `fork`, a cost paid per probe on the poll thread, never the UI thread.
+#[cfg(unix)]
 fn probe(program: &str) -> Command {
     let mut cmd = Command::new(program);
     cmd.stdin(std::process::Stdio::null());
@@ -405,6 +410,7 @@ fn probe(program: &str) -> Command {
 
 /// croft's descriptor limit with its soft value lowered to
 /// [`PROBE_FD_LIMIT`], or `None` when it is already that low or unreadable.
+#[cfg(unix)]
 fn probe_fd_limit() -> Option<libc::rlimit> {
     let mut lim = libc::rlimit {
         rlim_cur: 0,
@@ -424,6 +430,7 @@ fn probe_fd_limit() -> Option<libc::rlimit> {
 /// to scope the socket poll to the shell's own children so we don't surface
 /// every system daemon listening on loopback. Empty on `ps` failure (the poll
 /// then reports nothing, falling back to the output scrape).
+#[cfg(unix)]
 fn descendant_pids(root: i32) -> HashSet<i32> {
     let mut subtree: HashSet<i32> = HashSet::new();
     subtree.insert(root);
@@ -458,12 +465,19 @@ fn descendant_pids(root: i32) -> HashSet<i32> {
 /// Listening loopback TCP ports owned by `shell_pid`'s subtree, via `lsof`
 /// (macOS + Linux) with an `ss` fallback (Linux without lsof). Best-effort:
 /// any failure yields an empty list and the output scrape carries the load.
+#[cfg(unix)]
 pub fn poll_listeners(shell_pid: i32) -> Vec<PortHit> {
     let pids = descendant_pids(shell_pid);
     if let Some(hits) = poll_via_lsof(&pids) {
         return hits;
     }
     poll_via_ss(&pids).unwrap_or_default()
+}
+
+/// Socket polling is Unix-only; non-Unix platforms rely on the output scrape.
+#[cfg(not(unix))]
+pub fn poll_listeners(_shell_pid: i32) -> Vec<PortHit> {
+    Vec::new()
 }
 
 /// Every loopback TCP port listening on this machine, whoever owns it. The
@@ -479,14 +493,22 @@ pub fn poll_listeners(shell_pid: i32) -> Vec<PortHit> {
 /// only the caller's own processes and misses, say, a root-owned
 /// `docker-proxy` publishing a container's port, so it answers only where
 /// `ss` is missing, as on macOS.
+#[cfg(unix)]
 pub fn poll_all_listening() -> Option<HashSet<u16>> {
     listening_snapshot(run_ss(&["-tlnH"]), || {
         probe("lsof").args(LSOF_LISTEN_ARGS).output().ok()
     })
 }
 
+/// Socket polling is Unix-only; returns `None` so callers keep live entries.
+#[cfg(not(unix))]
+pub fn poll_all_listening() -> Option<HashSet<u16>> {
+    None
+}
+
 /// The [`poll_all_listening`] decision over its scans: a successful `ss`
 /// table wins, and `lsof` is only run without one.
+#[cfg(unix)]
 fn listening_snapshot(
     ss: Option<std::process::Output>,
     lsof: impl FnOnce() -> Option<std::process::Output>,
@@ -505,9 +527,11 @@ fn listening_snapshot(
 
 /// Set once `ss` turns out not to be installed, so a box without it doesn't
 /// pay a failed spawn on every poll.
+#[cfg(unix)]
 static SS_MISSING: AtomicBool = AtomicBool::new(false);
 
 /// `ss` run with `args`, or `None` when it isn't installed or didn't start.
+#[cfg(unix)]
 fn run_ss(args: &[&str]) -> Option<std::process::Output> {
     if SS_MISSING.load(Ordering::Relaxed) {
         return None;
@@ -523,6 +547,7 @@ fn run_ss(args: &[&str]) -> Option<std::process::Output> {
     }
 }
 
+#[cfg(unix)]
 fn poll_via_lsof(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
     if pids.is_empty() {
         return Some(Vec::new());
@@ -546,6 +571,7 @@ fn poll_via_lsof(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
 /// reading it as a failure sent every poll on to `ss` as well (#1903). A
 /// real failure, a bad option or a denied read, says why on stderr, which
 /// `-w` keeps free of warnings.
+#[cfg(unix)]
 fn lsof_rows(out: &std::process::Output) -> Option<String> {
     let no_match = out.status.code() == Some(1) && out.stderr.is_empty();
     (out.status.success() || !out.stdout.is_empty() || no_match)
@@ -556,6 +582,7 @@ fn lsof_rows(out: &std::process::Output) -> Option<String> {
 /// command; the NAME column (`*:3000`, `127.0.0.1:3000`) is followed by a
 /// `(LISTEN)` token, so we scan the row for the first field that parses as a
 /// loopback/wildcard address.
+#[cfg(any(unix, test))]
 fn parse_lsof(text: &str) -> Vec<PortHit> {
     let mut out: Vec<PortHit> = Vec::new();
     for line in text.lines().skip(1) {
@@ -574,6 +601,7 @@ fn parse_lsof(text: &str) -> Vec<PortHit> {
     out
 }
 
+#[cfg(unix)]
 fn poll_via_ss(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
     let out = run_ss(&["-tlnpH"])?;
     if !out.status.success() {
@@ -584,6 +612,7 @@ fn poll_via_ss(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
 
 /// Parse `ss -tlnpH` rows. The local-address column is field 3 and the process
 /// column embeds `pid=NNN`; we keep only rows whose pid is in the subtree.
+#[cfg(any(unix, test))]
 fn parse_ss(text: &str, pids: &HashSet<i32>) -> Vec<PortHit> {
     let mut out: Vec<PortHit> = Vec::new();
     for line in text.lines() {
@@ -612,6 +641,7 @@ fn parse_ss(text: &str, pids: &HashSet<i32>) -> Vec<PortHit> {
     out
 }
 
+#[cfg(any(unix, test))]
 fn ss_pid(field: &str) -> Option<i32> {
     let start = field.find("pid=")? + 4;
     let rest = &field[start..];
@@ -621,6 +651,7 @@ fn ss_pid(field: &str) -> Option<i32> {
     rest[..end].parse().ok()
 }
 
+#[cfg(any(unix, test))]
 fn ss_proc_name(field: &str) -> Option<String> {
     let start = field.find("((\"")? + 3;
     let rest = &field[start..];
@@ -631,6 +662,7 @@ fn ss_proc_name(field: &str) -> Option<String> {
 /// The port from a `host:port` address, but only for loopback / wildcard hosts
 /// (`*`, `0.0.0.0`, `127.0.0.1`, `[::]`, `[::1]`, `localhost`). A bound public
 /// interface isn't a dev server we should be offering to tunnel home.
+#[cfg(any(unix, test))]
 fn loopback_port(addr: &str) -> Option<u16> {
     let (host, port) = addr.rsplit_once(':')?;
     let host = host.trim_matches(|c| c == '[' || c == ']');
@@ -651,6 +683,7 @@ mod tests {
     /// A kernel notice about a hung NFS mount is printed on the controlling
     /// tty of the process waiting on it. A socket probe runs every few
     /// seconds, so it must own no tty: it leads its own session.
+    #[cfg(unix)]
     #[test]
     fn a_socket_probe_runs_in_its_own_session() {
         // Asked of the kernel, not of `ps`: macOS `ps` exposes no session id.
@@ -667,6 +700,7 @@ mod tests {
     /// The scoped `-b -w` scan still finds a listener: bind one and look
     /// for it through the real call site. Skipped where lsof is not
     /// installed.
+    #[cfg(unix)]
     #[test]
     fn the_lsof_scan_still_finds_a_loopback_listener() {
         if probe("lsof").arg("-v").output().is_err() {
@@ -683,6 +717,7 @@ mod tests {
 
     /// A helper runs under at most [`PROBE_FD_LIMIT`] descriptors, so an
     /// lsof that closes every one up to the limit stays cheap (#1903).
+    #[cfg(unix)]
     #[test]
     fn a_socket_probe_runs_under_a_low_descriptor_limit() {
         let out = probe("sh").args(["-c", "ulimit -n"]).output().unwrap();
@@ -694,6 +729,7 @@ mod tests {
 
     /// lsof's "nothing matched" is exit 1 with both streams empty: an
     /// answer of no listeners, so `ss` is not run after it (#1903).
+    #[cfg(unix)]
     #[test]
     fn an_lsof_that_matched_nothing_is_an_empty_scan_not_a_failure() {
         use std::os::unix::process::ExitStatusExt;
@@ -715,6 +751,7 @@ mod tests {
     /// publishing a container's port, and with none of the user's own
     /// listening it answers with an empty scan. ss reads the kernel's table
     /// and lists the port, so lsof is only asked when ss didn't run.
+    #[cfg(unix)]
     #[test]
     fn the_still_up_snapshot_asks_ss_before_lsof() {
         use std::os::unix::process::ExitStatusExt;
@@ -749,6 +786,7 @@ mod tests {
     /// The real lsof on a process with no listener: an empty scan rather
     /// than `None`, which is what sent the poll on to `ss`. Skipped where
     /// lsof is not installed.
+    #[cfg(unix)]
     #[test]
     fn the_lsof_scan_of_a_process_without_listeners_is_empty() {
         if probe("lsof").arg("-v").output().is_err() {

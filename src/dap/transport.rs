@@ -163,31 +163,20 @@ impl DapTransport {
     /// `python -m debugpy.adapter`). A reader thread frames stdout into the
     /// `incoming` channel until the adapter exits.
     pub fn spawn(program: &str, args: &[String], cwd: &std::path::Path) -> Result<DapTransport> {
-        use std::os::unix::process::CommandExt;
         let mut cmd = Command::new(program);
         cmd.args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // Detach the adapter into its own session before exec. debugpy launches
-        // the debuggee and does terminal job control (`tcsetpgrp`) on whatever
-        // controlling tty it inherits; sharing croft's tty would background
-        // croft and suspend it with SIGTTIN the moment the main loop next reads
-        // input. `setsid` gives the adapter (and every process it spawns) a
-        // brand-new session with no controlling terminal, so it physically
-        // cannot touch croft's tty. DAP itself rides the piped stdio, never the
-        // tty, so nothing is lost. Mirrors `lsp::install`'s detached probe.
-        //
-        // SAFETY: `setsid` is async-signal-safe and the only call in the
-        // pre-exec hook; the forked child is never a process-group leader (its
-        // pid differs from croft's pgid), so the call always succeeds.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
+        // Detach the adapter from croft's controlling tty / console window
+        // before exec. debugpy launches the debuggee and does terminal job
+        // control (`tcsetpgrp`) on whatever controlling tty it inherits;
+        // sharing croft's tty would background croft and suspend it with SIGTTIN
+        // the moment the main loop next reads input. DAP itself rides the
+        // piped stdio, never the tty, so nothing is lost. Mirrors
+        // `lsp::install`'s detached probe.
+        crate::platform::process::detach_from_tty(&mut cmd);
         let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning debug adapter `{program}`"))?;
@@ -247,7 +236,6 @@ impl DapTransport {
         port: u16,
         path_prepend: Option<&std::path::Path>,
     ) -> Result<DapTransport> {
-        use std::os::unix::process::CommandExt;
         let mut cmd = Command::new(program);
         cmd.args(args)
             .current_dir(cwd)
@@ -262,20 +250,9 @@ impl DapTransport {
             cmd.env("PATH", format!("{}:{existing}", dir.display()));
         }
         // Detach the server into its own session/process group, exactly as the
-        // stdio `spawn` path does. This is what lets `kill` later signal the
-        // whole group (server + the debuggee node it forks) in one shot rather
-        // than leaking the debuggee. The server's pid becomes its own pgid, so a
-        // group kill targets only this tree, never croft's.
-        //
-        // SAFETY: `setsid` is async-signal-safe and the only call in the
-        // pre-exec hook; the forked child is never a process-group leader (its
-        // pid differs from croft's pgid), so the call always succeeds.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
+        // stdio `spawn` path does, so `kill_tree` can signal the whole group
+        // on Unix and the server never touches croft's tty or pops a console.
+        crate::platform::process::detach_from_tty(&mut cmd);
         let child = cmd
             .spawn()
             .with_context(|| format!("spawning debug server `{program}`"))?;
@@ -366,12 +343,15 @@ impl DapTransport {
 /// is deliberately outside this group; the graceful `disconnect` handshake
 /// and the startup orphan sweep ([`crate::dap::reaper`]) are what retire it.
 fn kill_tree(child: &mut Child) {
-    let pid = child.id() as i32;
-    // SAFETY: `killpg` is a plain libc call; `pid` is this child's pgid
-    // (it `setsid`'d), distinct from croft's, so only the adapter tree
-    // is signalled.
-    unsafe {
-        libc::killpg(pid, libc::SIGKILL);
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        // SAFETY: `killpg` is a plain libc call; `pid` is this child's pgid
+        // (it `setsid`'d), distinct from croft's, so only the adapter tree
+        // is signalled.
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        }
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -380,15 +360,21 @@ fn kill_tree(child: &mut Child) {
 /// Whether `pid` is still running. A zombie (exited, not yet reaped by
 /// whoever inherited it) counts as gone.
 fn is_running(pid: i32) -> bool {
-    // SAFETY: signal 0 sends nothing; it only checks that the pid exists.
-    if unsafe { libc::kill(pid, 0) } != 0 {
+    if pid <= 0 || !crate::platform::process::is_pid_alive(pid as u32) {
         return false;
     }
-    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => !stat
-            .rsplit_once(')')
-            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
-        Err(_) => true,
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => !stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+            Err(_) => true,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
     }
 }
 
@@ -426,12 +412,9 @@ fn finish_teardown(mut child: Child, teardown: &(Mutex<Teardown>, Condvar), grac
     if let Some(pid) = debuggee
         && !lock.lock().unwrap().debuggee_ended
         && is_running(pid)
+        && let Ok(pid) = u32::try_from(pid)
     {
-        // SAFETY: `pid` is the debuggee the adapter reported for this
-        // launch, still running and not reported as ended.
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
+        crate::platform::process::terminate_pid(pid);
     }
 }
 

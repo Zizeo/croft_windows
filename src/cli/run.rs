@@ -529,7 +529,5 @@ impl Cli {
 /// session processes: they write to sockets and ptys whose peer can vanish
 /// and rely on that write failing instead of killing them.
 pub(super) fn end_quietly_when_stdout_closes() {
-    // SAFETY: setting SIGPIPE's disposition to its default installs no
-    // handler; the call has no memory-safety preconditions.
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    crate::platform::process::reset_sigpipe_default();
 }

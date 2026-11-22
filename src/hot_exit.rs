@@ -243,16 +243,9 @@ fn owner_runs(pid: u32, start: Option<u64>) -> bool {
     }
 }
 
-/// Whether no process `pid` exists. Signal 0 checks without delivering
-/// anything; ESRCH is the only answer that means "gone" (EPERM is a live
-/// process of another user).
+/// Whether no process `pid` exists.
 fn is_gone(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    pid > 0
-        && unsafe { libc::kill(pid, 0) } != 0
-        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    pid > 0 && !crate::platform::process::is_pid_alive(pid)
 }
 
 /// Whether the backup at `path` belongs to another croft that still runs

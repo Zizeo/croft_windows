@@ -124,7 +124,6 @@ impl McpTransport {
         cwd: &Path,
         env: &BTreeMap<String, String>,
     ) -> Result<McpTransport> {
-        use std::os::unix::process::CommandExt;
         let mut cmd = Command::new(program);
         cmd.args(args)
             .current_dir(cwd)
@@ -136,19 +135,10 @@ impl McpTransport {
             // ~64 KiB there (MCP puts logs on stderr) must never block on a
             // full pipe, and only the tail is kept to explain an exit.
             .stderr(Stdio::piped());
-        // Detach into its own session before exec (mirrors the DAP transport):
-        // a sidecar must never be able to touch croft's controlling tty. MCP
-        // rides the piped stdio, so the detach loses nothing.
-        //
-        // SAFETY: `setsid` is async-signal-safe and the only call in the
-        // pre-exec hook; the forked child is never a process-group leader, so
-        // the call always succeeds.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
+        // Detach from croft's controlling terminal (mirrors the DAP transport):
+        // a sidecar must never be able to touch croft's tty or pop a console
+        // window. MCP rides the piped stdio, so the detach loses nothing.
+        crate::platform::process::detach_from_tty(&mut cmd);
         let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning MCP server `{program}`"))?;

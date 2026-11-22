@@ -1961,32 +1961,12 @@ impl App {
         };
     }
 
-    /// Reveal `path` in macOS Finder by spawning `open -R`, which selects the
-    /// entry inside its containing folder. Fire-and-forget: `open` hands off to
-    /// LaunchServices and returns immediately, so the TUI never blocks. Only
-    /// reachable on a local macOS session because `maybe_add_reveal_in_finder`
-    /// withholds the menu entry everywhere else; the `cfg` guard keeps the call
-    /// out of non-macOS builds entirely.
+    /// Reveal `path` in the OS file manager (Finder on macOS, Explorer on
+    /// Windows). Fire-and-forget: the helper returns immediately so the TUI
+    /// never blocks.
     pub(super) fn reveal_in_finder(&mut self, path: PathBuf) {
-        #[cfg(target_os = "macos")]
-        {
-            self.status = if std::process::Command::new("open")
-                .arg("-R")
-                .arg(&path)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .is_ok()
-            {
-                String::from("Revealed in Finder")
-            } else {
-                String::from("Could not reveal in Finder")
-            };
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = path;
+        match crate::platform::os::reveal_in_file_manager(&path) {
+            Ok(msg) | Err(msg) => self.status = String::from(msg),
         }
     }
 }
