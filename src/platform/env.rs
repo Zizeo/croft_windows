@@ -68,6 +68,7 @@ pub fn cache_dir() -> PathBuf {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn config_dir_unix(xdg_config_home: Option<OsString>, home: Option<PathBuf>) -> PathBuf {
     if let Some(xdg) = xdg_config_home.filter(|v| !v.is_empty()) {
         return PathBuf::from(xdg).join("croft");
@@ -77,6 +78,7 @@ pub fn config_dir_unix(xdg_config_home: Option<OsString>, home: Option<PathBuf>)
         .join("croft")
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn state_dir_unix(xdg_state_home: Option<OsString>, home: Option<PathBuf>) -> PathBuf {
     if let Some(xdg) = xdg_state_home
         .map(PathBuf::from)

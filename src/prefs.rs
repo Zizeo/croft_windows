@@ -813,7 +813,11 @@ pub fn save_explorer_views(views: ExplorerViewsPrefs) -> Result<()> {
 /// Write `bytes` to `tmp`, created no more readable than `dest` already is
 /// (0600 when `dest` is new): the file replaces `dest`, which may hold
 /// notification headers, and must not widen to the umask's 0644.
-pub(crate) fn write_keeping_mode(tmp: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_keeping_mode(
+    tmp: &Path,
+    #[cfg_attr(not(unix), allow(unused_variables))] dest: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     use std::io::Write as _;
     // Created fresh, never opened through what is already there: the temp
     // names are predictable, and create+truncate followed a symlink planted

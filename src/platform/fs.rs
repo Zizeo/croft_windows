@@ -88,6 +88,7 @@ pub fn try_lock_exclusive(file: &File) -> io::Result<bool> {
 }
 
 /// Blocking exclusive lock on `file`.
+#[allow(dead_code)]
 pub fn lock_exclusive(file: &File) -> io::Result<()> {
     file.lock()
 }

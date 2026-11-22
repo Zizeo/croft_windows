@@ -2262,6 +2262,7 @@ pub struct App {
     /// deliberately, since an unclean exit leaves no `Drop` to run either.
     /// A field carrying a promise the code does not keep is worse than no
     /// field.
+    #[cfg_attr(not(unix), allow(dead_code))]
     view_listener: Option<crate::platform::ipc::LocalListener>,
     /// Agent edit approvals (#347): this workspace's hook socket, the
     /// proposals waiting on the user in arrival order, and the popup's
@@ -2306,6 +2307,7 @@ pub struct App {
     /// How long one frame may spend serving `croft view` clients (see
     /// `drain_view_requests`). A field so a test on a loaded machine can
     /// stretch it: the fixed 20ms is shorter than one file open there.
+    #[cfg_attr(not(unix), allow(dead_code))]
     view_drain_budget: std::time::Duration,
     /// URL awaiting the user's local-browser confirmation (remote-
     /// launched croft only). When `Some`, a modal asks Y/A/N and all

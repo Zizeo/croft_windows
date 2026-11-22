@@ -118,16 +118,16 @@ pub(super) fn copy_recursive(source: &Path, dest: &Path) -> std::io::Result<()> 
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&link_target, dest)?;
+            Ok(())
         }
         #[cfg(not(unix))]
         {
             let _ = link_target;
-            return Err(std::io::Error::new(
+            Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "symlink copy not supported on this platform",
-            ));
+            ))
         }
-        Ok(())
     } else {
         std::fs::copy(source, dest).map(|_| ())
     }

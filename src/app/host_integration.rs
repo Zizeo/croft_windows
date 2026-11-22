@@ -1596,6 +1596,7 @@ pub(super) fn prepare_view_listener(
 }
 
 #[cfg(not(unix))]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(super) fn prepare_view_listener(
     _path: &Path,
 ) -> std::io::Result<crate::platform::ipc::LocalListener> {

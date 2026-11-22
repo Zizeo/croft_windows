@@ -80,11 +80,15 @@ pub use launch::attach_or_create;
 use launch::*;
 #[cfg(unix)]
 use outbox::*;
+#[cfg(any(unix, test))]
 pub use protocol::Control;
+#[cfg(any(unix, test))]
 pub use protocol::Frame;
+#[cfg(any(unix, test))]
 pub use protocol::FrameReader;
 pub use protocol::Participant;
 pub use protocol::encode_bytes_frame;
+#[cfg(any(unix, test))]
 pub use protocol::encode_control_frame;
 #[cfg(all(unix, test))]
 use protocol::*;
@@ -275,6 +279,7 @@ pub struct InnerChannel {
 }
 
 #[cfg(not(unix))]
+#[cfg_attr(not(unix), allow(dead_code))]
 impl InnerChannel {
     pub fn from_env() -> Option<Self> {
         None

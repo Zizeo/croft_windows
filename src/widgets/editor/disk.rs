@@ -84,6 +84,7 @@ pub enum WriteProtection {
     Owned,
     /// Someone else's file the user may not write (root's `/etc/hosts`):
     /// only an elevated write can save it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     NotOwned,
 }
 

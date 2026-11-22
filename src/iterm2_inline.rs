@@ -511,6 +511,7 @@ pub fn detect_inline_image_protocol() -> InlineImageProtocol {
 }
 
 /// What the host terminal answered to [`ask_host`].
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HostProbe {
     /// It answered DA1, so a missing kitty keyboard reply means it has no
@@ -524,6 +525,7 @@ pub struct HostProbe {
     pub kitty_keyboard: bool,
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 impl HostProbe {
     /// Read the replies in `reply`, ignoring bytes around them.
     pub fn parse(reply: &[u8]) -> Self {
@@ -553,6 +555,7 @@ impl HostProbe {
 /// a standalone `;`-separated token (so it must not match the `4` inside `14`,
 /// `64`, etc.). Bytes outside the `\x1b[?` … `c` envelope are ignored, which
 /// tolerates stray input that arrived alongside the reply.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn da1_advertises_sixel(reply: &[u8]) -> bool {
     let text = String::from_utf8_lossy(reply);
     let Some(start) = text.find("\x1b[?") else {

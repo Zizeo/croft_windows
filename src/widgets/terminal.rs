@@ -45,6 +45,7 @@ pub use commands::CommandDecoration;
 pub use commands::human_duration;
 pub use commands::pick_prompt_jump;
 use commands::*;
+#[cfg(unix)]
 pub use images::SIXEL_HOST;
 use images::*;
 pub use input::osc52_copy_seq;
@@ -59,7 +60,9 @@ pub use processes::cwd_is_observable;
 pub use processes::cwd_of_pid;
 pub use processes::process_cmdline;
 pub use processes::process_name;
+#[cfg(any(unix, test))]
 use processes::*;
+#[cfg(any(unix, test))]
 pub(crate) use scroll::resize_term;
 #[cfg(test)]
 use scroll::*;
@@ -74,6 +77,7 @@ use shell_env::*;
 #[cfg(test)]
 use status::*;
 pub use text::FindLine;
+#[cfg(any(unix, test))]
 pub(crate) use text::ansi_rows_from;
 use text::*;
 

@@ -405,6 +405,7 @@ pub(super) fn ansi_rows(term: &Term<VoidListener>, top: i32) -> Vec<(String, Str
 }
 
 /// [`ansi_rows`] for another module's model of a pane (#694's pane host).
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn ansi_rows_from(term: &Term<VoidListener>, top: i32) -> Vec<(String, String, bool)> {
     ansi_rows(term, top)
 }

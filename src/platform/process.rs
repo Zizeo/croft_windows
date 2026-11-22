@@ -170,6 +170,7 @@ impl ManagedChild {
         }
     }
 
+    #[allow(dead_code)]
     pub fn id(&self) -> u32 {
         self.child.id()
     }
@@ -200,6 +201,7 @@ impl ManagedChild {
     /// Transfer ownership of the underlying `Child` out of `ManagedChild`,
     /// leaving the child running (on Windows, `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
     /// is cleared before the job handle is dropped).
+    #[allow(dead_code)]
     pub fn into_child(self) -> Child {
         #[cfg(windows)]
         if let Some(ref job) = self.job {
@@ -306,6 +308,7 @@ fn open_and_terminate(pid: u32) -> bool {
     }
 }
 
+#[allow(dead_code)]
 pub fn terminate_pid(pid: u32) -> bool {
     #[cfg(unix)]
     {
