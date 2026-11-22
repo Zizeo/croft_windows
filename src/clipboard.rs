@@ -23,7 +23,11 @@ pub fn read_string() -> Option<String> {
     {
         linux::read_string()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::clipboard::read_string()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         None
     }
@@ -79,7 +83,11 @@ pub fn write_string(text: &str) -> bool {
     {
         linux::write_string(text)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::clipboard::write_string(text)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         false
     }

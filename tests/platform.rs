@@ -183,3 +183,14 @@ fn process_into_child_preserves_liveness() {
     child.wait().unwrap();
     assert!(!platform::process::is_pid_alive(pid));
 }
+
+#[test]
+fn clipboard_utf16_codec_roundtrip_and_nul_rejection() {
+    for sample in ["", "hello world", "café naïve", "🚀🦀 Windows\r\nline2"] {
+        let encoded = platform::clipboard::encode_utf16_nul(sample).unwrap();
+        assert_eq!(encoded.last(), Some(&0));
+        let decoded = platform::clipboard::decode_utf16_nul(&encoded);
+        assert_eq!(decoded, sample);
+    }
+    assert!(platform::clipboard::encode_utf16_nul("a\0b").is_none());
+}

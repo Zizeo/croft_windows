@@ -90,6 +90,7 @@ mod pane_host;
 mod paths;
 mod pdf;
 mod permalink;
+mod platform;
 mod plot;
 mod port_detect;
 mod pr_review;
