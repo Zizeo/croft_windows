@@ -355,6 +355,7 @@ pub(super) fn foreground_group_of(pid: i32) -> Option<i32> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(super) fn foreground_group_of(_pid: i32) -> Option<i32> {
     None
 }

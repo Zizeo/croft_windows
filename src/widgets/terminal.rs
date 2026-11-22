@@ -263,6 +263,7 @@ pub struct PtyTerminal {
     /// Without it the join above can hang forever: on Linux a background job
     /// keeps the pty slave open after the shell dies, so the reader's `read`
     /// never returns EOF (macOS revokes the tty instead).
+    #[cfg(unix)]
     reader_shutdown: Option<std::io::PipeWriter>,
     /// The interactive shell's pid, captured at spawn. A shell at its
     /// prompt is its own foreground process-group leader, so this is the
@@ -608,8 +609,12 @@ impl PtyTerminal {
 /// it with an fd to poll for them, and the shell's pid.
 struct PaneLink {
     writer: Box<dyn Write + Send>,
+    #[cfg(unix)]
     reader: Box<dyn Read + Send>,
+    #[cfg(unix)]
     poll_fd: std::os::fd::RawFd,
+    #[cfg(windows)]
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
     shell_pid: Option<i32>,
     backend: PaneBackend,
 }

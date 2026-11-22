@@ -49,6 +49,7 @@ impl PtyTerminal {
     /// a saved session records so the next croft can reattach.
     pub fn host_socket(&self) -> Option<&std::path::Path> {
         match &self.backend {
+            #[cfg(unix)]
             PaneBackend::Hosted { socket, .. } => Some(socket),
             PaneBackend::Local { .. } => None,
         }
@@ -58,8 +59,13 @@ impl PtyTerminal {
 /// Where a pane's shell comes from.
 pub(super) enum PaneSource {
     /// Start `cmd`: on a PTY croft holds, or in a new pane host.
-    Spawn { cmd: CommandBuilder, hosted: bool },
+    Spawn {
+        cmd: CommandBuilder,
+        #[cfg_attr(not(unix), allow(dead_code))]
+        hosted: bool,
+    },
     /// Reattach to the pane host at this socket (#694).
+    #[cfg(unix)]
     Attach(std::path::PathBuf),
 }
 
@@ -67,12 +73,13 @@ pub(super) enum PaneSource {
 pub(super) enum PaneBackend {
     /// croft: the PTY dies with croft.
     Local {
-        master: Box<dyn MasterPty + Send>,
+        master: Option<Box<dyn MasterPty + Send>>,
         child: Box<dyn portable_pty::Child + Send + Sync>,
     },
     /// A pane host (#694): the shell outlives croft. `conn` carries input,
     /// resizes and the kill; the pid comes from the host's greeting, and
     /// `exit` from its notice that the shell ended.
+    #[cfg(unix)]
     Hosted {
         conn: Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>,
         socket: std::path::PathBuf,
@@ -85,6 +92,7 @@ impl PaneBackend {
     pub(super) fn pid(&self) -> Option<u32> {
         match self {
             PaneBackend::Local { child, .. } => child.process_id(),
+            #[cfg(unix)]
             PaneBackend::Hosted { pid, .. } => *pid,
         }
     }
@@ -93,22 +101,34 @@ impl PaneBackend {
     /// holds, the shell's `tpgid` from the process table for a hosted one
     /// (the same value, read without the master).
     pub(super) fn process_group_leader(&self) -> Option<i32> {
-        match self {
-            PaneBackend::Local { master, .. } => master.process_group_leader(),
-            PaneBackend::Hosted { pid, .. } => pid.and_then(|p| foreground_group_of(p as i32)),
+        #[cfg(unix)]
+        {
+            match self {
+                PaneBackend::Local { master, .. } => {
+                    master.as_ref().and_then(|m| m.process_group_leader())
+                }
+                PaneBackend::Hosted { pid, .. } => pid.and_then(|p| foreground_group_of(p as i32)),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            None
         }
     }
 
     pub(super) fn resize(&self, cols: u16, rows: u16) {
         match self {
             PaneBackend::Local { master, .. } => {
-                let _ = master.resize(PtySize {
-                    cols,
-                    rows,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                });
+                if let Some(master) = master.as_ref() {
+                    let _ = master.resize(PtySize {
+                        cols,
+                        rows,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                }
             }
+            #[cfg(unix)]
             PaneBackend::Hosted { conn, .. } => {
                 let frame = crate::session_host::encode_control_frame(
                     &crate::session_host::Control::Resize { cols, rows },
@@ -122,12 +142,16 @@ impl PaneBackend {
     /// holds (#912). A pane host reaps its own shell and sends the code
     /// before the pane's output closes, so it is read once
     /// `output_closed`; a host gone without sending one gives `Some(None)`.
-    pub(super) fn try_exit(&mut self, output_closed: bool) -> Option<Option<i32>> {
+    pub(super) fn try_exit(
+        &mut self,
+        #[cfg_attr(not(unix), allow(unused_variables))] output_closed: bool,
+    ) -> Option<Option<i32>> {
         match self {
             PaneBackend::Local { child, .. } => {
                 let status = child.try_wait().ok()??;
                 Some(Some(status.exit_code() as i32))
             }
+            #[cfg(unix)]
             PaneBackend::Hosted { exit, .. } => output_closed.then(|| *exit.lock().unwrap()),
         }
     }
@@ -136,15 +160,22 @@ impl PaneBackend {
     /// host too), then drop the connection so the demux thread ends.
     pub(super) fn end(&mut self) {
         match self {
-            PaneBackend::Local { child, .. } => {
+            PaneBackend::Local { master, child } => {
                 // A shell already reaped is never signalled: its pid may
                 // name another process by now.
-                if matches!(child.try_wait(), Ok(Some(_))) {
-                    return;
+                if !matches!(child.try_wait(), Ok(Some(_))) {
+                    let _ = child.kill();
+                    let _ = child.wait();
                 }
-                let _ = child.kill();
-                let _ = child.wait();
+                // On Windows, killing the child does not always close ConPTY
+                // until `MasterPty` is dropped (`ClosePseudoConsole`), which
+                // unblocks the bridge reader thread.
+                #[cfg(windows)]
+                drop(master.take());
+                #[cfg(not(windows))]
+                let _ = master;
             }
+            #[cfg(unix)]
             PaneBackend::Hosted { conn, .. } => {
                 let frame =
                     crate::session_host::encode_control_frame(&crate::session_host::Control::Kill);
@@ -157,8 +188,10 @@ impl PaneBackend {
 }
 
 /// Input for a hosted pane: each write is one bytes frame.
+#[cfg(unix)]
 pub(super) struct HostInput(Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>);
 
+#[cfg(unix)]
 impl Write for HostInput {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let frame = crate::session_host::encode_bytes_frame(buf);
@@ -174,6 +207,7 @@ impl Write for HostInput {
 impl PaneLink {
     pub(super) fn open(source: PaneSource, cols: u16, rows: u16) -> Result<Self> {
         match source {
+            #[cfg(unix)]
             PaneSource::Spawn { cmd, hosted: true } => {
                 let spec = crate::pane_host::PaneSpec {
                     socket: crate::pane_host::socket_for(&crate::pane_host::new_pane_id()),
@@ -201,11 +235,16 @@ impl PaneLink {
                     Err(_) => Self::local(cmd, cols, rows),
                 }
             }
+            #[cfg(unix)]
             PaneSource::Spawn { cmd, hosted: false } => Self::local(cmd, cols, rows),
+            #[cfg(not(unix))]
+            PaneSource::Spawn { cmd, hosted: _ } => Self::local(cmd, cols, rows),
+            #[cfg(unix)]
             PaneSource::Attach(socket) => Self::attach(&socket, cols, rows),
         }
     }
 
+    #[cfg(unix)]
     pub(super) fn local(cmd: CommandBuilder, cols: u16, rows: u16) -> Result<Self> {
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -230,7 +269,47 @@ impl PaneLink {
             poll_fd,
             shell_pid,
             backend: PaneBackend::Local {
-                master: pair.master,
+                master: Some(pair.master),
+                child,
+            },
+        })
+    }
+
+    #[cfg(windows)]
+    pub(super) fn local(cmd: CommandBuilder, cols: u16, rows: u16) -> Result<Self> {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                cols,
+                rows,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("openpty")?;
+        let child = pair.slave.spawn_command(cmd).context("spawn child")?;
+        let shell_pid = child.process_id().map(|p| p as i32);
+        drop(pair.slave);
+        let writer = pair.master.take_writer().context("take writer")?;
+        let mut reader = pair.master.try_clone_reader().context("clone reader")?;
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            writer,
+            rx,
+            shell_pid,
+            backend: PaneBackend::Local {
+                master: Some(pair.master),
                 child,
             },
         })
@@ -241,6 +320,7 @@ impl PaneLink {
     /// (the redraw first), so the reader reads it exactly as it reads a
     /// PTY. The pipe closes when the host says the shell exited or the
     /// connection ends, which the reader sees as the PTY's EOF.
+    #[cfg(unix)]
     pub(super) fn attach(socket: &std::path::Path, cols: u16, rows: u16) -> Result<Self> {
         use crate::session_host::{Control, Frame, FrameReader};
         use std::os::fd::AsRawFd;
@@ -324,6 +404,7 @@ impl PaneLink {
 /// blocking `read` is not enough to ever exit: on Linux a background job
 /// keeps the pty slave open after the shell dies, so the read never returns
 /// and joining the reader would freeze the UI for as long as the job runs.
+#[cfg(unix)]
 pub(super) fn wait_pty_readable(
     pty_fd: std::os::fd::RawFd,
     shutdown: &std::io::PipeReader,
@@ -356,6 +437,7 @@ pub(super) const PORT_URL_SETTLE_MS: i32 = 150;
 pub(super) const EXIT_OUTPUT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// What [`poll_pty`] saw.
+#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum PtyWait {
     /// The pty has output.
@@ -367,6 +449,7 @@ pub(super) enum PtyWait {
 }
 
 /// [`wait_pty_readable`] with a timeout in milliseconds (`-1` waits forever).
+#[cfg(unix)]
 pub(super) fn poll_pty(
     pty_fd: std::os::fd::RawFd,
     shutdown: &std::io::PipeReader,
@@ -422,11 +505,28 @@ impl Drop for PtyTerminal {
         // to the other panes (#694). Not left to the Arc: the reader thread
         // holds a clone until it is joined below.
         crate::rewind::budget().release(&self.rewind);
-        // Wake the reader (POLLHUP on its shutdown fd) and join it. EOF alone
-        // is not a reliable wake: see `wait_pty_readable`.
-        drop(self.reader_shutdown.take());
+        #[cfg(unix)]
+        {
+            // Wake the reader (POLLHUP on its shutdown fd) and join it. EOF alone
+            // is not a reliable wake: see `wait_pty_readable`.
+            drop(self.reader_shutdown.take());
+            if let Some(handle) = self.reader_thread.take() {
+                let _ = handle.join();
+            }
+        }
+        #[cfg(windows)]
         if let Some(handle) = self.reader_thread.take() {
-            let _ = handle.join();
+            // `end()` already dropped `MasterPty` (`ClosePseudoConsole`),
+            // which closes the ConPTY output pipe once no grandchild holds it.
+            // Poll briefly so normal exits join cleanly, and detach if a
+            // grandchild keeps the pipe open so UI exit never freezes.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
         }
     }
 }
