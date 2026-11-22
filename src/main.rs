@@ -111,10 +111,8 @@ mod quick_select;
 mod quickfix;
 mod rebase_todo;
 mod release_notes;
-#[cfg_attr(not(unix), allow(dead_code))]
 mod remote;
 mod remote_bulk;
-#[cfg_attr(not(unix), allow(dead_code))]
 mod remote_connect;
 mod remote_prebuilt;
 mod review_ops;

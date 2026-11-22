@@ -200,12 +200,13 @@ pub(super) fn install_remote_croft_streaming(
 ) -> Result<()> {
     // The release binary first (#261), over the same bulk lane.
     let mut ship = |binary: &Path| -> Result<()> {
-        let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
-        let status = ship_file_rsync_command(lane, &ssh.socket_path, binary, &dest)
-            .status()
-            .context("rsyncing the prebuilt croft to the remote")?;
-        anyhow::ensure!(status.success(), "rsync exited with {status}");
-        Ok(())
+        ship_local_file_to_remote(
+            lane,
+            &ssh.socket_path,
+            &ssh.host,
+            binary,
+            ".cargo/bin/croft.new",
+        )
     };
     let mut log = |m: String| {
         let _ = log_tx.send(m);
@@ -280,17 +281,17 @@ pub(super) fn try_local_cross_install_streaming(
         anyhow::bail!("remote mkdir exited with {mkdir_status}");
     }
 
-    let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
     let _ = log_tx.send(format!(
-        "Rsyncing binary to {dest} (bulk lane, {} KB/s cap)",
-        lane.bwlimit_kbps()
+        "Uploading croft binary to {}:~/.cargo/bin/croft.new",
+        ssh.host
     ));
-    let rsync = ship_file_rsync_command(lane, &ssh.socket_path, &binary, &dest);
-    let rsync_status =
-        run_command_streaming(rsync, log_tx).context("rsyncing croft binary to remote")?;
-    if !rsync_status.success() {
-        anyhow::bail!("rsync exited with {rsync_status}");
-    }
+    ship_local_file_to_remote(
+        lane,
+        &ssh.socket_path,
+        &ssh.host,
+        &binary,
+        ".cargo/bin/croft.new",
+    )?;
 
     let act = ssh.background_shell(&activate_command(source_stamp));
     let act_status =
@@ -313,21 +314,26 @@ pub(super) fn sync_local_source_to_remote_streaming(
     log_tx: &std::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mkdir = ssh.background_shell(&remote_source_dir_prep(&source));
-    let mkdir_status =
-        run_command_streaming(mkdir, log_tx).context("creating remote source dir")?;
-    if !mkdir_status.success() {
-        anyhow::bail!("remote mkdir exited with {mkdir_status}");
+    if cfg!(unix) && crate::platform::env::resolve_on_path("rsync").is_some() {
+        let mkdir = ssh.background_shell(&remote_source_dir_prep(&source));
+        let mkdir_status =
+            run_command_streaming(mkdir, log_tx).context("creating remote source dir")?;
+        if mkdir_status.success() {
+            let mut source_arg: std::ffi::OsString = source.clone().into_os_string();
+            source_arg.push("/");
+            let dest = format!("{}:.cache/croft/source/", ssh.host);
+            let rsync = source_sync_rsync_command(lane, &ssh.socket_path, &source_arg, &dest);
+            if let Ok(status) = run_command_streaming(rsync, log_tx)
+                && status.success()
+            {
+                return Ok(());
+            }
+        }
+        let _ = log_tx.send("rsync unavailable or failed; falling back to tar pipe".to_string());
+    } else {
+        let _ = log_tx.send("Shipping source archive over SSH tar pipe".to_string());
     }
-    let mut source_arg: std::ffi::OsString = source.clone().into_os_string();
-    source_arg.push("/");
-    let dest = format!("{}:.cache/croft/source/", ssh.host);
-    let rsync = source_sync_rsync_command(lane, &ssh.socket_path, &source_arg, &dest);
-    let status = run_command_streaming(rsync, log_tx).context("running rsync to remote")?;
-    if !status.success() {
-        anyhow::bail!("rsync exited with {status}");
-    }
-    Ok(())
+    sync_via_tar(ssh)
 }
 
 /// Run the update check + (re)install on a detached thread so the caller can

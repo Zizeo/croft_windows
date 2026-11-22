@@ -1,21 +1,18 @@
-#[cfg(unix)]
-use anyhow::Context;
-use anyhow::Result;
-#[cfg(unix)]
+use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(unix)]
-use std::sync::mpsc::channel;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::remote::AdoptedMaster;
 #[cfg(unix)]
 use crate::remote::ssh_control_dir;
+
+const WIN_AUTH_OK_MARKER: &str = "__CROFT_SSH_AUTH_OK__";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptKind {
@@ -43,6 +40,7 @@ pub struct SshAuth {
     events_rx: Receiver<SshAuthEvent>,
     reader_handle: Option<JoinHandle<()>>,
     cancelled: Arc<AtomicBool>,
+    auth_marker_seen: Arc<AtomicBool>,
     finished: bool,
     handed_off: bool,
     authenticated_signaled: bool,
@@ -50,10 +48,15 @@ pub struct SshAuth {
 }
 
 impl SshAuth {
-    #[cfg(unix)]
     pub fn start(host: &str) -> Result<Self> {
-        let socket_dir = ssh_control_dir().context("ssh control dir")?;
-        let socket_path = socket_dir.join("ctl");
+        #[cfg(unix)]
+        let (socket_dir, socket_path) = {
+            let dir = ssh_control_dir().context("ssh control dir")?;
+            let path = dir.join("ctl");
+            (dir, path)
+        };
+        #[cfg(not(unix))]
+        let (socket_dir, socket_path) = (PathBuf::new(), PathBuf::new());
 
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -66,16 +69,26 @@ impl SshAuth {
             .context("openpty for ssh auth")?;
 
         let mut cmd = CommandBuilder::new("ssh");
-        cmd.arg("-M");
-        cmd.arg("-S");
-        cmd.arg(&socket_path);
-        cmd.arg("-N");
+        #[cfg(unix)]
+        {
+            cmd.arg("-M");
+            cmd.arg("-S");
+            cmd.arg(&socket_path);
+            cmd.arg("-N");
+        }
         cmd.arg("-T");
         cmd.arg("-o");
         cmd.arg("BatchMode=no");
+        #[cfg(not(unix))]
+        {
+            cmd.arg("-o");
+            cmd.arg("ConnectTimeout=10");
+        }
         cmd.arg("-o");
         cmd.arg("ServerAliveInterval=15");
         cmd.arg(host);
+        #[cfg(not(unix))]
+        cmd.arg(format!("printf '%s\\n' {WIN_AUTH_OK_MARKER}"));
         cmd.env("TERM", "dumb");
         cmd.env_remove("SSH_ASKPASS");
         cmd.env_remove("SSH_ASKPASS_REQUIRE");
@@ -89,7 +102,13 @@ impl SshAuth {
 
         let (events_tx, events_rx) = channel();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let reader_handle = spawn_reader(reader, events_tx, cancelled.clone());
+        let auth_marker_seen = Arc::new(AtomicBool::new(false));
+        let reader_handle = spawn_reader(
+            reader,
+            events_tx,
+            cancelled.clone(),
+            auth_marker_seen.clone(),
+        );
 
         Ok(Self {
             host: host.to_string(),
@@ -100,6 +119,7 @@ impl SshAuth {
             events_rx,
             reader_handle: Some(reader_handle),
             cancelled,
+            auth_marker_seen,
             finished: false,
             handed_off: false,
             authenticated_signaled: false,
@@ -107,18 +127,19 @@ impl SshAuth {
         })
     }
 
-    #[cfg(not(unix))]
-    pub fn start(_host: &str) -> Result<Self> {
-        anyhow::bail!(
-            "croft remote is not supported on native Windows (Windows OpenSSH lacks ControlMaster); run croft in WSL2"
-        )
-    }
-
     pub fn drain_events(&mut self) -> Vec<SshAuthEvent> {
         let mut out = Vec::new();
         loop {
             match self.events_rx.try_recv() {
-                Ok(e) => out.push(e),
+                Ok(e) => {
+                    if matches!(e, SshAuthEvent::Authenticated) {
+                        if self.authenticated_signaled {
+                            continue;
+                        }
+                        self.authenticated_signaled = true;
+                    }
+                    out.push(e);
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     if !self.finished {
@@ -135,20 +156,23 @@ impl SshAuth {
     }
 
     fn poll_child_for_completion(&mut self, out: &mut Vec<SshAuthEvent>) {
-        if !self.authenticated_signaled && self.socket_path.exists() {
+        let socket_ready = !self.socket_path.as_os_str().is_empty() && self.socket_path.exists();
+        let auth_ready = self.auth_marker_seen.load(Ordering::SeqCst) || socket_ready;
+        if !self.authenticated_signaled && auth_ready {
             self.authenticated_signaled = true;
             out.push(SshAuthEvent::Authenticated);
             return;
         }
         if let Ok(Some(status)) = self.child.try_wait() {
             self.finished = true;
-            if status.success() && self.socket_path.exists() {
+            let ready = self.auth_marker_seen.load(Ordering::SeqCst) || socket_ready;
+            if status.success() && ready {
                 if !self.authenticated_signaled {
                     self.authenticated_signaled = true;
                     out.push(SshAuthEvent::Authenticated);
                 }
             } else {
-                let detail = if !self.socket_path.exists() {
+                let detail = if !socket_ready && cfg!(unix) {
                     format!(
                         "ssh exited {status} and no control socket appeared at {}",
                         self.socket_path.display()
@@ -186,7 +210,7 @@ impl SshAuth {
         self.writer.take();
         let _ = self.child.kill();
         let _ = self.child.wait();
-        if self.socket_path.exists() {
+        if !self.socket_path.as_os_str().is_empty() && self.socket_path.exists() {
             let _ = std::process::Command::new("ssh")
                 .arg("-S")
                 .arg(&self.socket_path)
@@ -197,7 +221,9 @@ impl SshAuth {
                 .stderr(std::process::Stdio::null())
                 .status();
         }
-        let _ = std::fs::remove_dir_all(&self.socket_dir);
+        if !self.socket_dir.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(&self.socket_dir);
+        }
         self.finished = true;
     }
 
@@ -226,7 +252,8 @@ impl Drop for SshAuth {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
-        if !self.handed_off && self.socket_path.exists() {
+        if !self.handed_off && !self.socket_path.as_os_str().is_empty() && self.socket_path.exists()
+        {
             let _ = std::process::Command::new("ssh")
                 .arg("-S")
                 .arg(&self.socket_path)
@@ -250,6 +277,7 @@ fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     events_tx: Sender<SshAuthEvent>,
     cancelled: Arc<AtomicBool>,
+    auth_marker_seen: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -262,10 +290,19 @@ fn spawn_reader(
                 Ok(0) => break,
                 Ok(n) => {
                     let chunk = strip_ansi(&buf[..n]);
-                    if events_tx.send(SshAuthEvent::Log(chunk.clone())).is_err() {
+                    let display = chunk.replace(WIN_AUTH_OK_MARKER, "");
+                    if !display.is_empty() && events_tx.send(SshAuthEvent::Log(display)).is_err() {
                         break;
                     }
                     tail.push_str(&chunk);
+                    if tail.contains(WIN_AUTH_OK_MARKER) {
+                        tail = tail.replace(WIN_AUTH_OK_MARKER, "");
+                        if !auth_marker_seen.swap(true, Ordering::SeqCst)
+                            && events_tx.send(SshAuthEvent::Authenticated).is_err()
+                        {
+                            break;
+                        }
+                    }
                     while let Some(prompt) = peel_prompt(&mut tail) {
                         if events_tx.send(prompt).is_err() {
                             return;

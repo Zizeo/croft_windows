@@ -246,7 +246,6 @@ pub(super) fn run_croft_session(
 /// runs the actual remote croft. Must be called only after the terminal
 /// has been returned to cooked mode and the alt-screen surrendered, since
 /// the spawned ssh shares stdin/stdout/stderr with the user's terminal.
-#[cfg(unix)]
 pub fn launch_only(adopted: AdoptedMaster, path: Option<&str>) -> Result<RemoteOutcome> {
     let ssh = SshControl::adopt(adopted);
     let host = ssh.host.clone();
@@ -254,18 +253,10 @@ pub fn launch_only(adopted: AdoptedMaster, path: Option<&str>) -> Result<RemoteO
     run_croft_session(ssh, &host, path, persistent, false)
 }
 
-#[cfg(not(unix))]
-pub fn launch_only(_adopted: AdoptedMaster, _path: Option<&str>) -> Result<RemoteOutcome> {
-    anyhow::bail!(
-        "croft remote is not supported on native Windows (Windows OpenSSH lacks ControlMaster); run croft in WSL2"
-    )
-}
-
 /// Same as `launch_croft` but reuses an already-established SSH ControlMaster
 /// socket so the in-TUI auth flow (PTY-driven password dialog) doesn't need
 /// to prompt the user a second time when the post-quit path hands off the
 /// connection.
-#[cfg(unix)]
 pub fn launch_croft_with(
     host: &str,
     path: Option<&str>,
@@ -294,18 +285,6 @@ pub fn launch_croft_with(
     }
     let persistent = remote_has_session_supervisor(&ssh);
     run_croft_session(ssh, host, path, persistent, solo)
-}
-
-#[cfg(not(unix))]
-pub fn launch_croft_with(
-    _host: &str,
-    _path: Option<&str>,
-    _adopted: Option<AdoptedMaster>,
-    _solo: bool,
-) -> Result<RemoteOutcome> {
-    anyhow::bail!(
-        "croft remote is not supported on native Windows (Windows OpenSSH lacks ControlMaster); run croft in WSL2"
-    )
 }
 
 pub(super) fn run_remote_croft(

@@ -11,19 +11,7 @@ pub(super) fn handle_clipboard_request(
 ) {
     let dest_dir = format!("{inbox_dir}/{request_id}");
     let mkdir = format!("mkdir -p {}", shell_quote(&dest_dir));
-    let mkdir_ok = Command::new("ssh")
-        .arg("-S")
-        .arg(socket)
-        .arg("-o")
-        .arg("ControlMaster=no")
-        .arg(host)
-        .arg(&mkdir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let mkdir_ok = ssh_exec(host, socket, &mkdir);
     if !mkdir_ok {
         write_relay_err(host, socket, inbox_dir, request_id, "remote mkdir failed");
         return;
@@ -45,11 +33,11 @@ pub(super) fn handle_clipboard_request(
         "cat > {dst}",
         dst = shell_quote(&format!("{dest_dir}/clipboard.txt")),
     );
-    let mut ssh_recv = match Command::new("ssh")
-        .arg("-S")
-        .arg(socket)
-        .arg("-o")
-        .arg("ControlMaster=no")
+    let mut ssh_cmd = ssh_socket_command(socket, false);
+    if socket.as_os_str().is_empty() {
+        ssh_cmd.arg("-o").arg("BatchMode=yes");
+    }
+    let mut ssh_recv = match ssh_cmd
         .arg(host)
         .arg(&remote_cmd)
         .stdin(Stdio::piped())
@@ -77,17 +65,7 @@ pub(super) fn handle_clipboard_request(
     match status {
         Ok(s) if s.success() => {
             let touch = format!("touch {}/.ok", shell_quote(&dest_dir));
-            let _ = Command::new("ssh")
-                .arg("-S")
-                .arg(socket)
-                .arg("-o")
-                .arg("ControlMaster=no")
-                .arg(host)
-                .arg(&touch)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            let _ = ssh_exec(host, socket, &touch);
         }
         Ok(s) => write_relay_err(
             host,
@@ -135,18 +113,7 @@ pub(super) fn handle_copy_request(host: &str, socket: &Path, inbox_dir: &str, re
     // `cat` would have streamed into local memory without end.
     let limit = MAX_COPY_PAYLOAD_BYTES + 1;
     let remote_cmd = format!("head -c {limit} {quoted}; rm -f {quoted}");
-    let Ok(mut child) = Command::new("ssh")
-        .arg("-S")
-        .arg(socket)
-        .arg("-o")
-        .arg("ControlMaster=no")
-        .arg(host)
-        .arg(&remote_cmd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
+    let Ok(mut child) = ssh_socket_read(socket, host, &remote_cmd).spawn() else {
         return;
     };
     let Some(mut out) = child.stdout.take() else {

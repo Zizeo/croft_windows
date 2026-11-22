@@ -233,11 +233,9 @@ pub(super) fn push_over_bulk_lane(
         let there = remote.get(syncable.name).map(String::as_str);
         match crate::config_sync::plan(&hash, there, state.file(host, syncable.name)) {
             crate::config_sync::Plan::Push => {
-                let dest = crate::config_sync::remote_dest(host, syncable.name);
-                let ok = matches!(
-                    ship_file_rsync_command(&bulk.lane, socket, local, &dest).status(),
-                    Ok(st) if st.success()
-                );
+                let remote_rel = format!(".config/croft/{}", syncable.name);
+                let ok =
+                    ship_local_file_to_remote(&bulk.lane, socket, host, local, &remote_rel).is_ok();
                 if ok {
                     let entry = state.file_mut(host, syncable.name);
                     entry.pushed = Some(hash);

@@ -307,3 +307,26 @@ fn lsp_bundled_binary_manifests_include_windows_targets() {
         );
     }
 }
+
+#[test]
+fn remote_and_sync_config_cli_subcommands_are_enabled() {
+    let exe = env!("CARGO_BIN_EXE_croft");
+    for args in [["remote", "--help"], ["sync-config", "--help"]] {
+        let out = std::process::Command::new(exe)
+            .args(args)
+            .output()
+            .expect("invoke croft binary");
+        assert!(
+            out.status.success(),
+            "`croft {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("not supported on native Windows"),
+            "`croft {}` unexpectedly reports Windows unsupported",
+            args.join(" ")
+        );
+    }
+}

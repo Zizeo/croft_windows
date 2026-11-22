@@ -111,16 +111,21 @@ pub(super) fn push_config_files(
         };
         match plan {
             crate::config_sync::Plan::Push => {
-                let dest = crate::config_sync::remote_dest(&ssh.host, syncable.name);
-                let mut rsync = ship_file_rsync_command(&bulk.lane, &ssh.socket_path, local, &dest);
-                match rsync.status() {
-                    Ok(st) if st.success() => {
+                let remote_rel = format!(".config/croft/{}", syncable.name);
+                match ship_local_file_to_remote(
+                    &bulk.lane,
+                    &ssh.socket_path,
+                    &ssh.host,
+                    local,
+                    &remote_rel,
+                ) {
+                    Ok(()) => {
                         let entry = state.file_mut(&ssh.host, syncable.name);
                         entry.pushed = Some(local_hash);
                         entry.kept = None;
                         pushed.push(syncable);
                     }
-                    _ => failed.push(syncable.name),
+                    Err(_) => failed.push(syncable.name),
                 }
             }
             crate::config_sync::Plan::UpToDate => {
@@ -233,22 +238,39 @@ pub(super) fn read_remote_config(
 pub(super) fn print_config_diff(ssh: &SshControl, name: &str) -> Result<()> {
     let local = crate::paths::config_dir().join(name);
     let remote = read_remote_config(&ssh.socket_path, &ssh.host, name)?;
-    let tmp = std::env::temp_dir().join(format!("croft-sync-{}-{name}", std::process::id()));
+    let pid = std::process::id();
+    let tmp = std::env::temp_dir().join(format!("croft-sync-{pid}-{name}"));
     std::fs::write(&tmp, &remote)?;
-    let local_arg = if local.is_file() {
-        local
+    let (local_arg, empty_tmp) = if local.is_file() {
+        (local, None)
+    } else if cfg!(windows) {
+        let empty = std::env::temp_dir().join(format!("croft-sync-empty-{pid}-{name}"));
+        std::fs::write(&empty, b"")?;
+        (empty.clone(), Some(empty))
     } else {
-        PathBuf::from("/dev/null")
+        (PathBuf::from("/dev/null"), None)
     };
-    let status = Command::new("diff")
+    let status = match Command::new("diff")
         .args(["-u", "--label"])
         .arg(format!("{}:{name}", ssh.host))
         .arg("--label")
         .arg(format!("local:{name}"))
         .arg(&tmp)
         .arg(&local_arg)
-        .status();
+        .status()
+    {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Command::new("git")
+            .args(["diff", "--no-index", "--"])
+            .arg(&tmp)
+            .arg(&local_arg)
+            .status(),
+        Err(e) => Err(e),
+    };
     let _ = std::fs::remove_file(&tmp);
+    if let Some(empty) = empty_tmp {
+        let _ = std::fs::remove_file(empty);
+    }
     let status = status?;
     if status.code() == Some(0) {
         println!("{name} is the same on {} and here", ssh.host);
@@ -322,4 +344,44 @@ pub(super) fn ship_file_rsync_command(
     rsync.arg("-e").arg(lane.rsync_ssh_arg(interactive_socket));
     rsync.arg(local).arg(dest);
     rsync
+}
+
+/// Upload `local` to `$HOME/<remote_rel>` on `host`. Uses `rsync` on Unix when
+/// available, otherwise streams the file over SSH `stdin` into a temporary
+/// file and atomically renames it into place (needed on native Windows, where
+/// `rsync` is typically absent).
+pub(super) fn ship_local_file_to_remote(
+    lane: &crate::remote_bulk::BulkLane,
+    interactive_socket: &Path,
+    host: &str,
+    local: &Path,
+    remote_rel: &str,
+) -> Result<()> {
+    if cfg!(unix) && crate::platform::env::resolve_on_path("rsync").is_some() {
+        let dest = format!("{host}:{remote_rel}");
+        let status = ship_file_rsync_command(lane, interactive_socket, local, &dest)
+            .status()
+            .with_context(|| format!("rsyncing {} to {dest}", local.display()))?;
+        anyhow::ensure!(status.success(), "rsync exited with {status}");
+        return Ok(());
+    }
+    let file =
+        std::fs::File::open(local).with_context(|| format!("opening {}", local.display()))?;
+    let q_dest = shell_quote(remote_rel);
+    let q_tmp = shell_quote(&format!("{remote_rel}.tmp.{}", std::process::id()));
+    let remote_cmd = format!("cat > {q_tmp} && mv -f {q_tmp} {q_dest}");
+    let mut cmd = lane.probe_ssh_command(interactive_socket);
+    cmd.arg(host)
+        .arg(&remote_cmd)
+        .stdin(Stdio::from(file))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = cmd
+        .output()
+        .with_context(|| format!("streaming {} over ssh", local.display()))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ssh file upload failed ({}): {}", output.status, err.trim());
+    }
+    Ok(())
 }

@@ -56,10 +56,27 @@ impl SshControl {
     }
 
     #[cfg(not(unix))]
-    pub(super) fn start(_host: &str) -> Result<Self> {
-        anyhow::bail!(
-            "croft remote is not supported on native Windows (Windows OpenSSH lacks ControlMaster); run croft in WSL2"
-        )
+    pub(super) fn start(host: &str) -> Result<Self> {
+        let status = Command::new(ssh_program())
+            .arg("-T")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg("-o")
+            .arg("ServerAliveInterval=10")
+            .arg("-o")
+            .arg("ServerAliveCountMax=3")
+            .arg(host)
+            .arg("true")
+            .status()
+            .context("starting SSH connection")?;
+        if !status.success() {
+            anyhow::bail!("ssh connection exited with {status}");
+        }
+        Ok(Self {
+            host: host.to_string(),
+            socket_dir: PathBuf::new(),
+            socket_path: PathBuf::new(),
+        })
     }
 
     pub(super) fn command(&self) -> Command {
@@ -117,11 +134,16 @@ pub(super) fn ssh_socket_read(socket_path: &Path, host: &str, script: &str) -> C
 /// keep the terminal, so it passes `false`.
 pub(super) fn ssh_socket_command(socket_path: &Path, background: bool) -> Command {
     let mut command = Command::new(ssh_program());
+    if !socket_path.as_os_str().is_empty() {
+        command
+            .arg("-S")
+            .arg(socket_path)
+            .arg("-o")
+            .arg("ControlMaster=no");
+    } else if background {
+        command.arg("-o").arg("BatchMode=yes");
+    }
     command
-        .arg("-S")
-        .arg(socket_path)
-        .arg("-o")
-        .arg("ControlMaster=no")
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg("-o")
@@ -140,6 +162,9 @@ pub(super) fn ssh_socket_command(socket_path: &Path, background: bool) -> Comman
 
 impl Drop for SshControl {
     fn drop(&mut self) {
+        if self.socket_path.as_os_str().is_empty() {
+            return;
+        }
         let _ = Command::new("ssh")
             .arg("-S")
             .arg(&self.socket_path)
@@ -155,16 +180,10 @@ impl Drop for SshControl {
 /// nested master). Used for the relay inbox bookkeeping (`mkdir`, sentinel
 /// writes). Returns whether it exited zero.
 pub(super) fn ssh_exec(host: &str, socket: &Path, cmd: &str) -> bool {
-    Command::new("ssh")
-        .arg("-S")
-        .arg(socket)
-        .arg("-o")
-        .arg("ControlMaster=no")
+    let mut command = ssh_socket_command(socket, true);
+    command
         .arg(host)
         .arg(cmd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -176,6 +195,7 @@ pub(super) fn ssh_exec(host: &str, socket: &Path, cmd: &str) -> bool {
 /// `create_dir_all` accepted a directory another local user had made first,
 /// who could then plant a `ctl` that reads as "authenticated" or swap in a
 /// socket of their own. The create fails if the name already exists.
+#[cfg(any(unix, test))]
 pub fn ssh_control_dir() -> Result<PathBuf> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

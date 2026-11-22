@@ -115,6 +115,11 @@ pub(super) fn sync_local_source_to_remote(ssh: &SshControl) -> Result<()> {
 /// (typically rebuilding only the 1-3 crates that actually changed)
 /// instead of starting from scratch every time.
 pub(super) fn sync_via_rsync(ssh: &SshControl) -> Result<()> {
+    if ssh.socket_path.as_os_str().is_empty()
+        || crate::platform::env::resolve_on_path("rsync").is_none()
+    {
+        anyhow::bail!("rsync unavailable");
+    }
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mkdir_status = ssh
         .command()

@@ -58,10 +58,15 @@ impl BulkLane {
     /// The `-e` remote-shell string rsync should use: the bulk socket in
     /// dedicated mode, the interactive socket otherwise.
     pub fn rsync_ssh_arg(&self, interactive_socket: &Path) -> String {
-        format!(
-            "ssh -S {} -o ControlMaster=no",
-            crate::remote::shell_quote_for_e_arg(self.socket(interactive_socket)),
-        )
+        let sock = self.socket(interactive_socket);
+        if sock.as_os_str().is_empty() {
+            String::from("ssh")
+        } else {
+            format!(
+                "ssh -S {} -o ControlMaster=no",
+                crate::remote::shell_quote_for_e_arg(sock),
+            )
+        }
     }
 
     /// Extra rsync args pacing the transfer. Always present: even a
@@ -99,11 +104,17 @@ impl BulkLane {
 
     fn base_ssh_command(&self, interactive_socket: &Path) -> Command {
         let mut command = Command::new("ssh");
+        let sock = self.socket(interactive_socket);
+        if !sock.as_os_str().is_empty() {
+            command
+                .arg("-S")
+                .arg(sock)
+                .arg("-o")
+                .arg("ControlMaster=no");
+        } else {
+            command.arg("-o").arg("BatchMode=yes");
+        }
         command
-            .arg("-S")
-            .arg(self.socket(interactive_socket))
-            .arg("-o")
-            .arg("ControlMaster=no")
             .arg("-o")
             .arg("ConnectTimeout=10")
             .arg("-o")
@@ -113,6 +124,7 @@ impl BulkLane {
         command
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn bwlimit_kbps(&self) -> u32 {
         self.bwlimit_kbps
     }
@@ -263,6 +275,10 @@ pub fn establish(host: &str, interactive_socket: &Path, log: impl Fn(String)) ->
 }
 
 fn open_dedicated_master(host: &str) -> Option<MasterGuard> {
+    if cfg!(not(unix)) {
+        let _ = host;
+        return None;
+    }
     let probe_ok = Command::new("ssh")
         .args(probe_args(host))
         .stdin(Stdio::null())

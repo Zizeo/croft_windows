@@ -89,21 +89,14 @@ impl DropPump {
         if inbox_dir.is_empty() || requests_log.is_empty() {
             anyhow::bail!("remote relay setup returned blank paths");
         }
-        let mut tail = Command::new("ssh")
-            .arg("-S")
-            .arg(&ssh.socket_path)
-            .arg("-o")
-            .arg("ControlMaster=no")
-            .arg(&ssh.host)
+        let mut cmd = ssh_socket_command(&ssh.socket_path, true);
+        cmd.arg(&ssh.host)
             .arg(format!(
                 "exec tail -F -n 0 {} 2>/dev/null",
                 shell_quote(&requests_log)
             ))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .stdin(Stdio::null())
-            .spawn()
-            .context("spawning remote requests tail")?;
+            .stdout(Stdio::piped());
+        let mut tail = cmd.spawn().context("spawning remote requests tail")?;
         let stdout = tail
             .stdout
             .take()
@@ -334,17 +327,7 @@ pub(super) fn write_relay_err(
         msg = shell_quote(message),
         err = shell_quote(&err_path),
     );
-    let _ = Command::new("ssh")
-        .arg("-S")
-        .arg(socket)
-        .arg("-o")
-        .arg("ControlMaster=no")
-        .arg(host)
-        .arg(&cmd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let _ = ssh_exec(host, socket, &cmd);
 }
 
 /// Stable id for the drop-relay directory, keyed on the launch arg — the exact

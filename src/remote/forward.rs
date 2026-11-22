@@ -26,17 +26,29 @@ pub(super) fn url_is_safe_to_open(url: &str) -> bool {
 /// Hand `url` to the local platform opener (`open` on macOS, `xdg-open` on
 /// Linux). The caller has already validated the URL.
 pub(super) fn open_local_url(url: &str) -> std::io::Result<std::process::ExitStatus> {
-    let program = if cfg!(target_os = "linux") {
-        "xdg-open"
-    } else {
-        "open"
-    };
-    Command::new(program)
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+    #[cfg(windows)]
+    {
+        return Command::new("cmd.exe")
+            .args(["/d", "/c", "start", "", url])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let program = if cfg!(target_os = "linux") {
+            "xdg-open"
+        } else {
+            "open"
+        };
+        Command::new(program)
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+    }
 }
 
 pub(super) fn handle_open_request(
@@ -105,12 +117,14 @@ pub(super) fn pick_local_port(remote: u16) -> u16 {
         .unwrap_or(remote)
 }
 
+#[cfg(not(unix))]
+static WINDOWS_FORWARDS: std::sync::Mutex<std::collections::BTreeMap<(u16, u16), Child>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 /// Forward remote loopback `port` to the local machine by adding an `-L`
-/// channel to the live SSH master (`ssh -O forward` — no second auth), then,
-/// when `open`, launch the local browser at the forwarded address. The chosen
-/// local port is written as the `.ok` payload so remote croft can label the
-/// forward and re-open it; only digits ever reach the `-L` spec, so there's no
-/// metacharacter to smuggle.
+/// channel to the live SSH master (`ssh -O forward` — no second auth) on Unix
+/// or spawning a tracked `ssh -N -L` tunnel on Windows, then, when `open`,
+/// launch the local browser at the forwarded address.
 pub(super) fn handle_forward_request(
     host: &str,
     socket: &Path,
@@ -140,6 +154,7 @@ pub(super) fn handle_forward_request(
     }
     let local_port = pick_local_port(remote_port);
     let spec = format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}");
+    #[cfg(unix)]
     let forwarded = Command::new("ssh")
         .arg("-S")
         .arg(socket)
@@ -154,6 +169,42 @@ pub(super) fn handle_forward_request(
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
+    #[cfg(not(unix))]
+    let forwarded = {
+        match Command::new(ssh_program())
+            .args([
+                "-N",
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-L",
+                &spec,
+                host,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                std::thread::sleep(Duration::from_millis(150));
+                if child.try_wait().ok().flatten().is_some() {
+                    false
+                } else {
+                    if let Ok(mut map) = WINDOWS_FORWARDS.lock()
+                        && let Some(mut old) = map.insert((local_port, remote_port), child)
+                    {
+                        let _ = old.kill();
+                        let _ = old.wait();
+                    }
+                    true
+                }
+            }
+            Err(_) => false,
+        }
+    };
     if !forwarded {
         write_relay_err(host, socket, inbox_dir, request_id, "ssh -O forward failed");
         return;
@@ -168,24 +219,36 @@ pub(super) fn handle_forward_request(
     );
 }
 
-/// Tear down a forward added by [`handle_forward_request`] via `ssh -O cancel`
-/// against the live master. Best-effort and silent: only digits reach the `-L`
-/// spec, and a stale cancel (the forward already gone) is harmless.
+/// Tear down a forward added by [`handle_forward_request`]. Best-effort and
+/// silent: only digits reach the `-L` spec, and a stale cancel is harmless.
 pub(super) fn handle_unforward_request(host: &str, socket: &Path, local: &str, remote: &str) {
     let (Ok(local), Ok(remote)) = (local.parse::<u16>(), remote.parse::<u16>()) else {
         return;
     };
-    let spec = format!("127.0.0.1:{local}:127.0.0.1:{remote}");
-    let _ = Command::new("ssh")
-        .arg("-S")
-        .arg(socket)
-        .arg("-O")
-        .arg("cancel")
-        .arg("-L")
-        .arg(&spec)
-        .arg(host)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    #[cfg(unix)]
+    {
+        let spec = format!("127.0.0.1:{local}:127.0.0.1:{remote}");
+        let _ = Command::new("ssh")
+            .arg("-S")
+            .arg(socket)
+            .arg("-O")
+            .arg("cancel")
+            .arg("-L")
+            .arg(&spec)
+            .arg(host)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (host, socket);
+        if let Ok(mut map) = WINDOWS_FORWARDS.lock()
+            && let Some(mut child) = map.remove(&(local, remote))
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }

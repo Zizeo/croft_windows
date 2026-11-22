@@ -103,7 +103,11 @@ pub(super) const SSH_FLAGS_WITH_ARG: [char; 22] = [
 /// swept against real invocations without a live process.
 pub fn ssh_destination(cmd: &[&str]) -> Option<String> {
     // `rsplit` always yields at least one item, so there is no empty case.
-    let program = cmd.first()?.rsplit('/').next()?;
+    let raw_program = cmd.first()?.rsplit(['/', '\\']).next()?;
+    let program = raw_program
+        .strip_suffix(".exe")
+        .or_else(|| raw_program.strip_suffix(".EXE"))
+        .unwrap_or(raw_program);
     if !SSH_PROGRAMS.contains(&program) {
         return None;
     }

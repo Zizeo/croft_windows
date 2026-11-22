@@ -120,11 +120,11 @@ pub(super) fn handle_pull_request(
         "set -e; mkdir -p {dir} && tar -x -f - -C {dir}",
         dir = shell_quote(&dest_dir),
     );
-    let ssh_recv = match Command::new("ssh")
-        .arg("-S")
-        .arg(socket)
-        .arg("-o")
-        .arg("ControlMaster=no")
+    let mut ssh_cmd = ssh_socket_command(socket, false);
+    if socket.as_os_str().is_empty() {
+        ssh_cmd.arg("-o").arg("BatchMode=yes");
+    }
+    let ssh_recv = match ssh_cmd
         .arg(host)
         .arg(&remote_cmd)
         .stdin(Stdio::from(tar_stdout))
@@ -150,17 +150,7 @@ pub(super) fn handle_pull_request(
     match (tar_out, ssh_out) {
         (Ok(t), Ok(s)) if t.status.success() && s.status.success() => {
             let touch = format!("touch {}/.ok", shell_quote(&dest_dir));
-            let _ = Command::new("ssh")
-                .arg("-S")
-                .arg(socket)
-                .arg("-o")
-                .arg("ControlMaster=no")
-                .arg(host)
-                .arg(&touch)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            let _ = ssh_exec(host, socket, &touch);
         }
         (Ok(t), Ok(s)) => {
             let mut detail = format!("tar exited {}, ssh exited {}", t.status, s.status);

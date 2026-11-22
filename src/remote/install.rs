@@ -19,20 +19,14 @@ pub(super) fn install_remote_croft(ssh: &SshControl, source_stamp: &str) -> Resu
     // Before either: the release binary for this exact version (#261), when
     // this croft IS that release.
     let mut ship = |binary: &Path| -> Result<()> {
-        let ssh_e = format!(
-            "ssh -S {} -o ControlMaster=no",
-            shell_quote_for_e_arg(&ssh.socket_path),
-        );
-        let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
-        let status = Command::new("rsync")
-            .args(["-az", "--checksum", "-e"])
-            .arg(&ssh_e)
-            .arg(binary)
-            .arg(&dest)
-            .status()
-            .context("rsyncing the prebuilt croft to the remote")?;
-        anyhow::ensure!(status.success(), "rsync exited with {status}");
-        Ok(())
+        let lane = crate::remote_bulk::BulkLane::new(crate::remote_bulk::LaneMode::SharedMux, 0);
+        ship_local_file_to_remote(
+            &lane,
+            &ssh.socket_path,
+            &ssh.host,
+            binary,
+            ".cargo/bin/croft.new",
+        )
     };
     match try_prebuilt_install(ssh, source_stamp, &mut ship, &mut |m| println!("{m}")) {
         Ok(true) => return Ok(()),

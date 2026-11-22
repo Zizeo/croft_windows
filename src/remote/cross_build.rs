@@ -5,6 +5,7 @@ use super::*;
 
 /// Why a local static build for `triple` can't run, or `None` when it can.
 /// Shared by the remote installer and dev containers (#617).
+#[cfg(any(unix, test))]
 pub(crate) fn cross_build_unavailable(triple: &str) -> Option<String> {
     if let Some(reason) = cross_compile_unavailable_reason() {
         return Some(reason);
@@ -166,26 +167,12 @@ pub(super) fn cross_tool_program(tool: &str) -> Option<PathBuf> {
 }
 
 pub(super) fn find_executable_in_dirs(tool: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
-    dirs.iter()
-        .map(|dir| dir.join(tool))
-        .find(|candidate| is_executable_file(candidate))
+    crate::platform::env::find_executable_in(tool, dirs)
 }
 
+#[cfg(test)]
 pub(super) fn is_executable_file(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    crate::platform::env::is_executable_file(path)
 }
 
 /// A `Command` for a cross-build tool, resolved to its absolute path and run
@@ -235,10 +222,15 @@ pub(super) fn cross_tool_command_in_checkout(tool: &str) -> Command {
 /// and zig.
 pub(super) fn cargo_zigbuild_command(source: &Path, triple: &str, jobs: &str) -> Command {
     let cargo = cross_tool_program("cargo").unwrap_or_else(|| PathBuf::from("cargo"));
-    let mut zigbuild = Command::new("nice");
+    #[cfg(unix)]
+    let mut zigbuild = {
+        let mut cmd = Command::new("nice");
+        cmd.args(["-n", "19"]).arg(cargo);
+        cmd
+    };
+    #[cfg(not(unix))]
+    let mut zigbuild = Command::new(cargo);
     zigbuild
-        .args(["-n", "19"])
-        .arg(cargo)
         .args([
             "zigbuild",
             "--profile",
@@ -367,21 +359,14 @@ pub(super) fn try_local_cross_install(
         anyhow::bail!("remote mkdir exited with {mkdir}");
     }
 
-    let ssh_e = format!(
-        "ssh -S {} -o ControlMaster=no",
-        shell_quote_for_e_arg(&ssh.socket_path),
-    );
-    let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
-    let rsync_status = Command::new("rsync")
-        .args(["-az", "--checksum", "-e"])
-        .arg(&ssh_e)
-        .arg(&binary)
-        .arg(&dest)
-        .status()
-        .context("rsyncing croft binary to remote")?;
-    if !rsync_status.success() {
-        anyhow::bail!("rsync exited with {rsync_status}");
-    }
+    let lane = crate::remote_bulk::BulkLane::new(crate::remote_bulk::LaneMode::SharedMux, 0);
+    ship_local_file_to_remote(
+        &lane,
+        &ssh.socket_path,
+        &ssh.host,
+        &binary,
+        ".cargo/bin/croft.new",
+    )?;
 
     // Atomic-swap the freshly-shipped binary into place. `mv` on the
     // same filesystem is the standard way to avoid the race where a
