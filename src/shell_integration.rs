@@ -932,6 +932,17 @@ pub fn ensure_zsh_shim(config_dir: &std::path::Path) -> std::io::Result<PathBuf>
 /// after the user's startup files have run.
 pub const PANE_BIN_ENV: &str = "CROFT_PANE_BIN";
 
+#[cfg(not(unix))]
+fn same_file_snapshot(link: &std::path::Path, exe: &std::path::Path) -> bool {
+    let (Ok(lm), Ok(em)) = (std::fs::metadata(link), std::fs::metadata(exe)) else {
+        return false;
+    };
+    if !lm.is_file() || !em.is_file() || lm.len() != em.len() {
+        return false;
+    }
+    matches!((lm.modified(), em.modified()), (Ok(lt), Ok(et)) if lt == et)
+}
+
 /// The directory a pane puts first on PATH so that `croft` there is the
 /// croft running the pane (#1854), with another install earlier on the
 /// user's PATH (Homebrew's, say) answering nowhere inside croft. It holds
@@ -954,10 +965,7 @@ pub fn ensure_pane_bin(
         return Ok(dir);
     }
     #[cfg(not(unix))]
-    if let (Ok(em), Ok(lm)) = (std::fs::metadata(exe), std::fs::metadata(&link))
-        && em.len() == lm.len()
-        && em.modified().ok() == lm.modified().ok()
-    {
+    if same_file_snapshot(&link, exe) {
         return Ok(dir);
     }
     std::fs::create_dir_all(&dir)?;
@@ -965,8 +973,12 @@ pub fn ensure_pane_bin(
     // same moment never finds the name missing.
     let tmp = dir.join(format!(".croft-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
-    crate::platform::fs::create_file_link(exe, &tmp)?;
-    std::fs::rename(&tmp, &link)?;
+    if let Err(err) =
+        crate::platform::fs::create_file_link(exe, &tmp).and_then(|()| std::fs::rename(&tmp, &link))
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
     Ok(dir)
 }
 
