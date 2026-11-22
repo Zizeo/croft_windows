@@ -70,3 +70,74 @@ fn time_local_datetime_and_thread_cpu() {
     let cpu = platform::time::thread_cpu_time();
     assert!(cpu.is_some(), "thread_cpu_time should return Some");
 }
+
+#[test]
+fn fs_canonicalize_has_no_verbatim_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let canon = platform::fs::canonicalize(dir.path()).unwrap();
+    let s = canon.to_string_lossy();
+    assert!(!s.starts_with(r"\\?\"), "unexpected verbatim prefix: {s}");
+}
+
+#[test]
+fn fs_executable_lock_and_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let txt = dir.path().join("notes.txt");
+    std::fs::write(&txt, b"hello").unwrap();
+    assert!(!platform::fs::is_executable(&txt));
+
+    #[cfg(windows)]
+    {
+        let cmd = dir.path().join("tool.cmd");
+        std::fs::write(&cmd, b"@echo hi\r\n").unwrap();
+        assert!(platform::fs::is_executable(&cmd));
+    }
+
+    let lock_path = dir.path().join("lock.file");
+    let f1 = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    let f2 = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    assert!(platform::fs::try_lock_exclusive(&f1).unwrap());
+    assert!(!platform::fs::try_lock_exclusive(&f2).unwrap());
+    drop(f1);
+    assert!(platform::fs::try_lock_exclusive(&f2).unwrap());
+
+    let dst = dir.path().join("linked.txt");
+    platform::fs::create_file_link(&txt, &dst).unwrap();
+    assert_eq!(std::fs::read_to_string(&dst).unwrap(), "hello");
+}
+
+#[test]
+fn process_liveness_and_managed_child_kill_tree() {
+    assert!(platform::process::is_pid_alive(std::process::id()));
+
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("powershell.exe");
+        c.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+        c
+    };
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("sleep");
+        c.arg("30");
+        c
+    };
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    let mut managed = platform::process::ManagedChild::spawn_in_group(&mut cmd).unwrap();
+    let pid = managed.id();
+    assert!(platform::process::is_pid_alive(pid));
+    managed.kill_tree();
+    assert!(!platform::process::is_pid_alive(pid));
+}
