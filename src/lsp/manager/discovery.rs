@@ -190,70 +190,88 @@ pub(super) fn report_missing_servers_once(lang: Language, note: &str) {
 }
 
 pub(crate) fn is_on_path(cmd: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|entry| is_executable_file(&entry.join(cmd)))
+    crate::platform::env::resolve_on_path(cmd).is_some()
+}
+
+/// Resolve `cmd` against `PATH` to a spawnable command string: on Unix the
+/// bare name `cmd` suffices once `is_on_path(cmd)` holds; on Windows we return
+/// the full resolved path (with `.exe` / `.cmd` / `.bat`) so `Command::new`
+/// never trips over an extensionless POSIX shim in `.bin` directories.
+pub(crate) fn resolve_command_on_path(cmd: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        is_on_path(cmd).then(|| cmd.to_string())
+    }
+    #[cfg(windows)]
+    {
+        crate::platform::env::resolve_on_path(cmd).map(|p| p.to_string_lossy().into_owned())
+    }
 }
 
 /// True when `path` is a regular file with at least one execute bit set. On
 /// non-unix any existing file counts (no mode bits to inspect).
 pub(crate) fn is_executable_file(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    crate::platform::env::is_executable_file(path)
 }
 
-/// Toolchain `bin` dirs that a macOS GUI launch (Finder / Dock / the Croft.app
-/// bundle, which `open`s Ghostty under the stripped launchd PATH) drops because
-/// the login-shell profile is never sourced. rust-analyzer and gopls live here
-/// but resolve by bare name, so a GUI-launched croft can't find them even
-/// though a terminal launch (full PATH) can. Probed only when the command is
-/// already absent from the inherited PATH, so a normal launch never reaches it,
-/// which keeps local and remote behaviour identical.
+/// Toolchain `bin` dirs that a GUI or stripped launch drops because login-shell
+/// profiles or user shim dirs aren't on inherited PATH. Probed only when the
+/// command is already absent from inherited PATH.
 pub(super) fn toolchain_fallback_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = crate::platform::env::home_dir() {
         dirs.push(home.join(".cargo").join("bin"));
         dirs.push(home.join("go").join("bin"));
         dirs.push(home.join(".local").join("bin"));
+        #[cfg(windows)]
+        dirs.push(home.join("scoop").join("shims"));
     }
-    dirs.push(PathBuf::from("/opt/homebrew/bin"));
-    dirs.push(PathBuf::from("/usr/local/bin"));
+    #[cfg(unix)]
+    {
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        dirs.push(PathBuf::from("/usr/local/bin"));
+    }
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            dirs.push(PathBuf::from(appdata).join("npm"));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            dirs.push(
+                PathBuf::from(local)
+                    .join("Microsoft")
+                    .join("WinGet")
+                    .join("Links"),
+            );
+        }
+    }
     dirs
 }
 
 /// Absolute path to `cmd` in the first `dirs` entry that holds an executable
 /// file of that name, or `None`.
 pub(super) fn find_executable_in(cmd: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
-    dirs.iter()
-        .map(|dir| dir.join(cmd))
-        .find(|candidate| is_executable_file(candidate))
+    crate::platform::env::find_executable_in(cmd, dirs)
 }
 
 /// Resolve a PATH-only server (no managed provision) to a spawnable
 /// `(config, extra_path)` pair, or `None` to skip it. When `on_path` the
-/// bare command spawns as-is; otherwise the toolchain `fallback_dirs` are
-/// probed and a hit is pinned to its absolute path (with its dir prepended to
-/// the child's PATH) so a stripped GUI PATH can't hide it.
+/// bare command spawns on Unix (or resolved with extension on Windows);
+/// otherwise the toolchain `fallback_dirs` are probed and a hit is pinned to
+/// its absolute path (with its dir prepended to the child's PATH) so a
+/// stripped GUI PATH can't hide it.
 pub(super) fn resolve_path_only(
     config: &ServerConfig,
     on_path: bool,
     fallback_dirs: &[PathBuf],
 ) -> Option<(ServerConfig, Vec<PathBuf>)> {
     if on_path {
-        return Some((config.clone(), Vec::new()));
+        let mut resolved = config.clone();
+        #[cfg(windows)]
+        if let Some(cmd) = resolve_command_on_path(&config.command) {
+            resolved.command = cmd;
+        }
+        return Some((resolved, Vec::new()));
     }
     let abs = find_executable_in(&config.command, fallback_dirs)?;
     let extra = abs.parent().map(Path::to_path_buf).into_iter().collect();
@@ -343,10 +361,25 @@ pub(super) const RUSTUP_DEADLINE: std::time::Duration = std::time::Duration::fro
 pub(super) fn command_path(command: &str) -> Option<PathBuf> {
     let path = Path::new(command);
     if path.is_absolute() {
-        return Some(path.to_path_buf());
+        if is_executable_file(path) {
+            return Some(path.to_path_buf());
+        }
+        if let (Some(parent), Some(name)) =
+            (path.parent(), path.file_name().and_then(|n| n.to_str()))
+        {
+            return crate::platform::env::executable_in_dir(parent, name);
+        }
+        return None;
     }
-    let dirs: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH")?).collect();
-    find_executable_in(command, &dirs)
+    crate::platform::env::resolve_on_path(command)
+}
+
+#[cfg(windows)]
+fn same_hardlink_metadata(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    ma.len() > 0 && ma.len() == mb.len() && ma.modified().ok() == mb.modified().ok()
 }
 
 /// The `rustup` that `candidate` is a proxy for, or `None` when it is a
@@ -359,7 +392,19 @@ pub(super) fn rustup_behind(candidate: &Path) -> Option<PathBuf> {
     std::iter::once(candidate.to_path_buf())
         .chain(crate::platform::fs::canonicalize(candidate).ok())
         .map(|p| p.with_file_name(&rustup))
-        .find(|p| file_id(p).as_ref() == Some(&id))
+        .find(|p| {
+            if file_id(p).as_ref() == Some(&id) {
+                return true;
+            }
+            #[cfg(windows)]
+            {
+                return p.is_file() && same_hardlink_metadata(candidate, p);
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        })
 }
 
 /// What identifies the file `path` leads to, links followed.

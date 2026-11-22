@@ -20,4 +20,4 @@ command = "taplo"
 args = ["lsp", "stdio"]
 language = "toml"
 priority = 0
-provision = { kind = "binary", bin = "taplo", archive = "gz", targets = { "macos-aarch64" = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-darwin-aarch64.gz", "macos-x86_64" = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-darwin-x86_64.gz", "linux-x86_64" = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-x86_64.gz", "linux-aarch64" = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-aarch64.gz" } }
+provision = { kind = "binary", bin = "taplo", archive = "gz", targets = { "macos-aarch64" = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-darwin-aarch64.gz", "macos-x86_64" = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-darwin-x86_64.gz", "linux-x86_64" = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-x86_64.gz", "linux-aarch64" = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-aarch64.gz", "windows-x86_64" = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-windows-x86_64.zip" } }

@@ -8,8 +8,12 @@ fn env_home_and_dirs_resolve_non_empty() {
     let home = platform::env::home_dir();
     assert!(home.is_some(), "home_dir() must resolve on this OS");
     assert!(platform::env::config_dir().ends_with("croft"));
-    assert!(platform::env::state_dir().is_absolute() || platform::env::state_dir().ends_with("croft"));
-    assert!(platform::env::cache_dir().is_absolute() || platform::env::cache_dir().ends_with("croft"));
+    assert!(
+        platform::env::state_dir().is_absolute() || platform::env::state_dir().ends_with("croft")
+    );
+    assert!(
+        platform::env::cache_dir().is_absolute() || platform::env::cache_dir().ends_with("croft")
+    );
     assert!(!platform::env::hostname().is_empty());
     assert!(!platform::env::default_shell().is_empty());
 }
@@ -42,7 +46,9 @@ fn env_windows_config_honors_xdg_then_appdata() {
     );
     assert_eq!(
         state,
-        PathBuf::from(r"C:\Users\u\AppData\Local").join("croft").join("state")
+        PathBuf::from(r"C:\Users\u\AppData\Local")
+            .join("croft")
+            .join("state")
     );
 
     let cache = platform::env::cache_dir_windows(
@@ -51,7 +57,9 @@ fn env_windows_config_honors_xdg_then_appdata() {
     );
     assert_eq!(
         cache,
-        PathBuf::from(r"C:\Users\u\AppData\Local").join("croft").join("cache")
+        PathBuf::from(r"C:\Users\u\AppData\Local")
+            .join("croft")
+            .join("cache")
     );
 }
 
@@ -234,4 +242,68 @@ fn clipboard_utf16_codec_roundtrip_and_nul_rejection() {
         assert_eq!(decoded, sample);
     }
     assert!(platform::clipboard::encode_utf16_nul("a\0b").is_none());
+}
+
+#[test]
+fn env_executable_in_dir_prefers_windows_extensions_over_posix_shims() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    // Simulate an npm `.bin` folder containing both a bare POSIX shell script
+    // and a Windows `.cmd` wrapper, plus a native `.exe` binary.
+    let vtsls_posix = dir.join("vtsls");
+    let vtsls_cmd = dir.join("vtsls.cmd");
+    let ra_exe = dir.join("rust-analyzer.exe");
+    std::fs::write(&vtsls_posix, b"#!/bin/sh\n").unwrap();
+    std::fs::write(&vtsls_cmd, b"@echo off\r\n").unwrap();
+    std::fs::write(&ra_exe, b"").unwrap();
+
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            platform::env::executable_in_dir(dir, "vtsls"),
+            Some(vtsls_cmd)
+        );
+        assert_eq!(
+            platform::env::executable_in_dir(dir, "rust-analyzer"),
+            Some(ra_exe)
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&vtsls_posix, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            platform::env::executable_in_dir(dir, "vtsls"),
+            Some(vtsls_posix)
+        );
+    }
+}
+
+#[test]
+fn lsp_bundled_binary_manifests_include_windows_targets() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for rel in [
+        "assets/extensions/lsp-rust/extension.toml",
+        "assets/extensions/lsp-toml/extension.toml",
+        "assets/extensions/lsp-cpp/extension.toml",
+    ] {
+        let content = std::fs::read_to_string(root.join(rel)).unwrap();
+        assert!(
+            content.contains("\"windows-x86_64\""),
+            "{rel} must define a windows-x86_64 target"
+        );
+    }
+    for rel in [
+        "assets/extensions/lsp-markdown/extension.toml",
+        "assets/catalog/csvlens/extension.toml",
+    ] {
+        let content = std::fs::read_to_string(root.join(rel)).unwrap();
+        let count = content.matches("\"windows-x86_64\"").count();
+        assert!(
+            count >= 2,
+            "{rel} must define windows-x86_64 in both targets and sha256 (found {count})"
+        );
+    }
 }

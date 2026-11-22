@@ -426,7 +426,10 @@ mod tests {
             "Termux reroutes to `pkg install marksman`"
         );
         let keys: Vec<&str> = targets.iter().map(|(k, _)| *k).collect();
-        assert_eq!(keys, ["linux-aarch64", "linux-x86_64", "macos"]);
+        assert_eq!(
+            keys,
+            ["linux-aarch64", "linux-x86_64", "macos", "windows-x86_64"]
+        );
         for (key, _) in targets.iter() {
             let digest = sha256.iter().find(|(k, _)| k == key).map(|(_, d)| *d);
             assert!(

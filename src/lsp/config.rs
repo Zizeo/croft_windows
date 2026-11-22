@@ -128,6 +128,14 @@ const RUST_ANALYZER_TARGETS: &[(&str, &str)] = &[
         "macos-x86_64",
         "https://github.com/rust-lang/rust-analyzer/releases/download/2026-06-22/rust-analyzer-x86_64-apple-darwin.gz",
     ),
+    (
+        "windows-aarch64",
+        "https://github.com/rust-lang/rust-analyzer/releases/download/2026-06-22/rust-analyzer-aarch64-pc-windows-msvc.zip",
+    ),
+    (
+        "windows-x86_64",
+        "https://github.com/rust-lang/rust-analyzer/releases/download/2026-06-22/rust-analyzer-x86_64-pc-windows-msvc.zip",
+    ),
 ];
 
 // The executable spec the bundled manifests reproduce (the

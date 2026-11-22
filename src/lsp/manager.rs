@@ -80,6 +80,7 @@ use diagnostics::*;
 pub(crate) use discovery::is_executable_file;
 pub(crate) use discovery::is_on_path;
 pub(crate) use discovery::path_to_language;
+pub(crate) use discovery::resolve_command_on_path;
 use discovery::*;
 use documents::*;
 pub use formatting::FormatResult;

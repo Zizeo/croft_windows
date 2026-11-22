@@ -30,4 +30,4 @@ command = "clangd"
 args = []
 languages = ["c", "cpp"]
 priority = 0
-provision = { kind = "binary", bin = "clangd", archive = "zip", bin_path = "clangd_22.1.0/bin/clangd", targets = { "macos" = "https://github.com/clangd/clangd/releases/download/22.1.0/clangd-mac-22.1.0.zip", "linux-x86_64" = "https://github.com/clangd/clangd/releases/download/22.1.0/clangd-linux-22.1.0.zip" } }
+provision = { kind = "binary", bin = "clangd", archive = "zip", bin_path = "clangd_22.1.0/bin/clangd", targets = { "macos" = "https://github.com/clangd/clangd/releases/download/22.1.0/clangd-mac-22.1.0.zip", "linux-x86_64" = "https://github.com/clangd/clangd/releases/download/22.1.0/clangd-linux-22.1.0.zip", "windows-x86_64" = "https://github.com/clangd/clangd/releases/download/22.1.0/clangd-windows-22.1.0.zip" } }

@@ -43,7 +43,7 @@ command = "marksman"
 args = ["server"]
 language = "markdown"
 priority = 0
-provision = { kind = "binary", bin = "marksman", archive = "raw", termux_pkg = "marksman", targets = { "macos" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-macos", "linux-x86_64" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-linux-x64", "linux-aarch64" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-linux-arm64" }, sha256 = { "macos" = "6a801c17b5ac0dba69787c5282b3b3bd416e66c96253fae098d311c6bbd1833b", "linux-x86_64" = "be5098e8213219269c47fc0d916a66fa31ce0602ec967475c722260aabf26087", "linux-aarch64" = "db8e124527f7f8048e3e6c91821b9c52ef173d92c01e47d221bf1337afd962fb" } }
+provision = { kind = "binary", bin = "marksman", archive = "raw", termux_pkg = "marksman", targets = { "macos" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-macos", "linux-x86_64" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-linux-x64", "linux-aarch64" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-linux-arm64", "windows-x86_64" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman.exe" }, sha256 = { "macos" = "6a801c17b5ac0dba69787c5282b3b3bd416e66c96253fae098d311c6bbd1833b", "linux-x86_64" = "be5098e8213219269c47fc0d916a66fa31ce0602ec967475c722260aabf26087", "linux-aarch64" = "db8e124527f7f8048e3e6c91821b9c52ef173d92c01e47d221bf1337afd962fb", "windows-x86_64" = "a6d05beb08ebe41b0a9f09c98a438540421436fa5531424c22e0bb1d22529705" } }
 
 [[language_servers]]
 name = "rumdl"

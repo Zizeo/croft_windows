@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// User home directory: `HOME` on Unix; `HOME` -> `USERPROFILE` ->
 /// `HOMEDRIVE` + `HOMEPATH` on Windows.
@@ -212,4 +212,71 @@ fn find_on_path(exe: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// True when `path` is a regular file that is executable (checks `0o111` on Unix;
+/// any regular file on Windows).
+pub fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Find an executable named `cmd` inside `dir`.
+///
+/// On Unix, checks `dir.join(cmd)`.
+/// On Windows, probes `.exe`, `.cmd`, `.bat` BEFORE the bare name `cmd` so that
+/// in directories like `node_modules/.bin` or `%APPDATA%\npm` (which contain
+/// both a bare POSIX `#!/bin/sh` script and a `<cmd>.cmd` batch wrapper),
+/// the runnable Windows `.exe`/`.cmd` file always wins.
+pub fn executable_in_dir(dir: &Path, cmd: &str) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        let candidate = dir.join(cmd);
+        is_executable_file(&candidate).then_some(candidate)
+    }
+    #[cfg(windows)]
+    {
+        if Path::new(cmd).extension().is_some() {
+            let candidate = dir.join(cmd);
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+        for ext in [".exe", ".cmd", ".bat", ""] {
+            let name = if ext.is_empty() {
+                cmd.to_string()
+            } else {
+                format!("{cmd}{ext}")
+            };
+            let candidate = dir.join(name);
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+}
+
+/// Find the first executable matching `cmd` across `dirs`.
+pub fn find_executable_in(cmd: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    dirs.iter().find_map(|dir| executable_in_dir(dir, cmd))
+}
+
+/// Resolve `cmd` against the process `PATH`, returning the full path to the
+/// matched executable (including `.exe`/`.cmd`/`.bat` on Windows).
+pub fn resolve_on_path(cmd: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| executable_in_dir(&dir, cmd))
 }

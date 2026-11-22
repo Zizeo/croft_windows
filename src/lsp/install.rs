@@ -390,10 +390,7 @@ fn npm_command(name: &str, bin: &str) -> Option<String> {
     {
         return Some(p.to_string_lossy().into_owned());
     }
-    if crate::lsp::manager::is_on_path(bin) {
-        return Some(bin.to_string());
-    }
-    None
+    crate::lsp::manager::resolve_command_on_path(bin)
 }
 
 /// Resolve an invocable command for a uv-provisioned server. Unlike vtsls,
@@ -403,8 +400,8 @@ fn npm_command(name: &str, bin: &str) -> Option<String> {
 /// under an older pin is not used, so the caller reinstalls it at the pin
 /// this build carries (#1297).
 fn uv_command(bin: &str, package: &str, version: Option<&str>) -> Option<String> {
-    if crate::lsp::manager::is_on_path(bin) {
-        return Some(bin.to_string());
+    if let Some(cmd) = crate::lsp::manager::resolve_command_on_path(bin) {
+        return Some(cmd);
     }
     if let Some(p) = managed_uv_binary(bin)
         && p.is_file()
@@ -419,11 +416,11 @@ fn uv_command(bin: &str, package: &str, version: Option<&str>) -> Option<String>
 /// (the user's own, built for their toolchain) wins, then croft's copy at the
 /// pinned version. `None` when neither exists yet.
 fn go_command(name: &str, bin: &str, version: Option<&str>) -> Option<String> {
-    if crate::lsp::manager::is_on_path(bin) {
-        return Some(bin.to_string());
+    if let Some(cmd) = crate::lsp::manager::resolve_command_on_path(bin) {
+        return Some(cmd);
     }
-    let p = go_bin_dir(&servers_dir()?, name, version).join(bin);
-    p.is_file().then(|| p.to_string_lossy().into_owned())
+    let dir = go_bin_dir(&servers_dir()?, name, version);
+    crate::platform::env::executable_in_dir(&dir, bin).map(|p| p.to_string_lossy().into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -451,7 +448,9 @@ fn npm_bin_in(prefix: &Path, bin: &str) -> PathBuf {
 
 /// Absolute path to a managed npm-installed binary, whether or not it exists.
 fn managed_npm_binary(name: &str, bin: &str) -> Option<PathBuf> {
-    Some(npm_bin_in(&npm_prefix(name)?, bin))
+    let prefix = npm_prefix(name)?;
+    crate::platform::env::executable_in_dir(&prefix.join("node_modules").join(".bin"), bin)
+        .or_else(|| Some(npm_bin_in(&prefix, bin)))
 }
 
 /// The `GOBIN` a Go-provisioned server is installed into:
@@ -499,7 +498,8 @@ fn uv_receipt_matches_pin(tool_dir: &Path, package: &str, version: Option<&str>)
 
 /// Absolute path to a managed uv-installed binary, whether or not it exists.
 fn managed_uv_binary(bin: &str) -> Option<PathBuf> {
-    Some(uv_bin_dir()?.join(bin))
+    let dir = uv_bin_dir()?;
+    crate::platform::env::executable_in_dir(&dir, bin).or_else(|| Some(dir.join(bin)))
 }
 
 // ---------------------------------------------------------------------------
@@ -530,11 +530,28 @@ fn target_entry<'a>(
         .map(|(k, v)| (*k, *v))
 }
 
+/// Append `.exe` on Windows when `path` carries no extension.
+fn with_platform_exe(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    if path.extension().is_none() {
+        return path.with_extension("exe");
+    }
+    path
+}
+
 /// The executable inside a managed binary install. `bin_path` locates a binary
 /// nested in an extracted archive; absent, the binary sits directly at
 /// `<name>/<bin>`.
 fn managed_binary_path(name: &str, bin: &str, bin_path: Option<&str>) -> Option<PathBuf> {
-    Some(managed_binary_path_in(&servers_dir()?, name, bin, bin_path))
+    let base = managed_binary_path_in(&servers_dir()?, name, bin, bin_path);
+    #[cfg(windows)]
+    {
+        let exe = with_platform_exe(base.clone());
+        if exe.is_file() {
+            return Some(exe);
+        }
+    }
+    Some(base)
 }
 
 /// [`managed_binary_path`] under an explicit servers dir, so a test can
@@ -562,9 +579,24 @@ fn versioned_on_path(bin: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let Some(version) = name
-                .to_str()
-                .and_then(|n| n.strip_prefix(bin))
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            let trimmed = {
+                #[cfg(windows)]
+                {
+                    name_str
+                        .strip_suffix(".exe")
+                        .or_else(|| name_str.strip_suffix(".EXE"))
+                        .unwrap_or(name_str)
+                }
+                #[cfg(not(windows))]
+                {
+                    name_str
+                }
+            };
+            let Some(version) = trimmed
+                .strip_prefix(bin)
                 .and_then(|rest| rest.strip_prefix('-'))
             else {
                 continue;
@@ -596,8 +628,8 @@ fn versioned_on_path(bin: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
 /// (mirrors Zed: a user's own clangd/taplo, matching their toolchain, wins),
 /// then croft's managed copy. `None` when neither exists yet.
 fn binary_command(name: &str, bin: &str, bin_path: Option<&str>) -> Option<String> {
-    if crate::lsp::manager::is_on_path(bin) {
-        return Some(bin.to_string());
+    if let Some(cmd) = crate::lsp::manager::resolve_command_on_path(bin) {
+        return Some(cmd);
     }
     if let Some(p) = std::env::var_os("PATH").and_then(|path| versioned_on_path(bin, &path)) {
         return Some(p.to_string_lossy().into_owned());
@@ -665,13 +697,39 @@ fn extract_raw(bytes: &[u8], target: &Path) -> std::io::Result<()> {
     set_executable(target)
 }
 
+fn archive_for_url(url: &str, default: ArchiveKind) -> ArchiveKind {
+    if url.ends_with(".zip") {
+        ArchiveKind::Zip
+    } else if url.ends_with(".tar.xz") {
+        ArchiveKind::TarXz
+    } else if url.ends_with(".gz") && !url.ends_with(".tar.gz") {
+        ArchiveKind::Gz
+    } else {
+        default
+    }
+}
+
 /// Extract a `.zip` payload whole into `dir` (so the binary keeps its sibling
-/// files, e.g. clangd's `lib/`), then mark the resolved binary executable.
+/// files, e.g. clangd's `lib/`). If `target` is absent after unpacking (flat
+/// or per-target-folder release zips like rust-analyzer, taplo, or csvlens on
+/// Windows), locate the binary by file name and move it to `target`, then mark
+/// the resolved binary executable.
 fn extract_zip(bytes: &[u8], dir: &Path, target: &Path) -> std::io::Result<()> {
     let reader = std::io::Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(reader)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     archive.extract(dir).map_err(std::io::Error::other)?;
+    if !target.is_file()
+        && let Some(name) = target.file_name()
+        && let Some(found) = find_file_named(dir, name)
+    {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if std::fs::rename(&found, target).is_err() {
+            std::fs::copy(&found, target)?;
+        }
+    }
     if target.is_file() {
         set_executable(target)?;
     }
@@ -979,8 +1037,8 @@ fn run_binary_install(name: &'static str, language: Language, spec: BinarySpec<'
         set_status(format!("{name} install refused ({why})"));
         return;
     }
-    let target = dir.join(bin_path.unwrap_or(bin));
-    let extracted = match archive {
+    let target = with_platform_exe(dir.join(bin_path.unwrap_or(bin)));
+    let extracted = match archive_for_url(url, archive) {
         ArchiveKind::Gz => extract_gz(&bytes, &target),
         ArchiveKind::Zip => extract_zip(&bytes, &dir, &target),
         ArchiveKind::TarXz => extract_tar_xz(&bytes, &dir, &target),
@@ -1159,8 +1217,11 @@ fn run_npm_install(name: &'static str, language: Language, package: &str, versio
     }
     let extra = node_path_prepend();
     let npm: PathBuf = match &extra {
-        Some(dir) => dir.join("npm"),
-        None => PathBuf::from("npm"),
+        Some(dir) => crate::platform::env::executable_in_dir(dir, "npm")
+            .unwrap_or_else(|| dir.join(if cfg!(windows) { "npm.cmd" } else { "npm" })),
+        None => crate::lsp::manager::resolve_command_on_path("npm")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "npm.cmd" } else { "npm" })),
     };
     let spec = npm_spec(package, version);
     log_file::log(&format!("lsp[{name}] installing {spec} into {prefix:?}"));
@@ -1354,19 +1415,23 @@ fn uv_dist_dir() -> Option<PathBuf> {
 /// won't have those on PATH. `None` when uv isn't installed anywhere croft
 /// looks.
 fn uv_program() -> Option<PathBuf> {
-    if crate::lsp::manager::is_on_path("uv") {
-        return Some(PathBuf::from("uv"));
+    if let Some(cmd) = crate::lsp::manager::resolve_command_on_path("uv") {
+        return Some(PathBuf::from(cmd));
     }
+    let uv_bin = format!("uv{}", std::env::consts::EXE_SUFFIX);
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(dist) = uv_dist_dir() {
-        candidates.push(dist.join("uv"));
+        candidates.push(dist.join(&uv_bin));
     }
     if let Some(home) = crate::platform::env::home_dir() {
-        candidates.push(home.join(".local").join("bin").join("uv"));
-        candidates.push(home.join(".cargo").join("bin").join("uv"));
+        candidates.push(home.join(".local").join("bin").join(&uv_bin));
+        candidates.push(home.join(".cargo").join("bin").join(&uv_bin));
     }
-    candidates.push(PathBuf::from("/opt/homebrew/bin/uv"));
-    candidates.push(PathBuf::from("/usr/local/bin/uv"));
+    #[cfg(unix)]
+    {
+        candidates.push(PathBuf::from("/opt/homebrew/bin/uv"));
+        candidates.push(PathBuf::from("/usr/local/bin/uv"));
+    }
     candidates.into_iter().find(|p| p.is_file())
 }
 
@@ -1391,6 +1456,7 @@ fn ensure_uv() -> Option<PathBuf> {
 /// Pick the fetcher for the uv install script: `curl` preferred, `wget` as a
 /// fallback (the official one-liner ships both forms). `None` when neither is
 /// available — uv can't be fetched without an HTTP client on the box.
+#[cfg(any(unix, test))]
 fn uv_fetch_command(has_curl: bool, has_wget: bool) -> Option<&'static str> {
     if has_curl {
         Some("curl -LsSf https://astral.sh/uv/install.sh")
@@ -1401,54 +1467,107 @@ fn uv_fetch_command(has_curl: bool, has_wget: bool) -> Option<&'static str> {
     }
 }
 
-/// Install uv with Astral's official script, pointed at croft's own dir and
+/// Install uv with Astral's official installer, pointed at croft's own dir and
 /// told not to touch the user's shell rc files. Best-effort; returns the uv
 /// path on success.
 fn bootstrap_uv() -> Option<PathBuf> {
     let dir = uv_dist_dir()?;
-    let Some(fetch) = uv_fetch_command(
-        crate::lsp::manager::is_on_path("curl"),
-        crate::lsp::manager::is_on_path("wget"),
-    ) else {
-        log_file::log("lsp[uv] cannot bootstrap: neither `curl` nor `wget` found");
-        set_status("Python LSP needs uv: install uv or curl/wget (see ~/.croft/lsp.log)");
-        return None;
-    };
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        log_file::log(&format!("lsp[uv] could not create {dir:?}: {e}"));
-        set_status("uv install failed (could not create install dir)");
-        return None;
-    }
-    let script = format!("{fetch} | sh");
-    log_file::log(&format!(
-        "lsp[uv] bootstrapping uv via official installer into {dir:?}"
-    ));
-    set_status("Installing uv");
-    // `UV_INSTALL_DIR` puts uv in croft's dir; `INSTALLER_NO_MODIFY_PATH` keeps
-    // the script from editing the user's shell profiles. If the env vars are
-    // ignored by some installer version, uv lands in `~/.local/bin`, which
-    // `uv_program` also searches, so discovery still succeeds.
-    match Command::new("sh")
-        .arg("-c")
-        .arg(&script)
-        .env("UV_INSTALL_DIR", &dir)
-        .env("INSTALLER_NO_MODIFY_PATH", "1")
-        .output()
+    #[cfg(unix)]
     {
-        Ok(out) if out.status.success() => {
-            log_file::log("lsp[uv] bootstrap complete");
-            uv_program()
+        let Some(fetch) = uv_fetch_command(
+            crate::lsp::manager::is_on_path("curl"),
+            crate::lsp::manager::is_on_path("wget"),
+        ) else {
+            log_file::log("lsp[uv] cannot bootstrap: neither `curl` nor `wget` found");
+            set_status("Python LSP needs uv: install uv or curl/wget (see ~/.croft/lsp.log)");
+            return None;
+        };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log_file::log(&format!("lsp[uv] could not create {dir:?}: {e}"));
+            set_status("uv install failed (could not create install dir)");
+            return None;
         }
-        Ok(out) => {
-            let err = String::from_utf8_lossy(&out.stderr);
-            log_file::log(&format!("lsp[uv] bootstrap failed: {}", err.trim()));
-            set_status("uv install failed (see ~/.croft/lsp.log)");
-            None
+        let script = format!("{fetch} | sh");
+        log_file::log(&format!(
+            "lsp[uv] bootstrapping uv via official installer into {dir:?}"
+        ));
+        set_status("Installing uv");
+        // `UV_INSTALL_DIR` puts uv in croft's dir; `INSTALLER_NO_MODIFY_PATH` keeps
+        // the script from editing the user's shell profiles. If the env vars are
+        // ignored by some installer version, uv lands in `~/.local/bin`, which
+        // `uv_program` also searches, so discovery still succeeds.
+        match Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("UV_INSTALL_DIR", &dir)
+            .env("INSTALLER_NO_MODIFY_PATH", "1")
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                log_file::log("lsp[uv] bootstrap complete");
+                uv_program()
+            }
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                log_file::log(&format!("lsp[uv] bootstrap failed: {}", err.trim()));
+                set_status("uv install failed (see ~/.croft/lsp.log)");
+                None
+            }
+            Err(e) => {
+                log_file::log(&format!("lsp[uv] bootstrap error: {e}"));
+                set_status("uv install failed (see ~/.croft/lsp.log)");
+                None
+            }
         }
-        Err(e) => {
-            log_file::log(&format!("lsp[uv] bootstrap error: {e}"));
-            set_status("uv install failed (see ~/.croft/lsp.log)");
-            None
+    }
+    #[cfg(windows)]
+    {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log_file::log(&format!("lsp[uv] could not create {dir:?}: {e}"));
+            set_status("uv install failed (could not create install dir)");
+            return None;
+        }
+        log_file::log(&format!(
+            "lsp[uv] bootstrapping uv via PowerShell installer into {dir:?}"
+        ));
+        set_status("Installing uv");
+        let shell = crate::platform::env::default_shell();
+        let ps = if shell.to_ascii_lowercase().contains("powershell")
+            || shell.to_ascii_lowercase().contains("pwsh")
+        {
+            shell
+        } else {
+            String::from("powershell.exe")
+        };
+        match Command::new(&ps)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "ByPass",
+                "-Command",
+                "irm https://astral.sh/uv/install.ps1 | iex",
+            ])
+            .env("UV_INSTALL_DIR", &dir)
+            .env("UV_NO_MODIFY_PATH", "1")
+            .env("INSTALLER_NO_MODIFY_PATH", "1")
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                log_file::log("lsp[uv] bootstrap complete");
+                uv_program()
+            }
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                log_file::log(&format!("lsp[uv] bootstrap failed: {}", err.trim()));
+                set_status("uv install failed (see ~/.croft/lsp.log)");
+                None
+            }
+            Err(e) => {
+                log_file::log(&format!("lsp[uv] bootstrap error: {e}"));
+                set_status("uv install failed (see ~/.croft/lsp.log)");
+                None
+            }
         }
     }
 }
@@ -1497,10 +1616,10 @@ fn discover_node_dir() -> Option<PathBuf> {
     if let Some(dir) = nvm_node_dir() {
         return Some(dir);
     }
-    if let Some(dir) = well_known_node_dirs()
-        .into_iter()
-        .find(|dir| dir.join("node").is_file() && dir.join("npm").exists())
-    {
+    if let Some(dir) = well_known_node_dirs().into_iter().find(|dir| {
+        crate::platform::env::executable_in_dir(dir, "node").is_some()
+            && crate::platform::env::executable_in_dir(dir, "npm").is_some()
+    }) {
         return Some(dir);
     }
     detached_shell_node_dir()
@@ -1555,15 +1674,31 @@ fn run_detached_node_probe() -> Option<PathBuf> {
 /// [`parse_node_probe`]. Shared by the language-server install and the
 /// JavaScript debugger, so neither can run the shell attached (#2064).
 pub(crate) fn node_probe_command() -> Command {
-    let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
-    let script =
-        format!("node -e 'process.stdout.write(\"{NODE_PROBE_MARKER}\"+process.execPath)'");
-    detached_shell(&shell, &script)
+    #[cfg(unix)]
+    {
+        let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
+        let script =
+            format!("node -e 'process.stdout.write(\"{NODE_PROBE_MARKER}\"+process.execPath)'");
+        detached_shell(&shell, &script)
+    }
+    #[cfg(windows)]
+    {
+        use std::process::Stdio;
+        let script = format!("process.stdout.write(\"{NODE_PROBE_MARKER}\"+process.execPath)");
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/d", "/s", "/c", "node", "-e", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        crate::platform::process::detach_from_tty(&mut cmd);
+        cmd
+    }
 }
 
 /// `shell -l -i -c script` with stdin `/dev/null`, stdout piped and stderr
 /// discarded, detached from croft's controlling terminal so the interactive
 /// shell's job control can never reach croft's tty.
+#[cfg(unix)]
 fn detached_shell(shell: &std::ffi::OsStr, script: &str) -> Command {
     use std::process::Stdio;
 
@@ -1583,18 +1718,53 @@ fn detached_shell(shell: &std::ffi::OsStr, script: &str) -> Command {
 pub(crate) fn parse_node_probe(stdout: &str) -> Option<&str> {
     let after = &stdout[stdout.rfind(NODE_PROBE_MARKER)? + NODE_PROBE_MARKER.len()..];
     let path = after.trim();
-    (path.starts_with('/') && !path.is_empty()).then_some(path)
+    let is_unix_abs = path.starts_with('/');
+    let is_win_abs = path.len() >= 3
+        && path.as_bytes()[0].is_ascii_alphabetic()
+        && path.as_bytes()[1] == b':'
+        && matches!(path.as_bytes()[2], b'\\' | b'/');
+    ((is_unix_abs || is_win_abs) && !path.is_empty()).then_some(path)
 }
 
-/// Highest installed nvm node's `bin` dir: `$NVM_DIR/versions/node/vX.Y.Z/bin`
-/// (defaulting `NVM_DIR` to `~/.nvm`). Picks the greatest semver so we get a
-/// recent, working node; we only need *a* functional node to install/run vtsls,
-/// not the user's exact `default` alias.
+/// Highest installed nvm node's bin dir (`$NVM_DIR/versions/node/vX.Y.Z/bin` on
+/// Unix, plus `%NVM_HOME%\vX.Y.Z` on Windows for nvm-windows).
 fn nvm_node_dir() -> Option<PathBuf> {
     let nvm = std::env::var_os("NVM_DIR")
         .map(PathBuf::from)
-        .or_else(|| crate::platform::env::home_dir().map(|h| h.join(".nvm")))?;
-    nvm_node_dir_in(&nvm.join("versions").join("node"))
+        .or_else(|| crate::platform::env::home_dir().map(|h| h.join(".nvm")));
+    if let Some(dir) = nvm.and_then(|root| nvm_node_dir_in(&root.join("versions").join("node"))) {
+        return Some(dir);
+    }
+    #[cfg(windows)]
+    {
+        let nvm_home = std::env::var_os("NVM_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("nvm")));
+        if let Some(root) = nvm_home
+            && let Some(dir) = nvm_windows_node_dir_in(&root)
+        {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn nvm_windows_node_dir_in(versions: &Path) -> Option<PathBuf> {
+    let mut best: Option<((u64, u64, u64), PathBuf)> = None;
+    for entry in std::fs::read_dir(versions).ok()?.flatten() {
+        let dir = entry.path();
+        if crate::platform::env::executable_in_dir(&dir, "node").is_none()
+            || crate::platform::env::executable_in_dir(&dir, "npm").is_none()
+        {
+            continue;
+        }
+        let version = parse_node_version(&entry.file_name().to_string_lossy());
+        if best.as_ref().is_none_or(|(b, _)| version > *b) {
+            best = Some((version, dir));
+        }
+    }
+    best.map(|(_, dir)| dir)
 }
 
 /// Pure core of [`nvm_node_dir`], split out so it's testable against a temp
@@ -1603,7 +1773,7 @@ fn nvm_node_dir_in(versions: &Path) -> Option<PathBuf> {
     let mut best: Option<((u64, u64, u64), PathBuf)> = None;
     for entry in std::fs::read_dir(versions).ok()?.flatten() {
         let bin = entry.path().join("bin");
-        if !bin.join("node").is_file() {
+        if crate::platform::env::executable_in_dir(&bin, "node").is_none() {
             continue;
         }
         let version = parse_node_version(&entry.file_name().to_string_lossy());
@@ -1634,8 +1804,25 @@ fn well_known_node_dirs() -> Vec<PathBuf> {
     if let Some(home) = crate::platform::env::home_dir() {
         dirs.push(home.join(".volta").join("bin"));
     }
-    dirs.push(PathBuf::from("/opt/homebrew/bin"));
-    dirs.push(PathBuf::from("/usr/local/bin"));
+    #[cfg(unix)]
+    {
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        dirs.push(PathBuf::from("/usr/local/bin"));
+    }
+    #[cfg(windows)]
+    {
+        if let Some(symlink) = std::env::var_os("NVM_SYMLINK") {
+            dirs.push(PathBuf::from(symlink));
+        }
+        if let Some(pf) = std::env::var_os("ProgramFiles") {
+            dirs.push(PathBuf::from(pf).join("nodejs"));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let local = PathBuf::from(local);
+            dirs.push(local.clone().join("Programs").join("nodejs"));
+            dirs.push(local.join("Volta").join("bin"));
+        }
+    }
     dirs
 }
 
