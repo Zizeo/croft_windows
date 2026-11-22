@@ -1134,7 +1134,8 @@ impl App {
         // old one. Shares `pane_is_idle_at` with the runnable-fence path
         // (#430) — this guard existed twice and only one copy was fixed,
         // which is precisely how the two defects survived a green suite.
-        let canonical = folder.canonicalize().unwrap_or_else(|_| folder.clone());
+        let canonical =
+            crate::platform::fs::canonicalize(&folder).unwrap_or_else(|_| folder.clone());
         if let Some(idx) = self
             .terminals
             .iter()
@@ -2122,10 +2123,8 @@ impl App {
         // than a second copy: `README.md:1` is a likely name across two
         // repos opened in sequence, and a pane whose shell still sits in
         // the other repo must not receive this one's block (#430).
-        let root = block
-            .cwd
-            .canonicalize()
-            .unwrap_or_else(|_| block.cwd.clone());
+        let root =
+            crate::platform::fs::canonicalize(&block.cwd).unwrap_or_else(|_| block.cwd.clone());
         // `pane_is_idle_at` is main's shared predicate (#430): one
         // definition for tasks and for runnable blocks, so a correction to
         // the cwd rule cannot land on one and miss the other.
@@ -2606,12 +2605,11 @@ pub(super) const BLOCK_SCRIPT_TTL: std::time::Duration =
 /// [`BLOCK_SCRIPT_TTL`] are cleared first.
 pub(super) fn stage_block(dir: &Path, interpreter: &str, code: &str) -> std::io::Result<PathBuf> {
     use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
+    let mut dir_builder = std::fs::DirBuilder::new();
+    dir_builder.recursive(true);
+    crate::platform::fs::set_private_dir_mode(&mut dir_builder);
+    dir_builder.create(dir)?;
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let old = entry
@@ -2639,11 +2637,10 @@ pub(super) fn stage_block(dir: &Path, interpreter: &str, code: &str) -> std::io:
     if path.to_string_lossy().contains(['\'', '\\', '\n', '\r']) {
         return Err(std::io::Error::other("the block path cannot be quoted"));
     }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    crate::platform::fs::set_private_file_mode(&mut opts);
+    let mut file = opts.open(&path)?;
     file.write_all(format!("{code}\n").as_bytes())?;
     Ok(path)
 }

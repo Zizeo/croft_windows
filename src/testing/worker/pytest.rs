@@ -98,11 +98,8 @@ pub(super) fn pytest_script(path_var: Option<&std::ffi::OsStr>) -> Option<PathBu
             }
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let candidate = PathBuf::from(home)
-            .join(".local")
-            .join("bin")
-            .join("pytest");
+    if let Some(home) = crate::platform::env::home_dir() {
+        let candidate = home.join(".local").join("bin").join("pytest");
         if candidate.is_file() {
             return Some(candidate);
         }

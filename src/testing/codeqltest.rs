@@ -111,7 +111,7 @@ pub fn test_id(root: &Path, path: &Path) -> String {
         .or_else(|| {
             // The CLI prints resolved paths (/private/var/... on macOS)
             // while the root may be the symlinked spelling.
-            let canon = std::fs::canonicalize(root).ok()?;
+            let canon = crate::platform::fs::canonicalize(root).ok()?;
             dir.strip_prefix(canon).ok().map(Path::to_path_buf)
         })
         .unwrap_or_else(|| dir.to_path_buf());

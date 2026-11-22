@@ -1105,7 +1105,9 @@ impl HistoryEntry {
     pub fn refers_to(&self, path: &Path, names: &[&str]) -> bool {
         match &self.database_path {
             Some(p) => {
-                let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+                let canon = |p: &Path| {
+                    crate::platform::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+                };
                 canon(p) == canon(path)
             }
             None => names.contains(&self.database.as_str()),

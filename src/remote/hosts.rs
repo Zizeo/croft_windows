@@ -160,8 +160,8 @@ pub fn discover_ssh_targets() -> Vec<RemoteTarget> {
 
 pub(super) fn ssh_config_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        paths.push(PathBuf::from(home).join(".ssh/config"));
+    if let Some(home) = crate::platform::env::home_dir() {
+        paths.push(home.join(".ssh/config"));
     }
     paths
 }

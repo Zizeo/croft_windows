@@ -22,7 +22,7 @@ pub fn trash_one(path: &Path) -> io::Result<()> {
     // Spec: write the .trashinfo entry before moving the file so a reader
     // never sees a trashed file whose origin has not been recorded yet.
     let info_path = info.join(format!("{name}.trashinfo"));
-    let origin = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let origin = crate::platform::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut entry = fs::File::create(&info_path)?;
     write!(
         entry,
@@ -47,8 +47,9 @@ fn trash_dir() -> io::Result<PathBuf> {
     {
         return Ok(PathBuf::from(xdg).join("Trash"));
     }
-    let home = std::env::var_os("HOME").ok_or_else(|| io::Error::other("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".local/share/Trash"))
+    let home =
+        crate::platform::env::home_dir().ok_or_else(|| io::Error::other("HOME is not set"))?;
+    Ok(home.join(".local/share/Trash"))
 }
 
 /// Pick a name unused in both `files/` and `info/`, suffixing `.1`, `.2`,
@@ -94,25 +95,18 @@ fn hex(nibble: u8) -> char {
     }
 }
 
-/// Local-time `YYYY-MM-DDThh:mm:ss` via libc, already a croft dependency,
-/// so no date crate is pulled in for one android-only field.
+/// Local-time `YYYY-MM-DDThh:mm:ss` via the platform time layer.
 fn deletion_date() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0) as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+        .unwrap_or(0) as i64;
+    let Some(dt) = crate::platform::time::local_datetime(secs) else {
         return String::new();
-    }
+    };
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min,
-        tm.tm_sec
+        dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
     )
 }
 
@@ -121,6 +115,7 @@ fn deletion_date() -> String {
 fn move_entry(src: &Path, dst: &Path) -> io::Result<()> {
     match fs::rename(src, dst) {
         Ok(()) => Ok(()),
+        #[cfg(unix)]
         Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
             copy_recursive(src, dst)?;
             remove_recursive(src)

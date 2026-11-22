@@ -209,16 +209,11 @@ impl Scratch {
     /// into it follow symlinks, so a permissive umask would let a local user
     /// plant one between the create and the write.
     pub fn new(path: PathBuf) -> Result<Self> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&path)
-                .with_context(|| format!("making {}", path.display()))?;
-        }
-        #[cfg(not(unix))]
-        std::fs::create_dir(&path).with_context(|| format!("making {}", path.display()))?;
+        let mut builder = std::fs::DirBuilder::new();
+        crate::platform::fs::set_private_dir_mode(&mut builder);
+        builder
+            .create(&path)
+            .with_context(|| format!("making {}", path.display()))?;
         Ok(Self { path })
     }
 

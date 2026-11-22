@@ -271,7 +271,7 @@ pub fn source_cache_name(db: &Path, zip: &Path) -> String {
 /// removed by it.
 pub fn source_cache_prefix(db: &Path) -> String {
     use sha2::Digest;
-    let canon = db.canonicalize().unwrap_or_else(|_| db.to_path_buf());
+    let canon = crate::platform::fs::canonicalize(db).unwrap_or_else(|_| db.to_path_buf());
     let digest = format!(
         "{:x}",
         sha2::Sha256::digest(canon.to_string_lossy().as_bytes())

@@ -210,11 +210,11 @@ pub fn remote_for_slug(repo: &Path, slug: &str) -> String {
 
 /// Whether `path` is one of `repo`'s worktrees.
 pub(super) fn is_worktree_of(repo: &Path, path: &Path) -> bool {
-    let want = path.canonicalize().ok();
+    let want = crate::platform::fs::canonicalize(path).ok();
     run_git(repo, &["worktree", "list", "--porcelain"]).is_ok_and(|out| {
         out.lines()
             .filter_map(|l| l.strip_prefix("worktree "))
-            .any(|w| Path::new(w).canonicalize().ok() == want)
+            .any(|w| crate::platform::fs::canonicalize(Path::new(w)).ok() == want)
     })
 }
 

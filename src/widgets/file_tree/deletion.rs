@@ -13,8 +13,8 @@ pub fn delete_target_for(node: Option<&Node>, root: &Path) -> Option<PathBuf> {
     if n.depth == 0 || n.path == root {
         return None;
     }
-    let canon_root = root.canonicalize().ok();
-    let canon_target = n.path.canonicalize().ok();
+    let canon_root = crate::platform::fs::canonicalize(root).ok();
+    let canon_target = crate::platform::fs::canonicalize(&n.path).ok();
     if canon_root.is_some() && canon_target == canon_root {
         return None;
     }

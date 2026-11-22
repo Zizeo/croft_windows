@@ -45,12 +45,10 @@ pub fn unique_destination_in(dest_dir: &Path, source: &Path) -> PathBuf {
 /// a descendant of itself (which would either error or, worse, produce an
 /// infinite-recursion copy on filesystems that follow symlinks).
 pub fn is_descendant_or_same(target: &Path, source: &Path) -> bool {
-    let canon_target = target
-        .canonicalize()
-        .unwrap_or_else(|_| target.to_path_buf());
-    let canon_source = source
-        .canonicalize()
-        .unwrap_or_else(|_| source.to_path_buf());
+    let canon_target =
+        crate::platform::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    let canon_source =
+        crate::platform::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
     canon_target == canon_source || canon_target.starts_with(&canon_source)
 }
 
@@ -59,7 +57,7 @@ pub fn is_descendant_or_same(target: &Path, source: &Path) -> bool {
 /// it was cut) is not in place: it takes the ordinary path, which reports it
 /// missing. A dangling symlink still exists, as the link itself.
 pub fn is_directly_in(dir: &Path, source: &Path) -> bool {
-    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let canon = |p: &Path| crate::platform::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     source.symlink_metadata().is_ok()
         && source
             .parent()

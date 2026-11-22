@@ -104,8 +104,8 @@ impl App {
         // (#139). Not `scm_root`: Source Control can be pinned to another
         // folder of a multi-root workspace.
         let root = path.parent().and_then(crate::git::repo_toplevel)?;
-        let canon_root = std::fs::canonicalize(&root).unwrap_or(root);
-        let canon_path = std::fs::canonicalize(&path).ok()?;
+        let canon_root = crate::platform::fs::canonicalize(&root).unwrap_or(root);
+        let canon_path = crate::platform::fs::canonicalize(&path).ok()?;
         let rel = canon_path.strip_prefix(&canon_root).ok()?.to_string_lossy();
         let merged = crate::git::remerge_diff3(&canon_root, &rel).ok()?;
         let merged: Vec<String> = merged.lines().map(str::to_string).collect();
@@ -232,8 +232,9 @@ impl App {
             .owning_root(&path)
             .unwrap_or_else(|| self.roots.primary())
             .to_path_buf();
-        let canon_root = std::fs::canonicalize(&merge_root).unwrap_or_else(|_| merge_root.clone());
-        let canon_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let canon_root =
+            crate::platform::fs::canonicalize(&merge_root).unwrap_or_else(|_| merge_root.clone());
+        let canon_path = crate::platform::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         let rel = canon_path
             .strip_prefix(&canon_root)
             .map(|p| p.to_string_lossy().into_owned())
@@ -264,7 +265,7 @@ impl App {
     pub(super) fn open_merge_editor_for(&mut self, path: &Path) -> bool {
         // Stage specs are repo-toplevel-relative (#139): see `repo_rel`.
         let root = self.scm_root();
-        let canon_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let canon_root = crate::platform::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
         let rel = self.repo_rel(path);
         let to_lines = |s: String| -> Vec<String> { s.lines().map(str::to_string).collect() };
         let ours = crate::git::read_file_at_stage(&canon_root, &rel, 2).map(to_lines);
@@ -358,8 +359,9 @@ impl App {
     /// stage specs refuse and status messages shouldn't show.
     pub(super) fn repo_rel(&self, path: &Path) -> String {
         let root = self.scm_root();
-        let canon_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
-        let canon_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let canon_root = crate::platform::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let canon_path =
+            crate::platform::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         canon_path
             .strip_prefix(&canon_root)
             .map(|p| p.to_string_lossy().into_owned())
@@ -699,7 +701,7 @@ impl App {
         // path the view was opened with.
         let touched: Vec<PathBuf> = changed_files
             .iter()
-            .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+            .map(|p| crate::platform::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
             .collect();
         let mut changed = false;
         // The active group's active tab, by address: a rebuild there is the
@@ -1776,7 +1778,7 @@ pub(super) fn rebuild_diff_view(
         if touched.is_empty() {
             return false;
         }
-        let canon = std::fs::canonicalize(side).unwrap_or_else(|_| side.to_path_buf());
+        let canon = crate::platform::fs::canonicalize(side).unwrap_or_else(|_| side.to_path_buf());
         touched.iter().any(|t| *t == canon || t == side)
     };
     let lines = |t: &str| -> Vec<String> { t.lines().map(str::to_string).collect() };
@@ -1797,7 +1799,8 @@ pub(super) fn rebuild_diff_view(
             // (macOS's /tmp -> /private/tmp), while a root the app carries
             // as typed may not be, so the same repository can be spelled two
             // ways between the tag and the drain's record.
-            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            let canon =
+                |p: &Path| crate::platform::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
             let head_moved = git_too
                 && heads_moved
                     .iter()

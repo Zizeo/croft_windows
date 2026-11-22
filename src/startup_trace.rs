@@ -183,13 +183,7 @@ fn render(trace: &Trace, lineage: &[Lineage]) -> String {
 
 /// This thread's CPU time so far.
 fn thread_cpu() -> Option<Duration> {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `ts` is a valid out-pointer for the duration of the call.
-    let ok = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut ts) } == 0;
-    ok.then(|| Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+    crate::platform::time::thread_cpu_time()
 }
 
 /// How many ancestors are worth naming: the terminal, its login wrapper and

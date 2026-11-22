@@ -143,13 +143,8 @@ const INIT_SENTINEL: &str = "zoxide init";
 /// is not necessarily on croft's inherited `PATH`.
 fn fallback_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        paths.push(
-            PathBuf::from(&home)
-                .join(".local")
-                .join("bin")
-                .join("zoxide"),
-        );
+    if let Some(home) = crate::platform::env::home_dir() {
+        paths.push(home.join(".local").join("bin").join("zoxide"));
     }
     paths.push(PathBuf::from("/opt/homebrew/bin/zoxide"));
     paths.push(PathBuf::from("/usr/local/bin/zoxide"));
@@ -348,7 +343,7 @@ fn missing_hook_rc(shell_path: Option<&str>, home: Option<&Path>) -> Option<Stri
 
 /// [`missing_hook_rc`] for this process's `$SHELL` and `$HOME`.
 pub fn shell_hook_missing() -> Option<String> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = crate::platform::env::home_dir();
     missing_hook_rc(std::env::var("SHELL").ok().as_deref(), home.as_deref())
 }
 
@@ -415,11 +410,11 @@ fn ensure_shell_init() -> Option<String> {
         ));
         return None;
     };
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = crate::platform::env::home_dir() else {
         log_file::log("zoxide: $HOME unset, skipping shell-init wiring");
         return None;
     };
-    let rc = PathBuf::from(home).join(rc_file_name(shell));
+    let rc = home.join(rc_file_name(shell));
     let existing = std::fs::read_to_string(&rc).unwrap_or_default();
     let block = pending_init_block(shell, &existing)?;
     match std::fs::OpenOptions::new()

@@ -246,9 +246,7 @@ pub fn install_keybinds(config_path: &Path) -> Result<()> {
 /// Resolve the Ghostty config croft should edit, from `HOME` and
 /// `XDG_CONFIG_HOME` (see [`config_path_in`]).
 pub fn default_config_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = crate::platform::env::home_dir().unwrap_or_default();
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     config_path_in(&home, xdg.as_deref(), cfg!(target_os = "macos"))
 }

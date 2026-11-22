@@ -881,7 +881,7 @@ pub(crate) fn replace_file_contents(path: &Path, bytes: &[u8]) -> Result<(), Rep
         error,
         touched: false,
     };
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target = crate::platform::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let Ok(meta) = std::fs::metadata(&target) else {
         return std::fs::write(&target, bytes).map_err(|error| ReplaceError {
             error,

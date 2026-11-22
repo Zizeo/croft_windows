@@ -365,7 +365,7 @@ pub fn install(
 /// disk mid-write must not truncate the user's Claude Code settings. A
 /// symlinked settings file is written through, so the link survives.
 fn write_replacing(path: &Path, text: &str) -> std::io::Result<()> {
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target = crate::platform::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let tmp = target.with_extension(format!("json.{}.tmp", std::process::id()));
     std::fs::write(&tmp, text)?;
     if let Ok(meta) = std::fs::metadata(&target) {
@@ -450,7 +450,7 @@ pub struct EditRequest {
 /// The croft listening for `cwd`: the socket of the nearest enclosing
 /// workspace that accepts a connection.
 pub(crate) fn connect_croft(cwd: &Path) -> Option<std::os::unix::net::UnixStream> {
-    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let cwd = crate::platform::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     cwd.ancestors().find_map(|dir| {
         std::os::unix::net::UnixStream::connect(crate::session::hook_socket_path(dir)).ok()
     })

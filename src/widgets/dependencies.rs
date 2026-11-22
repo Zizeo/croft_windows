@@ -180,8 +180,8 @@ pub(crate) fn cargo_binary() -> PathBuf {
             }
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let candidate = PathBuf::from(home).join(".cargo").join("bin").join("cargo");
+    if let Some(home) = crate::platform::env::home_dir() {
+        let candidate = home.join(".cargo").join("bin").join("cargo");
         if candidate.is_file() {
             return candidate;
         }

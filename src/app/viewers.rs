@@ -155,8 +155,8 @@ impl App {
         };
         let raw = std::path::PathBuf::from(&fr.path);
         let abs = if let Some(rest) = fr.path.strip_prefix("~/") {
-            match std::env::var_os("HOME") {
-                Some(h) => std::path::PathBuf::from(h).join(rest),
+            match crate::platform::env::home_dir() {
+                Some(h) => h.join(rest),
                 None => return false,
             }
         } else if raw.is_absolute() {

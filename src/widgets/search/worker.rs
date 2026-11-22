@@ -147,7 +147,7 @@ pub fn search_worker_loop(
             let mut skip: HashSet<PathBuf> = HashSet::new();
             let mut buf_hits: Vec<SearchHit> = Vec::new();
             for (path, content) in &dirty_for_thread {
-                if let Ok(canon) = path.canonicalize() {
+                if let Ok(canon) = crate::platform::fs::canonicalize(path) {
                     skip.insert(canon);
                 }
                 // Filter globs are root-relative: judge against the root

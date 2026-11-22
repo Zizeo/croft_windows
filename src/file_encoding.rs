@@ -131,7 +131,7 @@ fn load_remembered() -> BTreeMap<PathBuf, &'static Encoding> {
 }
 
 fn key(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    crate::platform::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Remember that the user reopened `path` in `enc`, so the next open of the

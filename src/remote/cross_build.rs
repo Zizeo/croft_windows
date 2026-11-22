@@ -171,7 +171,7 @@ pub(super) fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 
 pub(super) fn cross_tool_search_dirs() -> Vec<PathBuf> {
     let path = std::env::var_os("PATH");
-    let home = std::env::var_os("HOME");
+    let home = crate::platform::env::home_dir().map(PathBuf::into_os_string);
     cross_tool_search_dirs_from(path.as_deref(), home.as_deref())
 }
 
@@ -180,7 +180,7 @@ pub(super) fn cross_tool_search_dirs() -> Vec<PathBuf> {
 /// invoking `zig`) resolve each other even under a stripped launchd PATH.
 pub(super) fn cross_tool_path() -> OsString {
     let path = std::env::var_os("PATH");
-    let home = std::env::var_os("HOME");
+    let home = crate::platform::env::home_dir().map(PathBuf::into_os_string);
     cross_tool_path_from(path.as_deref(), home.as_deref())
 }
 

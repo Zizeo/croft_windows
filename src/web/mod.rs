@@ -59,8 +59,7 @@ pub struct Options {
 
 /// `croft web` for the session of `workspace`.
 pub fn run(workspace: &Path, opts: Options) -> Result<()> {
-    let root = workspace
-        .canonicalize()
+    let root = crate::platform::fs::canonicalize(workspace)
         .with_context(|| format!("{} is not a directory", workspace.display()))?;
     let socket = crate::session::mux_socket_path(&root);
     let record = record_path(&socket);

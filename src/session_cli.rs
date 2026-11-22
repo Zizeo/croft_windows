@@ -94,9 +94,9 @@ pub fn attach(path: Option<PathBuf>, solo: bool) -> Result<()> {
     let workspace = match path {
         Some(p) => p,
         None => std::env::current_dir().context("resolving workspace path")?,
-    }
-    .canonicalize()
-    .context("resolving workspace path")?;
+    };
+    let workspace =
+        crate::platform::fs::canonicalize(&workspace).context("resolving workspace path")?;
     if !workspace.is_dir() {
         anyhow::bail!("{} is not a directory", workspace.display());
     }

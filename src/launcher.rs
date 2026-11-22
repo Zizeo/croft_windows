@@ -145,8 +145,8 @@ fn plist_cleanup_deletes() -> Vec<String> {
 /// `~/Applications` (`user = true`, no admin rights needed).
 pub fn applications_dir(user: bool) -> Result<PathBuf> {
     if user {
-        let home = std::env::var_os("HOME").context("HOME is not set")?;
-        Ok(PathBuf::from(home).join("Applications"))
+        let home = crate::platform::env::home_dir().context("HOME is not set")?;
+        Ok(home.join("Applications"))
     } else {
         Ok(PathBuf::from("/Applications"))
     }

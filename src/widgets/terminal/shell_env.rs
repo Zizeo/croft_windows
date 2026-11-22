@@ -39,9 +39,7 @@ pub(super) fn apply_shell_integration_env(
             // launched from a croft pane) is poisoned — the user's dotfiles
             // live in HOME.
             let inherited = std::env::var_os("ZDOTDIR").map(std::path::PathBuf::from);
-            let home = std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_default();
+            let home = crate::platform::env::home_dir().unwrap_or_default();
             if home.as_os_str().is_empty() {
                 return args;
             }
@@ -77,12 +75,9 @@ pub(super) fn apply_shell_integration_env(
             // Posix mode defaults HISTFILE to ~/.sh_history; pre-seed the
             // bash default and let the shim unexport it.
             if std::env::var_os("HISTFILE").is_none()
-                && let Some(home) = std::env::var_os("HOME")
+                && let Some(home) = crate::platform::env::home_dir()
             {
-                cmd.env(
-                    "HISTFILE",
-                    std::path::Path::new(&home).join(".bash_history"),
-                );
+                cmd.env("HISTFILE", home.join(".bash_history"));
                 cmd.env("CROFT_BASH_UNEXPORT_HISTFILE", "1");
             }
             std::iter::once("--posix".to_string()).chain(args).collect()

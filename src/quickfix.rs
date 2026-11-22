@@ -700,15 +700,15 @@ pub fn scope_filters(
         includes
     };
 
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let root = crate::platform::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let named: Vec<PathBuf> = if sc.paths.is_empty() {
         vec![cwd.to_path_buf()]
     } else {
         sc.paths
             .iter()
             .map(|p| match p.strip_prefix("~/") {
-                Some(rest) => std::env::var_os("HOME")
-                    .map(|h| PathBuf::from(h).join(rest))
+                Some(rest) => crate::platform::env::home_dir()
+                    .map(|h| h.join(rest))
                     .unwrap_or_else(|| PathBuf::from(p)),
                 None => cwd.join(p),
             })
@@ -722,9 +722,8 @@ pub fn scope_filters(
             .map(String::as_str)
             .chain(std::iter::repeat(".")),
     ) {
-        let canon = abs
-            .canonicalize()
-            .map_err(|_| format!("{typed} doesn't exist"))?;
+        let canon =
+            crate::platform::fs::canonicalize(abs).map_err(|_| format!("{typed} doesn't exist"))?;
         let rel = canon
             .strip_prefix(&root)
             .map_err(|_| format!("{typed} is outside the workspace"))?;

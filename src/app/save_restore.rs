@@ -2741,11 +2741,7 @@ pub(super) fn stage_sudo_save(bytes: &[u8]) -> std::io::Result<PathBuf> {
     use std::io::Write as _;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
+    crate::platform::fs::set_private_file_mode(&mut opts);
     let dir = std::env::temp_dir();
     let mut last = None;
     for seq in 0..16 {

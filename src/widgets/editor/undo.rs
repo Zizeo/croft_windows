@@ -85,7 +85,7 @@ pub(super) fn lines_hash(lines: &[String]) -> u64 {
 /// The key a file's closed history is filed under: its canonical path, so a
 /// symlink or a relative spelling finds the same history.
 pub(super) fn closed_history_key(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    crate::platform::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 impl Editor {

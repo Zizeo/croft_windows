@@ -14,7 +14,7 @@ pub(super) fn open_link(url: &str) -> Result<()> {
             .collect();
         link.host = crate::deep_link::resolve_host(&host, &local_hostname(), &targets)?;
     }
-    let home = std::env::var("HOME").ok();
+    let home = crate::platform::env::home_dir().and_then(|p| p.into_os_string().into_string().ok());
     if let Some(args) = crate::deep_link::decide_argv(&link, home.as_deref()) {
         // Answer where the edit waits, then report: nothing to attach to.
         let status = match &link.host {
@@ -62,9 +62,7 @@ pub(super) fn local_hostname() -> String {
 /// `croft install-link-handler` (#359).
 pub(super) fn install_link_handler() -> Result<()> {
     let exe = std::env::current_exe()?.display().to_string();
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .context("HOME is not set")?;
+    let home = crate::platform::env::home_dir().context("HOME is not set")?;
     if std::env::var_os("TERMUX_VERSION").is_some() {
         let bin = home.join("bin");
         std::fs::create_dir_all(&bin)?;

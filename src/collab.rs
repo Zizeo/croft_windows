@@ -793,10 +793,10 @@ pub fn contained_path(root: &std::path::Path, file: &str) -> Option<std::path::P
     // later open follows the link. Resolve the deepest existing ancestor
     // (the file itself may not exist) and require it to stay under the
     // resolved root; a link resolving inside the workspace remains fine.
-    let canon_root = root.canonicalize().ok()?;
+    let canon_root = crate::platform::fs::canonicalize(root).ok()?;
     let mut probe = joined.as_path();
     loop {
-        match probe.canonicalize() {
+        match crate::platform::fs::canonicalize(probe) {
             Ok(real) => return real.starts_with(&canon_root).then_some(joined),
             // Nothing exists at this depth yet; check the parent instead.
             // The walk ends at `root` itself, which trivially resolves.

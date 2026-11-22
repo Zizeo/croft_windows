@@ -227,7 +227,9 @@ impl PtyTerminal {
         // Symlink-tolerant equality (macOS reports /private/tmp for a
         // shell sitting in /tmp): equal canonical paths name the same
         // directory, so a claim passing this check cannot mislead.
-        (claim.canonicalize().ok()? == real.canonicalize().ok()?).then_some(claim)
+        (crate::platform::fs::canonicalize(&claim).ok()?
+            == crate::platform::fs::canonicalize(&real).ok()?)
+        .then_some(claim)
     }
 
     /// Process ID of the shell running inside this terminal, when the

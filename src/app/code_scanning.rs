@@ -613,9 +613,8 @@ impl App {
         let history = crate::codeql_query::History::load(&Self::codeql_history_path());
         let entry = history.entries.iter().find(|e| {
             e.output == *log
-                || e.output
-                    .canonicalize()
-                    .is_ok_and(|o| log.canonicalize().is_ok_and(|l| l == o))
+                || crate::platform::fs::canonicalize(&e.output)
+                    .is_ok_and(|o| crate::platform::fs::canonicalize(log).is_ok_and(|l| l == o))
         })?;
         Self::codeql_run_database(entry)
     }
@@ -1231,8 +1230,7 @@ impl App {
         };
         let v = value.trim();
         let typed = match v.strip_prefix("~/") {
-            Some(rest) => std::env::var_os("HOME")
-                .map(PathBuf::from)
+            Some(rest) => crate::platform::env::home_dir()
                 .unwrap_or_default()
                 .join(rest),
             None => PathBuf::from(v),
@@ -1474,8 +1472,11 @@ impl App {
         if !path.is_file() {
             std::fs::create_dir_all(&dir)?;
             std::fs::write(&path, bytes)?;
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))?;
+            }
         }
         self.editor.pin_active();
         match contents {

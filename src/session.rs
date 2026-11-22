@@ -120,36 +120,11 @@ pub(crate) fn try_acquire_pair_host_lock(path: &Path) -> Result<PairHostLock, Pa
         .write(true)
         .open(path)
         .map_err(PairHostLockError::Io)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        // flock is per open-file-description, so two independent opens contend
-        // even within one process — the mutual exclusion we want across croft
-        // instances. LOCK_NB: fail fast instead of blocking the tick.
-        // errno is read in the same breath as the call: anything run in
-        // between could overwrite it and turn a Busy into a spurious Io.
-        // EINTR carries no information for the user (nothing at the path
-        // to fix), so it is retried like every other syscall site here.
-        let e = loop {
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            let e = std::io::Error::last_os_error();
-            if rc == 0 {
-                return Ok(PairHostLock { _file: file });
-            }
-            if e.kind() != std::io::ErrorKind::Interrupted {
-                break e;
-            }
-        };
-        // EWOULDBLOCK is contention; anything else (ENOLCK, EROFS) is the
-        // environment, not another window.
-        Err(if e.kind() == std::io::ErrorKind::WouldBlock {
-            PairHostLockError::Busy
-        } else {
-            PairHostLockError::Io(e)
-        })
+    match crate::platform::fs::try_lock_exclusive(&file) {
+        Ok(true) => Ok(PairHostLock { _file: file }),
+        Ok(false) => Err(PairHostLockError::Busy),
+        Err(e) => Err(PairHostLockError::Io(e)),
     }
-    #[cfg(not(unix))]
-    Ok(PairHostLock { _file: file })
 }
 
 /// What `croft pair` records for the workspace's resident navigator.

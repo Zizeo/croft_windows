@@ -155,7 +155,7 @@ pub(super) fn refuse_conflict_markers(root: &Path, scope: Option<&[String]>) -> 
     let Some(top) = repo_toplevel(root) else {
         return Ok(());
     };
-    let canon = |p: PathBuf| std::fs::canonicalize(&p).unwrap_or(p);
+    let canon = |p: PathBuf| crate::platform::fs::canonicalize(&p).unwrap_or(p);
     let scope: Option<Vec<PathBuf>> =
         scope.map(|paths| paths.iter().map(|p| canon(root.join(p))).collect());
     let marked: Vec<String> = unmerged

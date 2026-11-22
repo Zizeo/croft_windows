@@ -1285,8 +1285,9 @@ impl App {
     /// Answer `croft edit --wait`'s poll (#620): whether `path` is still open
     /// in any tab of any group. Opens nothing.
     pub(super) fn probe_view_path(&self, path: &Path) -> crate::view_ipc::ViewReply {
-        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let is_it = |p: &Path| p == path || p.canonicalize().is_ok_and(|c| c == canon);
+        let canon = crate::platform::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let is_it =
+            |p: &Path| p == path || crate::platform::fs::canonicalize(p).is_ok_and(|c| c == canon);
         let open = self
             .editor
             .editors
@@ -1806,8 +1807,7 @@ pub(super) fn reexec_binary_path(
             .installed_path()
             .or_else(crate::update_watch::cargo_install_bin)
     } else {
-        std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(".cargo").join("bin").join("croft"))
+        crate::platform::env::home_dir().map(|home| home.join(".cargo").join("bin").join("croft"))
     };
     if let Some(p) = installed
         && p.exists()
@@ -1925,10 +1925,10 @@ pub(super) fn install_terminal_restore_panic_hook() {
 /// `~/.cache/croft/panic.log`. Best-effort and silent on any I/O failure.
 pub(super) fn log_panic_to_file(info: &std::panic::PanicHookInfo<'_>) {
     use std::io::Write;
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = crate::platform::env::home_dir() else {
         return;
     };
-    let dir = std::path::PathBuf::from(home).join(".cache").join("croft");
+    let dir = home.join(".cache").join("croft");
     let _ = std::fs::create_dir_all(&dir);
     let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)

@@ -31,8 +31,7 @@ pub(super) const SETTING_SOURCES: &str = "user";
 /// global bin, the native installer's `~/.claude/local`, homebrew).
 pub(super) fn claude_search_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
+    if let Some(home) = crate::platform::env::home_dir() {
         dirs.push(home.join(".claude").join("local"));
         dirs.push(home.join(".local").join("bin"));
         dirs.push(home.join(".npm-global").join("bin"));

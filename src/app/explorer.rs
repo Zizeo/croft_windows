@@ -1783,7 +1783,7 @@ impl App {
             // `add_workspace_folder` canonicalises internally; the re-root
             // path must not, since its callers rely on the root being exactly
             // what they passed.
-            let path = path.canonicalize().unwrap_or(path);
+            let path = crate::platform::fs::canonicalize(&path).unwrap_or(path);
             if add {
                 self.add_workspace_folder(path);
             } else {
@@ -1864,7 +1864,7 @@ impl App {
     /// changes). Session/collab identity deliberately stays keyed on the
     /// PRIMARY root: adding a folder never changes what the window IS.
     pub fn add_workspace_folder(&mut self, path: PathBuf) {
-        let path = path.canonicalize().unwrap_or(path);
+        let path = crate::platform::fs::canonicalize(&path).unwrap_or(path);
         if !path.is_dir() {
             self.status = format!("Not a folder: {}", path.display());
             return;
@@ -2491,11 +2491,11 @@ impl App {
         let canon_roots: Vec<PathBuf> = self
             .tree
             .root_paths()
-            .filter_map(|r| r.canonicalize().ok())
+            .filter_map(|r| crate::platform::fs::canonicalize(r).ok())
             .collect();
         let is_root = |p: &PathBuf| {
             self.tree.root_paths().any(|r| r == p)
-                || p.canonicalize()
+                || crate::platform::fs::canonicalize(p)
                     .ok()
                     .is_some_and(|cp| canon_roots.contains(&cp))
         };

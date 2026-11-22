@@ -943,11 +943,21 @@ pub fn ensure_pane_bin(
     exe: &std::path::Path,
 ) -> std::io::Result<PathBuf> {
     use sha2::Digest;
-    use std::os::unix::ffi::OsStrExt;
-    let key = format!("{:x}", sha2::Sha256::digest(exe.as_os_str().as_bytes()));
+    let key = format!(
+        "{:x}",
+        sha2::Sha256::digest(exe.as_os_str().as_encoded_bytes())
+    );
     let dir = cache_dir.join("pane-bin").join(&key[..16]);
-    let link = dir.join("croft");
+    let link = dir.join(if cfg!(windows) { "croft.exe" } else { "croft" });
+    #[cfg(unix)]
     if std::fs::read_link(&link).ok().as_deref() == Some(exe) {
+        return Ok(dir);
+    }
+    #[cfg(not(unix))]
+    if let (Ok(em), Ok(lm)) = (std::fs::metadata(exe), std::fs::metadata(&link))
+        && em.len() == lm.len()
+        && em.modified().ok() == lm.modified().ok()
+    {
         return Ok(dir);
     }
     std::fs::create_dir_all(&dir)?;
@@ -955,7 +965,7 @@ pub fn ensure_pane_bin(
     // same moment never finds the name missing.
     let tmp = dir.join(format!(".croft-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
-    std::os::unix::fs::symlink(exe, &tmp)?;
+    crate::platform::fs::create_file_link(exe, &tmp)?;
     std::fs::rename(&tmp, &link)?;
     Ok(dir)
 }

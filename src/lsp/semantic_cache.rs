@@ -44,8 +44,8 @@ const MAGIC: u32 = 0x53_54_43_31; // "STC1"
 const MAX_ENTRIES: usize = 4096;
 
 fn cache_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".croft").join("sem-cache"))
+    let home = crate::platform::env::home_dir()?;
+    Some(home.join(".croft").join("sem-cache"))
 }
 
 /// Stable 64-bit FNV-1a over the key material. Deterministic across runs and

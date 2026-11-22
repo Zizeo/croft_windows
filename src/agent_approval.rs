@@ -134,9 +134,8 @@ fn apply_edit(text: &str, edit: &Value) -> Result<String, String> {
 /// Listen for this workspace's hook requests. Non-blocking, so draining it
 /// never stalls a frame.
 pub fn bind(workspace: &Path) -> std::io::Result<UnixListener> {
-    let root = workspace
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
+    let root =
+        crate::platform::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let listener = crate::session::bind_socket_0600(&crate::session::hook_socket_path(&root))?;
     listener.set_nonblocking(true)?;
     Ok(listener)

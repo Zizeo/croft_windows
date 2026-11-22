@@ -1574,7 +1574,7 @@ impl App {
                 &path,
                 previous.as_deref(),
             )
-            .map(|wt| (path.canonicalize().unwrap_or(path), wt));
+            .map(|wt| (crate::platform::fs::canonicalize(&path).unwrap_or(path), wt));
             let _ = tx.send(result);
         });
         self.pr_checkout_rx = Some((number, rx));

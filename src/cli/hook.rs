@@ -20,9 +20,7 @@ pub(super) fn hook_command(action: HookAction) -> std::result::Result<(), String
             } else {
                 Scope::Project
             };
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .ok_or("HOME is not set")?;
+            let home = crate::platform::env::home_dir().ok_or("HOME is not set")?;
             let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
             let path = agent_hook::settings_path(scope, &home, &cwd);
             let records = agent_hook::default_record_dir();

@@ -386,9 +386,9 @@ pub fn record(workspace: Option<PathBuf>, out: Option<PathBuf>, stop: bool) -> R
     let workspace = match workspace {
         Some(p) => p,
         None => std::env::current_dir().context("resolving workspace path")?,
-    }
-    .canonicalize()
-    .context("resolving workspace path")?;
+    };
+    let workspace =
+        crate::platform::fs::canonicalize(&workspace).context("resolving workspace path")?;
     let socket = crate::session::mux_socket_path(&workspace);
     let pidfile = pid_path(&socket);
     if stop {

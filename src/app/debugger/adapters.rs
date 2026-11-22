@@ -74,10 +74,7 @@ pub(in crate::app) fn lldb_dap_missing_message() -> String {
 /// lldb-dap without a build step. The honest signal for "directly executable",
 /// since such files usually have no extension.
 pub(in crate::app) fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    crate::platform::fs::is_executable(path)
 }
 
 impl App {

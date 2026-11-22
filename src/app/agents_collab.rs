@@ -26,7 +26,7 @@ pub(super) fn canonicalize_existing_ancestor(path: &Path) -> Option<PathBuf> {
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut probe = path.to_path_buf();
     loop {
-        if let Ok(canon) = std::fs::canonicalize(&probe) {
+        if let Ok(canon) = crate::platform::fs::canonicalize(&probe) {
             let mut out = canon;
             for part in tail.iter().rev() {
                 out.push(part);
@@ -140,7 +140,8 @@ impl App {
     /// any editor group. An agent's proposal is computed from disk, so it
     /// knows nothing of these edits (#347).
     pub(super) fn dirty_tab_lines(&self, path: &Path) -> Option<Vec<String>> {
-        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let canon =
+            |p: &Path| crate::platform::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         let want = canon(path);
         let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
         groups
@@ -454,7 +455,8 @@ impl App {
         if let Some(target) = self.approval_merge_into.take() {
             // Your tab takes the merged text, one Undo from your edits, so
             // the agent's write lands on what the buffer already holds.
-            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            let canon =
+                |p: &Path| crate::platform::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
             let want = canon(&target);
             let lines: Vec<String> = text.lines().map(str::to_string).collect();
             let mut groups = self.editor_layout.inactive_groups_mut();
@@ -1978,9 +1980,7 @@ impl App {
                 // Canonical, like the workspace roots it is compared with
                 // when the lane closes; taken now, while the directory
                 // exists to resolve.
-                path: lane
-                    .path
-                    .canonicalize()
+                path: crate::platform::fs::canonicalize(&lane.path)
                     .unwrap_or_else(|_| lane.path.clone())
                     .display()
                     .to_string(),
@@ -2591,7 +2591,7 @@ impl App {
             .map(|r| {
                 (
                     r.to_path_buf(),
-                    std::fs::canonicalize(r).unwrap_or_else(|_| r.to_path_buf()),
+                    crate::platform::fs::canonicalize(r).unwrap_or_else(|_| r.to_path_buf()),
                 )
             })
             .collect()
@@ -3255,7 +3255,7 @@ pub(super) fn agent_ledger_store_path() -> PathBuf {
 /// A workspace's key in the agent review store: its canonical root, so the
 /// save and the load agree however the root was spelled.
 pub(super) fn agent_ledger_key(root: &Path) -> String {
-    std::fs::canonicalize(root)
+    crate::platform::fs::canonicalize(root)
         .unwrap_or_else(|_| root.to_path_buf())
         .display()
         .to_string()

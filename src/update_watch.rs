@@ -200,8 +200,8 @@ fn probe_drift(manifest_dir: &str, baked_full: &str) -> Option<String> {
     // a dir that is its own repo toplevel speaks for this source (mirrors
     // the same guard in `build.rs`).
     let toplevel = git_in(manifest_dir, &["rev-parse", "--show-toplevel"])?;
-    let dir = std::fs::canonicalize(manifest_dir).ok()?;
-    if Some(dir) != std::fs::canonicalize(&toplevel).ok() {
+    let dir = crate::platform::fs::canonicalize(std::path::Path::new(manifest_dir)).ok()?;
+    if Some(dir) != crate::platform::fs::canonicalize(std::path::Path::new(&toplevel)).ok() {
         return None;
     }
     let head = git_in(manifest_dir, &["rev-parse", "HEAD"])?;
@@ -263,7 +263,7 @@ pub fn cargo_install_bin() -> Option<PathBuf> {
     install_bin_from(
         std::env::var_os("CARGO_INSTALL_ROOT"),
         std::env::var_os("CARGO_HOME"),
-        std::env::var_os("HOME"),
+        crate::platform::env::home_dir().map(PathBuf::into_os_string),
     )
 }
 

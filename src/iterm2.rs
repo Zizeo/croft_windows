@@ -1056,9 +1056,7 @@ pub fn install_croft_settings(
 }
 
 pub fn default_plist_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = crate::platform::env::home_dir().unwrap_or_default();
     home.join(ITERM2_PLIST_REL)
 }
 

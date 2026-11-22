@@ -492,7 +492,7 @@ impl App {
         let mut runs: Vec<Vec<String>> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let root_config = root.join("tsconfig.json");
-        seen.insert(std::fs::canonicalize(&root_config).unwrap_or(root_config));
+        seen.insert(crate::platform::fs::canonicalize(&root_config).unwrap_or(root_config));
         Self::collect_tsc_runs(root, None, &text, &mut seen, &mut runs);
         if runs.is_empty() {
             return Some(ProjectCheck::Empty);
@@ -576,7 +576,7 @@ impl App {
             } else {
                 on_disk
             };
-            let key = std::fs::canonicalize(&file).unwrap_or(file.clone());
+            let key = crate::platform::fs::canonicalize(&file).unwrap_or(file.clone());
             if !seen.insert(key) {
                 continue;
             }

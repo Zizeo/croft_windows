@@ -3398,10 +3398,9 @@ impl App {
         let root = self.scm_root();
         let rel = match path.strip_prefix(&root) {
             Ok(rel) => rel.to_path_buf(),
-            Err(_) => path
-                .canonicalize()
+            Err(_) => crate::platform::fs::canonicalize(path)
                 .ok()?
-                .strip_prefix(root.canonicalize().ok()?)
+                .strip_prefix(crate::platform::fs::canonicalize(&root).ok()?)
                 .ok()?
                 .to_path_buf(),
         };

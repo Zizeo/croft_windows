@@ -148,9 +148,9 @@ pub fn executable_targets(build: &Path) -> Vec<ExeTarget> {
 fn same_file(a: &Path, b: &Path) -> bool {
     a == b
         || lexical(a) == lexical(b)
-        || a.canonicalize()
+        || crate::platform::fs::canonicalize(a)
             .ok()
-            .is_some_and(|a| b.canonicalize().is_ok_and(|b| a == b))
+            .is_some_and(|a| crate::platform::fs::canonicalize(b).is_ok_and(|b| a == b))
 }
 
 /// `path` with its `.` and `..` components folded away, without touching

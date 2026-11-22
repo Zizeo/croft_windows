@@ -431,15 +431,13 @@ fn clock(started: u64, now: u64) -> String {
     if ago >= 86_400 {
         return short_age(ago);
     }
-    // libc's localtime, as the terminal's timestamps take it: no date
-    // crate for one field. The alias is deprecated on musl; see there.
-    #[allow(deprecated)]
-    let secs = started as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+    let Ok(secs) = i64::try_from(started) else {
         return short_age(ago);
-    }
-    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+    };
+    let Some(dt) = crate::platform::time::local_datetime(secs) else {
+        return short_age(ago);
+    };
+    format!("{:02}:{:02}", dt.hour, dt.minute)
 }
 
 /// The colour the Explorer gives files of CodeQL language `lang`.

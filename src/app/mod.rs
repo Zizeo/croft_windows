@@ -5732,7 +5732,7 @@ impl App {
     fn typed_path_checked(&self, value: &str) -> Option<PathBuf> {
         resolve_typed_path(
             value,
-            std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+            crate::platform::env::home_dir().as_deref(),
             self.workspace_root(),
         )
     }

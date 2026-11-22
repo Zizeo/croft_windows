@@ -143,8 +143,9 @@ impl App {
                 let landed = match (target, self.editor.path.as_ref()) {
                     (Some(t), Some(p)) => {
                         &t == p
-                            || std::fs::canonicalize(&t)
-                                .is_ok_and(|t| std::fs::canonicalize(p).is_ok_and(|p| p == t))
+                            || crate::platform::fs::canonicalize(&t).is_ok_and(|t| {
+                                crate::platform::fs::canonicalize(p).is_ok_and(|p| p == t)
+                            })
                     }
                     _ => false,
                 };

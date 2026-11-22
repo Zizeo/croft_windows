@@ -22,7 +22,7 @@ pub(super) fn pull_source_allowed(src: &Path) -> bool {
     if !src.is_absolute() || hidden(src) {
         return false;
     }
-    std::fs::canonicalize(src).is_ok_and(|real| !hidden(&real))
+    crate::platform::fs::canonicalize(src).is_ok_and(|real| !hidden(&real))
 }
 
 /// The local `tar` arguments that pack a pulled `basename` from `parent`.

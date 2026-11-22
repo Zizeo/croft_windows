@@ -432,7 +432,10 @@ impl App {
         let same_file = self.editor.path.as_deref().is_some_and(|p| {
             p == target
                 || matches!(
-                    (p.canonicalize(), target.canonicalize()),
+                    (
+                        crate::platform::fs::canonicalize(p),
+                        crate::platform::fs::canonicalize(target),
+                    ),
                     (Ok(a), Ok(b)) if a == b
                 )
         });

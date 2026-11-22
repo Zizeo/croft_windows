@@ -433,8 +433,8 @@ fn go_command(name: &str, bin: &str, version: Option<&str>) -> Option<String> {
 /// croft's managed server store: `~/.croft/servers`. `None` when `$HOME` is
 /// unset (the same guard the rest of croft uses for `~/.croft`).
 fn servers_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".croft").join("servers"))
+    let home = crate::platform::env::home_dir()?;
+    Some(home.join(".croft").join("servers"))
 }
 
 /// Directory `npm install --prefix` targets for a given server.
@@ -1361,7 +1361,7 @@ fn uv_program() -> Option<PathBuf> {
     if let Some(dist) = uv_dist_dir() {
         candidates.push(dist.join("uv"));
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::platform::env::home_dir() {
         candidates.push(home.join(".local").join("bin").join("uv"));
         candidates.push(home.join(".cargo").join("bin").join("uv"));
     }
@@ -1600,7 +1600,7 @@ pub(crate) fn parse_node_probe(stdout: &str) -> Option<&str> {
 fn nvm_node_dir() -> Option<PathBuf> {
     let nvm = std::env::var_os("NVM_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".nvm")))?;
+        .or_else(|| crate::platform::env::home_dir().map(|h| h.join(".nvm")))?;
     nvm_node_dir_in(&nvm.join("versions").join("node"))
 }
 
@@ -1638,8 +1638,8 @@ fn parse_node_version(name: &str) -> (u64, u64, u64) {
 /// Static install locations for other managers, checked after nvm.
 fn well_known_node_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(PathBuf::from(&home).join(".volta").join("bin"));
+    if let Some(home) = crate::platform::env::home_dir() {
+        dirs.push(home.join(".volta").join("bin"));
     }
     dirs.push(PathBuf::from("/opt/homebrew/bin"));
     dirs.push(PathBuf::from("/usr/local/bin"));

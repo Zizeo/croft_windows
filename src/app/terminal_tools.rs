@@ -1150,7 +1150,7 @@ impl App {
     pub(super) fn resolve_pane_path(&self, idx: usize, raw: &str) -> Option<std::path::PathBuf> {
         let path = std::path::PathBuf::from(raw);
         if let Some(rest) = raw.strip_prefix("~/") {
-            return std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(rest));
+            return crate::platform::env::home_dir().map(|h| h.join(rest));
         }
         if path.is_absolute() {
             return Some(path);

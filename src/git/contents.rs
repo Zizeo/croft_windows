@@ -162,8 +162,7 @@ pub fn remerge_diff3(root: &Path, rel_path: &str) -> Result<String, String> {
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    crate::platform::fs::set_private_dir_mode(&mut builder);
     builder.create(&dir).map_err(|e| e.to_string())?;
     let merged = (|| {
         for (name, text) in &sides {

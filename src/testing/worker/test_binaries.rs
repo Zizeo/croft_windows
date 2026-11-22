@@ -154,7 +154,8 @@ pub fn build_test_binary(
             // Canonicalize both sides: cargo reports resolved paths
             // (/private/var/... on macOS) while the editor may hold the
             // symlinked spelling of the same file.
-            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            let canon =
+                |p: &Path| crate::platform::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
             let src = canon(src);
             let exact: Vec<&TestBinary> =
                 all.iter().filter(|c| canon(&c.src_path) == src).collect();

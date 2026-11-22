@@ -149,8 +149,7 @@ impl Cli {
                 }
             }
             Some(CliCommand::CollabAgent { workspace, name }) => {
-                let workspace = workspace
-                    .canonicalize()
+                let workspace = crate::platform::fs::canonicalize(&workspace)
                     .with_context(|| format!("workspace not found: {}", workspace.display()))?;
                 let socket = crate::session::collab_socket_path(&workspace);
                 if let Some(dir) = socket.parent() {
@@ -331,9 +330,8 @@ impl Cli {
                 off,
                 repl,
             }) => {
-                let workspace = workspace
-                    .unwrap_or_else(|| std::env::current_dir().expect("cwd"))
-                    .canonicalize()
+                let workspace = workspace.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+                let workspace = crate::platform::fs::canonicalize(&workspace)
                     .context("resolving workspace path")?;
                 let record_path = crate::session::pair_record_path(&workspace);
                 if let Some(dir) = record_path.parent() {

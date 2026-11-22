@@ -178,7 +178,7 @@ impl FileTree {
     /// entry added to `main` under `src/main/java` refreshes, and splits,
     /// that row.
     pub fn index_of_dir(&self, path: &Path) -> Option<usize> {
-        let canon_target = path.canonicalize().ok();
+        let canon_target = crate::platform::fs::canonicalize(path).ok();
         self.nodes.iter().position(|n| {
             if !n.is_dir {
                 return false;
@@ -187,7 +187,7 @@ impl FileTree {
                 return true;
             }
             if let Some(target) = canon_target.as_ref()
-                && let Ok(canon_node) = n.path.canonicalize()
+                && let Ok(canon_node) = crate::platform::fs::canonicalize(&n.path)
                 && canon_node
                     .ancestors()
                     .take(n.folded + 1)
@@ -266,9 +266,8 @@ pub fn affected_dir_for_event(
         }
         return event_path.parent().map(Path::to_path_buf);
     }
-    let canon_event = event_path
-        .canonicalize()
-        .unwrap_or_else(|_| event_path.to_path_buf());
+    let canon_event =
+        crate::platform::fs::canonicalize(event_path).unwrap_or_else(|_| event_path.to_path_buf());
     if !canon_event.starts_with(canon_root) {
         return None;
     }

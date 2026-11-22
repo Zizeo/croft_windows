@@ -2679,7 +2679,7 @@ pub(super) struct SqlitePlace {
 /// SQLite keeps the log beside the real database file, so a database opened
 /// through a symlink has its log beside the link's target, not the link.
 pub fn sqlite_wal_path(path: &Path) -> Option<PathBuf> {
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = crate::platform::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut name = path.file_name()?.to_os_string();
     name.push("-wal");
     Some(path.with_file_name(name))

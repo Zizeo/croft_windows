@@ -163,7 +163,9 @@ pub fn search_workspace_streaming_filtered<F>(
             // Dirty files are searched from their in-memory buffer elsewhere;
             // skip the stale disk copy. Only pay the canonicalize syscall when
             // there is actually something to skip.
-            if !skip.is_empty() && path.canonicalize().is_ok_and(|canon| skip.contains(&canon)) {
+            if !skip.is_empty()
+                && crate::platform::fs::canonicalize(path).is_ok_and(|canon| skip.contains(&canon))
+            {
                 return WalkState::Continue;
             }
             let mut batch: Vec<SearchHit> = Vec::new();

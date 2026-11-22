@@ -51,8 +51,8 @@ impl App {
     /// canonicalised; `None` when `path` is elsewhere, is `cache` itself, or
     /// either does not exist.
     pub(in crate::app) fn cache_entry_holding(cache: &Path, path: &Path) -> Option<PathBuf> {
-        let cache = cache.canonicalize().ok()?;
-        let path = path.canonicalize().ok()?;
+        let cache = crate::platform::fs::canonicalize(cache).ok()?;
+        let path = crate::platform::fs::canonicalize(path).ok()?;
         let first = path.strip_prefix(&cache).ok()?.components().next()?;
         Some(cache.join(first))
     }

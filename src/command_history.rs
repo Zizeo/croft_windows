@@ -39,17 +39,7 @@ pub fn is_local_host(h: &str) -> bool {
 /// mDNS-style domain the shells sometimes include).
 fn is_local_hostname(h: &str) -> bool {
     static LOCAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let local = LOCAL.get_or_init(|| {
-        let mut buf = [0u8; 256];
-        // SAFETY: gethostname writes at most buf.len() bytes and
-        // NUL-terminates within it on every supported platform.
-        let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
-        if !ok {
-            return String::new();
-        }
-        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        String::from_utf8_lossy(&buf[..end]).to_string()
-    });
+    let local = LOCAL.get_or_init(crate::platform::env::hostname);
     if local.is_empty() {
         return false;
     }

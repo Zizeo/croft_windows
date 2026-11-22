@@ -46,19 +46,6 @@ pub(super) fn compose_client_identity(relay_key: &str, nonce: &str) -> String {
     format!("{relay_key}.{nonce}")
 }
 
-#[cfg(unix)]
 pub(super) fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
-    if ok {
-        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        String::from_utf8_lossy(&buf[..end]).into_owned()
-    } else {
-        String::from("local")
-    }
-}
-
-#[cfg(not(unix))]
-pub(super) fn hostname() -> String {
-    String::from("local")
+    crate::platform::env::hostname()
 }

@@ -1968,73 +1968,72 @@ pub(super) fn find_texts(lines: Vec<crate::widgets::terminal::FindLine>) -> Vec<
     lines.into_iter().map(|l| l.text).collect()
 }
 
-/// Create `dir` (0700) if needed and write `contents` to `file` (0600). On
-/// non-unix hosts the modes do not exist and the plain write is used.
+/// Create `dir` (0700 on unix) if needed and write `contents` to `file` (0600 on unix).
 pub(super) fn write_private(dir: &Path, file: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    // `recursive` also creates any missing parent (`~/.cache/croft`
+    // itself on a first run) at 0700. Its other tenants are `sessions/`
+    // (session.rs), `tmp/` (pdf.rs) and the MCP registry cache
+    // (registry_index.rs), every one of them private per-user state
+    // that gains nothing from a wider parent.
+    let mut dir_builder = std::fs::DirBuilder::new();
+    dir_builder.recursive(true);
+    crate::platform::fs::set_private_dir_mode(&mut dir_builder);
+    dir_builder.create(dir)?;
+    // A pre-existing dir is tightened, a link is refused: `create` adopts
+    // an existing symlink to a dir, `symlink_metadata` reports the link's
+    // own mode (always loose), and `set_permissions` follows the link, so
+    // without this check a scrollback dir pointed at any dir the user
+    // owns would silently re-mode that dir on the first dump.
+    let meta = std::fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a symlink; refusing to write through it",
+                dir.display()
+            ),
+        ));
+    }
     #[cfg(unix)]
     {
-        use std::io::Write;
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-        // `recursive` also creates any missing parent (`~/.cache/croft`
-        // itself on a first run) at 0700. Its other tenants are `sessions/`
-        // (session.rs), `tmp/` (pdf.rs) and the MCP registry cache
-        // (registry_index.rs), every one of them private per-user state
-        // that gains nothing from a wider parent.
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-        // A pre-existing dir is tightened, a link is refused: `create` adopts
-        // an existing symlink to a dir, `symlink_metadata` reports the link's
-        // own mode (always loose), and `set_permissions` follows the link, so
-        // without this check a scrollback dir pointed at any dir the user
-        // owns would silently re-mode that dir on the first dump.
-        let meta = std::fs::symlink_metadata(dir)?;
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "{} is a symlink; refusing to write through it",
-                    dir.display()
-                ),
-            ));
-        }
+        use std::os::unix::fs::PermissionsExt;
         if meta.permissions().mode() & 0o077 != 0 {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
-        // The same for the file: `create(true).truncate(true)` follows a link
-        // planted where the dump goes, and the chmod below would re-mode its
-        // target after the truncate had emptied it. The dir is 0700, so the
-        // planter is this user's own tooling or a restored backup, and the
-        // answer is still a refusal rather than a destroyed file.
-        if let Ok(fmeta) = std::fs::symlink_metadata(file)
-            && fmeta.file_type().is_symlink()
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "{} is a symlink; refusing to write through it",
-                    file.display()
-                ),
-            ));
-        }
-        // `O_NOFOLLOW` makes the open itself refuse a link, so a link swapped
-        // in between the check above and this open cannot be followed either
-        // (the same pair config_layers.rs uses); the check above only buys
-        // the clearer error. `mode` applies on creation alone, hence the
-        // chmod below for a file left by an earlier dump.
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true).mode(0o600);
-        opts.custom_flags(libc::O_NOFOLLOW);
-        let mut f = opts.open(file)?;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        f.write_all(contents.as_bytes())
     }
-    #[cfg(not(unix))]
+    // The same for the file: `create(true).truncate(true)` follows a link
+    // planted where the dump goes, and the chmod below would re-mode its
+    // target after the truncate had emptied it. The dir is 0700, so the
+    // planter is this user's own tooling or a restored backup, and the
+    // answer is still a refusal rather than a destroyed file.
+    if let Ok(fmeta) = std::fs::symlink_metadata(file)
+        && fmeta.file_type().is_symlink()
     {
-        std::fs::create_dir_all(dir)?;
-        std::fs::write(file, contents)
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a symlink; refusing to write through it",
+                file.display()
+            ),
+        ));
     }
+    // `O_NOFOLLOW` makes the open itself refuse a link, so a link swapped
+    // in between the check above and this open cannot be followed either
+    // (the same pair config_layers.rs uses); the check above only buys
+    // the clearer error. `mode` applies on creation alone, hence the
+    // chmod below for a file left by an earlier dump.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    crate::platform::fs::set_private_file_mode(&mut opts);
+    crate::platform::fs::open_nofollow(&mut opts);
+    let mut f = opts.open(file)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    f.write_all(contents.as_bytes())
 }
 
 /// Remove the dumps under `dir` whose croft process is gone. A dump is named

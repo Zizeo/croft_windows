@@ -252,11 +252,7 @@ fn record_impl(
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
+    crate::platform::fs::set_private_dir_mode(&mut builder);
     builder.create(dir)?;
     #[cfg(unix)]
     {
@@ -321,11 +317,7 @@ fn write_staged(dir: &Path, millis: u64, ext: &str, content: &[u8]) -> std::io::
         // Owner-only, like the directory (see `create_private_dir`).
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
+        crate::platform::fs::set_private_file_mode(&mut opts);
         let mut file = opts.open(&tmp)?;
         file.lock()?;
         file.write_all(content)?;

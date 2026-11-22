@@ -105,7 +105,7 @@ pub struct FsWatch {
 /// it cannot be resolved (it may not exist yet). Called once per bind, never
 /// per event.
 fn canon_of(root: &Path) -> PathBuf {
-    root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+    crate::platform::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
 impl FsWatch {
@@ -314,7 +314,7 @@ impl FsWatch {
                         affected.insert(dir);
                     } else if path == &self.watch_root
                         || path.as_path() == self.canon_watch_root
-                        || path.canonicalize().ok().as_deref()
+                        || crate::platform::fs::canonicalize(path).ok().as_deref()
                             == Some(self.canon_watch_root.as_path())
                     {
                         affected.insert(self.watch_root.clone());
@@ -334,9 +334,11 @@ impl FsWatch {
                 if reread.contains(dir) {
                     continue;
                 }
-                let idx = tree
-                    .index_of_dir(dir)
-                    .or_else(|| dir.canonicalize().ok().and_then(|c| tree.index_of_dir(&c)));
+                let idx = tree.index_of_dir(dir).or_else(|| {
+                    crate::platform::fs::canonicalize(dir)
+                        .ok()
+                        .and_then(|c| tree.index_of_dir(&c))
+                });
                 if let Some(idx) = idx {
                     tree.refresh_children(idx);
                     if let Some(row) = tree.nodes.get(idx) {

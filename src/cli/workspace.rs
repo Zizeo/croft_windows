@@ -74,7 +74,7 @@ pub(super) fn resolve_open_file(open_file: PathBuf, root: &Path, cwd: &Path) -> 
     };
     candidates
         .iter()
-        .find_map(|p| p.canonicalize().ok())
+        .find_map(|p| crate::platform::fs::canonicalize(p).ok())
         .unwrap_or_else(|| candidates[candidates.len() - 1].clone())
 }
 
@@ -95,7 +95,7 @@ pub(super) fn new_file_in_existing_dir(
         std::path::Component::Normal(name) => name.to_os_string(),
         _ => return None,
     };
-    let parent = path.parent()?.canonicalize().ok()?;
+    let parent = crate::platform::fs::canonicalize(path.parent()?).ok()?;
     parent.is_dir().then_some((parent, name))
 }
 
@@ -106,7 +106,7 @@ pub(super) fn resolve_workspace_from(
     cwd: &Path,
 ) -> Result<(PathBuf, Option<PathBuf>, Vec<PathBuf>)> {
     let joined = cwd.join(path);
-    let path = match joined.canonicalize() {
+    let path = match crate::platform::fs::canonicalize(&joined) {
         Ok(p) => p,
         Err(e) => {
             // A file not written yet, in a folder that exists: root at the

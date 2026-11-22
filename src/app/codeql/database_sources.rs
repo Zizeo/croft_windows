@@ -73,8 +73,7 @@ impl App {
                     for old in std::fs::read_dir(&cache).into_iter().flatten().flatten() {
                         let path = old.path();
                         let stale = old.file_name().to_string_lossy().starts_with(&prefix);
-                        let open = path
-                            .canonicalize()
+                        let open = crate::platform::fs::canonicalize(&path)
                             .is_ok_and(|p| self.roots.iter().any(|r| r == p));
                         if stale && !open {
                             let _ = std::fs::remove_dir_all(&path);
@@ -99,7 +98,7 @@ impl App {
                 dest
             }
         };
-        let folder = folder.canonicalize().unwrap_or(folder);
+        let folder = crate::platform::fs::canonicalize(&folder).unwrap_or(folder);
         let name = db.name.clone();
         if self.roots.iter().any(|r| r == folder) {
             self.status =

@@ -458,8 +458,7 @@ fn binary_for(arch: &str) -> Result<PathBuf> {
 
 /// Bring up `root`'s dev container and run croft in it on this terminal.
 pub fn up_and_attach(root: &Path, rebuild: bool) -> Result<()> {
-    let root = root
-        .canonicalize()
+    let root = crate::platform::fs::canonicalize(root)
         .with_context(|| format!("opening {}", root.display()))?;
     let Some(config) = find_config(&root) else {
         bail!(

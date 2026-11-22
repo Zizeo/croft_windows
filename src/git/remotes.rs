@@ -222,10 +222,9 @@ pub fn share_link(
 ) -> Result<String, String> {
     let dir = file.parent().ok_or("the file has no folder")?;
     let top = repo_toplevel(dir).ok_or("the file is not in a git repository")?;
-    let rel = file
-        .canonicalize()
+    let rel = crate::platform::fs::canonicalize(file)
         .ok()
-        .zip(top.canonicalize().ok())
+        .zip(crate::platform::fs::canonicalize(&top).ok())
         .and_then(|(f, t)| f.strip_prefix(t).ok().map(Path::to_path_buf))
         .ok_or("the file is not in a git repository")?;
     let rel = rel

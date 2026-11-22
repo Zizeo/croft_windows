@@ -117,8 +117,11 @@ impl App {
             && std::fs::create_dir_all(parent).is_ok()
             && std::fs::write(&text, source).is_ok()
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&text, std::fs::Permissions::from_mode(0o444));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&text, std::fs::Permissions::from_mode(0o444));
+            }
         }
         let mut history = History::load(&Self::codeql_history_path());
         history.push(HistoryEntry {

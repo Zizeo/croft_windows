@@ -145,9 +145,7 @@ pub(crate) fn spawn_log_tee(
 }
 
 pub(super) fn install_log_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let home = crate::platform::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
     home.join(".cache").join("croft").join("install.log")
 }
 

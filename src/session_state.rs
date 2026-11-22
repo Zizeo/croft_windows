@@ -164,8 +164,6 @@ pub(crate) fn write_private_atomically(path: &Path, bytes: &[u8]) -> Result<()> 
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension(format!(
         "json.{}.{:?}.tmp",
         std::process::id(),
@@ -175,8 +173,7 @@ pub(crate) fn write_private_atomically(path: &Path, bytes: &[u8]) -> Result<()> 
     let write = || -> std::io::Result<()> {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
+        crate::platform::fs::set_private_file_mode(&mut opts);
         let mut f = opts.open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
@@ -237,9 +234,7 @@ pub(crate) fn dirs_cache_croft() -> PathBuf {
     if let Some(dir) = CACHE_DIR_FOR_THIS_TEST_THREAD.with(|d| d.borrow().clone()) {
         return dir;
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let home = crate::platform::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
     home.join(".cache").join("croft")
 }
 

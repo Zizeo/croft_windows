@@ -109,7 +109,10 @@ fn same_dir(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+    match (
+        crate::platform::fs::canonicalize(Path::new(a)),
+        crate::platform::fs::canonicalize(Path::new(b)),
+    ) {
         (Ok(x), Ok(y)) => x == y,
         _ => false,
     }

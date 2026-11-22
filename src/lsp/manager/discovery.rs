@@ -224,8 +224,7 @@ pub(crate) fn is_executable_file(path: &Path) -> bool {
 /// which keeps local and remote behaviour identical.
 pub(super) fn toolchain_fallback_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
+    if let Some(home) = crate::platform::env::home_dir() {
         dirs.push(home.join(".cargo").join("bin"));
         dirs.push(home.join("go").join("bin"));
         dirs.push(home.join(".local").join("bin"));
@@ -358,9 +357,9 @@ pub(super) fn rustup_behind(candidate: &Path) -> Option<PathBuf> {
     let id = file_id(candidate)?;
     let rustup = format!("rustup{}", std::env::consts::EXE_SUFFIX);
     std::iter::once(candidate.to_path_buf())
-        .chain(std::fs::canonicalize(candidate).ok())
+        .chain(crate::platform::fs::canonicalize(candidate).ok())
         .map(|p| p.with_file_name(&rustup))
-        .find(|p| file_id(p) == Some(id))
+        .find(|p| file_id(p).as_ref() == Some(&id))
 }
 
 /// What identifies the file `path` leads to, links followed.
@@ -372,7 +371,7 @@ pub(super) fn file_id(path: &Path) -> Option<(u64, u64)> {
 
 #[cfg(not(unix))]
 pub(super) fn file_id(path: &Path) -> Option<PathBuf> {
-    std::fs::canonicalize(path).ok()
+    crate::platform::fs::canonicalize(path).ok()
 }
 
 /// Why the proxy `rustup` puts in front of `bin` cannot start it for the

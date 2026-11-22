@@ -875,7 +875,10 @@ impl Editor {
         if open == event_path {
             return true;
         }
-        if let (Ok(a), Ok(b)) = (open.canonicalize(), event_path.canonicalize()) {
+        if let (Ok(a), Ok(b)) = (
+            crate::platform::fs::canonicalize(open),
+            crate::platform::fs::canonicalize(event_path),
+        ) {
             return a == b;
         }
         false
@@ -1495,7 +1498,7 @@ impl Editor {
             error,
             touched: false,
         };
-        let target = std::fs::canonicalize(path).map_err(untouched)?;
+        let target = crate::platform::fs::canonicalize(path).map_err(untouched)?;
         let mode = std::fs::metadata(&target).map_err(untouched)?.permissions();
         let mut writable = mode.clone();
         #[cfg(unix)]

@@ -16,7 +16,7 @@ impl App {
     /// Pick the `codeql` to run from settings, `PATH` and croft's managed
     /// copies (#578), at startup and when the setting changes.
     pub(in crate::app) fn resolve_codeql_cli(&mut self) {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = crate::platform::env::home_dir();
         let resolved = crate::codeql_cli::resolve(
             self.codeql_cli_setting.as_deref(),
             home.as_deref(),

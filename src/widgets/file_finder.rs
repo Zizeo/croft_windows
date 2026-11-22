@@ -1283,8 +1283,8 @@ pub fn is_path_under_noise_dir(path: &Path) -> bool {
 ///      `~/.croft/lsp.log` but `~/Library/Logs/*` is a reasonable
 ///      Cmd+P target too).
 fn macos_blocked_paths() -> Vec<PathBuf> {
-    match std::env::var_os("HOME") {
-        Some(home) => macos_blocked_paths_for(&PathBuf::from(home)),
+    match crate::platform::env::home_dir() {
+        Some(home) => macos_blocked_paths_for(&home),
         None => Vec::new(),
     }
 }

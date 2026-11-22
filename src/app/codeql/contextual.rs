@@ -123,8 +123,11 @@ impl App {
                 let doc = dir.join("cfg.md");
                 std::fs::write(&doc, crate::codeql_cfg::render_document(&cfg, &title))
                     .map_err(io)?;
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&doc, std::fs::Permissions::from_mode(0o444));
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&doc, std::fs::Permissions::from_mode(0o444));
+                }
                 Ok(doc)
             };
             let _ = tx.send(read());

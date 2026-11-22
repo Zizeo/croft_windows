@@ -82,7 +82,7 @@ pub fn install_source(exe: &Path) -> InstallSource {
 /// `bin/croft` link Homebrew puts on PATH is traced into the Cellar.
 pub fn current_install_source() -> InstallSource {
     std::env::current_exe()
-        .and_then(|p| p.canonicalize())
+        .and_then(|p| crate::platform::fs::canonicalize(&p))
         .map(|p| install_source(&p))
         .unwrap_or(InstallSource::SelfManaged)
 }

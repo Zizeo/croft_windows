@@ -13,10 +13,7 @@ use std::path::PathBuf;
 /// non-empty, otherwise `~/.config/croft`.
 #[cfg(not(test))]
 pub(crate) fn config_dir() -> PathBuf {
-    config_dir_from(
-        std::env::var_os("XDG_CONFIG_HOME"),
-        std::env::var_os("HOME"),
-    )
+    crate::platform::env::config_dir()
 }
 
 /// Test builds' config directory: one of the test process's own, never the
@@ -46,13 +43,11 @@ pub(crate) fn config_dir() -> PathBuf {
 /// test build, the developer's own. Tests check they never reach it.
 #[cfg(test)]
 pub(crate) fn real_config_dir() -> PathBuf {
-    config_dir_from(
-        std::env::var_os("XDG_CONFIG_HOME"),
-        std::env::var_os("HOME"),
-    )
+    crate::platform::env::config_dir()
 }
 
 /// [`config_dir`] from the given `XDG_CONFIG_HOME` and `HOME`.
+#[cfg(test)]
 fn config_dir_from(
     xdg_config_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
@@ -72,12 +67,13 @@ fn config_dir_from(
 /// `~/.local/state/croft`; the cache directory is for what can be rebuilt,
 /// and cleaners and `rm -rf ~/.cache` delete it.
 pub(crate) fn state_dir() -> PathBuf {
-    state_dir_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+    crate::platform::env::state_dir()
 }
 
 /// [`state_dir`] from the given `XDG_STATE_HOME` and `HOME`. The spec
 /// counts a relative value (an empty one included) as invalid, so it falls
 /// back to the default rather than landing under the working directory.
+#[cfg(test)]
 fn state_dir_from(
     xdg_state_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
@@ -111,10 +107,7 @@ pub(crate) fn croft_cache_dir() -> PathBuf {
     if let Some(dir) = CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap().clone() {
         return dir;
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".cache").join("croft")
+    crate::platform::env::cache_dir()
 }
 
 #[cfg(test)]

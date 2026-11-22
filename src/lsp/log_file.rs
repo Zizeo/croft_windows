@@ -10,8 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 
 fn default_path() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".croft").join("lsp.log");
+    if let Some(home) = crate::platform::env::home_dir() {
+        return home.join(".croft").join("lsp.log");
     }
     std::env::temp_dir().join("croft-lsp.log")
 }

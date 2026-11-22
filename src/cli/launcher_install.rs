@@ -9,18 +9,15 @@ pub(super) fn install_launcher(path: Option<PathBuf>, user: bool, yes: bool) -> 
     }
     // The croft that runs inside Ghostty is this very executable, through
     // the link Homebrew moves on upgrade when Homebrew installed it.
+    let exe = std::env::current_exe().context("resolving croft binary path")?;
     let croft_bin = crate::launcher::stable_croft_path(
-        &std::env::current_exe()
-            .context("resolving croft binary path")?
-            .canonicalize()
-            .context("canonicalizing croft binary path")?,
+        &crate::platform::fs::canonicalize(&exe).context("canonicalizing croft binary path")?,
     );
     let open_dir = match path {
         Some(p) => p,
-        None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?),
+        None => crate::platform::env::home_dir().context("HOME is not set")?,
     };
-    let open_dir = open_dir
-        .canonicalize()
+    let open_dir = crate::platform::fs::canonicalize(&open_dir)
         .with_context(|| format!("resolving {}", open_dir.display()))?;
     if !open_dir.is_dir() {
         anyhow::bail!("{} is not a directory", open_dir.display());

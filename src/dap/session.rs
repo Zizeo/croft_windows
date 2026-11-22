@@ -286,8 +286,7 @@ impl DebugBuildDir {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        crate::platform::fs::set_private_dir_mode(&mut builder);
         builder.create(&dir)?;
         Ok(Self(dir))
     }

@@ -371,11 +371,7 @@ impl ReportFile {
         let path = std::env::temp_dir().join(name);
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
+        crate::platform::fs::set_private_file_mode(&mut opts);
         opts.open(&path)?;
         Ok(ReportFile(path))
     }

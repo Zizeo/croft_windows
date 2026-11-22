@@ -89,11 +89,11 @@ pub fn ensure_codicon_font_in_background() {
     if !crate::iterm2_inline::detect_termux() {
         return;
     }
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = crate::platform::env::home_dir() else {
         log_file::log("termux font: $HOME unset, skipping font install");
         return;
     };
-    let target = font_path(Path::new(&home));
+    let target = font_path(&home);
     if !install_needed(true, target.exists()) {
         return;
     }

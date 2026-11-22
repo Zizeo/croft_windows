@@ -357,7 +357,7 @@ fn load_layer_document(
     chain: &mut Vec<PathBuf>,
     warnings: &mut Vec<String>,
 ) -> Option<Map<String, Value>> {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical = crate::platform::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if visited.contains(&canonical) {
         warnings.push(format!(
             "{}: extends cycle detected — this file is already in the chain and was skipped",
@@ -469,9 +469,7 @@ fn load_layer_document_inner(
 /// file's own directory.
 fn resolve_extends_path(target: &str, extending_file: &Path) -> PathBuf {
     if let Some(rest) = target.strip_prefix("~/") {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
+        let home = crate::platform::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
         return home.join(rest);
     }
     let p = PathBuf::from(target);
@@ -769,11 +767,7 @@ pub fn ensure_workspace_local_ignored(root: &Path) -> std::io::Result<()> {
     }
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
+    crate::platform::fs::open_nofollow(&mut opts);
     let mut f = opts.open(&gi)?;
     let mut existing = String::new();
     f.read_to_string(&mut existing)?;

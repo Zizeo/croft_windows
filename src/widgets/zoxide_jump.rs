@@ -278,7 +278,7 @@ impl ZoxideJump {
 /// reads like the shell (`~/Documents/croft`) instead of a long absolute
 /// path. Purely cosmetic; the jump still uses the absolute `PathBuf`.
 fn display_path(path: &Path) -> String {
-    match std::env::var_os("HOME") {
+    match crate::platform::env::home_dir() {
         Some(home) => collapse_home(path, &home.to_string_lossy()),
         None => path.to_string_lossy().into_owned(),
     }

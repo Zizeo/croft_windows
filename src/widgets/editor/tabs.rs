@@ -680,7 +680,7 @@ impl EditorTabs {
         target: &Path,
         extra: impl Fn(&Editor) -> bool,
     ) -> Option<usize> {
-        let canon_target = target.canonicalize().ok();
+        let canon_target = crate::platform::fs::canonicalize(target).ok();
         self.editors.iter().position(|e| {
             if !extra(e) {
                 return false;
@@ -691,7 +691,10 @@ impl EditorTabs {
             if p == target {
                 return true;
             }
-            match (canon_target.as_ref(), p.canonicalize().ok()) {
+            match (
+                canon_target.as_ref(),
+                crate::platform::fs::canonicalize(p).ok(),
+            ) {
                 (Some(a), Some(b)) => *a == b,
                 _ => false,
             }

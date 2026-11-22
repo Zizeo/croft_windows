@@ -48,7 +48,7 @@ const USER_DIRS: &[(&str, &str)] = &[
 /// Candidate user directories that exist on this machine, most standard first.
 pub fn discover_profiles() -> Vec<(String, PathBuf)> {
     let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::platform::env::home_dir() {
         // macOS keeps them under Application Support; Linux under the XDG
         // config dir. Probing both is cheaper than deciding by target_os and
         // works when a home directory is shared between them.
@@ -737,10 +737,7 @@ pub fn theme_extension_dirs_under(home: &Path, user_dir: &Path) -> Vec<PathBuf> 
 
 /// [`theme_extension_dirs_under`] for this machine's home.
 pub fn theme_extension_dirs(user_dir: &Path) -> Vec<PathBuf> {
-    // `discover_profiles` finds a Windows profile through APPDATA, where
-    // HOME is usually unset; the extensions live under the user profile.
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    match home.map(PathBuf::from) {
+    match crate::platform::env::home_dir() {
         Some(home) => theme_extension_dirs_under(&home, user_dir),
         None => Vec::new(),
     }

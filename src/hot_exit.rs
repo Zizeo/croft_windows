@@ -63,7 +63,7 @@ impl Backup {
 }
 
 pub(crate) fn canonical(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    crate::platform::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The directory under `dir` holding the backups of the workspace at
@@ -165,11 +165,7 @@ fn clear(path: &Path, root: &Path) -> std::io::Result<()> {
     let json = serde_json::to_vec(&empty).map_err(std::io::Error::other)?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
+    crate::platform::fs::open_nofollow(&mut options);
     let mut file = options.open(path)?;
     file.write_all(&json)?;
     // On disk before the unlink is tried: a power cut between the two must

@@ -38,8 +38,8 @@ const MAX_JS_DEBUG_BYTES: u64 = 64 * 1024 * 1024;
 /// `~/.croft/debug-venv`, or `None` when `$HOME` is unset (the guard the rest of
 /// croft uses for `~/.croft`).
 pub fn debug_venv_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".croft").join("debug-venv"))
+    let home = crate::platform::env::home_dir()?;
+    Some(home.join(".croft").join("debug-venv"))
 }
 
 /// The venv's interpreter, which runs `-m debugpy.adapter` only. The program
@@ -131,8 +131,8 @@ pub fn ensure_debug_venv() -> Result<PathBuf> {
 
 /// `~/.croft/js-debug`, the install root for the vscode-js-debug server.
 pub(crate) fn js_debug_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".croft").join("js-debug"))
+    let home = crate::platform::env::home_dir()?;
+    Some(home.join(".croft").join("js-debug"))
 }
 
 /// Path to the extracted `dapDebugServer.js` (the standalone DAP server).
@@ -343,7 +343,7 @@ pub fn dlv_missing_message(go_available: bool) -> String {
 pub fn dlv_program() -> Result<PathBuf> {
     let gobin = std::env::var_os("GOBIN").map(PathBuf::from);
     let gopath = std::env::var_os("GOPATH").map(PathBuf::from);
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = crate::platform::env::home_dir();
     find_dlv(
         std::env::var_os("PATH").as_deref(),
         gobin.as_deref(),

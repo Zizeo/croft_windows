@@ -17,8 +17,8 @@ fn enabled() -> bool {
 }
 
 fn default_path() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".croft").join("dap.log");
+    if let Some(home) = crate::platform::env::home_dir() {
+        return home.join(".croft").join("dap.log");
     }
     std::env::temp_dir().join("croft-dap.log")
 }

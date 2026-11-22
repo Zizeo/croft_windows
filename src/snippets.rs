@@ -283,34 +283,29 @@ pub fn clock_var(name: &str) -> Option<String> {
         "CURRENT_SECONDS_UNIX" => return Some(secs.to_string()),
         _ => name.strip_prefix("CURRENT_")?,
     };
-    // libc's localtime, as the terminal's timestamps take it: no date crate.
-    // The alias is deprecated on musl; see `widgets::terminal::hhmmss`.
-    #[allow(deprecated)]
-    let secs = secs as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: both pointers are to live locals of the types it takes.
-    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
-        return None;
-    }
+    let dt = crate::platform::time::local_datetime(secs as i64)?;
     let month =
         "January February March April May June July August September October November December";
-    let month = month.split(' ').nth(tm.tm_mon as usize).unwrap_or_default();
+    let month = month
+        .split(' ')
+        .nth(dt.month.saturating_sub(1) as usize)
+        .unwrap_or_default();
     let day = "Sunday Monday Tuesday Wednesday Thursday Friday Saturday";
-    let day = day.split(' ').nth(tm.tm_wday as usize).unwrap_or_default();
-    let offset = tm.tm_gmtoff / 60;
+    let day = day.split(' ').nth(dt.weekday as usize).unwrap_or_default();
+    let offset = dt.utc_offset_mins;
     let sign = if offset < 0 { '-' } else { '+' };
     Some(match part {
-        "YEAR" => (tm.tm_year + 1900).to_string(),
-        "YEAR_SHORT" => format!("{:02}", (tm.tm_year + 1900) % 100),
-        "MONTH" => format!("{:02}", tm.tm_mon + 1),
+        "YEAR" => dt.year.to_string(),
+        "YEAR_SHORT" => format!("{:02}", dt.year % 100),
+        "MONTH" => format!("{:02}", dt.month),
         "MONTH_NAME" => month.to_string(),
         "MONTH_NAME_SHORT" => month.chars().take(3).collect(),
-        "DATE" => format!("{:02}", tm.tm_mday),
+        "DATE" => format!("{:02}", dt.day),
         "DAY_NAME" => day.to_string(),
         "DAY_NAME_SHORT" => day.chars().take(3).collect(),
-        "HOUR" => format!("{:02}", tm.tm_hour),
-        "MINUTE" => format!("{:02}", tm.tm_min),
-        "SECOND" => format!("{:02}", tm.tm_sec),
+        "HOUR" => format!("{:02}", dt.hour),
+        "MINUTE" => format!("{:02}", dt.minute),
+        "SECOND" => format!("{:02}", dt.second),
         "TIMEZONE_OFFSET" => format!("{sign}{:02}:{:02}", offset.abs() / 60, offset.abs() % 60),
         _ => return None,
     })

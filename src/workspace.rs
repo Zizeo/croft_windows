@@ -240,11 +240,7 @@ where
         let _ = std::fs::remove_file(&tmp);
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
+        crate::platform::fs::set_private_file_mode(&mut opts);
         let mut f = opts.open(&tmp)?;
         #[cfg(unix)]
         {
@@ -309,7 +305,7 @@ fn resolve_folder(base: &Path, p: &str) -> PathBuf {
     } else {
         base.join(p)
     };
-    abs.canonicalize().unwrap_or(abs)
+    crate::platform::fs::canonicalize(&abs).unwrap_or(abs)
 }
 
 /// Write the folder set as a `.code-workspace` (#163), or update the one
@@ -356,7 +352,7 @@ pub fn workspace_file_update(path: &Path, folders: &[PathBuf]) -> Result<Option<
         None => serde_json::json!({}),
     };
     let base = path.parent().unwrap_or_else(|| Path::new("."));
-    let base_canon = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    let base_canon = crate::platform::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
     let listed = doc
         .get("folders")
         .and_then(Value::as_array)
@@ -364,7 +360,7 @@ pub fn workspace_file_update(path: &Path, folders: &[PathBuf]) -> Result<Option<
         .unwrap_or_default();
     let want: Vec<PathBuf> = folders
         .iter()
-        .map(|f| f.canonicalize().unwrap_or_else(|_| f.clone()))
+        .map(|f| crate::platform::fs::canonicalize(f).unwrap_or_else(|_| f.clone()))
         .collect();
     let names = |e: &Value, w: &Path| {
         e.get("path")
@@ -412,14 +408,19 @@ pub fn workspace_file_update(path: &Path, folders: &[PathBuf]) -> Result<Option<
 /// keeps the first answer.
 fn relative_to_base(base: &Path, base_canon: &Path, target: &Path) -> String {
     let direct = relative_or_absolute(base, target);
-    let target_canon = target.canonicalize().ok();
+    let target_canon = crate::platform::fs::canonicalize(target).ok();
     if !Path::new(&direct).is_absolute() {
         // A `..` walk is resolved by the OS AFTER following any symlink in
         // `base`: from `~/link/ws` (link -> /data/x), `../../other` opens
         // `/data/other`, not `~/other`. Keep the spelling only when it
         // reopens the same directory; otherwise save the folder absolute.
         let reopens = match &target_canon {
-            Some(want) => base.join(&direct).canonicalize().ok().as_ref() == Some(want),
+            Some(want) => {
+                crate::platform::fs::canonicalize(&base.join(&direct))
+                    .ok()
+                    .as_ref()
+                    == Some(want)
+            }
             // A folder not on disk cannot be checked; keep its spelling.
             None => true,
         };
