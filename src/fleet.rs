@@ -1,0 +1,1218 @@
+//! Running one command across several hosts and comparing what came back
+//! (#363).
+//!
+//! Broadcast typing already covers "type once"; this is the other half —
+//! laying the outputs side by side and saying what differs. The comparison
+//! is the whole value, because reading ten near-identical `uname -r` outputs
+//! by eye is exactly the task a person is worst at.
+//!
+//! # What "the reference" means
+//!
+//! Diff mode needs something to diff against, and the useful default is the
+//! output MOST hosts produced — the fleet's normal, so the tiles that light
+//! up are the exceptions. Not the first host: that makes the answer depend
+//! on the order hosts happen to be listed in, so the same fleet in a
+//! different order would highlight a different set.
+//!
+//! A tie is broken by picking neither. With 2-and-2 there is no majority and
+//! no honest "normal" to compare against, so saying so beats choosing one
+//! arbitrarily and painting half the fleet as deviant.
+
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+/// What one host returned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostResult {
+    pub host: String,
+    /// Combined stdout+stderr, as the tile shows it.
+    pub output: String,
+    /// `None` when the run timed out or ssh never returned a status.
+    pub exit: Option<i32>,
+    /// Wall-clock time from spawn to exit (or to the deadline).
+    pub elapsed: Duration,
+}
+
+impl HostResult {
+    /// Whether this host answered successfully.
+    ///
+    /// A non-zero exit is a FAILURE for fleet purposes even though its
+    /// output may be perfectly good: the point of the summary is to say
+    /// which hosts to look at, and one that errored is one to look at.
+    pub fn ok(&self) -> bool {
+        self.exit == Some(0)
+    }
+}
+
+/// How a fleet run turned out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FleetSummary {
+    /// Hosts whose output matches the reference.
+    pub identical: usize,
+    /// Hosts that succeeded but returned something else.
+    pub differ: usize,
+    /// Hosts that failed or timed out.
+    pub failed: usize,
+}
+
+impl FleetSummary {
+    /// The header line: `7 identical · 2 differ · 1 failed`.
+    ///
+    /// Zero counts are omitted rather than shown as `0 failed`, because a
+    /// clean run should read as clean at a glance instead of making the
+    /// reader parse three numbers to discover two are zero.
+    pub fn line(&self) -> String {
+        let mut parts = Vec::new();
+        if self.identical > 0 {
+            parts.push(format!("{} identical", self.identical));
+        }
+        if self.differ > 0 {
+            parts.push(format!("{} differ", self.differ));
+        }
+        if self.failed > 0 {
+            parts.push(format!("{} failed", self.failed));
+        }
+        if parts.is_empty() {
+            return String::from("no hosts");
+        }
+        parts.join(" \u{b7} ")
+    }
+}
+
+/// The output most successful hosts returned, or `None` when no single
+/// output leads.
+///
+/// A PLURALITY, not a majority: with `x,x,y,z` the winner has 2 of 4, and
+/// that is the right answer — the two odd hosts are still the exceptions.
+/// Only an exact TIE at the top yields `None`.
+///
+/// Only SUCCESSFUL hosts vote. A failing host's output is usually an error
+/// message, and letting three identical `Permission denied` results become
+/// the reference would paint every working host as the deviant one.
+pub fn reference_output(results: &[HostResult]) -> Option<&str> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for r in results.iter().filter(|r| r.ok()) {
+        *counts.entry(r.output.as_str()).or_default() += 1;
+    }
+    let best = counts.values().copied().max()?;
+    // A tie means no majority: with 2-and-2 there is no honest "normal", and
+    // choosing one would paint half the fleet as deviant on the strength of
+    // nothing. `BTreeMap` order would make that choice deterministic, which
+    // is worse — a stable wrong answer looks like a considered one.
+    let winners = counts.values().filter(|&&c| c == best).count();
+    if winners > 1 {
+        return None;
+    }
+    counts
+        .into_iter()
+        .find(|&(_, c)| c == best)
+        .map(|(out, _)| out)
+}
+
+/// Count the run against `reference`.
+pub fn summarise(results: &[HostResult], reference: Option<&str>) -> FleetSummary {
+    let mut s = FleetSummary {
+        identical: 0,
+        differ: 0,
+        failed: 0,
+    };
+    for r in results {
+        if !r.ok() {
+            s.failed += 1;
+        } else if Some(r.output.as_str()) == reference {
+            s.identical += 1;
+        } else {
+            s.differ += 1;
+        }
+    }
+    s
+}
+
+/// The ssh argv for running `command` on `host` non-interactively.
+///
+/// `-n` because stdin belongs to croft, not to the remote command: without
+/// it a fleet run reads the terminal the user is typing into, and the hosts
+/// race each other for the keystrokes. Same reason `remote.rs` passes it.
+///
+/// `BatchMode=yes` so a host that wants a password FAILS rather than hanging
+/// on a prompt nobody can see — a timeout the user waits out is worse than
+/// an error they can act on.
+///
+/// `StrictHostKeyChecking=yes` — a host with no `known_hosts` entry FAILS
+/// rather than being trusted on sight.
+///
+/// `accept-new` was the first choice and is wrong here specifically because
+/// this is a fleet. A single interactive `ssh` shows the user a fingerprint
+/// and asks; a fleet run shows nobody anything, so `accept-new` would
+/// silently trust a first-contact key on every unknown host at once — and an
+/// attacker impersonating one of them receives the command the user typed.
+/// Failing costs one `ssh host` to establish the key, done deliberately and
+/// with the fingerprint on screen, which is where that decision belongs.
+pub fn fleet_ssh_args(host: &str, command: &str) -> Vec<String> {
+    vec![
+        String::from("-n"),
+        String::from("-o"),
+        String::from("BatchMode=yes"),
+        String::from("-o"),
+        String::from("StrictHostKeyChecking=yes"),
+        String::from(host),
+        String::from("--"),
+        String::from(command),
+    ]
+}
+
+/// Split a fleet request into the hosts it names and the command to run.
+///
+/// The syntax is `host,host,host: command` — the fleet FIRST, because
+/// choosing who to run on is the decision, and a user typing left to right
+/// should have to make it before writing anything that could execute.
+///
+/// `Err` when no host list is given. That refusal is the point: without it
+/// "Fleet Run" means "run on every host in your ~/.ssh/config", which on an
+/// ordinary machine is every remote you have ever configured — a live
+/// production box beside a `github.com` entry that is not a shell host at
+/// all. A prompt asking you to confirm a list you cannot see is not consent,
+/// so the fleet has to be named rather than defaulted.
+///
+/// `*` is the explicit way to say "all of them", so the broadcast is still
+/// available to someone who means it.
+///
+/// A name is looked up as a saved group first and a host second (#363), so a
+/// group named after a host cannot silently shadow it — the group wins, and
+/// naming one after a host is the user's own doing.
+///
+/// Expansion is one level:
+/// a group listing another group's name resolves that entry as a host and
+/// fails the unknown-host check below, rather than recursing. Nesting would
+/// need cycle detection to be safe, and there is no case for it yet.
+///
+/// Every expanded name still goes through the same known-host check as a
+/// typed one. That is the property worth keeping: a group is a shorthand for
+/// hosts croft already knows, never a way to name a machine that is not in
+/// `~/.ssh/config`.
+pub fn parse_request_with_groups<'a>(
+    input: &str,
+    known: &'a [String],
+    groups: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<(Vec<&'a String>, String), RequestError> {
+    let (spec, command) = split_request(input).ok_or(RequestError::Syntax)?;
+    let command = command.trim();
+    if command.is_empty() {
+        return Err(RequestError::Syntax);
+    }
+    let spec = spec.trim();
+    if spec == "*" {
+        // Every ssh host: `*` has always meant ~/.ssh/config, and a local
+        // shell or container joining it unasked would change what the same
+        // request runs on.
+        let hosts: Vec<&String> = known.iter().filter(|k| !is_local_target(k)).collect();
+        return Ok((hosts, command.to_string()));
+    }
+    let mut hosts = Vec::new();
+    for name in spec.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        // A group expands to the names it holds; anything else is one name.
+        let group = groups.iter().find(|(g, _)| g.eq_ignore_ascii_case(name));
+        let members: Vec<&str> = match group {
+            Some((_, members)) => members.iter().map(String::as_str).collect(),
+            None => vec![name],
+        };
+        // A group that resolves to nothing REFUSES rather than contributing
+        // nothing. Silently, `web,db1: cmd` with an empty `web` would run on
+        // db1 alone - the user believes they addressed a fleet and addressed
+        // one box, which is the harm the unknown-host check below exists to
+        // prevent. Every other refusal in this function is loud.
+        if members.is_empty() {
+            return Err(RequestError::EmptyGroup(name.to_string()));
+        }
+        for member in members {
+            // Only hosts croft actually knows: a typo must not become an ssh
+            // attempt against a hostname the user never configured, and a
+            // group cannot smuggle one past that check either.
+            let found = known
+                .iter()
+                .find(|k| k.eq_ignore_ascii_case(member))
+                .ok_or_else(|| RequestError::UnknownHost {
+                    name: member.to_string(),
+                    group: group.map(|(g, _)| g.clone()),
+                })?;
+            if !hosts.contains(&found) {
+                hosts.push(found);
+            }
+        }
+    }
+    if hosts.is_empty() {
+        return Err(RequestError::Syntax);
+    }
+    Ok((hosts, command.to_string()))
+}
+
+/// Why a fleet request was refused (#1301).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestError {
+    /// Not `hosts: command`: no separator, no host named, or no command.
+    Syntax,
+    /// A name that is not a known target, typed or listed in `group`.
+    UnknownHost { name: String, group: Option<String> },
+    /// A saved group with no members.
+    EmptyGroup(String),
+}
+
+impl RequestError {
+    /// The status-bar line for this refusal. `known` is every target the
+    /// request could name.
+    pub fn message(&self, known: &[String]) -> String {
+        match self {
+            RequestError::Syntax => {
+                // `*` runs on the ssh hosts only, so that is what it counts.
+                let ssh: Vec<&String> = known.iter().filter(|k| !is_local_target(k)).collect();
+                match (ssh.first(), known.first()) {
+                    (Some(first), _) => format!(
+                        "Fleet run needs 'hosts: command' — e.g. '{first}: uptime', or '*: uptime' for all {}",
+                        ssh.len()
+                    ),
+                    (None, Some(first)) => {
+                        format!("Fleet run needs 'hosts: command' — e.g. '{first}: uptime'")
+                    }
+                    (None, None) => String::from("Fleet run needs 'hosts: command'"),
+                }
+            }
+            RequestError::UnknownHost { name, group } => {
+                let place = match group {
+                    Some(g) => format!("\"{name}\" in group \"{g}\""),
+                    None => format!("\"{name}\""),
+                };
+                let mut msg = format!(
+                    "Fleet run: {place} is not in ~/.ssh/config (or localhost / docker:<name>)"
+                );
+                if let Some(close) = closest_target(name, known) {
+                    msg.push_str(&format!(" — did you mean \"{close}\"?"));
+                }
+                msg
+            }
+            RequestError::EmptyGroup(g) => format!("Fleet run: group \"{g}\" has no hosts"),
+        }
+    }
+}
+
+/// The known target a mistyped `name` most likely meant: the nearest by
+/// edit distance (a swap of two neighbours counts as one edit), within a
+/// quarter of the name's length and at least one edit. `None` when nothing
+/// is that close, so an unrelated name gets no guess.
+fn closest_target<'a>(name: &str, known: &'a [String]) -> Option<&'a String> {
+    let name: Vec<char> = name.to_lowercase().chars().collect();
+    let limit = (name.len() / 4).max(1);
+    known
+        .iter()
+        .map(|k| {
+            (
+                edit_distance(&name, &k.to_lowercase().chars().collect::<Vec<_>>()),
+                k,
+            )
+        })
+        .filter(|(d, _)| *d <= limit)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k)
+}
+
+/// Optimal string alignment distance: insertions, deletions, substitutions
+/// and adjacent transpositions each cost one.
+fn edit_distance(a: &[char], b: &[char]) -> usize {
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            d[i][j] = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+            }
+        }
+    }
+    d[a.len()][b.len()]
+}
+
+/// Split `hosts: command` at the colon that ends the host list. A colon that
+/// only closes a `docker:` prefix (`docker:web: uptime`) belongs to the
+/// target, not to the separator.
+pub fn split_request(input: &str) -> Option<(&str, &str)> {
+    let mut from = 0;
+    while let Some(i) = input[from..].find(':').map(|i| i + from) {
+        let token_start = input[..i].rfind(',').map_or(0, |c| c + 1);
+        if input[token_start..i].trim() == "docker" {
+            from = i + 1;
+            continue;
+        }
+        return Some((&input[..i], &input[i + 1..]));
+    }
+    None
+}
+
+/// Whether a fleet target runs on this machine rather than over ssh:
+/// `localhost`, or a container as `docker:<name>` (#363).
+pub fn is_local_target(target: &str) -> bool {
+    target == "localhost"
+        || target
+            .strip_prefix("docker:")
+            .is_some_and(|n| !n.is_empty())
+}
+
+/// The local targets a fleet `request` may name besides ssh hosts:
+/// `localhost`, and every `docker:<name>` the request or one of `groups`
+/// names. Containers are not listed with `docker ps`: that waits on the
+/// Docker daemon, and a hung daemon would freeze the editor before the run
+/// even started. A container that does not exist fails in its own result,
+/// with docker's message.
+pub fn local_targets_in(
+    request: &str,
+    groups: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut out = vec![String::from("localhost")];
+    let spec = split_request(request).map_or("", |(spec, _)| spec);
+    let named = spec
+        .split(',')
+        .chain(groups.values().flatten().map(String::as_str))
+        .map(str::trim)
+        .filter(|n| n.strip_prefix("docker:").is_some_and(|c| !c.is_empty()));
+    for n in named {
+        if !out.iter().any(|o| o == n) {
+            out.push(n.to_string());
+        }
+    }
+    out
+}
+
+/// The program and arguments that run `command` on `target`: ssh for a
+/// host, `sh -c` for `localhost`, `docker exec` for `docker:<name>`.
+pub fn target_command(target: &str, command: &str) -> (String, Vec<String>) {
+    if target == "localhost" {
+        return (
+            String::from("sh"),
+            vec![String::from("-c"), command.to_string()],
+        );
+    }
+    if let Some(name) = target.strip_prefix("docker:").filter(|n| !n.is_empty()) {
+        return (
+            String::from("docker"),
+            ["exec", name, "sh", "-c", command]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        );
+    }
+    (String::from("ssh"), fleet_ssh_args(target, command))
+}
+
+/// How `output` differs from the reference, line by line and in order:
+/// `+ line` for what the host printed that the reference lacks, `- line`
+/// for a reference line the host's output is missing. Both sides, so a
+/// host that dropped a line says which one, not only that it differs.
+pub fn differing_lines(reference: &str, output: &str) -> Vec<String> {
+    use crate::widgets::diff::{DiffRow, build_diff_rows};
+    let old: Vec<String> = reference.lines().map(str::to_string).collect();
+    let new: Vec<String> = output.lines().map(str::to_string).collect();
+    let mut out = Vec::new();
+    for row in build_diff_rows(&old, &new) {
+        match row {
+            DiffRow::Equal { .. } => {}
+            DiffRow::Removed { left } => out.push(format!("- {}", old[left])),
+            DiffRow::Added { right } => out.push(format!("+ {}", new[right])),
+            DiffRow::Replaced { left, right } => {
+                out.push(format!("- {}", old[left]));
+                out.push(format!("+ {}", new[right]));
+            }
+        }
+    }
+    out
+}
+
+/// Run `command` on every host in parallel, one thread each.
+///
+/// Parallel because the whole point is comparing a fleet: serially, ten
+/// hosts at a two-second timeout is twenty seconds of staring, and one
+/// unreachable host holds every other result behind it. The issue's own
+/// criterion says a timing-out host must not delay the others.
+///
+/// The timeout is enforced by ssh's `ConnectTimeout` plus a wall-clock
+/// deadline on the join, so a host that connects and then hangs is bounded
+/// too — `ConnectTimeout` alone only covers the handshake.
+pub fn run_on_hosts(hosts: &[String], command: &str, timeout: Duration) -> Vec<HostResult> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (idx, host) in hosts.iter().enumerate() {
+        let tx = tx.clone();
+        let host = host.clone();
+        let command = command.to_string();
+        std::thread::spawn(move || {
+            // Keyed by REQUEST INDEX, not host name. Two entries naming the
+            // same host would otherwise collide in the collection: the second
+            // reply overwrites the first, one slot consumes it, and the other
+            // is filled in as a timeout — so a host that answered fine is
+            // reported red and the surviving result is whichever thread was
+            // SLOWER. The index makes duplicates independent.
+            let _ = tx.send((idx, run_one(&host, &command, timeout)));
+        });
+    }
+    drop(tx);
+
+    let deadline = std::time::Instant::now() + timeout + Duration::from_secs(2);
+    let mut got: Vec<Option<HostResult>> = (0..hosts.len()).map(|_| None).collect();
+    let mut filled = 0usize;
+    while filled < hosts.len() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(left) {
+            Ok((idx, r)) => {
+                if got.get(idx).is_some_and(Option::is_none) {
+                    got[idx] = Some(r);
+                    filled += 1;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    // A host that never reported still gets a tile: a fleet view that
+    // silently drops one is worse than one showing it red, because the user
+    // counts tiles to know the run was complete.
+    got.into_iter()
+        .zip(hosts)
+        .map(|(r, h)| {
+            r.unwrap_or_else(|| HostResult {
+                host: h.clone(),
+                output: String::from("timed out"),
+                exit: None,
+                elapsed: Duration::ZERO,
+            })
+        })
+        .collect()
+}
+
+/// One host's run, killed if it outlives `timeout`.
+///
+/// The kill is the point rather than tidiness. `ConnectTimeout` bounds the
+/// HANDSHAKE only — measured: a `sleep 30` under a 3-second connect timeout
+/// ran the full thirty seconds — so a host that connects and then hangs
+/// leaves an `ssh` child running after the deadline has already reported it
+/// as timed out. Every subsequent run leaks another, and a command the user
+/// gave up on can still complete minutes later.
+fn run_one(host: &str, command: &str, timeout: Duration) -> HostResult {
+    let started = std::time::Instant::now();
+    let mut result = run_one_untimed(host, command, timeout);
+    result.elapsed = started.elapsed();
+    result
+}
+
+fn run_one_untimed(host: &str, command: &str, timeout: Duration) -> HostResult {
+    let (program, mut args) = target_command(host, command);
+    if program == "ssh" {
+        let secs = timeout.as_secs().max(1);
+        let mut with_timeout = vec![String::from("-o"), format!("ConnectTimeout={secs}")];
+        with_timeout.append(&mut args);
+        args = with_timeout;
+    }
+    let mut cmd = std::process::Command::new(&program);
+    cmd.args(&args);
+    run_killable(cmd, &program, host, timeout)
+}
+
+/// Run `cmd` (`program`, for messages) for `host`, collecting stdout and
+/// stderr, and kill it if it outlives `timeout`.
+fn run_killable(
+    mut cmd: std::process::Command,
+    program: &str,
+    host: &str,
+    timeout: Duration,
+) -> HostResult {
+    use std::io::Read;
+    let result = |output: String, exit: Option<i32>| HostResult {
+        host: host.to_string(),
+        output,
+        exit,
+        elapsed: Duration::ZERO,
+    };
+    let spawned = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => return result(format!("could not run {program}: {e}"), None),
+    };
+    // Both pipes drain on their own threads WHILE the child runs. Read only
+    // after exit, a command printing more than a pipe buffer (~64 KiB, any
+    // `journalctl`) blocked on the write, never exited, and was killed at
+    // the deadline with all its output lost.
+    // Into a shared buffer, chunk by chunk: a command that leaves a
+    // background process holding the pipe (`nohup srv &`) never reaches EOF,
+    // and waiting for the whole read lost everything it had printed.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let sink = buf.clone();
+        std::thread::spawn(move || {
+            if let Some(mut p) = pipe {
+                let mut chunk = [0u8; 8192];
+                while let Ok(n) = p.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut b) = sink.lock() {
+                        b.extend_from_slice(&chunk[..n]);
+                    }
+                }
+            }
+            let _ = done_tx.send(());
+        });
+        (buf, done_rx)
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    // Poll rather than block, so the child can be killed when its time is
+    // up. `wait_with_output` would consume the child and leave no handle to
+    // kill, which is how the abandoned processes accumulated.
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                // Reaped, so the process does not linger as a zombie.
+                let _ = child.wait();
+                return result(String::from("timed out"), None);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(e) => return result(format!("could not wait on {program}: {e}"), None),
+        }
+    };
+    // A descendant the command left running can hold a pipe open past the
+    // exit, so the readers get a short grace rather than a join.
+    let grace = Duration::from_millis(500);
+    let take = |(buf, done): (
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        std::sync::mpsc::Receiver<()>,
+    )| {
+        let _ = done.recv_timeout(grace);
+        buf.lock().map(|b| b.clone()).unwrap_or_default()
+    };
+    let out = take(stdout);
+    let err = take(stderr);
+    // stdout AND stderr: a command that failed usually said why on
+    // stderr, and a tile showing an empty box for a failure tells
+    // the user nothing they can act on.
+    let mut text = String::from_utf8_lossy(&out).trim_end().to_string();
+    let err = String::from_utf8_lossy(&err);
+    let err = err.trim_end();
+    if !err.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(err);
+    }
+    result(text, status.code())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn local_targets_are_localhost_and_docker_containers() {
+        assert!(is_local_target("localhost"));
+        assert!(is_local_target("docker:web"));
+        assert!(!is_local_target("docker:"), "a container needs a name");
+        assert!(!is_local_target("db-1"));
+        assert!(!is_local_target("localhost.example.com"));
+    }
+
+    #[test]
+    fn each_target_kind_gets_its_own_runner() {
+        let (p, a) = target_command("localhost", "uname -r");
+        assert_eq!(
+            (p.as_str(), a),
+            ("sh", vec!["-c".to_string(), "uname -r".to_string()])
+        );
+        let (p, a) = target_command("docker:web", "uname -r");
+        assert_eq!(
+            (p.as_str(), a),
+            (
+                "docker",
+                vec!["exec", "web", "sh", "-c", "uname -r"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            )
+        );
+        let (p, a) = target_command("db-1", "uname -r");
+        assert_eq!((p.as_str(), a), ("ssh", fleet_ssh_args("db-1", "uname -r")));
+    }
+
+    #[test]
+    fn local_targets_are_what_the_request_or_a_group_names() {
+        let mut groups = std::collections::BTreeMap::new();
+        groups.insert(
+            String::from("web"),
+            vec![String::from("docker:front"), String::from("db-1")],
+        );
+        assert_eq!(
+            local_targets_in("docker:api, localhost: uptime", &groups),
+            vec!["localhost", "docker:api", "docker:front"]
+        );
+        assert_eq!(
+            local_targets_in("db-1: uptime", &std::collections::BTreeMap::new()),
+            vec!["localhost"]
+        );
+        assert_eq!(
+            local_targets_in("docker:: uptime", &std::collections::BTreeMap::new()),
+            vec!["localhost"],
+            "an empty container name is not a target"
+        );
+    }
+
+    #[test]
+    fn star_means_every_ssh_host_not_local_targets() {
+        let known: Vec<String> = ["db-1", "localhost", "docker:web", "db-2"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let (hosts, _) =
+            parse_request_with_groups("*: uptime", &known, &std::collections::BTreeMap::new())
+                .unwrap();
+        let names: Vec<&str> = hosts.iter().map(|h| h.as_str()).collect();
+        assert_eq!(names, vec!["db-1", "db-2"]);
+        // Named explicitly, a local target is fine.
+        let (hosts, _) = parse_request_with_groups(
+            "localhost,docker:web: uptime",
+            &known,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(hosts.len(), 2);
+    }
+
+    #[test]
+    fn the_separator_skips_a_docker_prefix() {
+        assert_eq!(split_request("db-1: uptime"), Some(("db-1", " uptime")));
+        assert_eq!(
+            split_request("docker:web: uname -r"),
+            Some(("docker:web", " uname -r"))
+        );
+        assert_eq!(
+            split_request("db-1, docker:web ,localhost: a:b"),
+            Some(("db-1, docker:web ,localhost", " a:b")),
+            "a colon inside the command is the command's"
+        );
+        assert_eq!(split_request("docker:web"), None, "no command");
+    }
+
+    #[test]
+    fn differing_lines_show_both_what_is_extra_and_what_is_missing() {
+        let reference = "Linux\n6.8.0-45\nx86_64\n";
+        assert!(differing_lines(reference, reference).is_empty());
+        assert_eq!(
+            differing_lines(reference, "Linux\n6.8.0-31\nx86_64\n"),
+            vec!["- 6.8.0-45", "+ 6.8.0-31"]
+        );
+        assert_eq!(
+            differing_lines(reference, "Linux\n6.8.0-45\nx86_64\nextra\n"),
+            vec!["+ extra"]
+        );
+        // A host missing a line says which.
+        assert_eq!(differing_lines("a\nb\nc\n", "a\nc\n"), vec!["- b"]);
+    }
+
+    #[test]
+    fn localhost_runs_locally_and_is_timed() {
+        let r = run_on_hosts(
+            &["localhost".to_string()],
+            "printf hi",
+            Duration::from_secs(10),
+        );
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].output, "hi");
+        assert_eq!(r[0].exit, Some(0));
+        assert!(
+            r[0].elapsed > Duration::ZERO,
+            "the tile shows how long it took"
+        );
+    }
+
+    use super::*;
+
+    #[test]
+    fn output_is_kept_when_a_background_child_holds_the_pipe() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "echo started; sleep 30 &"]);
+        let r = run_killable(cmd, "sh", "h", Duration::from_secs(20));
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(r.output, "started");
+    }
+
+    #[test]
+    fn a_command_printing_more_than_a_pipe_buffer_completes() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "head -c 300000 /dev/zero | tr '\\0' x; echo oops >&2"]);
+        let r = run_killable(cmd, "sh", "h", Duration::from_secs(20));
+        assert_eq!(
+            r.exit,
+            Some(0),
+            "{}",
+            &r.output[r.output.len().saturating_sub(80)..]
+        );
+        assert!(r.output.starts_with("xxxx"));
+        assert!(r.output.ends_with("\noops"));
+        assert_eq!(r.output.len(), 300_000 + "\noops".len());
+    }
+
+    fn groups(pairs: &[(&str, &[&str])]) -> std::collections::BTreeMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(g, m)| {
+                (
+                    (*g).to_string(),
+                    m.iter().map(|h| (*h).to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// A saved group expands to its hosts (#363).
+    ///
+    /// The fixture gives the group TWO members out of three known hosts, so
+    /// a bug that expanded to everything - or to nothing and fell back to
+    /// the whole fleet - fails here. Expanding to `known` is the shape `*`
+    /// already has, and is exactly what must not happen by accident.
+    #[test]
+    fn a_saved_group_expands_to_its_hosts_and_only_those() {
+        let known: Vec<String> = ["web1", "web2", "db1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let g = groups(&[("web", &["web1", "web2"])]);
+        let (hosts, cmd) = parse_request_with_groups("web: uname -r", &known, &g).expect("parsed");
+        assert_eq!(
+            hosts.iter().map(|h| h.as_str()).collect::<Vec<_>>(),
+            vec!["web1", "web2"],
+            "the group's members, not the whole fleet"
+        );
+        assert_eq!(cmd, "uname -r");
+    }
+
+    /// The known-host check survives group expansion, which is the safety
+    /// property: a group must be shorthand for hosts croft already knows,
+    /// never a way to name a machine that is not in `~/.ssh/config`.
+    #[test]
+    fn a_group_cannot_smuggle_an_unknown_host_past_the_check() {
+        let known: Vec<String> = ["web1"].iter().map(|s| s.to_string()).collect();
+        let g = groups(&[("web", &["web1", "not-configured"])]);
+        assert!(
+            parse_request_with_groups("web: uname -r", &known, &g).is_err(),
+            "an unknown member refuses the whole request rather than running on the rest"
+        );
+        // Paired presence: the same group without the stray member parses,
+        // so the refusal above is the check and not a broken fixture.
+        let ok = groups(&[("web", &["web1"])]);
+        assert!(parse_request_with_groups("web: uname -r", &known, &ok).is_ok());
+    }
+
+    /// A group that resolves to nothing refuses rather than narrowing the
+    /// fleet silently.
+    ///
+    /// The mixed case is the dangerous one: with an empty `web`, the spec
+    /// `web,db1` would otherwise run on db1 alone and report success, so the
+    /// user believes they addressed a fleet and addressed one box.
+    #[test]
+    fn an_empty_group_refuses_rather_than_narrowing_the_fleet() {
+        let known: Vec<String> = ["web1", "db1"].iter().map(|s| s.to_string()).collect();
+        let empty = groups(&[("web", &[])]);
+        assert!(
+            parse_request_with_groups("web: uptime", &known, &empty).is_err(),
+            "an empty group alone refuses"
+        );
+        assert!(
+            parse_request_with_groups("web,db1: uptime", &known, &empty).is_err(),
+            "and mixed with a real host it refuses too, rather than running on db1"
+        );
+        // Paired presence: the same spec with a populated group parses, so
+        // the refusals above are the emptiness and not a broken fixture.
+        let ok = groups(&[("web", &["web1"])]);
+        let (hosts, _) = parse_request_with_groups("web,db1: uptime", &known, &ok).expect("parsed");
+        assert_eq!(hosts.len(), 2);
+    }
+
+    /// Expansion is one level, so a self-referential group terminates at the
+    /// known-host check rather than looping. The doc makes this promise; a
+    /// later move to recursive expansion would break it silently.
+    #[test]
+    fn a_self_referential_group_refuses_instead_of_looping() {
+        let known: Vec<String> = ["web1"].iter().map(|s| s.to_string()).collect();
+        let looped = groups(&[("web", &["web"])]);
+        assert!(
+            parse_request_with_groups("web: uptime", &known, &looped).is_err(),
+            "'web' expands once to 'web', which is not a known host"
+        );
+        let mutual = groups(&[("a", &["b"]), ("b", &["a"])]);
+        assert!(
+            parse_request_with_groups("a: uptime", &known, &mutual).is_err(),
+            "mutual references terminate the same way"
+        );
+    }
+
+    fn refusal(input: &str, known: &[&str], g: &[(&str, &[&str])]) -> String {
+        let known: Vec<String> = known.iter().map(|s| s.to_string()).collect();
+        let err = parse_request_with_groups(input, &known, &groups(g)).expect_err("refused");
+        err.message(&known)
+    }
+
+    /// A typo in one name is refused by naming it, not by blaming the
+    /// syntax the request already has (#1301).
+    #[test]
+    fn an_unknown_host_is_named_with_the_closest_known_one() {
+        let known: Vec<String> = ["box", "localhost"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            parse_request_with_groups("box, localhost, lcoalhost: uptime", &known, &groups(&[])),
+            Err(RequestError::UnknownHost {
+                name: String::from("lcoalhost"),
+                group: None
+            })
+        );
+        assert_eq!(
+            refusal(
+                "box, localhost, lcoalhost: uptime",
+                &["box", "localhost"],
+                &[]
+            ),
+            "Fleet run: \"lcoalhost\" is not in ~/.ssh/config (or localhost / docker:<name>) — did you mean \"localhost\"?"
+        );
+        // Nothing close: no guess.
+        assert_eq!(
+            refusal("box, zebra: uptime", &["box", "localhost"], &[]),
+            "Fleet run: \"zebra\" is not in ~/.ssh/config (or localhost / docker:<name>)"
+        );
+    }
+
+    #[test]
+    fn an_unknown_group_member_and_an_empty_group_are_named() {
+        assert_eq!(
+            refusal(
+                "web: uptime",
+                &["web1", "localhost"],
+                &[("web", &["web1", "wbe2"])]
+            ),
+            "Fleet run: \"wbe2\" in group \"web\" is not in ~/.ssh/config (or localhost / docker:<name>)"
+        );
+        assert_eq!(
+            refusal("web, db1: uptime", &["db1", "localhost"], &[("web", &[])]),
+            "Fleet run: group \"web\" has no hosts"
+        );
+    }
+
+    /// Negative: a request without the `hosts: command` shape keeps the
+    /// syntax hint, and its count is what `*` would run on: the ssh hosts,
+    /// not `localhost` or a container.
+    #[test]
+    fn the_syntax_hint_stays_for_a_malformed_request_and_counts_ssh_hosts() {
+        let known = ["box", "localhost", "docker:web"];
+        for bad in ["uptime", "box:", ": uptime", " , : uptime"] {
+            assert_eq!(
+                refusal(bad, &known, &[]),
+                "Fleet run needs 'hosts: command' — e.g. 'box: uptime', or '*: uptime' for all 1",
+                "{bad:?}"
+            );
+        }
+        // With no ssh host, the hint offers what is there and no `*`.
+        assert_eq!(
+            refusal("uptime", &["localhost"], &[]),
+            "Fleet run needs 'hosts: command' — e.g. 'localhost: uptime'"
+        );
+    }
+
+    /// A bare host name still works when groups exist, and a group named
+    /// after a host wins - naming one that way is the user's own doing, and
+    /// silent shadowing in either direction is worse than a documented rule.
+    #[test]
+    fn a_group_name_takes_precedence_over_a_host_of_the_same_name() {
+        let known: Vec<String> = ["web1", "web2"].iter().map(|s| s.to_string()).collect();
+        let g = groups(&[("web1", &["web1", "web2"])]);
+        let (hosts, _) = parse_request_with_groups("web1: uptime", &known, &g).expect("parsed");
+        assert_eq!(
+            hosts.len(),
+            2,
+            "the GROUP named web1 expanded, not the host"
+        );
+
+        // With no group of that name, the same spec is the single host.
+        let (one, _) =
+            parse_request_with_groups("web1: uptime", &known, &groups(&[])).expect("parsed");
+        assert_eq!(
+            one.iter().map(|h| h.as_str()).collect::<Vec<_>>(),
+            vec!["web1"]
+        );
+    }
+
+    fn r(host: &str, out: &str, exit: Option<i32>) -> HostResult {
+        HostResult {
+            host: String::from(host),
+            output: String::from(out),
+            exit,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    /// The reference is the majority output, not the first host's.
+    ///
+    /// Asserted with the odd one out FIRST in the list, because "the first
+    /// host" and "the majority" agree in most orderings — a fixture where
+    /// they coincide cannot tell which rule is implemented.
+    #[test]
+    fn the_reference_is_the_majority_not_the_first_host() {
+        let results = vec![
+            r("odd", "6.1.0", Some(0)),
+            r("a", "5.15.0", Some(0)),
+            r("b", "5.15.0", Some(0)),
+            r("c", "5.15.0", Some(0)),
+        ];
+        assert_eq!(
+            reference_output(&results),
+            Some("5.15.0"),
+            "the fleet's normal, not whichever host was listed first"
+        );
+
+        let s = summarise(&results, reference_output(&results));
+        assert_eq!(
+            (s.identical, s.differ, s.failed),
+            (3, 1, 0),
+            "the odd host is the one that differs"
+        );
+        assert_eq!(s.line(), "3 identical \u{b7} 1 differ");
+    }
+
+    /// A failing host does not get a vote, and is never the reference.
+    ///
+    /// Its output is usually an error message, and letting three identical
+    /// `Permission denied` results become the normal would paint every
+    /// working host as the deviant one — the exact inversion of what the
+    /// summary is for.
+    #[test]
+    fn a_failing_host_does_not_define_the_normal() {
+        let results = vec![
+            r("bad1", "Permission denied", Some(255)),
+            r("bad2", "Permission denied", Some(255)),
+            r("bad3", "Permission denied", None),
+            r("good", "5.15.0", Some(0)),
+        ];
+        assert_eq!(
+            reference_output(&results),
+            Some("5.15.0"),
+            "only successful hosts vote"
+        );
+        let s = summarise(&results, reference_output(&results));
+        assert_eq!((s.identical, s.differ, s.failed), (1, 0, 3));
+        assert_eq!(s.line(), "1 identical \u{b7} 3 failed");
+    }
+
+    /// An even split has no normal, and says so rather than picking one.
+    ///
+    /// Choosing arbitrarily would paint half the fleet as deviant on the
+    /// strength of nothing — and would do it DETERMINISTICALLY, which is
+    /// worse, because a stable wrong answer reads as a considered one.
+    #[test]
+    fn an_even_split_has_no_reference() {
+        let results = vec![
+            r("a", "x", Some(0)),
+            r("b", "x", Some(0)),
+            r("c", "y", Some(0)),
+            r("d", "y", Some(0)),
+        ];
+        assert_eq!(reference_output(&results), None, "2-and-2 has no majority");
+
+        // With no reference every successful host counts as differing:
+        // nothing has been declared normal, so nothing matches it.
+        let s = summarise(&results, None);
+        assert_eq!((s.identical, s.differ, s.failed), (0, 4, 0));
+        assert_eq!(s.line(), "4 differ");
+    }
+
+    /// Nothing to run, and everything failing, both read honestly.
+    #[test]
+    fn an_empty_or_wholly_failed_run_says_so() {
+        assert_eq!(reference_output(&[]), None);
+        let empty = summarise(&[], None);
+        assert_eq!(empty.line(), "no hosts", "zero hosts is not '0 identical'");
+
+        let all_bad = vec![r("a", "boom", Some(1)), r("b", "boom", None)];
+        assert_eq!(
+            reference_output(&all_bad),
+            None,
+            "no successful host means no normal"
+        );
+        assert_eq!(summarise(&all_bad, None).line(), "2 failed");
+    }
+
+    /// Every host gets a tile, including one that never reports.
+    ///
+    /// The issue's criterion is that a timing-out host shows red WITHOUT
+    /// delaying the others, and the half that is easy to get wrong is the
+    /// tile count: a fleet view that silently drops a host is worse than one
+    /// showing it failed, because the user counts tiles to know the run was
+    /// complete.
+    ///
+    /// Driven with unreachable hosts and a short timeout so it stays fast:
+    /// what is under test is the collection and fill-in, not ssh.
+    #[test]
+    fn a_host_that_never_reports_still_gets_a_tile() {
+        let hosts: Vec<String> = ["no-such-host-a.invalid", "no-such-host-b.invalid"]
+            .iter()
+            .map(|s| String::from(*s))
+            .collect();
+        let started = std::time::Instant::now();
+        let out = run_on_hosts(&hosts, "true", Duration::from_secs(1));
+
+        assert_eq!(out.len(), hosts.len(), "one tile per host, always");
+        // Order follows the HOSTS list, not completion order, so the tiles
+        // do not rearrange themselves between runs.
+        assert_eq!(out[0].host, hosts[0]);
+        assert_eq!(out[1].host, hosts[1]);
+        for r in &out {
+            assert!(!r.ok(), "an unreachable host must not read as success");
+            assert!(!r.output.is_empty(), "a failed tile must say something");
+        }
+        // Parallel: two hosts at a 1s timeout must not take two timeouts.
+        assert!(
+            started.elapsed() < Duration::from_secs(12),
+            "hosts ran serially: {:?}",
+            started.elapsed()
+        );
+
+        // A DUPLICATE host exercises the fill-in directly. Both threads
+        // report under the same key, so the map holds one entry for two
+        // requested hosts — and the result must still be two tiles, in the
+        // requested order. Without the fill-in this returns one tile and a
+        // host silently vanishes from the fleet view.
+        let dup = vec![
+            String::from("no-such-host-a.invalid"),
+            String::from("no-such-host-a.invalid"),
+        ];
+        let out = run_on_hosts(&dup, "true", Duration::from_secs(1));
+        assert_eq!(
+            out.len(),
+            2,
+            "a host requested twice must yield two tiles, not one"
+        );
+        assert!(out.iter().all(|r| r.host == dup[0]));
+        // And BOTH carry a real answer. Keying the collection by host name
+        // made the second reply overwrite the first, so one slot consumed the
+        // single entry and the other was filled in as a timeout — a host that
+        // answered reported red, with the surviving result whichever thread
+        // was slower. Asserting only the count cannot see that.
+        assert!(
+            out.iter().all(|r| r.output != "timed out"),
+            "a duplicate lost its real result: {out:?}"
+        );
+    }
+
+    /// The fleet must be NAMED; there is no default of "everything".
+    ///
+    /// Without this, "Fleet Run" means "run on every host in your
+    /// ~/.ssh/config" — on an ordinary machine every remote ever configured,
+    /// a live production box beside a `github.com` entry that is not a shell
+    /// host at all. And a confirmation saying "run on 5 hosts?" asks the
+    /// user to approve a list they cannot see, which is not consent.
+    #[test]
+    fn a_fleet_must_be_named_rather_than_defaulted() {
+        let known: Vec<String> = ["web-1", "web-2", "db-1"]
+            .iter()
+            .map(|s| String::from(*s))
+            .collect();
+        let p = |input: &str| {
+            parse_request_with_groups(input, &known, &std::collections::BTreeMap::new())
+                .ok()
+                .map(|(h, c)| (h.iter().map(|s| s.as_str()).collect::<Vec<_>>(), c))
+        };
+
+        assert_eq!(
+            p("web-1: uname -r"),
+            Some((vec!["web-1"], String::from("uname -r")))
+        );
+        assert_eq!(
+            p("web-1,db-1: uptime"),
+            Some((vec!["web-1", "db-1"], String::from("uptime")))
+        );
+        // Whitespace and case are the user's, not the parser's business.
+        assert_eq!(
+            p("  WEB-2 , db-1 :  df -h  "),
+            Some((vec!["web-2", "db-1"], String::from("df -h")))
+        );
+        // `*` is how you say "all of them" ON PURPOSE, so the broadcast is
+        // still available to someone who means it.
+        assert_eq!(
+            p("*: uptime").map(|(h, _)| h.len()),
+            Some(3),
+            "a deliberate broadcast is still possible"
+        );
+        // A host repeated is one host: two threads racing on one name would
+        // otherwise collide in the collection.
+        assert_eq!(p("db-1,db-1: uptime").map(|(h, _)| h.len()), Some(1));
+
+        for bad in [
+            "uname -r",             // no fleet named at all
+            ": uname -r",           // an empty fleet is not "everything"
+            "web-1:",               // no command
+            "web-1:   ",            // whitespace is no command
+            "nosuchhost: uptime",   // a typo must not become an ssh attempt
+            "web-1,nosuchhost: up", // one bad name refuses the whole run
+            "",
+        ] {
+            assert_eq!(p(bad), None, "must refuse: {bad:?}");
+        }
+    }
+
+    /// The ssh invocation cannot steal the user's keyboard or hang on a
+    /// password prompt.
+    #[test]
+    fn the_fleet_ssh_invocation_is_non_interactive() {
+        let args = fleet_ssh_args("db-1", "uname -r");
+        assert!(
+            args.contains(&String::from("-n")),
+            "without -n the remote command reads the terminal croft is using"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-o", "BatchMode=yes"].map(String::from)),
+            "a host wanting a password must fail, not hang: {args:?}"
+        );
+        // An UNKNOWN host must fail rather than be trusted on sight. A single
+        // interactive ssh shows a fingerprint and asks; a fleet run shows
+        // nobody anything, so `accept-new` would silently trust a first
+        // contact on every unknown host at once.
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-o", "StrictHostKeyChecking=yes"].map(String::from)),
+            "a fleet must not auto-trust first-contact keys: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("accept-new")),
+            "accept-new trusts an unseen key with nobody watching: {args:?}"
+        );
+        // The command is one argument after `--`, so a command containing
+        // spaces or a host-looking word cannot be read as another option.
+        let tail: Vec<&String> = args.iter().skip_while(|a| *a != "--").collect();
+        assert_eq!(tail.len(), 2, "exactly one command argument: {args:?}");
+        assert_eq!(tail[1], "uname -r");
+    }
+}

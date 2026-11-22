@@ -1,0 +1,1000 @@
+//! The Source Control "⋯" title menu: a VS Code-style actions menu with
+//! one level of fly-out submenus (Commit ›, Changes ›, Branch ›, Stash ›,
+//! …). Opened from the `⋯` pill in the SOURCE CONTROL header.
+//!
+//! The widget is a thin renderer over a static menu tree. It owns no git
+//! state: every leaf is an [`ScmAction`] the App dispatches in
+//! `dispatch_scm_action`, and the open/expanded state plus hit-test rects
+//! live in [`ScmMenuState`] (held by the App, mirroring how the commit
+//! dropdown stores its rects on the panel).
+
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Style},
+    widgets::{Clear, Widget},
+};
+
+/// Every leaf action reachable from the SCM "⋯" menu. The App maps each to
+/// a handler (some fire immediately, some open an input modal or picker).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScmAction {
+    // Top-level leaves.
+    Pull,
+    Push,
+    Clone,
+    CheckoutTo,
+    Fetch,
+    ShowGitOutput,
+    // Commit submenu.
+    Commit,
+    CommitStaged,
+    CommitAll,
+    CommitAmend,
+    UndoLastCommit,
+    CommitAndPush,
+    CommitAndSync,
+    // Changes submenu.
+    StageAll,
+    UnstageAll,
+    DiscardAll,
+    // Pull, Push submenu.
+    Sync,
+    PullRebase,
+    PushTo,
+    PushForce,
+    PublishBranch,
+    // Branch submenu.
+    CreateBranch,
+    CreateBranchFrom,
+    RenameBranch,
+    DeleteBranch,
+    Merge,
+    Rebase,
+    // Remote submenu.
+    AddRemote,
+    RemoveRemote,
+    // Stash submenu.
+    Stash,
+    StashIncludeUntracked,
+    StashStaged,
+    ApplyStash,
+    PopStashLatest,
+    PopStashPick,
+    DropStash,
+    /// Pick a stash and open its changes (#1581).
+    ViewStash,
+    // Tags submenu.
+    CreateTag,
+    DeleteTag,
+    /// Push every local tag to the push remote (#1582).
+    PushTags,
+    /// Pick a tag on the push remote and delete it there (#1582).
+    DeleteRemoteTag,
+    // The operation in progress (#1356), listed first while there is one.
+    ContinueOperation,
+    SkipOperation,
+    AbortOperation,
+    BisectGood,
+    BisectBad,
+}
+
+/// A leaf row: the action it fires, its label, and its codicon glyph.
+#[derive(Clone, Copy, Debug)]
+pub struct Leaf {
+    pub action: ScmAction,
+    pub label: &'static str,
+    pub icon: char,
+}
+
+const fn leaf(action: ScmAction, label: &'static str, icon: char) -> Leaf {
+    Leaf {
+        action,
+        label,
+        icon,
+    }
+}
+
+/// A top-level row: either a leaf, a separator, or a submenu (label + icon
+/// + its leaf children).
+pub enum Node {
+    Item(Leaf),
+    Sep,
+    Sub {
+        label: &'static str,
+        icon: char,
+        items: &'static [Leaf],
+    },
+}
+
+// Codicon glyphs (Nerd Fonts `cod-*` PUA, verified against
+// ryanoasis/nerd-fonts glyphnames.json v3.4.0 on 2026-06-19).
+const ICON_CLOUD_DOWNLOAD: char = '\u{eac2}'; // pull
+const ICON_CLOUD_UPLOAD: char = '\u{eac3}'; // push
+const ICON_REPO_CLONE: char = '\u{eb3e}'; // clone
+const ICON_GIT_BRANCH: char = '\u{ea96}'; // checkout / branch
+const ICON_GIT_FETCH: char = '\u{ec1d}'; // fetch
+const ICON_OUTPUT: char = '\u{eb9d}'; // show git output
+const ICON_CHECK: char = '\u{eab2}'; // commit
+const ICON_SYNC: char = '\u{ea77}'; // sync
+const ICON_ADD: char = '\u{ea60}'; // add / stage
+const ICON_REMOVE: char = '\u{eb3b}'; // unstage
+const ICON_DISCARD: char = '\u{eae2}'; // discard
+const ICON_ARROW_UP: char = '\u{eaa1}'; // push variants
+const ICON_EDIT: char = '\u{ea73}'; // rename
+const ICON_TRASH: char = '\u{ea81}'; // delete
+const ICON_GIT_MERGE: char = '\u{eafe}'; // merge
+const ICON_GIT_PR: char = '\u{ea64}'; // rebase
+const ICON_BROADCAST: char = '\u{eaad}'; // remote
+const ICON_ARCHIVE: char = '\u{ea98}'; // stash
+const ICON_TAG: char = '\u{ea66}'; // tags
+const ICON_NEW_FOLDER: char = '\u{ea80}'; // create from
+const ICON_ARROW_RIGHT: char = '\u{ea9c}'; // skip
+
+/// The codicon painted on the `⋯` header pill that opens this menu.
+pub const ICON_ELLIPSIS: char = '\u{ea7c}';
+
+const COMMIT_ITEMS: &[Leaf] = &[
+    leaf(ScmAction::Commit, "Commit", ICON_CHECK),
+    leaf(ScmAction::CommitStaged, "Commit Staged", ICON_CHECK),
+    leaf(ScmAction::CommitAll, "Commit All", ICON_CHECK),
+    leaf(ScmAction::CommitAmend, "Commit (Amend)", ICON_EDIT),
+    leaf(ScmAction::UndoLastCommit, "Undo Last Commit", ICON_DISCARD),
+    leaf(ScmAction::CommitAndPush, "Commit & Push", ICON_CLOUD_UPLOAD),
+    leaf(ScmAction::CommitAndSync, "Commit & Sync", ICON_SYNC),
+];
+
+const CHANGES_ITEMS: &[Leaf] = &[
+    leaf(ScmAction::StageAll, "Stage All Changes", ICON_ADD),
+    leaf(ScmAction::UnstageAll, "Unstage All Changes", ICON_REMOVE),
+    leaf(ScmAction::DiscardAll, "Discard All Changes", ICON_DISCARD),
+];
+
+const PULL_PUSH_ITEMS: &[Leaf] = &[
+    leaf(ScmAction::Sync, "Sync", ICON_SYNC),
+    leaf(ScmAction::PullRebase, "Pull (Rebase)", ICON_CLOUD_DOWNLOAD),
+    leaf(ScmAction::PushTo, "Push to", ICON_ARROW_UP),
+    leaf(ScmAction::PushForce, "Push (Force)", ICON_ARROW_UP),
+    leaf(
+        ScmAction::PublishBranch,
+        "Publish Branch",
+        ICON_CLOUD_UPLOAD,
+    ),
+];
+
+const BRANCH_ITEMS: &[Leaf] = &[
+    leaf(ScmAction::CreateBranch, "Create Branch", ICON_GIT_BRANCH),
+    leaf(
+        ScmAction::CreateBranchFrom,
+        "Create Branch from",
+        ICON_NEW_FOLDER,
+    ),
+    leaf(ScmAction::RenameBranch, "Rename Branch", ICON_EDIT),
+    leaf(ScmAction::DeleteBranch, "Delete Branch", ICON_TRASH),
+    leaf(ScmAction::Merge, "Merge", ICON_GIT_MERGE),
+    leaf(ScmAction::Rebase, "Rebase", ICON_GIT_PR),
+];
+
+const REMOTE_ITEMS: &[Leaf] = &[
+    leaf(ScmAction::AddRemote, "Add Remote", ICON_ADD),
+    leaf(ScmAction::RemoveRemote, "Remove Remote", ICON_TRASH),
+];
+
+const STASH_ITEMS: &[Leaf] = &[
+    leaf(ScmAction::Stash, "Stash", ICON_ARCHIVE),
+    leaf(
+        ScmAction::StashIncludeUntracked,
+        "Stash (Include Untracked)",
+        ICON_ARCHIVE,
+    ),
+    leaf(ScmAction::StashStaged, "Stash Staged", ICON_ARCHIVE),
+    leaf(ScmAction::ApplyStash, "Apply Stash", ICON_ARCHIVE),
+    leaf(ScmAction::PopStashLatest, "Pop Latest Stash", ICON_ARCHIVE),
+    leaf(ScmAction::PopStashPick, "Pop Stash", ICON_ARCHIVE),
+    leaf(ScmAction::DropStash, "Drop Stash", ICON_TRASH),
+    leaf(ScmAction::ViewStash, "View Stash", ICON_ARCHIVE),
+];
+
+const TAGS_ITEMS: &[Leaf] = &[
+    leaf(ScmAction::CreateTag, "Create Tag", ICON_TAG),
+    leaf(ScmAction::DeleteTag, "Delete Tag", ICON_TRASH),
+    leaf(ScmAction::PushTags, "Push Tags", ICON_ARROW_UP),
+    leaf(ScmAction::DeleteRemoteTag, "Delete Remote Tag", ICON_TRASH),
+];
+
+/// The rows a stopped operation adds (#1356): its way forward, then its
+/// way out. Labels name the operation, as VS Code's do.
+fn operation_items(op: crate::git::RepoOp) -> Vec<Leaf> {
+    use crate::git::RepoOp;
+    let (cont, skip, abort): (Option<&str>, Option<&str>, &str) = match op {
+        RepoOp::Merge => (None, None, "Abort Merge"),
+        RepoOp::Rebase { .. } => (Some("Continue Rebase"), Some("Skip Commit"), "Abort Rebase"),
+        RepoOp::CherryPick => (
+            Some("Continue Cherry-Pick"),
+            Some("Skip Commit"),
+            "Abort Cherry-Pick",
+        ),
+        RepoOp::Revert => (Some("Continue Revert"), Some("Skip Commit"), "Abort Revert"),
+        RepoOp::Bisect => {
+            return vec![
+                leaf(ScmAction::BisectGood, "Bisect: Mark Good", ICON_CHECK),
+                leaf(ScmAction::BisectBad, "Bisect: Mark Bad", ICON_DISCARD),
+                leaf(ScmAction::AbortOperation, "Bisect: Reset", ICON_TRASH),
+            ];
+        }
+    };
+    let mut items = Vec::new();
+    if let Some(label) = cont {
+        items.push(leaf(ScmAction::ContinueOperation, label, ICON_CHECK));
+    }
+    if let Some(label) = skip {
+        items.push(leaf(ScmAction::SkipOperation, label, ICON_ARROW_RIGHT));
+    }
+    items.push(leaf(ScmAction::AbortOperation, abort, ICON_DISCARD));
+    items
+}
+
+/// [`menu`] for a repository in the middle of `op` (#1356): the
+/// operation's Continue / Skip / Abort rows come first, above a separator.
+pub fn menu_for(op: Option<crate::git::RepoOp>) -> Vec<Node> {
+    let mut nodes: Vec<Node> = op
+        .map(|op| operation_items(op).into_iter().map(Node::Item).collect())
+        .unwrap_or_default();
+    if !nodes.is_empty() {
+        nodes.push(Node::Sep);
+    }
+    nodes.extend(base_menu());
+    nodes
+}
+
+/// The full top-level menu, mirroring VS Code's SCM "⋯" menu order.
+fn base_menu() -> Vec<Node> {
+    vec![
+        Node::Item(leaf(ScmAction::Pull, "Pull", ICON_CLOUD_DOWNLOAD)),
+        Node::Item(leaf(ScmAction::Push, "Push", ICON_CLOUD_UPLOAD)),
+        Node::Item(leaf(ScmAction::Clone, "Clone", ICON_REPO_CLONE)),
+        Node::Item(leaf(ScmAction::CheckoutTo, "Checkout to", ICON_GIT_BRANCH)),
+        Node::Item(leaf(ScmAction::Fetch, "Fetch", ICON_GIT_FETCH)),
+        Node::Sep,
+        Node::Sub {
+            label: "Commit",
+            icon: ICON_CHECK,
+            items: COMMIT_ITEMS,
+        },
+        Node::Sub {
+            label: "Changes",
+            icon: ICON_ADD,
+            items: CHANGES_ITEMS,
+        },
+        Node::Sub {
+            label: "Pull, Push",
+            icon: ICON_SYNC,
+            items: PULL_PUSH_ITEMS,
+        },
+        Node::Sub {
+            label: "Branch",
+            icon: ICON_GIT_BRANCH,
+            items: BRANCH_ITEMS,
+        },
+        Node::Sub {
+            label: "Remote",
+            icon: ICON_BROADCAST,
+            items: REMOTE_ITEMS,
+        },
+        Node::Sub {
+            label: "Stash",
+            icon: ICON_ARCHIVE,
+            items: STASH_ITEMS,
+        },
+        Node::Sub {
+            label: "Tags",
+            icon: ICON_TAG,
+            items: TAGS_ITEMS,
+        },
+        Node::Sep,
+        Node::Item(leaf(
+            ScmAction::ShowGitOutput,
+            "Show Git Output",
+            ICON_OUTPUT,
+        )),
+    ]
+}
+
+/// What a click on a top-level row resolves to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopHit {
+    /// A leaf row: fire this action and close.
+    Action(ScmAction),
+    /// A submenu row: toggle its fly-out (this is its top-level index).
+    Expand(usize),
+}
+
+/// Open/closed + expansion state and the hit-test rects, owned by the App.
+#[derive(Default)]
+pub struct ScmMenuState {
+    pub open: bool,
+    /// Index (into `menu_for(operation)`) of the submenu whose fly-out is showing.
+    pub expanded: Option<usize>,
+    pub top_hits: Vec<(Rect, TopHit)>,
+    pub sub_hits: Vec<(Rect, ScmAction)>,
+    /// The repository's operation in progress (#1356), whose rows the menu
+    /// shows first. Set by the App when it opens the menu.
+    pub operation: Option<crate::git::RepoOp>,
+    /// The pointer's cell at render time, set by the App before each draw,
+    /// so a `surfaces` theme can lift the row under it.
+    pub hover: Option<(u16, u16)>,
+}
+
+impl ScmMenuState {
+    pub fn close(&mut self) {
+        self.open = false;
+        self.expanded = None;
+        self.top_hits.clear();
+        self.sub_hits.clear();
+    }
+
+    /// Resolve a click at (x, y) to a menu outcome, mutating expansion
+    /// state for submenu toggles. Returns `Some(action)` only when a leaf
+    /// fired (the caller then dispatches and closes). Returns `None` for a
+    /// submenu toggle (menu stays open) or a miss.
+    pub fn click(&mut self, x: u16, y: u16) -> ClickOutcome {
+        for (rect, action) in &self.sub_hits {
+            if hit(*rect, x, y) {
+                return ClickOutcome::Fire(*action);
+            }
+        }
+        for (rect, top) in &self.top_hits {
+            if hit(*rect, x, y) {
+                return match top {
+                    TopHit::Action(a) => ClickOutcome::Fire(*a),
+                    TopHit::Expand(i) => {
+                        self.expanded = if self.expanded == Some(*i) {
+                            None
+                        } else {
+                            Some(*i)
+                        };
+                        ClickOutcome::Toggled
+                    }
+                };
+            }
+        }
+        ClickOutcome::Missed
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClickOutcome {
+    Fire(ScmAction),
+    Toggled,
+    Missed,
+}
+
+fn hit(rect: Rect, x: u16, y: u16) -> bool {
+    rect.width > 0
+        && rect.height > 0
+        && x >= rect.x
+        && x < rect.x + rect.width
+        && y >= rect.y
+        && y < rect.y + rect.height
+}
+
+const BG: Color = Color::Rgb(0x25, 0x2b, 0x37);
+const SUB_BG: Color = Color::Rgb(0x2b, 0x32, 0x3f);
+const FG: Color = Color::Rgb(0xe6, 0xe9, 0xef);
+const SEP_FG: Color = Color::Rgb(0x3b, 0x42, 0x52);
+const SUB_ARROW_FG: Color = Color::Rgb(0x9a, 0xa4, 0xb2);
+
+// Per-action icon accents, matching the Commit split-button dropdown so
+// the two menus read as one design: network/sync ops blue, branch/remote
+// cyan, commit/stage green, stash/tags amber, merge/rebase purple,
+// destructive ops red, neutral grey.
+const ACCENT_BLUE: Color = Color::Rgb(0x6c, 0xb6, 0xff);
+const ACCENT_CYAN: Color = Color::Rgb(0x88, 0xc0, 0xd0);
+const ACCENT_GREEN: Color = Color::Rgb(0xa3, 0xbe, 0x8c);
+const ACCENT_AMBER: Color = Color::Rgb(0xeb, 0xcb, 0x8b);
+const ACCENT_PURPLE: Color = Color::Rgb(0xc0, 0xa4, 0xf5);
+const ACCENT_RED: Color = Color::Rgb(0xe7, 0x70, 0x70);
+const ACCENT_GREY: Color = Color::Rgb(0x9a, 0xa4, 0xb2);
+
+/// Accent colour for a leaf's icon.
+fn action_color(action: ScmAction) -> Color {
+    use ScmAction::*;
+    match action {
+        Pull | Push | Fetch | Clone | Sync | PullRebase | PushTo | PushForce | PublishBranch
+        | CommitAndPush | CommitAndSync | PushTags => ACCENT_BLUE,
+        CheckoutTo | CreateBranch | CreateBranchFrom => ACCENT_CYAN,
+        Commit | CommitStaged | CommitAll | StageAll | AddRemote => ACCENT_GREEN,
+        CommitAmend | UndoLastCommit | RenameBranch => ACCENT_AMBER,
+        Merge | Rebase => ACCENT_PURPLE,
+        DiscardAll | DeleteBranch | RemoveRemote | DropStash | DeleteTag | DeleteRemoteTag => {
+            ACCENT_RED
+        }
+        Stash
+        | StashIncludeUntracked
+        | StashStaged
+        | ApplyStash
+        | PopStashLatest
+        | PopStashPick
+        | CreateTag => ACCENT_AMBER,
+        UnstageAll | ShowGitOutput | ViewStash => ACCENT_GREY,
+        ContinueOperation | BisectGood => ACCENT_GREEN,
+        SkipOperation => ACCENT_AMBER,
+        AbortOperation | BisectBad => ACCENT_RED,
+    }
+}
+
+/// Accent colour for a submenu parent row, by category.
+fn submenu_color(label: &str) -> Color {
+    match label {
+        "Commit" | "Changes" => ACCENT_GREEN,
+        "Pull, Push" => ACCENT_BLUE,
+        "Branch" | "Remote" => ACCENT_CYAN,
+        "Stash" | "Tags" => ACCENT_AMBER,
+        _ => ACCENT_GREY,
+    }
+}
+
+/// Width a column needs to show the longest of `labels` as
+/// `[pad][icon][gap][label][gap][›][pad]`.
+fn column_width(labels: impl Iterator<Item = usize>, with_arrow: bool) -> u16 {
+    let arrow = if with_arrow { 2 } else { 0 };
+    let max = labels.max().unwrap_or(0) as u16;
+    // 1 pad + icon + 1 gap + label + arrow + 1 pad
+    (1 + 1 + 1 + max + arrow + 1).max(12)
+}
+
+/// Paint the menu anchored under `anchor` within `screen`, recording hit
+/// rects into `state`. The submenu fly-out renders to the right of the top
+/// column (or to its left when there is no room).
+pub fn render(
+    state: &mut ScmMenuState,
+    anchor: Rect,
+    screen: Rect,
+    buf: &mut Buffer,
+    theme: crate::theme::Theme,
+) {
+    state.top_hits.clear();
+    state.sub_hits.clear();
+    if let Some(t) = crate::widgets::surface::tones(theme) {
+        render_card(state, anchor, screen, buf, theme, t);
+        return;
+    }
+    let nodes = menu_for(state.operation);
+
+    let top_w = column_width(
+        nodes.iter().filter_map(|n| match n {
+            Node::Item(l) => Some(l.label.chars().count()),
+            Node::Sub { label, .. } => Some(label.chars().count()),
+            Node::Sep => None,
+        }),
+        true,
+    );
+    let top_h = nodes.len() as u16;
+    let top_x = anchor.x.min(screen.x + screen.width.saturating_sub(top_w));
+    let top_y = (anchor.y + anchor.height).min(screen.y + screen.height.saturating_sub(top_h));
+    let top_rect = Rect {
+        x: top_x,
+        y: top_y,
+        width: top_w,
+        height: top_h.min(screen.height),
+    };
+    Widget::render(Clear, top_rect, buf);
+    fill(buf, top_rect, theme.ui(BG));
+
+    for (i, node) in nodes.iter().enumerate() {
+        let row_y = top_rect.y + i as u16;
+        if row_y >= screen.y + screen.height {
+            break;
+        }
+        let row = Rect {
+            x: top_rect.x,
+            y: row_y,
+            width: top_rect.width,
+            height: 1,
+        };
+        match node {
+            Node::Sep => {
+                for x in row.x + 1..row.x + row.width.saturating_sub(1) {
+                    buf.set_string(
+                        x,
+                        row_y,
+                        "─",
+                        Style::default().fg(theme.ui(SEP_FG)).bg(theme.ui(BG)),
+                    );
+                }
+            }
+            Node::Item(l) => {
+                paint_row(
+                    buf,
+                    row,
+                    l.icon,
+                    theme.ui(action_color(l.action)),
+                    l.label,
+                    false,
+                    theme.ui(BG),
+                    theme,
+                );
+                state.top_hits.push((row, TopHit::Action(l.action)));
+            }
+            Node::Sub { label, icon, .. } => {
+                let is_open = state.expanded == Some(i);
+                let row_bg = if is_open {
+                    theme.ui(SUB_BG)
+                } else {
+                    theme.ui(BG)
+                };
+                paint_row(
+                    buf,
+                    row,
+                    *icon,
+                    theme.ui(submenu_color(label)),
+                    label,
+                    true,
+                    row_bg,
+                    theme,
+                );
+                state.top_hits.push((row, TopHit::Expand(i)));
+            }
+        }
+    }
+
+    // Fly-out submenu column.
+    if let Some(i) = state.expanded
+        && let Some(Node::Sub { items, .. }) = nodes.get(i)
+    {
+        let sub_w = column_width(items.iter().map(|l| l.label.chars().count()), false);
+        let parent_y = top_rect.y + i as u16;
+        // Prefer the right of the top column; fall back to its left.
+        let right_x = top_rect.x + top_rect.width;
+        let sub_x = if right_x + sub_w <= screen.x + screen.width {
+            right_x
+        } else {
+            top_rect.x.saturating_sub(sub_w)
+        };
+        let sub_h = items.len() as u16;
+        let sub_y = parent_y.min(screen.y + screen.height.saturating_sub(sub_h));
+        let sub_rect = Rect {
+            x: sub_x,
+            y: sub_y,
+            width: sub_w,
+            height: sub_h.min(screen.height),
+        };
+        Widget::render(Clear, sub_rect, buf);
+        fill(buf, sub_rect, theme.ui(SUB_BG));
+        for (j, l) in items.iter().enumerate() {
+            let row_y = sub_rect.y + j as u16;
+            if row_y >= screen.y + screen.height {
+                break;
+            }
+            let row = Rect {
+                x: sub_rect.x,
+                y: row_y,
+                width: sub_rect.width,
+                height: 1,
+            };
+            paint_row(
+                buf,
+                row,
+                l.icon,
+                theme.ui(action_color(l.action)),
+                l.label,
+                false,
+                theme.ui(SUB_BG),
+                theme,
+            );
+            state.sub_hits.push((row, l.action));
+        }
+    }
+}
+
+/// The menu as a `surfaces` theme draws it: each column a raised card with
+/// the accent lip (the menu is what the user is driving), its rows one cell
+/// in from the card's top and bottom edges and its rim on the rows' pad
+/// columns, so each hit rect is still exactly the row drawn. Icons rest
+/// muted and lift to the body ink with their row; the row under the pointer
+/// gets the neutral hover lift, and the open submenu's parent the selected
+/// band with its accent bar. Separators run edge to edge.
+fn render_card(
+    state: &mut ScmMenuState,
+    anchor: Rect,
+    screen: Rect,
+    buf: &mut Buffer,
+    theme: crate::theme::Theme,
+    t: crate::widgets::surface::Tones,
+) {
+    use crate::widgets::surface;
+    let nodes = menu_for(state.operation);
+    let top_w = column_width(
+        nodes.iter().filter_map(|n| match n {
+            Node::Item(l) => Some(l.label.chars().count()),
+            Node::Sub { label, .. } => Some(label.chars().count()),
+            Node::Sep => None,
+        }),
+        true,
+    );
+    let rows = nodes.len() as u16;
+    // The card pads its rows with a row above and below for its rim, but
+    // only while that still fits: on a short terminal every action matters
+    // more than the padding, so the rows take the rim's rows instead.
+    let pad = edge_pad(rows, screen.height);
+    let card_h = (rows + 2 * pad).min(screen.height);
+    let card = Rect {
+        x: anchor.x.min(screen.x + screen.width.saturating_sub(top_w)),
+        y: (anchor.y + anchor.height).min(screen.y + screen.height.saturating_sub(card_h)),
+        width: top_w.min(screen.width),
+        height: card_h,
+    };
+    paint_card(buf, card, theme, t);
+    let hover = state.hover;
+    for (i, node) in nodes.iter().enumerate() {
+        let row_y = card.y + pad + i as u16;
+        if row_y + pad >= card.bottom() {
+            break;
+        }
+        let row = Rect::new(card.x, row_y, card.width, 1);
+        match node {
+            Node::Sep => {
+                let rule = "─".repeat(usize::from(row.width));
+                buf.set_string(row.x, row_y, rule, Style::default().fg(t.rim()));
+            }
+            Node::Item(l) => {
+                let lit = crate::widgets::hover::contains(row, hover);
+                paint_card_row(buf, row, t, l.icon, l.label, false, lit, false);
+                state.top_hits.push((row, TopHit::Action(l.action)));
+            }
+            Node::Sub { label, icon, .. } => {
+                let open = state.expanded == Some(i);
+                let lit = crate::widgets::hover::contains(row, hover);
+                paint_card_row(buf, row, t, *icon, label, true, lit, open);
+                state.top_hits.push((row, TopHit::Expand(i)));
+            }
+        }
+    }
+
+    if let Some(i) = state.expanded
+        && let Some(Node::Sub { items, .. }) = nodes.get(i)
+    {
+        let sub_w = column_width(items.iter().map(|l| l.label.chars().count()), false);
+        let right_x = card.x + card.width;
+        let sub_x = if right_x + sub_w <= screen.x + screen.width {
+            right_x
+        } else {
+            card.x.saturating_sub(sub_w)
+        };
+        let sub_pad = edge_pad(items.len() as u16, screen.height);
+        let sub_h = (items.len() as u16 + 2 * sub_pad).min(screen.height);
+        // Level the fly-out's first row with its parent row.
+        let parent_y = card.y + pad + i as u16;
+        let sub = Rect {
+            x: sub_x,
+            y: parent_y
+                .saturating_sub(sub_pad)
+                .min(screen.y + screen.height.saturating_sub(sub_h)),
+            width: sub_w,
+            height: sub_h,
+        };
+        paint_card(buf, sub, theme, t);
+        for (j, l) in items.iter().enumerate() {
+            let row_y = sub.y + sub_pad + j as u16;
+            if row_y + sub_pad >= sub.bottom() {
+                break;
+            }
+            let row = Rect::new(sub.x, row_y, sub.width, 1);
+            let lit = crate::widgets::hover::contains(row, hover);
+            paint_card_row(buf, row, t, l.icon, l.label, false, lit, false);
+            state.sub_hits.push((row, l.action));
+        }
+    }
+
+    /// The rim rows a card of `rows` items gets above and below them: one
+    /// while the padded card fits the screen's height, else none.
+    fn edge_pad(rows: u16, height: u16) -> u16 {
+        u16::from(rows.saturating_add(2) <= height)
+    }
+
+    /// Clear `card`, fill it with the raised tone and draw its edge.
+    fn paint_card(
+        buf: &mut Buffer,
+        card: Rect,
+        theme: crate::theme::Theme,
+        t: crate::widgets::surface::Tones,
+    ) {
+        Widget::render(Clear, card, buf);
+        fill(buf, card, t.raised());
+        surface::paint_overlay_frame(buf, card, theme);
+    }
+}
+
+/// One row of a `surfaces` card: `[rim][icon][gap][label]…[›][rim]`. A
+/// `selected` row (an open submenu's parent) is the band with the accent
+/// bar on the card's edge; a `lit` one (under the pointer) the hover lift.
+#[allow(clippy::too_many_arguments)]
+fn paint_card_row(
+    buf: &mut Buffer,
+    row: Rect,
+    t: crate::widgets::surface::Tones,
+    icon: char,
+    label: &str,
+    submenu: bool,
+    lit: bool,
+    selected: bool,
+) {
+    let body = Rect::new(row.x, row.y, row.width.saturating_sub(1), 1);
+    if selected {
+        crate::widgets::surface::paint_selected_row(buf, body, t, t.raised, true);
+    } else if lit {
+        let inner = Rect::new(row.x + 1, row.y, row.width.saturating_sub(2), 1);
+        buf.set_style(inner, Style::default().bg(t.hover_on(t.raised)));
+    }
+    let active = selected || lit;
+    let icon_fg = if active { t.text() } else { t.muted() };
+    buf.set_string(
+        row.x + 1,
+        row.y,
+        icon.to_string(),
+        Style::default().fg(icon_fg),
+    );
+    let avail = row.width.saturating_sub(3 + if submenu { 2 } else { 1 }) as usize;
+    let shown: String = label.chars().take(avail).collect();
+    let ink = if active { t.strong() } else { t.text() };
+    buf.set_string(row.x + 3, row.y, &shown, Style::default().fg(ink));
+    if submenu && row.width >= 2 {
+        let fg = if active { t.text() } else { t.faint() };
+        buf.set_string(row.x + row.width - 2, row.y, "›", Style::default().fg(fg));
+    }
+}
+
+fn fill(buf: &mut Buffer, rect: Rect, bg: Color) {
+    let style = Style::default().bg(bg);
+    for ry in 0..rect.height {
+        for rx in 0..rect.width {
+            buf[(rect.x + rx, rect.y + ry)]
+                .set_symbol(" ")
+                .set_style(style);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_row(
+    buf: &mut Buffer,
+    row: Rect,
+    icon: char,
+    icon_color: Color,
+    label: &str,
+    submenu: bool,
+    bg: Color,
+    theme: crate::theme::Theme,
+) {
+    let fg = Style::default().fg(theme.ui(FG)).bg(bg);
+    buf.set_string(
+        row.x + 1,
+        row.y,
+        icon.to_string(),
+        Style::default().fg(icon_color).bg(bg),
+    );
+    let label_x = row.x + 3;
+    let avail = row.width.saturating_sub(3 + if submenu { 2 } else { 1 }) as usize;
+    let shown: String = label.chars().take(avail).collect();
+    buf.set_string(label_x, row.y, &shown, fg);
+    if submenu && row.width >= 2 {
+        buf.set_string(
+            row.x + row.width - 2,
+            row.y,
+            "›",
+            Style::default().fg(theme.ui(SUB_ARROW_FG)).bg(bg),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1356: a stopped rebase puts Continue, Skip and Abort first, above
+    /// a separator; a merge gets only Abort (a commit concludes it); no
+    /// operation, no extra rows.
+    #[test]
+    fn an_operation_in_progress_leads_the_menu() {
+        use crate::git::RepoOp;
+        let labels = |op| -> Vec<&'static str> {
+            menu_for(op)
+                .iter()
+                .map_while(|n| match n {
+                    Node::Item(l) => Some(l.label),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            labels(Some(RepoOp::Rebase { step: 2, total: 5 })),
+            ["Continue Rebase", "Skip Commit", "Abort Rebase"]
+        );
+        assert_eq!(labels(Some(RepoOp::Merge)), ["Abort Merge"]);
+        assert!(matches!(menu_for(Some(RepoOp::Merge))[1], Node::Sep));
+        assert_eq!(menu_for(None).len(), base_menu().len());
+    }
+
+    #[test]
+    fn menu_has_the_expected_top_level_shape() {
+        let m = menu_for(None);
+        // 5 leaves + sep + 7 submenus + sep + 1 leaf = 15 nodes.
+        assert_eq!(m.len(), 15);
+        let subs = m.iter().filter(|n| matches!(n, Node::Sub { .. })).count();
+        assert_eq!(subs, 7, "Commit/Changes/Pull-Push/Branch/Remote/Stash/Tags");
+    }
+
+    #[test]
+    fn clicking_a_submenu_row_toggles_its_flyout_without_firing() {
+        let mut st = ScmMenuState::default();
+        let screen = Rect::new(0, 0, 120, 40);
+        let anchor = Rect::new(10, 0, 2, 1);
+        let mut buf = Buffer::empty(screen);
+        st.open = true;
+        render(
+            &mut st,
+            anchor,
+            screen,
+            &mut buf,
+            crate::theme::Theme::default(),
+        );
+        // Find the "Branch" submenu's top-level index and its rect.
+        let branch_idx = menu_for(None)
+            .iter()
+            .position(|n| matches!(n, Node::Sub { label, .. } if *label == "Branch"))
+            .unwrap();
+        let (rect, _) = st
+            .top_hits
+            .iter()
+            .find(|(_, t)| *t == TopHit::Expand(branch_idx))
+            .copied()
+            .unwrap();
+        let outcome = st.click(rect.x, rect.y);
+        assert_eq!(outcome, ClickOutcome::Toggled);
+        assert_eq!(st.expanded, Some(branch_idx));
+    }
+
+    #[test]
+    fn clicking_a_leaf_fires_its_action() {
+        let mut st = ScmMenuState::default();
+        let screen = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(screen);
+        st.open = true;
+        render(
+            &mut st,
+            Rect::new(10, 0, 2, 1),
+            screen,
+            &mut buf,
+            crate::theme::Theme::default(),
+        );
+        let (rect, _) = st
+            .top_hits
+            .iter()
+            .find(|(_, t)| *t == TopHit::Action(ScmAction::Pull))
+            .copied()
+            .unwrap();
+        assert_eq!(
+            st.click(rect.x, rect.y),
+            ClickOutcome::Fire(ScmAction::Pull)
+        );
+    }
+
+    /// The boxed brand theme keeps its per-action icon accents.
+    #[test]
+    fn leaf_icons_carry_their_per_action_accent_colour() {
+        let mut st = ScmMenuState::default();
+        let screen = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(screen);
+        st.open = true;
+        render(
+            &mut st,
+            Rect::new(10, 0, 2, 1),
+            screen,
+            &mut buf,
+            crate::theme::Theme::BLACK,
+        );
+        let (rect, _) = st
+            .top_hits
+            .iter()
+            .find(|(_, t)| *t == TopHit::Action(ScmAction::Pull))
+            .copied()
+            .unwrap();
+        // The icon sits one cell in from the row's left edge.
+        assert_eq!(
+            buf[(rect.x + 1, rect.y)].fg,
+            ACCENT_BLUE,
+            "the Pull icon must be painted in its blue accent, not the neutral foreground"
+        );
+    }
+
+    /// Croft Loch draws the menu as a raised card: its rows sit inside an
+    /// edge one row above and below them (the hits are the rows drawn),
+    /// icons rest muted, and the row under the pointer lifts with its icon
+    /// in the body ink.
+    #[test]
+    fn croft_loch_draws_the_menu_as_a_card_with_a_hover_lift() {
+        let theme = crate::theme::Theme::from_id("loch");
+        let t = crate::widgets::surface::tones(theme).unwrap();
+        let screen = Rect::new(0, 0, 120, 40);
+        let anchor = Rect::new(10, 0, 2, 1);
+        let mut st = ScmMenuState {
+            open: true,
+            ..Default::default()
+        };
+        let mut buf = Buffer::empty(screen);
+        render(&mut st, anchor, screen, &mut buf, theme);
+        let (first, _) = st.top_hits[0];
+        assert_eq!(first.y, anchor.bottom() + 1, "a card edge above the rows");
+        assert_eq!(buf[(first.x, first.y - 1)].symbol(), "\u{2594}");
+        assert_eq!(buf[(first.x + 3, first.y)].bg, t.raised());
+        let (pull, _) = st
+            .top_hits
+            .iter()
+            .find(|(_, h)| *h == TopHit::Action(ScmAction::Pull))
+            .copied()
+            .unwrap();
+        assert_eq!(buf[(pull.x + 1, pull.y)].fg, t.muted(), "icons rest muted");
+
+        st.hover = Some((pull.x + 4, pull.y));
+        let mut buf = Buffer::empty(screen);
+        render(&mut st, anchor, screen, &mut buf, theme);
+        assert_eq!(buf[(pull.x + 3, pull.y)].bg, t.hover_on(t.raised));
+        assert_eq!(buf[(pull.x + 1, pull.y)].fg, t.text(), "the icon lifts too");
+        assert_eq!(
+            st.click(pull.x + 4, pull.y),
+            ClickOutcome::Fire(ScmAction::Pull)
+        );
+    }
+
+    /// On a terminal too short for the padded card, Croft Loch's menu gives
+    /// its rim rows to the actions: every row the boxed menu reaches stays
+    /// reachable on the card too.
+    #[test]
+    fn croft_loch_keeps_every_action_reachable_on_a_short_terminal() {
+        let rows = menu_for(None).len() as u16;
+        let screen = Rect::new(0, 0, 120, rows + 1);
+        let anchor = Rect::new(10, 0, 2, 1);
+        let hits = |theme| {
+            let mut st = ScmMenuState {
+                open: true,
+                ..Default::default()
+            };
+            let mut buf = Buffer::empty(screen);
+            render(&mut st, anchor, screen, &mut buf, theme);
+            st.top_hits.len()
+        };
+        assert_eq!(
+            hits(crate::theme::Theme::from_id("loch")),
+            menu_for(None)
+                .iter()
+                .filter(|n| !matches!(n, Node::Sep))
+                .count(),
+            "no action clipped"
+        );
+        assert!(hits(crate::theme::Theme::from_id("loch")) >= hits(crate::theme::Theme::BLACK));
+    }
+
+    #[test]
+    fn expanded_submenu_exposes_its_leaves_as_hits() {
+        let mut st = ScmMenuState::default();
+        let screen = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(screen);
+        st.open = true;
+        let stash_idx = menu_for(None)
+            .iter()
+            .position(|n| matches!(n, Node::Sub { label, .. } if *label == "Stash"))
+            .unwrap();
+        st.expanded = Some(stash_idx);
+        render(
+            &mut st,
+            Rect::new(10, 0, 2, 1),
+            screen,
+            &mut buf,
+            crate::theme::Theme::default(),
+        );
+        assert!(
+            st.sub_hits.iter().any(|(_, a)| *a == ScmAction::DropStash),
+            "the expanded Stash submenu must expose Drop Stash as a hit target"
+        );
+    }
+}

@@ -1,0 +1,1236 @@
+//! Declarative extension manifests (`extension.toml`).
+//!
+//! A croft extension is described by a TOML manifest with two Tier-0 (pure
+//! data) blocks: `[[languages]]` (a language identity — its lsp id, file
+//! extensions, project-root markers, server family) and `[[language_servers]]`
+//! (a server and the languages it serves). The bundled Python/TypeScript/Rust/Go
+//! servers and the core language identities are expressed as manifests in
+//! exactly the format a third-party extension uses; the registry and language
+//! table are built by loading them plus any user extensions under
+//! `~/.config/croft/extensions/`, instead of hardcoding the data in Rust.
+//!
+//! Strings parsed from a manifest are interned to `&'static` (via [`intern`]):
+//! server/package names live for the whole process (the install path keys a
+//! `static` set on them and moves them into background threads), so a leak-once
+//! intern is the right representation and keeps `ServerConfig`/`Provision`
+//! `Copy`-friendly and the install path untouched.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+use crate::lsp::config::{Language, ServerConfig};
+use crate::lsp::install::{ArchiveKind, Provision};
+
+/// Bundled (first-party) extension manifests, embedded so they ship in the
+/// binary and load identically on every host. The same declarative
+/// `extension.toml` format a third-party extension uses. `core-languages`
+/// declares the file-type identities for formats with no bundled server.
+pub const BUNDLED_MANIFESTS: &[&str] = &[
+    include_str!("../../assets/extensions/core-languages/extension.toml"),
+    include_str!("../../assets/extensions/pdf/extension.toml"),
+    include_str!("../../assets/extensions/csv/extension.toml"),
+    include_str!("../../assets/extensions/vim/extension.toml"),
+    include_str!("../../assets/extensions/lsp-python/extension.toml"),
+    include_str!("../../assets/extensions/lsp-typescript/extension.toml"),
+    include_str!("../../assets/extensions/lsp-rust/extension.toml"),
+    include_str!("../../assets/extensions/lsp-go/extension.toml"),
+    include_str!("../../assets/extensions/lsp-yaml/extension.toml"),
+    include_str!("../../assets/extensions/lsp-json/extension.toml"),
+    include_str!("../../assets/extensions/lsp-html/extension.toml"),
+    include_str!("../../assets/extensions/lsp-css/extension.toml"),
+    include_str!("../../assets/extensions/lsp-bash/extension.toml"),
+    include_str!("../../assets/extensions/lsp-toml/extension.toml"),
+    include_str!("../../assets/extensions/lsp-cpp/extension.toml"),
+    include_str!("../../assets/extensions/lsp-lua/extension.toml"),
+    include_str!("../../assets/extensions/lsp-markdown/extension.toml"),
+    include_str!("../../assets/extensions/dap-python/extension.toml"),
+    include_str!("../../assets/extensions/dap-lldb/extension.toml"),
+    include_str!("../../assets/extensions/dap-js/extension.toml"),
+    include_str!("../../assets/extensions/dap-go/extension.toml"),
+    // Runner order is detection priority: cargo, then the JS runners, then
+    // pytest — a mixed repo's root is usually the crate.
+    include_str!("../../assets/extensions/test-cargo/extension.toml"),
+    include_str!("../../assets/extensions/test-vitest/extension.toml"),
+    include_str!("../../assets/extensions/test-jest/extension.toml"),
+    include_str!("../../assets/extensions/test-pytest/extension.toml"),
+    include_str!("../../assets/extensions/test-go/extension.toml"),
+    include_str!("../../assets/extensions/themes/extension.toml"),
+];
+
+/// The curated MCP-server catalog: vetted sidecars a user can *add* from the
+/// Extensions panel (Available → Add → Installed). Unlike [`BUNDLED_MANIFESTS`]
+/// these are NOT loaded as active extensions; adding one writes its manifest
+/// into the user extensions dir, after which it loads like any installed
+/// extension. Same `extension.toml` format. Each is a keyless (or opt-in)
+/// server croft can drive through its single-argument command model.
+pub const CATALOG_MANIFESTS: &[&str] = &[
+    include_str!("../../assets/catalog/mcp-fetch/extension.toml"),
+    include_str!("../../assets/catalog/mcp-time/extension.toml"),
+    include_str!("../../assets/catalog/mcp-markitdown/extension.toml"),
+    include_str!("../../assets/catalog/csvlens/extension.toml"),
+];
+
+/// A parsed `extension.toml`. Only the fields phase B1 consumes are modelled;
+/// unknown keys are ignored so the format can grow without breaking old builds.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExtensionManifest {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub builtin: bool,
+    /// Infrastructure extensions (e.g. `core-languages`) set this so they don't
+    /// appear in the user-facing Extensions panel.
+    #[serde(default)]
+    pub hidden: bool,
+    #[allow(dead_code)] // a required manifest key; croft never reads it back
+    pub api_version: u32,
+    #[serde(default)]
+    pub languages: Vec<LanguageDecl>,
+    #[serde(default)]
+    pub language_servers: Vec<LanguageServerDecl>,
+    /// Color themes this extension contributes. An extension can ship languages,
+    /// servers, AND/OR themes; a pure theme extension declares only these.
+    #[serde(default)]
+    pub themes: Vec<ThemeDecl>,
+    /// Debug adapters this extension contributes. Each maps a set of file
+    /// extensions to one of croft's built-in launch mechanisms (its `kind`).
+    /// Disabling the extension stops F5 from offering that debugger.
+    #[serde(default)]
+    pub debug_adapters: Vec<DebugAdapterDecl>,
+    /// Test runners this extension contributes. Each maps workspace marker
+    /// files (and/or package.json dependency names) to one of croft's built-in
+    /// run mechanisms (its `kind`). Disabling the extension stops the Testing
+    /// view from detecting that runner's projects.
+    #[serde(default)]
+    pub test_runners: Vec<TestRunnerDecl>,
+    /// MCP sidecar servers this extension contributes (Tier-1 extensions). Each
+    /// is a local process croft spawns lazily and drives over JSON-RPC/NDJSON
+    /// stdio. Paired with [`commands`](Self::commands) that invoke their tools.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerDecl>,
+    /// Palette commands this extension contributes. Each invokes one tool on one
+    /// of this extension's [`mcp_servers`](Self::mcp_servers); registered eagerly
+    /// in the command palette, the server is spawned lazily on first invocation.
+    #[serde(default)]
+    pub commands: Vec<CommandDecl>,
+    /// External viewers this extension contributes (#465): a terminal program
+    /// that opens a file kind in a pane of its own, such as csvlens for CSV.
+    #[serde(default)]
+    pub viewers: Vec<ViewerDecl>,
+}
+
+/// One `[[viewers]]` entry: a terminal program croft runs on a file in a new
+/// pane. `args` may carry `{file}`, replaced by the file's absolute path;
+/// `extensions` are the lower-cased file extensions it is offered for;
+/// `provision` installs it pinned when absent from PATH, as for servers.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ViewerDecl {
+    pub id: String,
+    pub label: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    #[serde(default)]
+    pub provision: Option<ProvisionDecl>,
+}
+
+/// One `[[mcp_servers]]` entry: a sidecar server croft spawns and drives over
+/// MCP. `command`/`args` are the spawn line; `provision` (reused from the LSP
+/// backends) installs it pinned into a host-managed dir when absent from PATH,
+/// never fetching-at-launch; `env` is the explicit least-privilege environment
+/// handed to the process (croft does not leak its own environment).
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpServerDecl {
+    /// Stable id referenced by a [`CommandDecl::server`].
+    pub id: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub provision: Option<ProvisionDecl>,
+    /// Explicit environment variables the server is launched with (e.g. an API
+    /// key sourced by the host). Empty by default.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// One `[[commands]]` entry: a palette command that calls `tool` on `server`.
+/// `prompt`, when set, is the label of a single string argument croft collects
+/// from the user (e.g. a URL or search query) and passes to the tool.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommandDecl {
+    /// Stable command id (e.g. `fetch.url`).
+    pub id: String,
+    /// Human-facing palette label.
+    pub title: String,
+    /// The [`McpServerDecl::id`] this command's tool lives on.
+    pub server: String,
+    /// The MCP tool name to call.
+    pub tool: String,
+    /// When set, the tool's argument NAME that the collected input fills (e.g.
+    /// `url`). Paired with `prompt`. Absent for a no-argument tool.
+    #[serde(default)]
+    pub arg: Option<String>,
+    /// When set, the human label of the single string argument to collect from
+    /// the user before calling the tool (e.g. `URL`). Absent for a no-argument
+    /// tool.
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+/// One `[[debug_adapters]]` entry: a debugger contributed by an extension. The
+/// `kind` selects which built-in launch mechanism croft drives (debugpy /
+/// lldb-dap / vscode-js-debug — the launch flows are heterogeneous and stay
+/// native, like the PDF/CSV viewers); the `extensions` list is the data that
+/// used to live in the hardcoded `adapter_for_extension` match.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DebugAdapterDecl {
+    /// Stable id (matches the contributing extension's id for the toggle, e.g.
+    /// the `debugpy` adapter id; the panel toggle keys on the manifest `id`).
+    #[allow(dead_code)] // a required manifest key; croft never reads it back
+    pub id: String,
+    /// Human-facing adapter name (shown in docs / future debugger UI).
+    #[allow(dead_code)] // a required manifest key; croft never reads it back
+    pub label: String,
+    /// Which built-in launch mechanism croft drives for this adapter.
+    pub kind: AdapterKindDecl,
+    /// Lowercased, dot-less file extensions this adapter debugs.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+}
+
+/// The built-in debug-adapter launch mechanisms croft knows. Mirrors (and maps
+/// onto) `crate::dap::session::AdapterKind`; kept here as pure manifest data so
+/// the manifest layer carries no dependency on the dap module.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AdapterKindDecl {
+    /// debugpy (CPython 3.14+), launches `.py` source under an interpreter.
+    Debugpy,
+    /// lldb-dap, builds then launches a compiled binary (Rust / C / C++).
+    Lldb,
+    /// vscode-js-debug, launches a Node program over its TCP multi-session.
+    JsDebug,
+    /// delve (`dlv dap`), launches a Go package or test over TCP (#264).
+    Delve,
+}
+
+/// One `[[test_runners]]` entry: a test runner contributed by an extension.
+/// The `kind` selects which built-in run mechanism the Testing view drives
+/// (cargo libtest / pytest / vitest / jest — the commands and parsers are
+/// heterogeneous and stay native, like the debug adapters); the `markers` and
+/// `package_deps` lists are the detection data that used to live in the
+/// hardcoded `runner_for` ladder. A workspace matches when any marker file
+/// exists at its root OR its package.json names any of `package_deps` in
+/// (dev)dependencies.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TestRunnerDecl {
+    /// Stable id (matches the contributing extension's id for the toggle).
+    #[allow(dead_code)] // a required manifest key; croft never reads it back
+    pub id: String,
+    /// Human-facing runner name (shown in docs / future Testing UI).
+    #[allow(dead_code)] // a required manifest key; croft never reads it back
+    pub label: String,
+    /// Which built-in run mechanism croft drives for this runner.
+    pub kind: RunnerKindDecl,
+    /// Files whose presence at the workspace root marks the project.
+    #[serde(default)]
+    pub markers: Vec<String>,
+    /// package.json (dev)dependency names that mark the project. A
+    /// package.json naming none of these is NOT a test project — plenty of
+    /// repos carry one only for docs tooling.
+    #[serde(default)]
+    pub package_deps: Vec<String>,
+}
+
+/// The built-in test-run mechanisms croft knows. Mirrors (and maps onto)
+/// `crate::testing::worker::Runner`; kept here as pure manifest data so the
+/// manifest layer carries no dependency on the testing module.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunnerKindDecl {
+    /// `cargo test` libtest output (Rust).
+    Cargo,
+    /// pytest verbose / collect-only output (Python).
+    Pytest,
+    /// vitest tap-flat streaming output (JS/TS).
+    Vitest,
+    /// jest `--json` document output (JS/TS).
+    Jest,
+    /// `go test -json` event stream (Go).
+    Go,
+    /// `codeql test run` text output (CodeQL test packs).
+    Codeql,
+}
+
+/// One `[[themes]]` entry: a complete IDE color palette. All colors are
+/// `#rrggbb` strings; `gradient` selects the teal brand/gradient chrome scheme
+/// (vs the flat-accent scheme). croft's first-party Black/Dark-Blue ship as two
+/// of these; a third party adds a theme by dropping a manifest with another.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThemeDecl {
+    /// Stable id persisted in prefs (e.g. `"black"`).
+    pub id: String,
+    /// Human-facing name shown in the theme picker.
+    pub label: String,
+    /// Editor/panel background (the `SetColors` session fill).
+    pub background: String,
+    /// Primary accent (selected-row text, active chrome).
+    pub accent: String,
+    /// Selected-row fill in lists/popups.
+    pub selection: String,
+    /// Filter/search input fill.
+    pub search: String,
+    /// Primary-button / lit-toggle fill.
+    pub button: String,
+    /// Whether this theme uses the gradient brand chrome (focused-pane gradient
+    /// border, popup gradient, brand accents) vs the flat-accent look.
+    #[serde(default)]
+    pub gradient: bool,
+    /// On-screen-keyboard normal key cap fill (Termux).
+    pub osk_key: String,
+    /// On-screen-keyboard special key cap fill (Termux).
+    pub osk_special: String,
+    /// On-screen-keyboard armed (held) key fill (Termux).
+    pub osk_armed: String,
+    /// Optional 16-entry ANSI terminal palette (`#rrggbb`, black..bright
+    /// white in the standard order). Absent or wrong-length falls back to
+    /// VS Code's dark terminal defaults.
+    #[serde(default)]
+    pub ansi: Vec<String>,
+    /// Optional editor tab-bar chrome (`#rrggbb`): strip background, inactive
+    /// tab, active tab, hovered inactive tab, and the close-cross hover pill.
+    /// Each omitted color is derived from the palette above (strip from
+    /// `search`, active from `selection`, hover/pill from `accent`), so most
+    /// themes need none of these; the two built-ins pin their historical
+    /// values.
+    #[serde(default)]
+    pub tab_strip: String,
+    #[serde(default)]
+    pub tab_inactive: String,
+    #[serde(default)]
+    pub tab_active: String,
+    #[serde(default)]
+    pub tab_hover: String,
+    #[serde(default)]
+    pub tab_close_pill: String,
+    /// Optional code-highlight colors (`#rrggbb`). Each omitted field keeps the
+    /// Base16-Ocean-Dark default, so a theme can recolor just a few token roles.
+    /// comment / keyword / string / constant (numbers, consts, params) /
+    /// function (calls, methods, properties) / type (types, namespaces) /
+    /// tag (attributes, JSX tags, builtins) / fg (plain identifiers, operators).
+    #[serde(default)]
+    pub syn_comment: String,
+    #[serde(default)]
+    pub syn_keyword: String,
+    #[serde(default)]
+    pub syn_string: String,
+    #[serde(default)]
+    pub syn_constant: String,
+    #[serde(default)]
+    pub syn_function: String,
+    #[serde(default)]
+    pub syn_type: String,
+    #[serde(default)]
+    pub syn_tag: String,
+    #[serde(default)]
+    pub syn_fg: String,
+    /// A high contrast theme (VS Code's `hc-black` / `hc-light`, #1548):
+    /// croft's own chrome greys resolve to the theme's pure foreground and
+    /// background, and every other chrome color is lifted until it reads
+    /// at 7:1 against the background.
+    #[serde(default)]
+    pub high_contrast: bool,
+    /// Draw the workbench as layered surfaces instead of boxed panes (Croft
+    /// Loch): panes lose their line frames, regions are told apart by tone
+    /// with a one-eighth-cell seam where two meet, and focus shows as a rule
+    /// along the focused pane's top edge. See `Theme::surfaces`.
+    #[serde(default)]
+    pub surfaces: bool,
+    /// Optional surface colors (`#rrggbb`) for a `surfaces` theme: `chrome`
+    /// (side bar, activity bar, tab strip, panel title row, status bar),
+    /// `raised` (Command Palette, menus, popups), `hairline` (the seam
+    /// between two surfaces) and `fg_muted` (labels and status items). Each
+    /// omitted one is derived from `background`.
+    #[serde(default)]
+    pub chrome: String,
+    #[serde(default)]
+    pub raised: String,
+    #[serde(default)]
+    pub hairline: String,
+    #[serde(default)]
+    pub fg_muted: String,
+}
+
+/// One `[[languages]]` entry: a language identity contributed by an extension.
+/// Carries the data the closed `Language` enum used to hardcode — its LSP
+/// `languageId`, the file extensions that map to it, the project-root markers,
+/// and the server "family" it shares a managed server with.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LanguageDecl {
+    /// LSP `languageId` (e.g. `"python"`, `"typescriptreact"`). The language's
+    /// stable identity.
+    pub id: String,
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// File-name patterns that map to this language ahead of the extension
+    /// table (#1084): `tsconfig*.json` is JSON with comments although its
+    /// extension says JSON. `*` matches within one path component, and a
+    /// pattern with `/` also matches the directories above the file
+    /// (`.vscode/*.json`).
+    #[serde(default)]
+    pub filenames: Vec<String>,
+    /// Project-manifest filenames that mark a directory as this language's
+    /// project root (anchors the server at the right sub-project).
+    #[serde(default)]
+    pub root_markers: Vec<String>,
+    /// The canonical language id this one shares a managed server with (e.g.
+    /// `typescriptreact` -> `typescript`). Absent means the language is its own
+    /// family.
+    #[serde(default)]
+    pub family: Option<String>,
+}
+
+/// One `[[language_servers]]` entry: a server and the language id(s) it serves.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LanguageServerDecl {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Single language id (`language = "python"`). Combined with `languages`.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Multiple language ids (`languages = ["typescript", …]`) for a server
+    /// that serves a whole family from one process.
+    #[serde(default)]
+    pub languages: Vec<String>,
+    /// Registration order within a language: lower wins each capability it
+    /// advertises (the registry is first-registered-wins). Mirrors the call
+    /// order the old hardcoded `with_defaults` relied on.
+    #[serde(default)]
+    pub priority: i64,
+    #[serde(default)]
+    pub provision: Option<ProvisionDecl>,
+    /// `initializationOptions` sent in the LSP `initialize` request. Absent for
+    /// the common case.
+    #[serde(default)]
+    pub initialization_options: Option<serde_json::Value>,
+}
+
+/// How croft provisions the server when it isn't on PATH (maps to [`Provision`]).
+/// `npm`/`uv`/`go` use `package`; `binary` uses `url` + `archive` + the OS/arch token
+/// maps. Unused fields for a given kind are simply absent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProvisionDecl {
+    pub kind: ProvisionKind,
+    /// npm/uv package name, or the Go module path (unused by `binary`).
+    #[serde(default)]
+    pub package: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    pub bin: String,
+    /// `binary`: supported platform -> literal download URL. Keys are
+    /// `"<os>-<arch>"` (e.g. `linux-x86_64`) or a bare `"<os>"` (e.g. `macos`
+    /// for a universal build), using Rust's `target_os`/`target_arch` tokens.
+    /// Host-agnostic: each URL is a full literal (GitHub, Codeberg, anywhere).
+    #[serde(default)]
+    pub targets: BTreeMap<String, String>,
+    /// `binary`: archive format of the downloaded asset.
+    #[serde(default)]
+    pub archive: Option<ArchiveKindDecl>,
+    /// `binary`: literal path to the executable inside the unpacked archive.
+    /// Absent for a single-file `.gz` or a `raw` asset.
+    #[serde(default)]
+    pub bin_path: Option<String>,
+    /// Termux/Android package for `pkg install`, where the normal install
+    /// can't run. `binary`: absent (or `false`) leaves Android to a copy on
+    /// PATH. `uv`: absent means Termux names it like PyPI (`package`), and
+    /// `false` says Termux does not package it at all.
+    #[serde(default)]
+    pub termux_pkg: Option<TermuxPkgDecl>,
+    /// `binary`: per-platform SHA-256 of the asset, keyed like `targets`.
+    /// Three outcomes: no map at all installs unverified; a platform with an
+    /// entry has its download verified before anything is unpacked; a map that
+    /// pins other platforms but not this one refuses to install here, so a
+    /// partial map fails loudly rather than skipping the gate.
+    #[serde(default)]
+    pub sha256: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProvisionKind {
+    Npm,
+    Uv,
+    Binary,
+    /// `go install <package>@<version>` with the user's `go` (gopls, #930).
+    Go,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArchiveKindDecl {
+    Gz,
+    Zip,
+    /// A `.tar.xz` holding the binary, possibly inside a per-target folder
+    /// (cargo-dist's layout).
+    #[serde(rename = "tar.xz")]
+    TarXz,
+    /// No archive: the asset is the executable itself.
+    Raw,
+}
+
+/// A manifest's `termux_pkg`: a Termux package name, or `false` for a tool
+/// Termux does not package (`true` means the default for the provision kind).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum TermuxPkgDecl {
+    Name(String),
+    Flag(bool),
+}
+
+/// A server registration extracted from a manifest: its priority, the language
+/// it is registered under, and the spawnable config.
+#[derive(Debug, Clone)]
+pub struct ServerEntry {
+    pub priority: i64,
+    pub language: Language,
+    pub config: ServerConfig,
+}
+
+/// Parse an `extension.toml` source, once per process per source text.
+///
+/// The language table, the server, debugger and test-runner registries, the
+/// theme list and the Extensions panel each read every manifest, and a
+/// launch reached five of them before its first frame: five TOML parses of
+/// the same bundled files, a quarter of startup's work. Each text is parsed
+/// once now and handed out as a copy; a bundled one in its own slot, which
+/// [`prewarm_bundled`] fills at launch. A caller that finds a slot still
+/// empty parses the text itself rather than waiting on that thread, so the
+/// editor never waits for another thread to be scheduled. Parsing is pure,
+/// so every parse of a text gives the same answer.
+pub fn parse(src: &str) -> Result<ExtensionManifest, toml::de::Error> {
+    type Parsed = Result<ExtensionManifest, toml::de::Error>;
+    static BUNDLED: [std::sync::OnceLock<Parsed>; BUNDLED_MANIFESTS.len()] =
+        [const { std::sync::OnceLock::new() }; BUNDLED_MANIFESTS.len()];
+    static OTHERS: std::sync::Mutex<BTreeMap<String, Parsed>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    if let Some(i) = BUNDLED_MANIFESTS.iter().position(|b| *b == src) {
+        if let Some(parsed) = BUNDLED[i].get() {
+            return parsed.clone();
+        }
+        let parsed = parse_uncached(src);
+        let _ = BUNDLED[i].set(parsed.clone());
+        return parsed;
+    }
+    if let Some(hit) = OTHERS.lock().ok().and_then(|m| m.get(src).cloned()) {
+        return hit;
+    }
+    let parsed = parse_uncached(src);
+    if let Ok(mut m) = OTHERS.lock() {
+        m.insert(src.to_string(), parsed.clone());
+    }
+    parsed
+}
+
+/// Parse the bundled manifests into [`parse`]'s slots. Startup runs this on
+/// a thread of its own the moment the editor launches, so the registries
+/// built before the first frame find them parsed.
+pub fn prewarm_bundled() {
+    for src in BUNDLED_MANIFESTS {
+        let _ = parse(src);
+    }
+}
+
+/// [`parse`] without the per-process memory. Ids are checked here because
+/// they name directories (`~/.croft/servers/<id>/`, the user extensions dir)
+/// and dispatch keys (`viewer:<extension>/<viewer>`): a separator, a parent
+/// reference or whitespace in one would reach a path join or split a key.
+fn parse_uncached(src: &str) -> Result<ExtensionManifest, toml::de::Error> {
+    let m: ExtensionManifest = toml::from_str(src)?;
+    for (what, id) in std::iter::once(("extension", m.id.as_str()))
+        .chain(m.viewers.iter().map(|v| ("viewer", v.id.as_str())))
+    {
+        if !id_is_sound(id) {
+            return Err(serde::de::Error::custom(format!(
+                "{what} id {id:?} is not allowed: ids are non-empty, contain no `/`, `\\` or whitespace, and are not `.` or `..`"
+            )));
+        }
+    }
+    // A provisioned path is joined under the managed store and then run:
+    // `Path::join` with an absolute argument drops the store prefix, and a
+    // parent reference walks out of it, so either would let a manifest run
+    // (and write) outside the store. Refused for every provision.
+    let provisions = m
+        .viewers
+        .iter()
+        .filter_map(|v| v.provision.as_ref().map(|p| ("viewer", v.id.as_str(), p)))
+        .chain(
+            m.mcp_servers
+                .iter()
+                .filter_map(|s| s.provision.as_ref().map(|p| ("server", s.id.as_str(), p))),
+        )
+        .chain(
+            m.language_servers
+                .iter()
+                .filter_map(|s| s.provision.as_ref().map(|p| ("server", s.name.as_str(), p))),
+        );
+    for (what, id, p) in provisions {
+        let runs = p.bin_path.as_deref().unwrap_or(&p.bin);
+        if !provisioned_path_stays_in_store(runs) {
+            return Err(serde::de::Error::custom(format!(
+                "{what} {id:?} provisions {runs:?}: a provisioned path must stay inside the managed store"
+            )));
+        }
+    }
+    // The consent prompt shows a viewer's `command`; when the viewer is
+    // provisioned, what runs is the provision's `bin_path` when set, else
+    // its `bin`. A manifest in which the two name different programs would
+    // have the user allow one and croft run another, so it is refused here
+    // rather than at spawn time.
+    for v in &m.viewers {
+        if v.command.trim().is_empty() {
+            return Err(serde::de::Error::custom(format!(
+                "viewer {:?} has an empty command",
+                v.id
+            )));
+        }
+        if let Some(p) = &v.provision {
+            let runs = p.bin_path.as_deref().unwrap_or(&p.bin);
+            if command_file_name(&v.command) != command_file_name(runs) {
+                return Err(serde::de::Error::custom(format!(
+                    "viewer {:?} runs {:?} but provisions {runs:?}: the command and the provisioned binary must name one program",
+                    v.id, v.command
+                )));
+            }
+        }
+    }
+    Ok(m)
+}
+
+/// The program a spawn line names, without any directory: `/opt/t/csvlens`
+/// and `csvlens` are the same program for the purpose of the consent check.
+fn command_file_name(command: &str) -> &str {
+    command.rsplit(['/', '\\']).next().unwrap_or(command)
+}
+
+/// Whether a provisioned `bin`/`bin_path` stays under the managed store once
+/// joined there: relative, and never through a parent reference.
+fn provisioned_path_stays_in_store(runs: &str) -> bool {
+    let path = std::path::Path::new(runs);
+    !runs.is_empty()
+        && !path.is_absolute()
+        && !runs.starts_with('\\')
+        && !path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
+}
+
+/// Whether an id can safely name a directory and a key segment.
+fn id_is_sound(id: &str) -> bool {
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && !id
+            .chars()
+            .any(|c| c == '/' || c == '\\' || c.is_whitespace())
+}
+
+/// A user-facing extension entry for the Extensions panel: identity and blurb,
+/// with no contribution detail. Enabled/disabled state is held separately (in
+/// prefs), so this stays a pure projection of the manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub builtin: bool,
+}
+
+/// Project a set of manifest sources to the panel's extension list, skipping
+/// unparseable and `hidden` (infrastructure) manifests.
+pub fn summaries(sources: &[&str]) -> Vec<ExtensionSummary> {
+    sources
+        .iter()
+        .filter_map(|s| parse(s).ok())
+        .filter(|m| !m.hidden)
+        .map(|m| ExtensionSummary {
+            id: m.id,
+            name: m.name,
+            description: m.description,
+            builtin: m.builtin,
+        })
+        .collect()
+}
+
+/// The strings handed out by [`intern`], so each distinct string is leaked
+/// once however often it is asked for.
+static INTERNED: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// The slices handed out by [`intern_pairs`], keyed by their content, so a
+/// map seen before hands back the slice it got the first time.
+static INTERNED_PAIRS: std::sync::Mutex<PairTable> = std::sync::Mutex::new(BTreeMap::new());
+
+/// A parsed string map, by content, to the interned slice built from it.
+type PairTable = BTreeMap<Vec<(String, String)>, &'static [(&'static str, &'static str)]>;
+
+/// A `&'static str` for a parsed string, leaked at most once per distinct
+/// string. Sound because the data it represents (server / package names)
+/// lives for the whole process; bounded by the number of distinct strings
+/// the installed manifests carry, not by how often a provision is built,
+/// since a viewer's provision is rebuilt on every right-click and every
+/// palette open (#485 review). The language table interns through here too,
+/// so rebuilding it as extensions come and go leaks nothing new.
+pub(crate) fn intern(s: &str) -> &'static str {
+    let mut set = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = set.get(s) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+    set.insert(leaked);
+    leaked
+}
+
+/// A `&'static [(&'static str, &'static str)]` (the OS/arch token form
+/// `Provision::Binary` carries) for a parsed string map, leaked at most once
+/// per distinct map. Same soundness and the same bound as [`intern`].
+fn intern_pairs(m: &BTreeMap<String, String>) -> &'static [(&'static str, &'static str)] {
+    let key: Vec<(String, String)> = m.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut table = INTERNED_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = table.get(&key) {
+        return existing;
+    }
+    let v: Vec<(&'static str, &'static str)> =
+        m.iter().map(|(k, val)| (intern(k), intern(val))).collect();
+    let leaked: &'static [(&'static str, &'static str)] = Box::leak(v.into_boxed_slice());
+    table.insert(key, leaked);
+    leaked
+}
+
+impl ProvisionDecl {
+    pub(crate) fn to_provision(&self) -> Provision {
+        let version = self.version.as_deref().map(intern);
+        let bin = intern(&self.bin);
+        let package = || intern(self.package.as_deref().unwrap_or_default());
+        match self.kind {
+            ProvisionKind::Npm => Provision::Npm {
+                package: package(),
+                version,
+                bin,
+            },
+            ProvisionKind::Uv => Provision::Uv {
+                package: package(),
+                version,
+                bin,
+                termux_pkg: match &self.termux_pkg {
+                    None | Some(TermuxPkgDecl::Flag(true)) => Some(package()),
+                    Some(TermuxPkgDecl::Name(name)) => Some(intern(name)),
+                    Some(TermuxPkgDecl::Flag(false)) => None,
+                },
+            },
+            ProvisionKind::Binary => Provision::Binary {
+                targets: intern_pairs(&self.targets),
+                bin,
+                archive: match self.archive.unwrap_or(ArchiveKindDecl::Gz) {
+                    ArchiveKindDecl::Gz => ArchiveKind::Gz,
+                    ArchiveKindDecl::Zip => ArchiveKind::Zip,
+                    ArchiveKindDecl::TarXz => ArchiveKind::TarXz,
+                    ArchiveKindDecl::Raw => ArchiveKind::Raw,
+                },
+                bin_path: self.bin_path.as_deref().map(intern),
+                termux_pkg: match &self.termux_pkg {
+                    Some(TermuxPkgDecl::Name(name)) => Some(intern(name)),
+                    None | Some(TermuxPkgDecl::Flag(_)) => None,
+                },
+                sha256: intern_pairs(&self.sha256),
+            },
+            ProvisionKind::Go => Provision::Go {
+                package: package(),
+                version,
+                bin,
+            },
+        }
+    }
+}
+
+/// Flatten a manifest into the server registrations it contributes. One decl
+/// that lists N languages yields N entries sharing one config (matching the old
+/// `with_defaults`, which registered the same `ServerConfig` under each key).
+/// The config's own `language` field is the decl's first language id (the
+/// canonical one), mirroring the old behaviour where `ServerConfig::vtsls`
+/// carried `Language::TypeScript` even when registered under the React/JS keys.
+///
+/// The language is built straight from the decl's id, not looked up in the
+/// global language table — a manifest declaring a server for a brand-new
+/// language must register it even before (or without) a matching `[[languages]]`
+/// block, which is what lets a user add a language with zero Rust.
+pub fn entries(manifest: &ExtensionManifest) -> Vec<ServerEntry> {
+    let mut out = Vec::new();
+    for decl in &manifest.language_servers {
+        let lang_ids: Vec<&str> = decl
+            .language
+            .as_deref()
+            .into_iter()
+            .chain(decl.languages.iter().map(String::as_str))
+            .collect();
+        let Some(first) = lang_ids.first() else {
+            continue;
+        };
+        let config = ServerConfig {
+            name: intern(&decl.name),
+            command: decl.command.clone(),
+            args: decl.args.clone(),
+            language: Language(intern(first)),
+            initialization_options: decl.initialization_options.clone(),
+            provision: decl.provision.as_ref().map(ProvisionDecl::to_provision),
+        };
+        for id in &lang_ids {
+            out.push(ServerEntry {
+                priority: decl.priority,
+                language: Language(intern(id)),
+                config: config.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// The directory user-installed extensions live in: `<config>/extensions`
+/// (e.g. `~/.config/croft/extensions`). Each extension is a subdirectory
+/// holding an `extension.toml`.
+pub fn user_extensions_dir() -> PathBuf {
+    crate::paths::config_dir().join("extensions")
+}
+
+/// Read every `<dir>/<id>/extension.toml` into a source string, sorted by path
+/// for a deterministic load order. Best-effort: a missing directory or an
+/// unreadable entry yields no source rather than an error, so a fresh box with
+/// no user extensions simply gets the bundled set.
+pub fn read_extension_sources(dir: &Path) -> Vec<String> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut subdirs: Vec<PathBuf> = read
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    subdirs.sort();
+    subdirs
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p.join("extension.toml")).ok())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A text parsed once is handed out from memory after that, with the
+    /// answer a fresh parse gives, a refusal included; a bundled text the
+    /// same whether it was copied into a `String` or not.
+    #[test]
+    fn a_remembered_parse_answers_like_a_fresh_one() {
+        for src in BUNDLED_MANIFESTS {
+            let fresh = parse_uncached(src).expect("bundled manifest parses");
+            let owned = src.to_string();
+            for remembered in [parse(src), parse(src), parse(&owned)] {
+                assert_eq!(remembered.expect("parses").id, fresh.id);
+            }
+        }
+        let bad = "id = 'a/b'\nname = \"x\"\napi_version = 1\n";
+        assert!(parse(bad).is_err());
+        assert!(parse(bad).is_err(), "a refusal is remembered too");
+    }
+
+    /// Ids name directories and dispatch keys, so a separator or a parent
+    /// reference in one is refused at parse time rather than reaching a
+    /// path join.
+    #[test]
+    fn ids_with_a_separator_or_parent_reference_do_not_parse() {
+        const OK: &str = "id = \"fine.id-1\"\nname = \"x\"\napi_version = 1\n";
+        assert!(parse(OK).is_ok(), "dots, hyphens and digits are fine");
+        for bad in ["a/b", "a\\b", "..", ".", "", "a b"] {
+            // Literal (single-quoted) TOML strings, so a backslash stays a backslash.
+            let src = format!("id = '{bad}'\nname = \"x\"\napi_version = 1\n");
+            assert!(parse(&src).is_err(), "extension id {bad:?} must be refused");
+            let src = format!(
+                "id = \"ok\"\nname = \"x\"\napi_version = 1\n\n[[viewers]]\nid = '{bad}'\nlabel = \"l\"\ncommand = \"c\"\n"
+            );
+            assert!(parse(&src).is_err(), "viewer id {bad:?} must be refused");
+        }
+    }
+
+    /// A binary provision may pin the asset's digest per platform (#485
+    /// review): the parsed form carries it alongside the URL map.
+    #[test]
+    fn a_binary_provision_carries_per_target_checksums() {
+        const DECL: &str = r#"
+id = "x"
+name = "x"
+api_version = 1
+
+[[viewers]]
+id = "x"
+label = "x"
+command = "x"
+provision = { kind = "binary", bin = "x", archive = "tar.xz", targets = { "macos-aarch64" = "https://example.invalid/x.tar.xz" }, sha256 = { "macos-aarch64" = "d227c0acee1ac49956eacf12f301e7ce2e20ab36aa863d4c44b8bca93ec8e7b3" } }
+"#;
+        let m = parse(DECL).expect("parses");
+        let Provision::Binary { sha256, .. } =
+            m.viewers[0].provision.as_ref().unwrap().to_provision()
+        else {
+            panic!("binary");
+        };
+        assert_eq!(
+            sha256,
+            &[(
+                "macos-aarch64",
+                "d227c0acee1ac49956eacf12f301e7ce2e20ab36aa863d4c44b8bca93ec8e7b3"
+            )]
+        );
+    }
+
+    /// The provision is rebuilt on every right-click and every palette open
+    /// (#485 review), so its interned strings must be interned, not leaked
+    /// afresh each time: a second build hands back the same allocations.
+    #[test]
+    fn rebuilding_a_provision_reuses_its_interned_strings() {
+        const DECL: &str = r#"
+id = "y"
+name = "y"
+api_version = 1
+
+[[viewers]]
+id = "y"
+label = "y"
+command = "ybin"
+provision = { kind = "binary", bin = "ybin", archive = "tar.xz", targets = { "linux-x86_64" = "https://example.invalid/y.tar.xz" }, sha256 = { "linux-x86_64" = "d227c0acee1ac49956eacf12f301e7ce2e20ab36aa863d4c44b8bca93ec8e7b3" } }
+"#;
+        let m = parse(DECL).expect("parses");
+        let decl = m.viewers[0].provision.as_ref().unwrap();
+        let (
+            Provision::Binary {
+                targets: t1,
+                sha256: s1,
+                bin: b1,
+                ..
+            },
+            Provision::Binary {
+                targets: t2,
+                sha256: s2,
+                bin: b2,
+                ..
+            },
+        ) = (decl.to_provision(), decl.to_provision())
+        else {
+            panic!("binary");
+        };
+        assert!(std::ptr::eq(t1, t2), "the target map is interned once");
+        assert!(std::ptr::eq(s1, s2), "and so is the digest map");
+        assert!(std::ptr::eq(b1, b2), "and every string");
+    }
+
+    /// The consent prompt shows the viewer's `command`; when the viewer is
+    /// provisioned, what runs is the provision's `bin`. A manifest in which
+    /// the two disagree would have the user allow one program and croft run
+    /// another, so it is refused at parse time (#485 review).
+    #[test]
+    fn a_viewer_whose_provisioned_binary_differs_from_its_command_is_refused() {
+        const MISMATCH: &str = r#"
+id = "z"
+name = "z"
+api_version = 1
+
+[[viewers]]
+id = "z"
+label = "z"
+command = "csvlens"
+provision = { kind = "binary", bin = "something-else", archive = "tar.xz", targets = { "linux-x86_64" = "https://example.invalid/z.tar.xz" } }
+"#;
+        let err = parse(MISMATCH)
+            .expect_err("a viewer that would run a program other than the one it names is refused");
+        assert!(
+            err.to_string().contains("something-else") && err.to_string().contains("csvlens"),
+            "the refusal names both programs: {err}"
+        );
+        // A command given as a path agrees with a bare `bin` by its file name.
+        const AGREES: &str = r#"
+id = "z"
+name = "z"
+api_version = 1
+
+[[viewers]]
+id = "z"
+label = "z"
+command = "/opt/tools/csvlens"
+provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { "linux-x86_64" = "https://example.invalid/z.tar.xz" } }
+"#;
+        assert!(
+            parse(AGREES).is_ok(),
+            "a path whose file name is the bin agrees"
+        );
+    }
+
+    /// The program that runs is `bin_path` when the manifest sets one, not
+    /// `bin`: the consent check follows the path that is spawned, and a
+    /// provisioned path that leaves the managed store (absolute, or through
+    /// a parent reference) is refused for every provision, not only a
+    /// viewer's, since `Path::join` with an absolute argument drops the
+    /// store prefix entirely.
+    #[test]
+    fn a_provisioned_bin_path_must_name_the_command_and_stay_in_the_store() {
+        const OTHER_PROGRAM: &str = r#"
+id = "z"
+name = "z"
+api_version = 1
+
+[[viewers]]
+id = "z"
+label = "z"
+command = "csvlens"
+provision = { kind = "binary", bin = "csvlens", bin_path = "payload/other-program", archive = "tar.xz", targets = { "linux-x86_64" = "https://example.invalid/z.tar.xz" } }
+"#;
+        let err = parse(OTHER_PROGRAM).expect_err("a bin_path naming another program is refused");
+        assert!(err.to_string().contains("other-program"), "{err}");
+        const NESTED_SAME: &str = r#"
+id = "z"
+name = "z"
+api_version = 1
+
+[[viewers]]
+id = "z"
+label = "z"
+command = "csvlens"
+provision = { kind = "binary", bin = "csvlens", bin_path = "csvlens-1.0/bin/csvlens", archive = "tar.xz", targets = { "linux-x86_64" = "https://example.invalid/z.tar.xz" } }
+"#;
+        assert!(
+            parse(NESTED_SAME).is_ok(),
+            "a nested path to the same program agrees"
+        );
+        for (what, bin_path) in [
+            ("absolute", "/tmp/evil"),
+            ("parent", "../../../../tmp/evil"),
+        ] {
+            let src = format!(
+                r#"
+id = "z"
+name = "z"
+api_version = 1
+
+[[mcp_servers]]
+id = "srv"
+command = "evil"
+provision = {{ kind = "binary", bin = "evil", bin_path = "{bin_path}", archive = "gz", targets = {{ "linux-x86_64" = "https://example.invalid/z.gz" }} }}
+"#
+            );
+            let err = parse(&src).expect_err("a provisioned path that leaves the store is refused");
+            assert!(
+                err.to_string().contains("managed store"),
+                "the {what} path is refused for leaving the store: {err}"
+            );
+        }
+    }
+
+    /// #465: a catalog entry that opens a file kind in an external TUI.
+    #[test]
+    fn a_viewers_block_parses_with_its_provision() {
+        const CSVLENS: &str = r#"id = "csvlens"
+name = "csvlens"
+description = "Browse CSV and TSV files in csvlens, a terminal spreadsheet viewer."
+builtin = false
+api_version = 1
+
+[[viewers]]
+id = "csvlens"
+label = "Open in csvlens"
+command = "csvlens"
+args = ["{file}"]
+extensions = ["csv", "tsv"]
+provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { "macos-aarch64" = "https://example.invalid/csvlens-aarch64-apple-darwin.tar.xz" } }
+"#;
+        let m = parse(CSVLENS).expect("the manifest parses");
+        assert_eq!(m.viewers.len(), 1, "one viewer: {:?}", m.viewers);
+        let v = &m.viewers[0];
+        assert_eq!(
+            (v.id.as_str(), v.label.as_str(), v.command.as_str()),
+            ("csvlens", "Open in csvlens", "csvlens")
+        );
+        assert_eq!(v.args, vec!["{file}"]);
+        assert_eq!(v.extensions, vec!["csv", "tsv"]);
+        let p = v.provision.as_ref().expect("provisioned").to_provision();
+        let Provision::Binary { archive, bin, .. } = p else {
+            panic!("a binary provision was declared");
+        };
+        assert_eq!(
+            archive,
+            ArchiveKind::TarXz,
+            "the archive kind reads `tar.xz`"
+        );
+        assert_eq!(bin, "csvlens");
+    }
+
+    /// `archive = "raw"` names an asset that is the executable itself (#834).
+    #[test]
+    fn a_raw_archive_kind_parses() {
+        const DECL: &str = r#"
+id = "r"
+name = "r"
+api_version = 1
+
+[[language_servers]]
+name = "rbin"
+command = "rbin"
+language = "markdown"
+provision = { kind = "binary", bin = "rbin", archive = "raw", targets = { "macos" = "https://example.invalid/rbin" } }
+"#;
+        let m = parse(DECL).expect("the manifest parses");
+        let p = m.language_servers[0]
+            .provision
+            .as_ref()
+            .expect("provisioned")
+            .to_provision();
+        let Provision::Binary { archive, .. } = p else {
+            panic!("a binary provision was declared");
+        };
+        assert_eq!(archive, ArchiveKind::Raw, "the archive kind reads `raw`");
+    }
+
+    /// A uv tool's Termux package defaults to its PyPI name (ty, ruff), can be
+    /// named, and `termux_pkg = false` says Termux has none (rumdl, #851).
+    #[test]
+    fn a_uv_provision_reads_its_termux_package() {
+        let termux_pkg_of = |extra: &str| {
+            let src = format!(
+                "id = \"u\"\nname = \"u\"\napi_version = 1\n\n[[language_servers]]\nname = \"u\"\ncommand = \"u\"\nlanguage = \"markdown\"\nprovision = {{ kind = \"uv\", package = \"pypi-u\", bin = \"u\"{extra} }}\n"
+            );
+            let m = parse(&src).expect("the manifest parses");
+            let Provision::Uv { termux_pkg, .. } = m.language_servers[0]
+                .provision
+                .as_ref()
+                .expect("provisioned")
+                .to_provision()
+            else {
+                panic!("a uv provision was declared");
+            };
+            termux_pkg
+        };
+        assert_eq!(
+            termux_pkg_of(""),
+            Some("pypi-u"),
+            "defaults to the PyPI name"
+        );
+        assert_eq!(termux_pkg_of(", termux_pkg = \"t-u\""), Some("t-u"));
+        assert_eq!(termux_pkg_of(", termux_pkg = false"), None);
+    }
+
+    const PYTHON: &str = include_str!("../../assets/extensions/lsp-python/extension.toml");
+
+    #[test]
+    fn parses_python_manifest_header() {
+        let m = parse(PYTHON).expect("python manifest parses");
+        assert_eq!(m.id, "lsp-python");
+        assert!(m.builtin);
+        assert_eq!(m.api_version, 1);
+        assert_eq!(m.language_servers.len(), 3);
+    }
+
+    #[test]
+    fn entries_python_yields_three_servers_in_priority_order() {
+        let m = parse(PYTHON).unwrap();
+        let entries = entries(&m);
+        let names: Vec<&str> = entries.iter().map(|e| e.config.name).collect();
+        assert_eq!(names, vec!["ty", "basedpyright", "ruff"]);
+        assert!(entries.iter().all(|e| e.language == Language::PYTHON));
+    }
+
+    #[test]
+    fn bundled_summaries_list_user_facing_extensions_and_hide_infra() {
+        let s = summaries(BUNDLED_MANIFESTS);
+        let ids: Vec<&str> = s.iter().map(|e| e.id.as_str()).collect();
+        // The user-facing built-ins appear (incl. the color-themes extension)...
+        for id in [
+            "pdf",
+            "csv",
+            "vim",
+            "lsp-python",
+            "lsp-rust",
+            "themes",
+            "test-cargo",
+            "test-pytest",
+            "test-vitest",
+            "test-jest",
+            "test-go",
+        ] {
+            assert!(ids.contains(&id), "missing {id} in {ids:?}");
+        }
+        // ...and the hidden infrastructure manifest does not.
+        assert!(!ids.contains(&"core-languages"));
+        assert!(s.iter().all(|e| e.builtin));
+    }
+
+    #[test]
+    fn parses_an_mcp_sidecar_manifest() {
+        let src = r#"
+id = "mcp-fetch"
+name = "Fetch"
+api_version = 1
+
+[[mcp_servers]]
+id = "fetch"
+command = "mcp-server-fetch"
+args = ["--quiet"]
+env = { USER_AGENT = "croft" }
+
+[[commands]]
+id = "fetch.url"
+title = "Fetch: URL to Markdown"
+server = "fetch"
+tool = "fetch"
+prompt = "URL"
+"#;
+        let m = parse(src).expect("sidecar manifest parses");
+        assert_eq!(m.mcp_servers.len(), 1);
+        assert_eq!(m.mcp_servers[0].id, "fetch");
+        assert_eq!(m.mcp_servers[0].command, "mcp-server-fetch");
+        assert_eq!(m.mcp_servers[0].env.get("USER_AGENT").unwrap(), "croft");
+        assert_eq!(m.commands.len(), 1);
+        let c = &m.commands[0];
+        assert_eq!(
+            (c.id.as_str(), c.server.as_str(), c.tool.as_str()),
+            ("fetch.url", "fetch", "fetch")
+        );
+        assert_eq!(c.prompt.as_deref(), Some("URL"));
+    }
+
+    #[test]
+    fn reads_sorted_extension_manifests_skipping_subdirs_without_one() {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("croft-ext-read-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("bbb")).unwrap();
+        fs::create_dir_all(base.join("aaa")).unwrap();
+        fs::create_dir_all(base.join("no-manifest")).unwrap();
+        fs::write(base.join("aaa/extension.toml"), "id='aaa'").unwrap();
+        fs::write(base.join("bbb/extension.toml"), "id='bbb'").unwrap();
+        let sources = read_extension_sources(&base);
+        let _ = fs::remove_dir_all(&base);
+        // Sorted by path, and the manifest-less subdir is skipped.
+        assert_eq!(
+            sources,
+            vec!["id='aaa'".to_string(), "id='bbb'".to_string()]
+        );
+        // A missing directory is not an error.
+        assert!(read_extension_sources(&base.join("gone")).is_empty());
+    }
+}

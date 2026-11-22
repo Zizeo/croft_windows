@@ -1,0 +1,2950 @@
+//! Auto-detected project tasks.
+//!
+//! Croft deliberately has no tasks.json requirement of its own: the repo
+//! already declares its rituals in the manifests it ships anyway. This
+//! module reads them and turns each into a runnable shell command for the
+//! "Tasks: Run Task" picker and the `Cmd+Shift+B` default build:
+//!
+//! - `.vscode/tasks.json` (JSONC tolerated) — honoured when present so
+//!   VS Code repos work unchanged, but never required
+//! - `Makefile` / `makefile` / `GNUmakefile` targets → `make <target>`
+//! - `justfile` / `Justfile` recipes → `just <recipe>`
+//! - `package.json` scripts → `npm|pnpm|yarn|bun run <script>` (runner
+//!   picked from the lockfile present)
+//! - `Cargo.toml` → the standard cargo verbs
+//! - `pyproject.toml` `[project.scripts]` → `uv run <name>` (plus
+//!   `uv run pytest` when the file mentions pytest)
+//! - `tsconfig*.json` → `tsc -p <file>` (`tsc -b <file>` when it has
+//!   project references), labelled `tsc: build - <file>` as VS Code
+//!   labels it
+//!
+//! The command line is written to a shell pane's PTY, so PATH, aliases,
+//! and env resolve exactly as if the user typed it.
+
+use std::collections::BTreeSet;
+use std::path::Path;
+
+/// One runnable task. `label` names it in the picker, `command` is the
+/// line written to the pane, `source` says which manifest declared it,
+/// and `is_build` marks candidates for the `Cmd+Shift+B` default build.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Task {
+    pub label: String,
+    pub command: String,
+    pub source: String,
+    pub is_build: bool,
+    /// tasks.json `group.isDefault` — the one task VS Code's Run Build
+    /// Task executes when several carry the build group. Always false for
+    /// convention-derived sources (Makefile, Cargo, …).
+    pub is_default: bool,
+    /// tasks.json `problemMatcher`, kept raw ("$name" string, object, or
+    /// array); `problem_matchers::from_tasks_json` translates it when the
+    /// task runs (#252). Always None for convention-derived sources.
+    pub problem_matcher: Option<serde_json::Value>,
+    /// tasks.json `isBackground`: a watcher (`tsc --watch`) that keeps
+    /// running, so a launch waiting on it waits for its first build rather
+    /// than its exit (#1541). Always false for convention-derived sources.
+    pub is_background: bool,
+    /// A tasks.json entry's parts, kept apart so `${...}` variables are
+    /// expanded and arguments quoted when the task runs; `command` is only
+    /// its display line then. None for convention-derived sources.
+    pub vscode: Option<VscodeCommand>,
+}
+
+/// The runnable parts of a tasks.json entry (see [`Task::command_line`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VscodeCommand {
+    pub command: String,
+    /// How a `{ "value", "quoting" }` command is quoted (#1441); None for a
+    /// plain string, whose text keeps its shell meaning.
+    pub command_quoting: Option<Quoting>,
+    pub args: Vec<TaskArg>,
+    /// `options.cwd`.
+    pub cwd: Option<String>,
+    /// `options.env`, in file order.
+    pub env: Vec<(String, String)>,
+    /// Why croft can't run this entry (a provider `type` it doesn't know,
+    /// or a `dependsOn`-only compound task). The task is still listed, so
+    /// its build-default slot is never handed to another task (#1185).
+    pub unrunnable: Option<String>,
+    /// tasks.json's `inputs` (#1424): what a `${input:id}` asks for.
+    pub inputs: Vec<crate::dap::configs::LaunchInput>,
+    /// The answers given for this run, by input id.
+    pub answers: std::collections::BTreeMap<String, String>,
+}
+
+/// One tasks.json argument: a plain string, or VS Code's
+/// `{ "value": …, "quoting": … }` (`ShellQuotedString`, #1441).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskArg {
+    pub value: String,
+    pub quoting: Option<Quoting>,
+}
+
+/// VS Code's `ShellQuoting` for a `{ "value", "quoting" }` word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quoting {
+    /// Each character the shell would read as syntax gets a backslash.
+    Escape,
+    /// Single quotes: nothing inside is expanded.
+    Strong,
+    /// Double quotes: `$VAR` still expands.
+    Weak,
+}
+
+impl Quoting {
+    /// The `quoting` of a tasks.json word; VS Code quotes strongly when it
+    /// is left out.
+    fn parse(v: Option<&serde_json::Value>) -> Quoting {
+        match v.and_then(|q| q.as_str()) {
+            Some("escape") => Quoting::Escape,
+            Some("weak") => Quoting::Weak,
+            _ => Quoting::Strong,
+        }
+    }
+
+    /// `value` as one shell word, quoted this way.
+    fn apply(self, value: &str) -> String {
+        match self {
+            Quoting::Strong => quote_word(value),
+            Quoting::Weak => format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")),
+            // A backslash before a newline joins lines instead of keeping
+            // the newline, so such a value is quoted strongly instead.
+            Quoting::Escape if value.is_empty() || value.contains('\n') => quote_word(value),
+            Quoting::Escape => value
+                .chars()
+                .flat_map(|c| {
+                    let plain =
+                        c.is_ascii_alphanumeric() || "/._-+=:,@%".contains(c) || !c.is_ascii();
+                    (!plain)
+                        .then_some('\\')
+                        .into_iter()
+                        .chain(std::iter::once(c))
+                })
+                .collect(),
+        }
+    }
+}
+
+impl TaskArg {
+    /// A tasks.json word: a string, or an object with a string `value`.
+    fn parse(v: &serde_json::Value) -> Option<TaskArg> {
+        match v {
+            serde_json::Value::String(s) => Some(TaskArg {
+                value: s.clone(),
+                quoting: None,
+            }),
+            serde_json::Value::Object(o) => Some(TaskArg {
+                value: o.get("value")?.as_str()?.to_string(),
+                quoting: Some(Quoting::parse(o.get("quoting"))),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The word as the picker shows it.
+    fn shown(&self) -> String {
+        match self.quoting {
+            Some(q) => q.apply(&self.value),
+            None => self.value.clone(),
+        }
+    }
+}
+
+impl Task {
+    /// The distinct `${input:id}` ids this task's command, arguments,
+    /// `cwd` and `env` use, in order (#1424).
+    pub fn input_refs(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(v) = &self.vscode {
+            let texts = std::iter::once(&v.command)
+                .chain(v.args.iter().map(|a| &a.value))
+                .chain(&v.cwd)
+                .chain(v.env.iter().map(|(_, value)| value));
+            for text in texts {
+                crate::dap::configs::text_input_refs(text, &mut out);
+            }
+        }
+        out
+    }
+
+    /// The line to type into the task's shell. A tasks.json entry gets its
+    /// `${workspaceFolder}` / `${file}` variables expanded (the shell would
+    /// otherwise expand them to nothing and run `/scripts/build.sh`), each
+    /// argument with whitespace kept one word (`"fix bug"`), and
+    /// `options.cwd` / `options.env` applied in a subshell, so the pane's
+    /// own directory and environment are left alone. Err only when a
+    /// `${file}`-family variable is used with no file open.
+    pub fn command_line(&self, ctx: &crate::dap::configs::SubstCtx) -> Result<String, String> {
+        let Some(v) = &self.vscode else {
+            return Ok(self.command.clone());
+        };
+        if let Some(why) = &v.unrunnable {
+            return Err(why.clone());
+        }
+        let mut answered;
+        let ctx = if v.answers.is_empty() {
+            ctx
+        } else {
+            answered = ctx.clone();
+            answered
+                .inputs
+                .extend(v.answers.iter().map(|(k, a)| (k.clone(), a.clone())));
+            &answered
+        };
+        // The command's literal text keeps its shell meaning (`&&`, globs);
+        // an argument's is quoted only when it must stay one word.
+        let mut line = match v.command_quoting {
+            Some(q) => q.apply(&expand_task_value(&v.command, ctx)?),
+            None => expand_task_text(&v.command, ctx, false)?,
+        };
+        for TaskArg {
+            value: raw,
+            quoting,
+        } in &v.args
+        {
+            if let Some(q) = quoting {
+                line.push(' ');
+                line.push_str(&q.apply(&expand_task_value(raw, ctx)?));
+                continue;
+            }
+            let literal_space =
+                raw.is_empty() || literal_parts(raw).any(|l| l.contains(char::is_whitespace));
+            line.push(' ');
+            // An argument that expands to nothing (an unset `${env:X}`) is
+            // still an argument: left out, the next one took its place
+            // (`--name  f` passed `f` as the name).
+            let arg = expand_task_text(raw, ctx, literal_space)?;
+            line.push_str(if arg.is_empty() { "''" } else { &arg });
+        }
+        let mut setup = Vec::new();
+        if let Some(cwd) = &v.cwd {
+            setup.push(format!("cd {}", expand_task_text(cwd, ctx, true)?));
+        }
+        for (key, value) in &v.env {
+            setup.push(format!(
+                "export {key}={}",
+                expand_task_text(value, ctx, true)?
+            ));
+        }
+        if setup.is_empty() {
+            return Ok(line);
+        }
+        Ok(format!("({} && {line})", setup.join(" && ")))
+    }
+}
+
+/// `raw` with its `${...}` variables substituted for a shell line. A value
+/// a variable filled in is data whatever it holds, so it is quoted when it
+/// needs to be: a workspace `it's` or a file `a;touch x.rs` from a cloned
+/// repo must not reach the shell as syntax, in `python3 ${file}` as much as
+/// in an argument. A variable croft does not know (`${HOME}`) is left bare
+/// for the shell to expand rather than refusing the task; an unset
+/// `${env:X}` is empty, as in VS Code; `${input:...}` / `${command:...}`,
+/// which VS Code prompts for, refuse the task.
+/// With `quote_literals`, the literal text is quoted too, so the whole
+/// result is one shell word.
+fn expand_task_text(
+    raw: &str,
+    ctx: &crate::dap::configs::SubstCtx,
+    quote_literals: bool,
+) -> Result<String, String> {
+    let literal = |out: &mut String, text: &str| {
+        if quote_literals && !text.is_empty() {
+            out.push_str(&quote_word(text));
+        } else {
+            out.push_str(text);
+        }
+    };
+    let mut out = String::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find("${") {
+        let Some(len) = rest[start + 2..].find('}') else {
+            break;
+        };
+        literal(&mut out, &rest[..start]);
+        let var = &rest[start + 2..start + 2 + len];
+        match crate::dap::configs::substitute(&format!("${{{var}}}"), ctx) {
+            Ok(value) if needs_quote(&value) || (quote_literals && value.is_empty()) => {
+                out.push_str(&quote_word(&value));
+            }
+            Ok(value) => out.push_str(&value),
+            Err(e) if e.contains("no active file") => return Err(e),
+            // Asked for before the task runs (#1424); unanswered, bash would
+            // read `${input:x}` as a substring expansion and pass nothing.
+            Err(e) if var.starts_with("input:") => return Err(e),
+            Err(_) if var.starts_with("command:") => {
+                return Err(format!("${{{var}}}: croft cannot run commands in tasks"));
+            }
+            Err(_) if var.starts_with("env:") => {}
+            Err(_) => {
+                out.push_str("${");
+                out.push_str(var);
+                out.push('}');
+            }
+        }
+        rest = &rest[start + 2 + len + 1..];
+    }
+    literal(&mut out, rest);
+    if quote_literals && out.is_empty() {
+        out.push_str("''");
+    }
+    Ok(out)
+}
+
+/// `raw` with its `${...}` variables substituted and nothing quoted, for a
+/// word its `quoting` then quotes whole (#1441). Refuses the same variables
+/// [`expand_task_text`] refuses.
+fn expand_task_value(raw: &str, ctx: &crate::dap::configs::SubstCtx) -> Result<String, String> {
+    let mut out = String::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find("${") {
+        let Some(len) = rest[start + 2..].find('}') else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let var = &rest[start + 2..start + 2 + len];
+        let whole = format!("${{{var}}}");
+        match crate::dap::configs::substitute(&whole, ctx) {
+            Ok(value) => out.push_str(&value),
+            Err(e) if e.contains("no active file") => return Err(e),
+            Err(_) if var.starts_with("input:") || var.starts_with("command:") => {
+                return Err(format!("${{{var}}}: croft cannot prompt for task inputs"));
+            }
+            Err(_) if var.starts_with("env:") => {}
+            Err(_) => out.push_str(&whole),
+        }
+        rest = &rest[start + 2 + len + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// The literal text of `raw` between its `${...}` variables.
+fn literal_parts(raw: &str) -> impl Iterator<Item = &str> {
+    let mut rest = Some(raw);
+    std::iter::from_fn(move || {
+        let r = rest?;
+        match r
+            .find("${")
+            .and_then(|s| r[s + 2..].find('}').map(|l| (s, l)))
+        {
+            Some((s, l)) => {
+                rest = Some(&r[s + 2 + l + 1..]);
+                Some(&r[..s])
+            }
+            None => {
+                rest = None;
+                Some(r)
+            }
+        }
+    })
+}
+
+/// Whether `s` holds anything a shell would read as more than plain text.
+fn needs_quote(s: &str) -> bool {
+    !s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-+=:,@%".contains(c))
+}
+
+/// `s` as one single-quoted POSIX shell word.
+fn quote_word(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Every task the workspace's manifests declare, in source priority
+/// order (tasks.json first so an explicit VS Code default-build wins).
+/// A repeated (label, command line) pair is dropped, first source wins.
+pub fn discover_tasks(root: &Path) -> Vec<Task> {
+    let mut out = Vec::new();
+    out.extend(vscode_tasks(root));
+    out.extend(makefile_tasks(root));
+    out.extend(justfile_tasks(root));
+    out.extend(package_json_tasks(root));
+    out.extend(cargo_tasks(root));
+    out.extend(pyproject_tasks(root));
+    out.extend(go_tasks(root));
+    out.extend(cmake_tasks(root));
+    out.extend(tsconfig_tasks(root));
+    dedup(out)
+}
+
+/// The task a launch.json `preLaunchTask` / `postDebugTask` names (#1412).
+/// The label as written wins; failing that, the label VS Code gives the
+/// same auto-detected task: `npm: <script>` for a package.json script
+/// (whatever runner croft uses for it, as VS Code labels pnpm, yarn and
+/// bun scripts `npm:` too). Err carries a near match to suggest, if any.
+pub fn find_task(tasks: Vec<Task>, label: &str) -> Result<Task, Option<String>> {
+    if let Some(i) = tasks.iter().position(|t| t.label == label) {
+        return Ok(tasks.into_iter().nth(i).expect("found"));
+    }
+    if let Some(script) = label.strip_prefix("npm: ")
+        && let Some(i) = tasks
+            .iter()
+            .position(|t| t.source == "package.json" && package_script(&t.label) == Some(script))
+    {
+        return Ok(tasks.into_iter().nth(i).expect("found"));
+    }
+    // The last word is the script or target name in every label croft
+    // and VS Code give (`npm: build`, `npm run build`, `make build`).
+    let last = |l: &str| l.rsplit([' ', ':']).next().unwrap_or("").to_lowercase();
+    let want = last(label);
+    Err(tasks
+        .into_iter()
+        .find(|t| !want.is_empty() && last(&t.label) == want)
+        .map(|t| t.label))
+}
+
+/// The script a package.json task's label runs.
+fn package_script(label: &str) -> Option<&str> {
+    ["npm run ", "pnpm run ", "bun run ", "yarn "]
+        .iter()
+        .find_map(|runner| label.strip_prefix(runner))
+}
+
+/// VS Code's auto-detected TypeScript build task (#1412): `tsc: build -
+/// <file>` for each `tsconfig*.json` at the root, running `tsc -p <file>`
+/// with the project's own compiler when it has one.
+fn tsconfig_tasks(root: &Path) -> Vec<Task> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("tsconfig") && n.ends_with(".json"))
+        .filter(|n| !n.contains(char::is_whitespace))
+        .collect();
+    names.sort();
+    let tsc = if root.join("node_modules/.bin/tsc").is_file() {
+        "node_modules/.bin/tsc"
+    } else {
+        "tsc"
+    };
+    names
+        .into_iter()
+        .map(|name| {
+            // The filename is repository-controlled and the terminal runs
+            // this line, so anything beyond plain text goes in as one word.
+            let word = if needs_quote(&name) {
+                quote_word(&name)
+            } else {
+                name.clone()
+            };
+            // A config with project references builds them only in build
+            // mode, which is what VS Code's task switches to.
+            let mode = if has_references(&root.join(&name)) {
+                "-b"
+            } else {
+                "-p"
+            };
+            Task {
+                label: format!("tsc: build - {name}"),
+                command: format!("{tsc} {mode} {word}"),
+                source: name,
+                is_build: true,
+                is_default: false,
+                problem_matcher: Some(serde_json::Value::String(String::from("$tsc"))),
+                is_background: false,
+                vscode: None,
+            }
+        })
+        .collect()
+}
+
+/// Whether the tsconfig at `path` lists any project `references`.
+fn has_references(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| {
+            serde_json::from_str::<serde_json::Value>(&crate::jsonc::strip_jsonc(&text)).ok()
+        })
+        .and_then(|v| v.get("references")?.as_array().map(|a| !a.is_empty()))
+        .unwrap_or(false)
+}
+
+/// The task `Cmd+Shift+B` runs: the explicit `isDefault` build task when
+/// one is declared, else the first build-flagged task in source priority
+/// order.
+pub fn default_build_task(tasks: &[Task]) -> Option<&Task> {
+    tasks
+        .iter()
+        .find(|t| t.is_build && t.is_default)
+        .or_else(|| tasks.iter().find(|t| t.is_build))
+}
+
+fn read_first(root: &Path, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|n| std::fs::read_to_string(root.join(n)).ok())
+}
+
+fn vscode_tasks(root: &Path) -> Vec<Task> {
+    let Some(text) = read_first(root, &[".vscode/tasks.json"]) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&crate::jsonc::strip_jsonc(&text)) else {
+        return Vec::new();
+    };
+    let Some(tasks) = v.get("tasks").and_then(|t| t.as_array()) else {
+        return Vec::new();
+    };
+    let inputs = crate::dap::configs::parse_inputs(&v);
+    tasks
+        .iter()
+        .map(|t| with_top_level(t, &v))
+        .filter_map(|t| {
+            let t = &t;
+            let entry = provider_command(root, t)?;
+            let command = entry.command.as_str();
+            let mut args: Vec<TaskArg> = entry.args;
+            args.extend(
+                t.get("args")
+                    .and_then(|a| a.as_array())
+                    .map(|a| a.iter().filter_map(TaskArg::parse).collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            );
+            let options = t.get("options");
+            let vscode = VscodeCommand {
+                command: command.to_string(),
+                command_quoting: entry.command_quoting,
+                args: args.clone(),
+                cwd: options
+                    .and_then(|o| o.get("cwd"))
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string)
+                    .or(entry.cwd),
+                unrunnable: entry.unrunnable,
+                inputs: inputs.clone(),
+                answers: Default::default(),
+                env: options
+                    .and_then(|o| o.get("env"))
+                    .and_then(|e| e.as_object())
+                    .map(|e| {
+                        e.iter()
+                            .filter(|(k, _)| {
+                                !k.is_empty()
+                                    && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                    && !k.starts_with(|c: char| c.is_ascii_digit())
+                            })
+                            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            };
+            let mut line = match entry.command_quoting {
+                Some(q) => q.apply(command),
+                None => command.to_string(),
+            };
+            for a in &args {
+                line.push(' ');
+                line.push_str(&a.shown());
+            }
+            // VS Code labels a label-less entry by its full command line,
+            // not the bare program: three label-less `npm` entries must
+            // stay three tasks, not collapse to one "npm".
+            let label = t
+                .get("label")
+                .and_then(|l| l.as_str())
+                .map(str::to_string)
+                .or(entry.label)
+                .unwrap_or(line.clone());
+            let is_build = match t.get("group") {
+                Some(serde_json::Value::String(s)) => s == "build",
+                Some(g) => g.get("kind").and_then(|k| k.as_str()) == Some("build"),
+                None => false,
+            };
+            let is_default = t
+                .get("group")
+                .and_then(|g| g.get("isDefault"))
+                .and_then(|d| d.as_bool())
+                .unwrap_or(false);
+            Some(Task {
+                label,
+                command: line,
+                source: "tasks.json".to_string(),
+                is_build,
+                is_default,
+                problem_matcher: t.get("problemMatcher").cloned(),
+                is_background: t
+                    .get("isBackground")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                vscode: Some(vscode),
+            })
+        })
+        .collect()
+}
+
+/// A tasks.json entry with what it leaves out taken from the file's top
+/// level, as VS Code does (#1441): the top-level `options` sit under the
+/// task's own (its `cwd` wins, and the `env` maps merge key by key with the
+/// task's values winning), and a task with no `command` of its own runs the
+/// top-level `command` and its `args`, followed by any of its own. A `type` it
+/// leaves out is the top level's too. A `dependsOn` task with no command
+/// stays a compound task.
+fn with_top_level(t: &serde_json::Value, top: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    let mut t = t.clone();
+    let Some(task) = t.as_object_mut() else {
+        return t;
+    };
+    if let Some(kind) = top.get("type")
+        && !task.contains_key("type")
+    {
+        task.insert("type".into(), kind.clone());
+    }
+    if !task.contains_key("command")
+        && !task.contains_key("dependsOn")
+        && let Some(command) = top.get("command")
+    {
+        task.insert("command".into(), command.clone());
+        // The task's own `args` are extra arguments to the shared command,
+        // after the top-level ones, as VS Code's `fillGlobals` joins them.
+        if let Some(Value::Array(shared)) = top.get("args") {
+            let mut args = shared.clone();
+            if let Some(Value::Array(own)) = task.get("args") {
+                args.extend(own.iter().cloned());
+            }
+            task.insert("args".into(), Value::Array(args));
+        }
+    }
+    if let Some(Value::Object(shared)) = top.get("options") {
+        let mut options = shared.clone();
+        if let Some(Value::Object(own)) = task.get("options") {
+            for (key, value) in own {
+                if let (Some(Value::Object(env)), "env", Value::Object(own_env)) =
+                    (options.get_mut(key), key.as_str(), value)
+                {
+                    env.extend(own_env.clone());
+                } else {
+                    options.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        task.insert("options".into(), Value::Object(options));
+    }
+    t
+}
+
+/// What a tasks.json entry runs, before its own `args` and `options`.
+struct ProviderCommand {
+    command: String,
+    command_quoting: Option<Quoting>,
+    args: Vec<TaskArg>,
+    cwd: Option<String>,
+    /// VS Code's label for a provider task with none of its own.
+    label: Option<String>,
+    unrunnable: Option<String>,
+}
+
+/// The command a tasks.json entry runs. One with a `command` runs it. One
+/// without is a provider task (`"type": "npm", "script": "compile"` is what
+/// VS Code's Configure Default Build Task writes for an npm script) or a
+/// `dependsOn`-only compound task: an npm script runs with the runner the
+/// repo's lockfile picks, from its `path` package; anything else is kept
+/// as an entry croft refuses to run, so a default build is never swapped
+/// for another task (#1185). `None` only for an entry that is not a task.
+fn provider_command(root: &Path, t: &serde_json::Value) -> Option<ProviderCommand> {
+    if let Some(command) = t.get("command").and_then(TaskArg::parse) {
+        return Some(ProviderCommand {
+            command: command.value,
+            command_quoting: command.quoting,
+            args: Vec::new(),
+            cwd: None,
+            label: None,
+            unrunnable: None,
+        });
+    }
+    let kind = t.get("type").and_then(|k| k.as_str());
+    let path = t
+        .get("path")
+        .and_then(|p| p.as_str())
+        .map(|p| p.trim_end_matches('/'))
+        .filter(|p| !p.is_empty());
+    if kind == Some("npm")
+        && let Some(script) = t.get("script").and_then(|s| s.as_str())
+    {
+        let runner = js_runner(root);
+        return Some(ProviderCommand {
+            command: runner.to_string(),
+            command_quoting: None,
+            args: vec![TaskArg {
+                value: script.to_string(),
+                quoting: None,
+            }],
+            cwd: path.map(|p| format!("${{workspaceFolder}}/{p}")),
+            label: Some(match path {
+                Some(p) => format!("npm: {script} - {p}"),
+                None => format!("npm: {script}"),
+            }),
+            unrunnable: None,
+        });
+    }
+    let (label, why) = match kind {
+        Some(k) if k != "shell" && k != "process" => (
+            format!("{k} task"),
+            format!("it uses type \"{k}\", which croft cannot run"),
+        ),
+        _ if t.get("dependsOn").is_some() => (
+            String::from("compound task"),
+            String::from("it only runs its dependsOn tasks, which croft cannot chain yet"),
+        ),
+        _ => return None,
+    };
+    Some(ProviderCommand {
+        command: String::new(),
+        command_quoting: None,
+        args: Vec::new(),
+        cwd: None,
+        label: Some(label),
+        unrunnable: Some(why),
+    })
+}
+
+/// The package script runner a JS repo uses, by its lockfile.
+fn js_runner(root: &Path) -> &'static str {
+    if root.join("bun.lockb").exists() || root.join("bun.lock").exists() {
+        "bun run"
+    } else if root.join("pnpm-lock.yaml").exists() {
+        "pnpm run"
+    } else if root.join("yarn.lock").exists() {
+        "yarn"
+    } else {
+        "npm run"
+    }
+}
+
+fn makefile_tasks(root: &Path) -> Vec<Task> {
+    let Some(text) = read_first(root, &["Makefile", "makefile", "GNUmakefile"]) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for line in text.lines() {
+        // Recipe lines are tab-indented; rules start at column zero.
+        if line.starts_with(['\t', ' ', '#']) {
+            continue;
+        }
+        // `target: deps` — but not `var := value` / `var = value`, not
+        // pattern rules (`%.o:`), not special targets (`.PHONY:`).
+        let Some((head, rest)) = line.split_once(':') else {
+            continue;
+        };
+        if rest.starts_with('=') {
+            continue;
+        }
+        let name = head.trim();
+        if name.is_empty()
+            || name.starts_with('.')
+            || name.contains(['%', '$', '=', ' ', '\t'])
+            || !seen.insert(name.to_string())
+        {
+            continue;
+        }
+        out.push(Task {
+            label: format!("make {name}"),
+            command: format!("make {name}"),
+            source: "Makefile".to_string(),
+            is_build: name == "build" || name == "all",
+            is_default: false,
+            problem_matcher: None,
+            is_background: false,
+            vscode: None,
+        });
+    }
+    out
+}
+
+fn justfile_tasks(root: &Path) -> Vec<Task> {
+    let Some(text) = read_first(root, &["justfile", "Justfile", ".justfile"]) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.starts_with([' ', '\t', '#', '@']) || line.starts_with("set ") {
+            continue;
+        }
+        // `recipe arg="x":` — the name is the first word; assignments
+        // (`name := value`) carry `:=` and are skipped.
+        let Some((head, rest)) = line.split_once(':') else {
+            continue;
+        };
+        if rest.starts_with('=') {
+            continue;
+        }
+        let name = head.split_whitespace().next().unwrap_or("");
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_alphanumeric() || "_-".contains(c))
+        {
+            continue;
+        }
+        out.push(Task {
+            label: format!("just {name}"),
+            command: format!("just {name}"),
+            source: "justfile".to_string(),
+            is_build: name == "build",
+            is_default: false,
+            problem_matcher: None,
+            is_background: false,
+            vscode: None,
+        });
+    }
+    out
+}
+
+fn package_json_tasks(root: &Path) -> Vec<Task> {
+    let Some(text) = read_first(root, &["package.json"]) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    // Pick the runner the repo actually uses, by its lockfile.
+    let runner = js_runner(root);
+    let mut out: Vec<Task> = v
+        .get("scripts")
+        .and_then(|s| s.as_object())
+        .into_iter()
+        .flat_map(|scripts| scripts.keys())
+        .map(|name| Task {
+            label: format!("{runner} {name}"),
+            command: format!("{runner} {name}"),
+            source: "package.json".to_string(),
+            is_build: name == "build",
+            is_default: false,
+            problem_matcher: None,
+            is_background: false,
+            vscode: None,
+        })
+        .collect();
+    // A workspaces monorepo keeps most scripts in its packages (#1515).
+    // Each runs from its own folder with the root lockfile's runner, under
+    // the label VS Code's npm task detection gives it, which is also what a
+    // launch.json `preLaunchTask` names. None is a build default: with
+    // several packages, picking one's `build` for Run Build Task would be
+    // a guess.
+    for rel in workspace_packages(root, &v) {
+        let Ok(text) = std::fs::read_to_string(root.join(&rel).join("package.json")) else {
+            continue;
+        };
+        let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(scripts) = pkg.get("scripts").and_then(|s| s.as_object()) else {
+            continue;
+        };
+        for name in scripts.keys() {
+            out.push(Task {
+                label: format!("npm: {name} - {rel}"),
+                command: format!("{runner} {name}"),
+                source: format!("{rel}/package.json"),
+                is_build: false,
+                is_default: false,
+                problem_matcher: None,
+                is_background: false,
+                vscode: Some(VscodeCommand {
+                    command: runner.to_string(),
+                    command_quoting: None,
+                    // A script name can hold shell syntax (`check;false`);
+                    // it goes to the runner as one word.
+                    args: vec![TaskArg {
+                        value: name.clone(),
+                        quoting: needs_quote(name).then_some(Quoting::Strong),
+                    }],
+                    cwd: Some(format!("${{workspaceFolder}}/{rel}")),
+                    env: Vec::new(),
+                    unrunnable: None,
+                    // package.json scripts have no `${input:id}` prompts.
+                    inputs: Vec::new(),
+                    answers: Default::default(),
+                }),
+            });
+        }
+    }
+    out
+}
+
+/// Deepest folder level a workspace glob is followed to: `packages/*` is
+/// two, a `**` pattern stops here, so a stray glob cannot walk the disk.
+const WORKSPACE_GLOB_DEPTH: usize = 4;
+
+/// The member packages of a JS workspaces monorepo at `root`, as sorted
+/// `/`-separated paths relative to it (#1515): `pnpm-workspace.yaml`'s
+/// `packages:` list when that file exists (pnpm reads only it), or else the
+/// root package.json's `workspaces` globs (an array, or yarn's
+/// `{ "packages": [...] }`). A `!` glob excludes.
+/// Only folders holding a package.json count, and `node_modules` and
+/// dot folders are never entered.
+fn workspace_packages(root: &Path, manifest: &serde_json::Value) -> Vec<String> {
+    let globs: Vec<String> = match std::fs::read_to_string(root.join("pnpm-workspace.yaml")) {
+        Ok(yaml) => pnpm_workspace_globs(&yaml),
+        Err(_) => manifest
+            .get("workspaces")
+            .and_then(|w| {
+                w.as_array()
+                    .or_else(|| w.get("packages").and_then(|p| p.as_array()))
+            })
+            .into_iter()
+            .flatten()
+            .filter_map(|g| g.as_str().map(str::to_string))
+            .collect(),
+    };
+    let build = |neg: bool| {
+        let mut b = globset::GlobSetBuilder::new();
+        for g in &globs {
+            if g.starts_with('!') != neg {
+                continue;
+            }
+            let g = g.trim_start_matches('!').trim_start_matches("./");
+            let g = g.trim_end_matches('/');
+            if let Ok(glob) = globset::GlobBuilder::new(g).literal_separator(true).build() {
+                b.add(glob);
+            }
+        }
+        b.build().ok()
+    };
+    let (Some(include), Some(exclude)) = (build(false), build(true)) else {
+        return Vec::new();
+    };
+    if include.is_empty() {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    let mut stack = vec![(String::new(), 0usize)];
+    while let Some((rel, depth)) = stack.pop() {
+        if depth == WORKSPACE_GLOB_DEPTH {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(root.join(&rel)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == "node_modules" || name.starts_with('.') {
+                continue;
+            }
+            // `file_type` does not follow a symlink: a linked package
+            // (pnpm's) is not walked twice.
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if include.is_match(&child)
+                && !exclude.is_match(&child)
+                && root.join(&child).join("package.json").is_file()
+            {
+                found.push(child.clone());
+            }
+            stack.push((child, depth + 1));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// The `packages:` globs of a `pnpm-workspace.yaml`, read as the plain
+/// block list pnpm documents (`  - 'packages/*'`), without a YAML parser.
+fn pnpm_workspace_globs(yaml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in yaml.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !line.starts_with([' ', '\t', '-']) {
+            inside = trimmed == "packages:";
+            continue;
+        }
+        if inside && let Some(item) = trimmed.strip_prefix('-') {
+            let item = item.split(" #").next().unwrap_or("").trim();
+            let item = item.trim_matches(|c| c == '\'' || c == '"');
+            if !item.is_empty() {
+                out.push(item.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn cargo_tasks(root: &Path) -> Vec<Task> {
+    if !root.join("Cargo.toml").is_file() {
+        return Vec::new();
+    }
+    [
+        ("cargo build", true),
+        ("cargo test", false),
+        ("cargo clippy", false),
+        ("cargo run", false),
+    ]
+    .into_iter()
+    .map(|(cmd, is_build)| Task {
+        label: cmd.to_string(),
+        command: cmd.to_string(),
+        source: "Cargo.toml".to_string(),
+        is_build,
+        is_default: false,
+        problem_matcher: None,
+        is_background: false,
+        vscode: None,
+    })
+    .collect()
+}
+
+/// A convention task: `command` under its own name, with a built-in
+/// problem matcher so its errors land in PROBLEMS.
+fn convention_task(command: String, source: &str, is_build: bool, matcher: Option<&str>) -> Task {
+    Task {
+        label: command.clone(),
+        command,
+        source: source.to_string(),
+        is_build,
+        is_default: false,
+        problem_matcher: matcher.map(serde_json::Value::from),
+        is_background: false,
+        vscode: None,
+    }
+}
+
+/// Tasks for a Go module (#1361): build, test and vet every package, and
+/// `go run .` when the module root is a command. Errors go through the
+/// `$go` matcher.
+fn go_tasks(root: &Path) -> Vec<Task> {
+    if !root.join("go.mod").is_file() {
+        return Vec::new();
+    }
+    let mut out = vec![
+        convention_task("go build ./...".into(), "go.mod", true, Some("$go")),
+        convention_task("go test ./...".into(), "go.mod", false, Some("$go")),
+        convention_task("go vet ./...".into(), "go.mod", false, Some("$go")),
+    ];
+    if root_is_go_main(root) {
+        out.push(convention_task(
+            "go run .".into(),
+            "go.mod",
+            false,
+            Some("$go"),
+        ));
+    }
+    out
+}
+
+/// Whether the module root holds a `package main` (a test file aside).
+/// The package clause is the first token outside comments, and a file
+/// marked `//go:build ignore` is not part of the package.
+fn root_is_go_main(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        name.ends_with(".go")
+            && !name.ends_with("_test.go")
+            && std::fs::read_to_string(e.path())
+                .is_ok_and(|text| go_package_name(&text).as_deref() == Some("main"))
+    })
+}
+
+/// The package a Go source file declares, or `None` when it has none or
+/// a `//go:build ignore` constraint keeps the Go tool from building it.
+fn go_package_name(text: &str) -> Option<String> {
+    let mut rest = text;
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix("//") {
+            let (line, tail) = after.split_once('\n').unwrap_or((after, ""));
+            if let Some(expr) = line.strip_prefix("go:build")
+                && expr
+                    .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '!')
+                    .any(|w| w == "ignore")
+            {
+                return None;
+            }
+            rest = tail;
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/")?.1;
+        } else {
+            let mut words = rest.split_whitespace();
+            return (words.next()? == "package")
+                .then(|| words.next())
+                .flatten()
+                .map(|w| w.trim_end_matches(';').to_string());
+        }
+    }
+}
+
+/// Tasks for a CMake project (#1361): configure, build (the build task)
+/// and test. `CMakePresets.json` presets are used when it has them;
+/// otherwise the build folder is the one `compile_commands.json` already
+/// points into, else `build`. Before the folder is configured, the build
+/// task configures it first, so `Cmd+Shift+B` works on a fresh checkout.
+/// Compiler errors go through the `$gcc` matcher.
+fn cmake_tasks(root: &Path) -> Vec<Task> {
+    if !root.join("CMakeLists.txt").is_file() {
+        return Vec::new();
+    }
+    const SOURCE: &str = "CMakeLists.txt";
+    let word = |s: &str| {
+        if needs_quote(s) {
+            quote_word(s)
+        } else {
+            s.to_string()
+        }
+    };
+    if let Some(presets) = cmake_presets(root) {
+        let dir = word(&presets.binary_dir);
+        let mut out = vec![convention_task(
+            format!("cmake --preset {}", word(&presets.configure)),
+            SOURCE,
+            false,
+            None,
+        )];
+        let build = match &presets.build {
+            Some(b) => format!("cmake --build --preset {}", word(b)),
+            None => format!("cmake --build {dir}"),
+        };
+        let build = if root
+            .join(&presets.binary_dir)
+            .join("CMakeCache.txt")
+            .is_file()
+        {
+            build
+        } else {
+            format!("{} && {build}", out[0].command)
+        };
+        out.push(convention_task(build, SOURCE, true, Some("$gcc")));
+        out.push(convention_task(
+            match &presets.test {
+                Some(t) => format!("ctest --preset {}", word(t)),
+                None => format!("ctest --test-dir {dir}"),
+            },
+            SOURCE,
+            false,
+            None,
+        ));
+        return out;
+    }
+    let dir = cmake_build_dir(root);
+    let shell_dir = word(&dir);
+    let configure = format!("cmake -S . -B {shell_dir}");
+    let build = format!("cmake --build {shell_dir}");
+    let build_line = if root.join(&dir).join("CMakeCache.txt").is_file() {
+        build
+    } else {
+        format!("{configure} && {build}")
+    };
+    vec![
+        convention_task(configure, SOURCE, false, None),
+        convention_task(build_line, SOURCE, true, Some("$gcc")),
+        convention_task(format!("ctest --test-dir {shell_dir}"), SOURCE, false, None),
+    ]
+}
+
+/// The build folder a CMake project already uses: the one the root's
+/// `compile_commands.json` link points into (how clangd is usually shown
+/// the build), else `build`.
+fn cmake_build_dir(root: &Path) -> String {
+    std::fs::read_link(root.join("compile_commands.json"))
+        .ok()
+        .and_then(|target| {
+            let target = if target.is_absolute() {
+                target.strip_prefix(root).ok()?.to_path_buf()
+            } else {
+                target
+            };
+            let dir = target
+                .parent()?
+                .to_str()?
+                .trim_start_matches("./")
+                .to_string();
+            (!dir.is_empty() && !dir.split('/').any(|c| c == "..")).then_some(dir)
+        })
+        .unwrap_or_else(|| String::from("build"))
+}
+
+/// What `CMakePresets.json` names: its first enabled configure preset,
+/// that preset's build folder, and the first build and test presets made
+/// for it.
+struct CmakePresets {
+    configure: String,
+    binary_dir: String,
+    build: Option<String>,
+    test: Option<String>,
+}
+
+fn cmake_presets(root: &Path) -> Option<CmakePresets> {
+    let text = std::fs::read_to_string(root.join("CMakePresets.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let all = |kind: &str| -> Vec<serde_json::Value> {
+        v.get(kind)
+            .and_then(|p| p.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let name = |p: &serde_json::Value| p["name"].as_str().unwrap_or_default().to_string();
+    // Presets a user can pick: named, not hidden, and not disabled by
+    // their (possibly inherited) condition on this host.
+    let visible = |presets: &[serde_json::Value]| -> Vec<serde_json::Value> {
+        presets
+            .iter()
+            .filter(|p| p.get("hidden").and_then(|h| h.as_bool()) != Some(true))
+            .filter(|p| p.get("name").and_then(|n| n.as_str()).is_some())
+            .filter(|p| {
+                preset_field(presets, p, "condition", 0)
+                    .is_none_or(|c| cmake_condition_holds(&c, &name(p)))
+            })
+            .cloned()
+            .collect()
+    };
+    let configures = all("configurePresets");
+    let configure = visible(&configures).into_iter().next()?;
+    let configure_name = name(&configure);
+    let binary_dir = preset_field(&configures, &configure, "binaryDir", 0)
+        .and_then(|b| b.as_str().map(str::to_string))
+        .map(|b| {
+            b.replace("${sourceDir}/", "")
+                .replace("${presetName}", &configure_name)
+        })
+        .filter(|b| !b.contains("${") && !b.is_empty())
+        .unwrap_or_else(|| String::from("build"));
+    let for_configure = |kind: &str| {
+        let presets = all(kind);
+        visible(&presets)
+            .iter()
+            .find(|p| {
+                preset_field(&presets, p, "configurePreset", 0)
+                    .is_some_and(|c| c.as_str() == Some(&configure_name))
+            })
+            .map(name)
+    };
+    Some(CmakePresets {
+        build: for_configure("buildPresets"),
+        test: for_configure("testPresets"),
+        configure: configure_name,
+        binary_dir,
+    })
+}
+
+/// A preset's `key`, its own or the first one its `inherits` chain gives.
+fn preset_field(
+    presets: &[serde_json::Value],
+    preset: &serde_json::Value,
+    key: &str,
+    depth: usize,
+) -> Option<serde_json::Value> {
+    if let Some(value) = preset.get(key) {
+        return Some(value.clone());
+    }
+    if depth > 16 {
+        return None;
+    }
+    let parents: Vec<&str> = match preset.get("inherits")? {
+        serde_json::Value::String(s) => vec![s.as_str()],
+        serde_json::Value::Array(a) => a.iter().filter_map(|p| p.as_str()).collect(),
+        _ => Vec::new(),
+    };
+    parents.into_iter().find_map(|parent| {
+        let p = presets
+            .iter()
+            .find(|p| p.get("name").and_then(|n| n.as_str()) == Some(parent))?;
+        preset_field(presets, p, key, depth + 1)
+    })
+}
+
+/// Whether a preset `condition` holds on this host. A kind this does not
+/// know counts as true, so an unfamiliar preset is still offered.
+fn cmake_condition_holds(c: &serde_json::Value, preset_name: &str) -> bool {
+    let expand = |s: &serde_json::Value| -> String {
+        let host = match std::env::consts::OS {
+            "linux" => "Linux",
+            "macos" => "Darwin",
+            "windows" => "Windows",
+            other => other,
+        };
+        let s = s
+            .as_str()
+            .unwrap_or_default()
+            .replace("${hostSystemName}", host)
+            .replace("${presetName}", preset_name);
+        regex::Regex::new(r"\$p?env\{([^}]*)\}")
+            .map(|re| {
+                re.replace_all(&s, |m: &regex::Captures| {
+                    std::env::var(&m[1]).unwrap_or_default()
+                })
+                .into_owned()
+            })
+            .unwrap_or(s)
+    };
+    let list = |key: &str| -> Vec<String> {
+        c.get(key)
+            .and_then(|l| l.as_array())
+            .map(|a| a.iter().map(expand).collect())
+            .unwrap_or_default()
+    };
+    let conditions = |key: &str| -> Vec<serde_json::Value> {
+        c.get(key)
+            .and_then(|l| l.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let matches = || {
+        regex::Regex::new(&expand(&c["regex"])).is_ok_and(|re| re.is_match(&expand(&c["string"])))
+    };
+    match c {
+        serde_json::Value::Null => return true,
+        serde_json::Value::Bool(b) => return *b,
+        _ => {}
+    }
+    match c.get("type").and_then(|t| t.as_str()) {
+        Some("const") => c.get("value").and_then(|v| v.as_bool()).unwrap_or(true),
+        Some("equals") => expand(&c["lhs"]) == expand(&c["rhs"]),
+        Some("notEquals") => expand(&c["lhs"]) != expand(&c["rhs"]),
+        Some("inList") => list("list").contains(&expand(&c["string"])),
+        Some("notInList") => !list("list").contains(&expand(&c["string"])),
+        Some("matches") => matches(),
+        Some("notMatches") => !matches(),
+        Some("anyOf") => conditions("conditions")
+            .iter()
+            .any(|c| cmake_condition_holds(c, preset_name)),
+        Some("allOf") => conditions("conditions")
+            .iter()
+            .all(|c| cmake_condition_holds(c, preset_name)),
+        Some("not") => !cmake_condition_holds(&c["condition"], preset_name),
+        _ => true,
+    }
+}
+
+fn pyproject_tasks(root: &Path) -> Vec<Task> {
+    let on_path = |tool: &str| {
+        std::env::var_os("PATH")
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join(tool).is_file()))
+    };
+    pyproject_tasks_on(root, &on_path)
+}
+
+/// Tasks for a `pyproject.toml`: its scripts and, when it mentions pytest,
+/// pytest, run the way the project runs things (#1296). The runner comes
+/// from what the project has, as `package_json_tasks` picks one from the
+/// lockfile: `uv.lock` means uv, Poetry's lock or table means Poetry, PDM's
+/// means PDM, then a project venv, then uv only when it is installed. A
+/// Poetry project under `uv run` fails with "No `project` table found", and
+/// a machine without uv fails every task. Each tool is used only when
+/// `on_path` finds it: a Poetry repo set up with a plain `python -m venv`
+/// offered nothing but `poetry run` tasks that failed with exit 127, while
+/// its `.venv` would have run them.
+fn pyproject_tasks_on(root: &Path, on_path: &dyn Fn(&str) -> bool) -> Vec<Task> {
+    let Some(text) = read_first(root, &["pyproject.toml"]) else {
+        return Vec::new();
+    };
+    let table = text.parse::<toml::Table>().unwrap_or_default();
+    let tool = |name: &str| table.get("tool").and_then(|t| t.get(name));
+    let venv = [".venv", "venv"]
+        .into_iter()
+        .find(|v| root.join(v).join("bin/python").is_file());
+    // (prefix for a script, the pytest command)
+    let uv_on_path = on_path("uv");
+    let uv_runs = root.join("uv.lock").exists() && uv_on_path;
+    let poetry_runs = !uv_runs
+        && (root.join("poetry.lock").exists() || tool("poetry").is_some())
+        && on_path("poetry");
+    let pdm_runs = !uv_runs
+        && !poetry_runs
+        && (root.join("pdm.lock").exists() || tool("pdm").is_some())
+        && on_path("pdm");
+    let (script_prefix, pytest) = if uv_runs {
+        (String::from("uv run "), String::from("uv run pytest"))
+    } else if poetry_runs {
+        (
+            String::from("poetry run "),
+            String::from("poetry run pytest"),
+        )
+    } else if pdm_runs {
+        (String::from("pdm run "), String::from("pdm run pytest"))
+    } else if let Some(venv) = venv {
+        (
+            format!("{venv}/bin/"),
+            format!("{venv}/bin/python -m pytest"),
+        )
+    } else if uv_on_path {
+        (String::from("uv run "), String::from("uv run pytest"))
+    } else {
+        (String::new(), String::from("python3 -m pytest"))
+    };
+    // `[project.scripts]` and Poetry's scripts are entry points installed
+    // into the venv's `bin/`, so any runner reaches them. `[tool.pdm.scripts]`
+    // are PDM's own task definitions (`lint = "ruff check ."`), which only
+    // `pdm run` understands: under the venv or uv they named a binary that
+    // does not exist.
+    let script_tables = [
+        table.get("project").and_then(|p| p.get("scripts")),
+        tool("poetry").and_then(|p| p.get("scripts")),
+        tool("pdm")
+            .and_then(|p| p.get("scripts"))
+            .filter(|_| pdm_runs),
+    ];
+    let mut names: Vec<&String> = Vec::new();
+    for scripts in script_tables
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.as_table())
+    {
+        for name in scripts.keys() {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    let task = |command: String| Task {
+        label: command.clone(),
+        command,
+        source: "pyproject.toml".to_string(),
+        is_build: false,
+        is_default: false,
+        problem_matcher: None,
+        is_background: false,
+        vscode: None,
+    };
+    let mut out: Vec<Task> = names
+        .into_iter()
+        .map(|name| {
+            // A quoted TOML key can hold shell syntax; the terminal runs this
+            // line, so the name goes in as one word.
+            let word = if needs_quote(name) {
+                quote_word(name)
+            } else {
+                name.clone()
+            };
+            task(format!("{script_prefix}{word}"))
+        })
+        .collect();
+    if text.contains("pytest") {
+        out.push(task(pytest));
+    }
+    out
+}
+
+/// One task per (label, command line), first source winning. The label is
+/// the identifier everything else keys on (`preLaunchTask`, the Run Task
+/// picker), so a label the workspace declares must survive; the command is
+/// what runs, so a distinct command must survive too. De-duplicating by
+/// command line alone dropped a convention source's label whenever
+/// tasks.json reused its command under another name, and the lookup then
+/// reported "not found" for a task the workspace plainly declared (#336).
+/// The one thing that still collapses is a true repeat: the same label
+/// running the same line. A user who relabels `cargo build` sees it listed
+/// under both names, by design. Two tasks sharing a label with DIFFERENT
+/// commands both survive here; the lookups keyed on the label alone
+/// (`preLaunchTask`, task-pane reuse) then resolve to the first, so a
+/// workspace that reuses a label across commands gets first-source-wins at
+/// the lookup, not in this list.
+fn dedup(tasks: Vec<Task>) -> Vec<Task> {
+    let mut seen = BTreeSet::new();
+    tasks
+        .into_iter()
+        .filter(|t| seen.insert((t.label.clone(), t.command.clone())))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn commands(root: &Path) -> Vec<String> {
+        discover_tasks(root)
+            .into_iter()
+            .map(|t| t.command)
+            .collect()
+    }
+
+    /// The words a shell line splits into, and the cwd/env it sets up, as a
+    /// real `sh` sees them: the program is swapped for a printer, so each
+    /// argument comes back bracketed.
+    fn shell_words(line: &str, program: &str) -> String {
+        let probe = line.replacen(program, "printf '[%s]'", 1);
+        let out = std::process::Command::new("sh")
+            .args(["-c", &probe])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[test]
+    fn a_tasks_json_line_expands_variables_quotes_args_and_applies_options() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{"tasks": [
+                {"label": "build", "command": "${workspaceFolder}/scripts/build.sh",
+                 "args": ["-m", "fix bug", "${file}"],
+                 "options": {"cwd": "${workspaceFolder}/web", "env": {"MODE": "it's"}}},
+                {"label": "line", "command": "python3 ${file} ${env:CROFT_TEST_UNSET_VAR} ${HOME}"},
+                {"label": "plain", "command": "npm run lint"},
+                {"label": "empty", "command": "prog", "args": ["--name", "${env:CROFT_TEST_UNSET_VAR}", "f"]},
+                {"label": "input", "command": "prog ${input:target}"}
+            ]}"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let task = |label: &str| tasks.iter().find(|t| t.label == label).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("it's work");
+        std::fs::create_dir_all(ws.join("web")).unwrap();
+        let ctx = crate::dap::configs::SubstCtx {
+            workspace_folder: ws.clone(),
+            file: Some(ws.join("a;touch${IFS}pwned.rs")),
+            inputs: Default::default(),
+            folders: Vec::new(),
+        };
+        let build = task("build").command_line(&ctx).unwrap();
+        assert!(
+            build.starts_with("(cd ") && build.contains("export MODE="),
+            "{build}"
+        );
+        let program = build.rsplit(" && ").next().unwrap().trim_end_matches(')');
+        let words = shell_words(program, program.split(" -m").next().unwrap());
+        assert_eq!(
+            words,
+            format!(
+                "[-m][fix bug][{}]",
+                ws.join("a;touch${IFS}pwned.rs").display()
+            )
+        );
+        // A shell-line command: the file stays one word and runs nothing;
+        // an unset env var is empty; `${HOME}` is left for the shell.
+        let line = task("line").command_line(&ctx).unwrap();
+        assert!(line.contains("${HOME}"), "{line}");
+        let words = shell_words(&line, "python3");
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert_eq!(
+            words,
+            format!("[{}][{home}]", ws.join("a;touch${IFS}pwned.rs").display())
+        );
+        assert!(!std::path::Path::new("pwned.rs").exists());
+        assert_eq!(task("plain").command_line(&ctx).unwrap(), "npm run lint");
+        assert_eq!(
+            task("empty").command_line(&ctx).unwrap(),
+            "prog --name '' f"
+        );
+        assert!(
+            task("input")
+                .command_line(&ctx)
+                .unwrap_err()
+                .contains("${input:target}: no answer")
+        );
+        let no_file = crate::dap::configs::SubstCtx {
+            workspace_folder: PathBuf::from("/w"),
+            file: None,
+            inputs: Default::default(),
+            folders: Vec::new(),
+        };
+        assert!(
+            task("build").command_line(&no_file).is_err(),
+            "${{file}} with no file"
+        );
+    }
+
+    /// A workspace whose `.vscode/tasks.json` is `json`, with `sub` and
+    /// `other` folders, and its real path (what `pwd` prints).
+    fn tasks_workspace(json: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in [".vscode", "sub", "other"] {
+            std::fs::create_dir(tmp.path().join(dir)).unwrap();
+        }
+        std::fs::write(tmp.path().join(".vscode/tasks.json"), json).unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        (tmp, root)
+    }
+
+    /// What `label`'s command line prints when `sh` runs it in `root`.
+    fn run_task(root: &Path, label: &str) -> String {
+        let tasks = discover_tasks(root);
+        let task = tasks
+            .iter()
+            .find(|t| t.label == label)
+            .unwrap_or_else(|| panic!("no task {label} in {tasks:?}"));
+        let line = task.command_line(&ctx_at(root)).unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", &line])
+            .current_dir(root)
+            .env_remove("GREETING")
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// #1441: the top-level `options` apply to every task; a task's own
+    /// `cwd` wins, and its `env` merges over the shared one key by key.
+    #[test]
+    fn top_level_options_apply_to_every_task_and_a_tasks_own_win() {
+        let (_tmp, root) = tasks_workspace(
+            r#"{ "version": "2.0.0",
+                 "options": { "cwd": "${workspaceFolder}/sub", "env": { "GREETING": "hi", "A": "1", "B": "1" } },
+                 "tasks": [
+                   { "label": "where", "type": "shell", "command": "pwd; echo \"GREETING=$GREETING A=$A B=$B\"" },
+                   { "label": "own", "type": "shell", "command": "pwd; echo \"A=$A B=$B\"",
+                     "options": { "cwd": "${workspaceFolder}/other", "env": { "B": "2" } } }
+                 ] }"#,
+        );
+        assert_eq!(
+            run_task(&root, "where"),
+            format!("{}\nGREETING=hi A=1 B=1\n", root.join("sub").display())
+        );
+        assert_eq!(
+            run_task(&root, "own"),
+            format!("{}\nA=1 B=2\n", root.join("other").display())
+        );
+    }
+
+    /// #1441: `{ "value", "quoting" }` arguments and commands are kept, each
+    /// one shell word quoted the way it asks.
+    #[test]
+    fn quoted_arguments_and_commands_are_kept_as_one_word() {
+        let (_tmp, root) = tasks_workspace(
+            r#"{ "version": "2.0.0", "tasks": [
+                 { "label": "argobj", "type": "shell", "command": "echo",
+                   "args": ["A", { "value": "two words", "quoting": "strong" }, "Z"] },
+                 { "label": "kinds", "type": "shell", "command": "printf '[%s]'",
+                   "args": [ { "value": "$NOPE stays", "quoting": "strong" },
+                             { "value": "a b;c 'q'", "quoting": "escape" },
+                             { "value": "say \"hi\" $GREETING", "quoting": "weak" },
+                             { "value": "${workspaceFolder}/x y" },
+                             { "value": "", "quoting": "escape" } ] },
+                 { "label": "tool", "type": "process",
+                   "command": { "value": "my tool", "quoting": "strong" }, "args": ["--v"] }
+               ] }"#,
+        );
+        let tasks = discover_tasks(&root);
+        let line = |label: &str| {
+            tasks
+                .iter()
+                .find(|t| t.label == label)
+                .unwrap()
+                .command_line(&ctx_at(&root))
+                .unwrap()
+        };
+        assert_eq!(line("argobj"), "echo A 'two words' Z");
+        assert_eq!(run_task(&root, "argobj"), "A two words Z\n");
+        assert_eq!(
+            run_task(&root, "kinds"),
+            format!(
+                "[$NOPE stays][a b;c 'q'][say \"hi\" ][{}/x y][]",
+                root.display()
+            ),
+            "strong keeps `$` literal, escape and weak keep one word, weak still expands"
+        );
+        assert_eq!(line("tool"), "'my tool' --v");
+        let tool = tasks.iter().find(|t| t.label == "tool").unwrap();
+        assert_eq!(tool.command, "'my tool' --v", "the picker shows it quoted");
+    }
+
+    /// #1441: a task with no command of its own runs the top-level one, with
+    /// the top-level `args` and then its own; a `dependsOn` task stays
+    /// compound.
+    #[test]
+    fn a_task_without_a_command_runs_the_top_level_one() {
+        let (_tmp, root) = tasks_workspace(
+            r#"{ "version": "2.0.0", "command": "echo", "args": ["top"], "type": "shell",
+                 "tasks": [
+                   { "label": "mine", "args": ["mine"] },
+                   { "label": "none", "args": [] },
+                   { "label": "bare" },
+                   { "label": "both", "dependsOn": ["mine", "bare"] },
+                   { "label": "own", "command": "echo own" }
+                 ] }"#,
+        );
+        assert_eq!(run_task(&root, "mine"), "top mine\n", "top args first");
+        assert_eq!(run_task(&root, "none"), "top\n", "empty args add nothing");
+        assert_eq!(run_task(&root, "bare"), "top\n");
+        assert_eq!(
+            run_task(&root, "own"),
+            "own\n",
+            "its own command, no top args"
+        );
+        let tasks = discover_tasks(&root);
+        let both = tasks.iter().find(|t| t.label == "both").unwrap();
+        assert!(
+            both.command_line(&ctx_at(&root))
+                .unwrap_err()
+                .contains("dependsOn"),
+            "a compound task does not run the top-level command"
+        );
+    }
+
+    /// #1441, negative: a file with no top level runs each task as written,
+    /// in the workspace root, and words that are neither a string nor an
+    /// object with a string `value` are still dropped.
+    #[test]
+    fn without_a_top_level_tasks_run_as_written_and_odd_words_are_dropped() {
+        let (_tmp, root) = tasks_workspace(
+            r#"{ "version": "2.0.0", "tasks": [
+                 { "label": "plain", "type": "shell", "command": "pwd" },
+                 { "label": "odd", "type": "shell", "command": "echo",
+                   "args": ["a", 7, { "quoting": "strong" }, { "value": ["x"] }, "b"] },
+                 { "label": "numeric", "command": 42 }
+               ] }"#,
+        );
+        let tasks = discover_tasks(&root);
+        let plain = tasks.iter().find(|t| t.label == "plain").unwrap();
+        assert_eq!(plain.command_line(&ctx_at(&root)).unwrap(), "pwd");
+        assert_eq!(run_task(&root, "plain"), format!("{}\n", root.display()));
+        assert_eq!(run_task(&root, "odd"), "a b\n");
+        assert!(
+            !tasks.iter().any(|t| t.label == "numeric"),
+            "a command that is no word is no task: {tasks:?}"
+        );
+    }
+
+    #[test]
+    fn discovers_makefile_targets_and_skips_machinery() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Makefile"),
+            "CC := gcc\n\
+             .PHONY: build test\n\
+             build: src/main.c\n\
+             \tgcc -o app src/main.c\n\
+             test:\n\
+             \t./run-tests\n\
+             %.o: %.c\n\
+             \t$(CC) -c $<\n",
+        )
+        .unwrap();
+        let cmds = commands(tmp.path());
+        assert!(cmds.contains(&"make build".to_string()), "{cmds:?}");
+        assert!(cmds.contains(&"make test".to_string()), "{cmds:?}");
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| c.contains('%') || c.contains(".PHONY") || c.contains("CC")),
+            "pattern rules, special targets, and variables are not tasks: {cmds:?}"
+        );
+        let tasks = discover_tasks(tmp.path());
+        let build = tasks.iter().find(|t| t.command == "make build").unwrap();
+        assert!(build.is_build, "a target named build is the build task");
+    }
+
+    #[test]
+    fn discovers_justfile_recipes() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("justfile"),
+            "set shell := [\"bash\", \"-c\"]\n\
+             version := \"1.0\"\n\
+             # deploy everything\n\
+             deploy target=\"prod\":\n\
+             \techo deploying\n\
+             lint:\n\
+             \tcargo clippy\n",
+        )
+        .unwrap();
+        let cmds = commands(tmp.path());
+        assert!(cmds.contains(&"just deploy".to_string()), "{cmds:?}");
+        assert!(cmds.contains(&"just lint".to_string()), "{cmds:?}");
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| c.contains("version") || c.contains("set ")),
+            "assignments and settings are not recipes: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn package_json_scripts_use_the_lockfiles_runner() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"x","scripts":{"build":"tsc","dev":"vite"}}"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("pnpm-lock.yaml"), "").unwrap();
+        let cmds = commands(tmp.path());
+        assert!(cmds.contains(&"pnpm run build".to_string()), "{cmds:?}");
+        assert!(cmds.contains(&"pnpm run dev".to_string()), "{cmds:?}");
+        let tasks = discover_tasks(tmp.path());
+        assert!(
+            tasks
+                .iter()
+                .any(|t| t.command == "pnpm run build" && t.is_build),
+            "the build script is the build task"
+        );
+    }
+
+    /// #1541: `isBackground` marks a watcher; absent, or not a bool, it
+    /// is an ordinary task.
+    #[test]
+    fn tasks_json_is_background_marks_a_watcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{ "tasks": [
+  { "label": "watch", "command": "tsc --watch", "isBackground": true },
+  { "label": "build", "command": "tsc" },
+  { "label": "odd", "command": "tsc", "isBackground": "yes" }
+] }"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let background = |label: &str| {
+            tasks
+                .iter()
+                .find(|t| t.label == label)
+                .unwrap()
+                .is_background
+        };
+        assert!(background("watch"));
+        assert!(!background("build"));
+        assert!(!background("odd"));
+    }
+
+    #[test]
+    fn tasks_json_problem_matcher_rides_along_raw() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{ "tasks": [
+  { "label": "cc", "command": "make", "problemMatcher": "$gcc" },
+  { "label": "plain", "command": "true" }
+] }"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let cc = tasks.iter().find(|t| t.label == "cc").unwrap();
+        assert_eq!(
+            cc.problem_matcher,
+            Some(serde_json::json!("$gcc")),
+            "the raw problemMatcher value travels with the task"
+        );
+        let plain = tasks.iter().find(|t| t.label == "plain").unwrap();
+        assert_eq!(plain.problem_matcher, None);
+    }
+
+    #[test]
+    fn cargo_projects_get_the_standard_verbs() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let cmds: Vec<&str> = tasks.iter().map(|t| t.command.as_str()).collect();
+        assert!(cmds.contains(&"cargo build"), "{cmds:?}");
+        assert!(cmds.contains(&"cargo test"), "{cmds:?}");
+        assert!(
+            tasks
+                .iter()
+                .any(|t| t.command == "cargo build" && t.is_build),
+            "cargo build is the build task"
+        );
+    }
+
+    fn task_commands(tasks: &[Task]) -> Vec<&str> {
+        tasks.iter().map(|t| t.command.as_str()).collect()
+    }
+
+    /// #1361: a Go module builds, tests and vets every package, runs a
+    /// root `package main`, and sends errors through `$go`.
+    #[test]
+    fn a_go_module_gets_build_test_vet_and_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("go.mod"),
+            "module example.com/hello\n\ngo 1.22\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("main.go"),
+            "// Command hello.\npackage main\n\nfunc main() {}\n",
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            task_commands(&tasks),
+            [
+                "go build ./...",
+                "go test ./...",
+                "go vet ./...",
+                "go run ."
+            ]
+        );
+        let build = default_build_task(&tasks).unwrap();
+        assert_eq!(build.command, "go build ./...");
+        assert!(
+            tasks
+                .iter()
+                .all(|t| t.problem_matcher == Some(serde_json::json!("$go")))
+        );
+        assert!(crate::problem_matchers::from_tasks_json(&serde_json::json!("$go")).is_some());
+    }
+
+    /// #1361, negative: a library module (no root `package main`; a test
+    /// file's package does not count) gets no `go run .`.
+    #[test]
+    fn a_go_library_has_no_run_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.mod"), "module example.com/lib\n").unwrap();
+        std::fs::write(tmp.path().join("lib.go"), "package lib\n").unwrap();
+        std::fs::write(tmp.path().join("main_test.go"), "package main\n").unwrap();
+        // Comment text and an ignored generator file do not count either.
+        std::fs::write(
+            tmp.path().join("doc.go"),
+            "/*\nUsage:\npackage main\n*/\npackage lib\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("gen.go"),
+            "//go:build ignore\n\npackage main\n",
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            task_commands(&tasks),
+            ["go build ./...", "go test ./...", "go vet ./..."]
+        );
+    }
+
+    /// #1361: a CMake project configures, builds and tests in `build`; on
+    /// a fresh checkout the build task configures first.
+    #[test]
+    fn a_cmake_project_builds_in_its_build_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.20)\nproject(hi C)\nadd_executable(hi main.c)\n",
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            task_commands(&tasks),
+            [
+                "cmake -S . -B build",
+                "cmake -S . -B build && cmake --build build",
+                "ctest --test-dir build"
+            ]
+        );
+        let build = default_build_task(&tasks).unwrap();
+        assert_eq!(build.problem_matcher, Some(serde_json::json!("$gcc")));
+        // Configured: the build task only builds.
+        std::fs::create_dir_all(tmp.path().join("build")).unwrap();
+        std::fs::write(tmp.path().join("build/CMakeCache.txt"), "").unwrap();
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            default_build_task(&tasks).unwrap().command,
+            "cmake --build build"
+        );
+    }
+
+    /// #1361: the folder `compile_commands.json` already points into is
+    /// the build folder.
+    #[test]
+    fn a_cmake_project_keeps_the_build_folder_clangd_uses() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("CMakeLists.txt"), "project(hi)\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("out/debug")).unwrap();
+        std::fs::write(tmp.path().join("out/debug/compile_commands.json"), "[]").unwrap();
+        std::fs::write(tmp.path().join("out/debug/CMakeCache.txt"), "").unwrap();
+        std::os::unix::fs::symlink(
+            "out/debug/compile_commands.json",
+            tmp.path().join("compile_commands.json"),
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            task_commands(&tasks),
+            [
+                "cmake -S . -B out/debug",
+                "cmake --build out/debug",
+                "ctest --test-dir out/debug"
+            ]
+        );
+    }
+
+    /// #1361: `CMakePresets.json` presets are used, the first visible
+    /// configure preset and the build and test presets made for it.
+    #[test]
+    fn cmake_presets_are_used_when_the_project_has_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("CMakeLists.txt"), "project(hi)\n").unwrap();
+        std::fs::write(
+            tmp.path().join("CMakePresets.json"),
+            r#"{"version": 3,
+              "configurePresets": [
+                {"name": "base", "hidden": true},
+                {"name": "dev", "inherits": "base", "binaryDir": "${sourceDir}/out/${presetName}"},
+                {"name": "release"}
+              ],
+              "buildPresets": [{"name": "rel-build", "configurePreset": "release"}, {"name": "dev-build", "configurePreset": "dev"}],
+              "testPresets": [{"name": "dev-test", "configurePreset": "dev"}]}"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        // Not configured yet: the build task configures first.
+        assert_eq!(
+            task_commands(&tasks),
+            [
+                "cmake --preset dev",
+                "cmake --preset dev && cmake --build --preset dev-build",
+                "ctest --preset dev-test"
+            ]
+        );
+        std::fs::create_dir_all(tmp.path().join("out/dev")).unwrap();
+        std::fs::write(tmp.path().join("out/dev/CMakeCache.txt"), "").unwrap();
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            default_build_task(&tasks).unwrap().command,
+            "cmake --build --preset dev-build"
+        );
+        // A configure preset with no build or test preset of its own
+        // builds and tests its binaryDir.
+        std::fs::write(
+            tmp.path().join("CMakePresets.json"),
+            r#"{"version": 3, "configurePresets": [{"name": "dev", "binaryDir": "${sourceDir}/out/${presetName}"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            task_commands(&discover_tasks(tmp.path())),
+            [
+                "cmake --preset dev",
+                "cmake --build out/dev",
+                "ctest --test-dir out/dev"
+            ]
+        );
+    }
+
+    /// #1361: a configure preset's binaryDir may come from the hidden
+    /// base it inherits.
+    #[test]
+    fn cmake_presets_inherit_the_build_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("CMakeLists.txt"), "project(hi)\n").unwrap();
+        std::fs::write(
+            tmp.path().join("CMakePresets.json"),
+            r#"{"version": 3, "configurePresets": [
+                {"name": "base", "hidden": true, "binaryDir": "${sourceDir}/out/${presetName}"},
+                {"name": "dev", "inherits": ["base"]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            task_commands(&discover_tasks(tmp.path())),
+            [
+                "cmake --preset dev",
+                "cmake --preset dev && cmake --build out/dev",
+                "ctest --test-dir out/dev"
+            ]
+        );
+    }
+
+    /// #1361: a preset its condition disables on this host is skipped for
+    /// the next enabled one.
+    #[test]
+    fn cmake_presets_skip_ones_disabled_on_this_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("CMakeLists.txt"), "project(hi)\n").unwrap();
+        std::fs::write(
+            tmp.path().join("CMakePresets.json"),
+            r#"{"version": 3, "configurePresets": [
+                {"name": "never", "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "Plan9"}},
+                {"name": "off", "condition": {"type": "const", "value": false}},
+                {"name": "base", "hidden": true, "condition": {"type": "not", "condition": {"type": "const", "value": true}}},
+                {"name": "child", "inherits": "base"},
+                {"name": "here", "condition": {"type": "notEquals", "lhs": "${hostSystemName}", "rhs": "Plan9"}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            task_commands(&discover_tasks(tmp.path()))[0],
+            "cmake --preset here"
+        );
+    }
+
+    /// #1361, negative: neither source speaks without its file.
+    #[test]
+    fn no_go_or_cmake_tasks_without_their_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.go"), "package main\n").unwrap();
+        std::fs::write(tmp.path().join("main.c"), "int main(void){return 0;}\n").unwrap();
+        assert!(discover_tasks(tmp.path()).is_empty());
+    }
+
+    /// Everything that looks a task up does so by label, so de-duplication
+    /// must key on labels too: a tasks.json entry that reuses a convention
+    /// source's command line under its own name must not make the
+    /// convention label unfindable (#336).
+    #[test]
+    fn a_relabelled_command_keeps_the_convention_label_findable() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{ "tasks": [ { "label": "Build Project", "type": "shell", "command": "cargo build" } ] }"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let labels: Vec<&str> = tasks.iter().map(|t| t.label.as_str()).collect();
+        assert!(labels.contains(&"Build Project"), "{labels:?}");
+        assert!(
+            labels.contains(&"cargo build"),
+            "the Cargo label must survive a tasks.json entry with the same command: {labels:?}"
+        );
+    }
+
+    /// A label-less tasks.json entry is labelled by its whole command line
+    /// (VS Code's rule), so several entries sharing a program stay distinct
+    /// tasks instead of collapsing to one bare "npm".
+    #[test]
+    fn label_less_entries_sharing_a_program_stay_distinct() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{ "tasks": [
+              { "type": "shell", "command": "npm", "args": ["run", "build"] },
+              { "type": "shell", "command": "npm", "args": ["run", "test"] },
+              { "type": "shell", "command": "npm", "args": ["run", "lint"] }
+            ] }"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let pairs: Vec<(&str, &str)> = tasks
+            .iter()
+            .map(|t| (t.label.as_str(), t.command.as_str()))
+            .collect();
+        for cmd in ["npm run build", "npm run test", "npm run lint"] {
+            assert!(
+                pairs.contains(&(cmd, cmd)),
+                "{cmd} must survive as its own task, labelled by its line: {pairs:?}"
+            );
+        }
+    }
+
+    /// Only a true repeat collapses: the same label running the same line.
+    /// One that relabels a convention command lists under both names, by
+    /// design.
+    #[test]
+    fn only_a_repeated_label_and_command_pair_collapses() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Makefile"), "build:\n\ttrue\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{ "tasks": [
+              { "label": "make build", "type": "shell", "command": "make build" },
+              { "label": "Build", "type": "shell", "command": "make build" }
+            ] }"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let rows: Vec<(&str, &str, &str)> = tasks
+            .iter()
+            .map(|t| (t.label.as_str(), t.command.as_str(), t.source.as_str()))
+            .collect();
+        let repeats: Vec<_> = rows
+            .iter()
+            .filter(|r| (r.0, r.1) == ("make build", "make build"))
+            .collect();
+        assert_eq!(repeats.len(), 1, "the exact repeat folds to one: {rows:?}");
+        assert_eq!(
+            repeats[0].2, "tasks.json",
+            "and the first source wins over the Makefile's"
+        );
+        assert!(
+            rows.iter().any(|r| (r.0, r.1) == ("Build", "make build")),
+            "a relabelled command keeps its own entry: {rows:?}"
+        );
+    }
+
+    /// A label reused for a DIFFERENT command is not a repeat: both tasks
+    /// survive, and the label-keyed lookup (the `preLaunchTask` rule) takes
+    /// the first declared.
+    #[test]
+    fn a_label_reused_for_a_different_command_keeps_both_and_the_lookup_takes_the_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{ "tasks": [
+              { "label": "Build", "type": "shell", "command": "make a" },
+              { "label": "Build", "type": "shell", "command": "make b" }
+            ] }"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let builds: Vec<&str> = tasks
+            .iter()
+            .filter(|t| t.label == "Build")
+            .map(|t| t.command.as_str())
+            .collect();
+        assert_eq!(
+            builds,
+            ["make a", "make b"],
+            "both survive, declaration order kept"
+        );
+        assert_eq!(
+            tasks
+                .iter()
+                .find(|t| t.label == "Build")
+                .map(|t| t.command.as_str()),
+            Some("make a"),
+            "a lookup by label resolves to the first declared"
+        );
+    }
+
+    #[test]
+    fn pyproject_scripts_run_through_uv() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\nversion = \"0\"\ndependencies = [\"pytest\"]\n\n[project.scripts]\nserve = \"x.main:run\"\n",
+        )
+        .unwrap();
+        let cmds = py_commands(tmp.path(), true);
+        assert_eq!(cmds, ["uv run serve", "uv run pytest"]);
+        // A uv.lock means uv, while uv is installed (#1296).
+        std::fs::write(tmp.path().join("uv.lock"), "").unwrap();
+        assert_eq!(
+            py_commands_with(tmp.path(), &["uv"]),
+            ["uv run serve", "uv run pytest"]
+        );
+        assert_eq!(
+            py_commands(tmp.path(), false),
+            ["serve", "python3 -m pytest"]
+        );
+    }
+
+    /// The commands with every runner on PATH, or none.
+    fn py_commands(root: &Path, on_path: bool) -> Vec<String> {
+        let tools: &[&str] = if on_path {
+            &["uv", "poetry", "pdm"]
+        } else {
+            &[]
+        };
+        py_commands_with(root, tools)
+    }
+
+    /// The commands with only `tools` on PATH.
+    fn py_commands_with(root: &Path, tools: &[&str]) -> Vec<String> {
+        pyproject_tasks_on(root, &|tool: &str| tools.contains(&tool))
+            .into_iter()
+            .map(|t| {
+                assert_eq!(t.label, t.command);
+                t.command
+            })
+            .collect()
+    }
+
+    /// A script key with shell syntax in it runs as one quoted word, never
+    /// as a second command.
+    #[test]
+    fn a_script_name_with_shell_syntax_is_quoted() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n\n[project.scripts]\n\"a; touch pwned\" = \"x:a\"\nserve = \"x:run\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            py_commands(tmp.path(), true),
+            ["uv run 'a; touch pwned'", "uv run serve"]
+        );
+    }
+
+    const POETRY_PYPROJECT: &str = "[tool.poetry]\nname = \"calc\"\nversion = \"0.1.0\"\n\n[tool.poetry.group.dev.dependencies]\npytest = \"^8\"\n\n[tool.poetry.scripts]\ncalc = \"calc:main\"\n";
+
+    /// A Poetry project runs its tasks through Poetry, and its
+    /// `[tool.poetry.scripts]` are listed (#1296).
+    #[test]
+    fn a_poetry_project_runs_tasks_through_poetry() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("pyproject.toml"), POETRY_PYPROJECT).unwrap();
+        assert_eq!(
+            py_commands(tmp.path(), true),
+            ["poetry run calc", "poetry run pytest"]
+        );
+        // A poetry.lock says the same for a PEP 621 `[project]` table.
+        let pep621 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pep621.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n\n[project.scripts]\nserve = \"x:run\"\n\n[dependency-groups]\ndev = [\"pytest\"]\n",
+        )
+        .unwrap();
+        std::fs::write(pep621.path().join("poetry.lock"), "").unwrap();
+        assert_eq!(
+            py_commands(pep621.path(), true),
+            ["poetry run serve", "poetry run pytest"]
+        );
+    }
+
+    #[test]
+    fn a_pdm_project_runs_tasks_through_pdm() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n\n[tool.pdm.scripts]\nlint = \"ruff check .\"\n\n[tool.pdm.dev-dependencies]\ntest = [\"pytest\"]\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("pdm.lock"), "").unwrap();
+        assert_eq!(
+            py_commands(tmp.path(), true),
+            ["pdm run lint", "pdm run pytest"]
+        );
+    }
+
+    /// #1296 negative: `[tool.pdm.scripts]` are PDM task definitions, not
+    /// installed binaries, so without PDM they are left out rather than
+    /// offered as `.venv/bin/lint` or `uv run lint`, which fail.
+    #[test]
+    fn pdm_scripts_need_pdm_to_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n\n[project.scripts]\nserve = \"x:main\"\n\n[tool.pdm.scripts]\nlint = \"ruff check .\"\n\n[tool.pdm.dev-dependencies]\ntest = [\"pytest\"]\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("pdm.lock"), "").unwrap();
+        assert_eq!(
+            py_commands_with(tmp.path(), &["pdm"]),
+            ["pdm run serve", "pdm run lint", "pdm run pytest"]
+        );
+        assert_eq!(
+            py_commands_with(tmp.path(), &["uv"]),
+            ["uv run serve", "uv run pytest"]
+        );
+        std::fs::create_dir_all(tmp.path().join(".venv/bin")).unwrap();
+        std::fs::write(tmp.path().join(".venv/bin/python"), "").unwrap();
+        assert_eq!(
+            py_commands_with(tmp.path(), &[]),
+            [".venv/bin/serve", ".venv/bin/python -m pytest"]
+        );
+    }
+
+    /// #1296: a Poetry, PDM or uv project whose tool is not installed runs
+    /// through the venv it was set up with, rather than offering only tasks
+    /// that fail with exit 127.
+    #[test]
+    fn a_project_whose_tool_is_not_installed_runs_through_its_venv() {
+        let venv = |root: &Path| {
+            std::fs::create_dir_all(root.join(".venv/bin")).unwrap();
+            std::fs::write(root.join(".venv/bin/python"), "").unwrap();
+        };
+        let poetry = tempfile::tempdir().unwrap();
+        std::fs::write(poetry.path().join("pyproject.toml"), POETRY_PYPROJECT).unwrap();
+        venv(poetry.path());
+        assert_eq!(
+            py_commands_with(poetry.path(), &["uv"]),
+            [".venv/bin/calc", ".venv/bin/python -m pytest"]
+        );
+        let pdm = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pdm.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n\n[tool.pdm.dev-dependencies]\ntest = [\"pytest\"]\n",
+        )
+        .unwrap();
+        std::fs::write(pdm.path().join("pdm.lock"), "").unwrap();
+        venv(pdm.path());
+        assert_eq!(
+            py_commands_with(pdm.path(), &["poetry"]),
+            [".venv/bin/python -m pytest"]
+        );
+        let uv = tempfile::tempdir().unwrap();
+        std::fs::write(
+            uv.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\ndependencies = [\"pytest\"]\n",
+        )
+        .unwrap();
+        std::fs::write(uv.path().join("uv.lock"), "").unwrap();
+        venv(uv.path());
+        assert_eq!(
+            py_commands(uv.path(), false),
+            [".venv/bin/python -m pytest"]
+        );
+    }
+
+    /// #1296 negative: with the project's own tool installed, it still runs
+    /// the tasks, venv or not.
+    #[test]
+    fn a_project_whose_tool_is_installed_still_uses_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("pyproject.toml"), POETRY_PYPROJECT).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".venv/bin")).unwrap();
+        std::fs::write(tmp.path().join(".venv/bin/python"), "").unwrap();
+        assert_eq!(
+            py_commands_with(tmp.path(), &["poetry"]),
+            ["poetry run calc", "poetry run pytest"]
+        );
+    }
+
+    /// With no lockfile, a project venv runs pytest and the scripts it
+    /// installed, the way the Testing view already runs pytest.
+    #[test]
+    fn a_plain_venv_project_runs_tasks_through_its_venv() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            POETRY_PYPROJECT
+                .replace("[tool.poetry]", "[tool.other]")
+                .replace("tool.poetry.", "project."),
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join(".venv/bin")).unwrap();
+        std::fs::write(tmp.path().join(".venv/bin/python"), "").unwrap();
+        assert_eq!(
+            py_commands(tmp.path(), true),
+            [".venv/bin/calc", ".venv/bin/python -m pytest"]
+        );
+    }
+
+    /// Negative: with no lockfile, no venv and no uv on PATH, nothing says
+    /// `uv`, which would only fail with "uv: command not found".
+    #[test]
+    fn without_a_runner_or_uv_python_tasks_do_not_use_uv() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\ndependencies = [\"pytest\"]\n\n[project.scripts]\nserve = \"x:run\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            py_commands(tmp.path(), false),
+            ["serve", "python3 -m pytest"]
+        );
+        // And a project that never mentions pytest gets no pytest task.
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n",
+        )
+        .unwrap();
+        assert!(py_commands(tmp.path(), true).is_empty());
+    }
+
+    #[test]
+    fn an_explicit_vscode_default_build_wins_over_an_earlier_build_task() {
+        // Two build-group tasks; only the second carries `isDefault: true`.
+        // VS Code runs the default on Cmd+Shift+B, not the first-listed.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{"tasks":[
+  {"label":"build A","type":"shell","command":"make a","group":"build"},
+  {"label":"build B","type":"shell","command":"make b","group":{"kind":"build","isDefault":true}}
+]}"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            default_build_task(&tasks).unwrap().label,
+            "build B",
+            "the explicit default build outranks the first build-group task"
+        );
+    }
+
+    /// A workspace with `package.json` scripts and the given tasks.json.
+    fn npm_workspace(tasks_json: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{ "name": "demo", "scripts": { "build": "echo FULL-PROD-BUILD", "compile": "echo quick-compile" } }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(tmp.path().join(".vscode/tasks.json"), tasks_json).unwrap();
+        tmp
+    }
+
+    fn ctx_at(root: &Path) -> crate::dap::configs::SubstCtx {
+        crate::dap::configs::SubstCtx {
+            workspace_folder: root.to_path_buf(),
+            file: None,
+            inputs: Default::default(),
+            folders: Vec::new(),
+        }
+    }
+
+    /// VS Code's Configure Default Build Task writes `"type": "npm"` with no
+    /// `command`; that entry is the default build, not package.json's
+    /// `build` script (#1185).
+    #[test]
+    fn an_npm_provider_task_is_the_default_build() {
+        let tmp = npm_workspace(
+            r#"{ "version": "2.0.0", "tasks": [
+                { "type": "npm", "script": "compile", "group": { "kind": "build", "isDefault": true },
+                  "problemMatcher": [], "label": "npm: compile" } ] }"#,
+        );
+        let tasks = discover_tasks(tmp.path());
+        let build = default_build_task(&tasks).unwrap();
+        assert_eq!(build.label, "npm: compile");
+        assert_eq!(
+            build.command_line(&ctx_at(tmp.path())).unwrap(),
+            "npm run compile"
+        );
+    }
+
+    /// An npm task runs with the lockfile's runner, from its `path` package,
+    /// and is labelled the way VS Code labels it when it has no label.
+    #[test]
+    fn an_npm_provider_task_uses_the_lockfile_runner_and_its_path() {
+        let tmp = npm_workspace(
+            r#"{ "tasks": [ { "type": "npm", "script": "compile", "path": "packages/app/" } ] }"#,
+        );
+        std::fs::write(tmp.path().join("pnpm-lock.yaml"), "").unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let t = tasks.iter().find(|t| t.source == "tasks.json").unwrap();
+        assert_eq!(t.label, "npm: compile - packages/app");
+        let line = t.command_line(&ctx_at(tmp.path())).unwrap();
+        assert!(
+            line.starts_with("(cd ") && line.contains("/packages/app"),
+            "{line}"
+        );
+        assert!(line.ends_with(" && pnpm run compile)"), "{line}");
+    }
+
+    /// The #1515 repro: an npm workspaces repo whose scripts live in its
+    /// packages, plus whatever `extra` files a test adds.
+    fn js_monorepo(root_manifest: &str, extra: &[(&str, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |rel: &str, text: &str| {
+            let p = tmp.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        write("package.json", root_manifest);
+        write(
+            "packages/web/package.json",
+            r#"{ "name": "web", "scripts": { "dev": "echo web-dev", "build": "echo web-build" } }"#,
+        );
+        write(
+            "packages/api/package.json",
+            r#"{ "name": "api", "scripts": { "start": "echo api-start", "test": "echo api-test" } }"#,
+        );
+        for (rel, text) in extra {
+            write(rel, text);
+        }
+        tmp
+    }
+
+    /// The tasks' labels, sorted: script order follows the JSON map's.
+    fn labels(tasks: &[Task]) -> Vec<&str> {
+        let mut out: Vec<&str> = tasks.iter().map(|t| t.label.as_str()).collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// #1515: every package's scripts are listed, labelled as VS Code
+    /// labels them, and each runs from its own package folder.
+    #[test]
+    fn a_workspaces_monorepo_lists_every_packages_scripts() {
+        let tmp = js_monorepo(
+            r#"{ "name": "mono", "private": true, "workspaces": ["packages/*"], "scripts": { "lint": "echo lint-all" } }"#,
+            &[],
+        );
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            labels(&tasks),
+            [
+                "npm run lint",
+                "npm: build - packages/web",
+                "npm: dev - packages/web",
+                "npm: start - packages/api",
+                "npm: test - packages/api",
+            ]
+        );
+        let build = tasks
+            .iter()
+            .find(|t| t.label == "npm: build - packages/web")
+            .unwrap();
+        assert_eq!(build.source, "packages/web/package.json");
+        let line = build.command_line(&ctx_at(tmp.path())).unwrap();
+        assert!(
+            line.starts_with("(cd ") && line.contains("/packages/web"),
+            "{line}"
+        );
+        assert!(line.ends_with(" && npm run build)"), "{line}");
+    }
+
+    /// #1515: yarn's `{ "packages": [...] }` form and pnpm's
+    /// `pnpm-workspace.yaml` declare packages too, and the root lockfile
+    /// picks the runner.
+    #[test]
+    fn yarn_and_pnpm_workspace_declarations_are_followed() {
+        let yarn = js_monorepo(
+            r#"{ "private": true, "workspaces": { "packages": ["packages/web"] } }"#,
+            &[("yarn.lock", "")],
+        );
+        let tasks = discover_tasks(yarn.path());
+        assert_eq!(
+            labels(&tasks),
+            ["npm: build - packages/web", "npm: dev - packages/web"]
+        );
+        assert!(tasks.iter().any(|t| t.command == "yarn dev"));
+
+        let pnpm = js_monorepo(
+            r#"{ "private": true }"#,
+            &[
+                (
+                    "pnpm-workspace.yaml",
+                    "# the monorepo\npackages:\n  - 'packages/*'   # every package\n  - \"!packages/web\"\ncatalog:\n  react: ^19\n",
+                ),
+                ("pnpm-lock.yaml", ""),
+            ],
+        );
+        let tasks = discover_tasks(pnpm.path());
+        assert_eq!(
+            labels(&tasks),
+            ["npm: start - packages/api", "npm: test - packages/api"]
+        );
+        let start = tasks
+            .iter()
+            .find(|t| t.label.starts_with("npm: start"))
+            .unwrap();
+        assert!(
+            start
+                .command_line(&ctx_at(pnpm.path()))
+                .unwrap()
+                .ends_with(" && pnpm run start)")
+        );
+    }
+
+    /// #1515: pnpm reads only `pnpm-workspace.yaml`, so a stale root
+    /// `workspaces` field left from a yarn/npm migration is ignored when
+    /// the YAML exists.
+    #[test]
+    fn pnpm_workspace_yaml_wins_over_a_stale_workspaces_field() {
+        let tmp = js_monorepo(
+            r#"{ "private": true, "workspaces": ["packages/web"] }"#,
+            &[
+                ("pnpm-workspace.yaml", "packages:\n  - packages/api\n"),
+                ("pnpm-lock.yaml", ""),
+            ],
+        );
+        assert_eq!(
+            labels(&discover_tasks(tmp.path())),
+            ["npm: start - packages/api", "npm: test - packages/api"]
+        );
+    }
+
+    /// #1515: a package script name holding shell syntax reaches the
+    /// runner as one word, never as shell commands.
+    #[test]
+    fn a_package_script_name_is_quoted_on_the_command_line() {
+        let tmp = js_monorepo(
+            r#"{ "workspaces": ["packages/*"] }"#,
+            &[(
+                "packages/web/package.json",
+                r#"{ "scripts": { "check;false": "echo x", "build$(id)": "echo y" } }"#,
+            )],
+        );
+        let tasks = discover_tasks(tmp.path());
+        let ctx = ctx_at(tmp.path());
+        let line = |label: &str| {
+            tasks
+                .iter()
+                .find(|t| t.label == label)
+                .unwrap()
+                .command_line(&ctx)
+                .unwrap()
+        };
+        assert!(
+            line("npm: check;false - packages/web").ends_with(" && npm run 'check;false')"),
+            "{}",
+            line("npm: check;false - packages/web")
+        );
+        assert!(
+            line("npm: build$(id) - packages/web").ends_with(" && npm run 'build$(id)')"),
+            "{}",
+            line("npm: build$(id) - packages/web")
+        );
+    }
+
+    /// #1515 negatives: without a workspaces declaration a nested
+    /// package.json is not a task source; `node_modules`, folders with no
+    /// package.json and `!` globs are skipped; and a package's `build` never
+    /// becomes the build default, which stays the root's.
+    #[test]
+    fn only_declared_workspace_packages_add_tasks() {
+        let plain = js_monorepo(r#"{ "scripts": { "build": "echo root" } }"#, &[]);
+        let tasks = discover_tasks(plain.path());
+        assert_eq!(labels(&tasks), ["npm run build"]);
+
+        let tmp = js_monorepo(
+            r#"{ "workspaces": ["packages/**", "!packages/api"], "scripts": { "build": "echo root" } }"#,
+            &[
+                (
+                    "packages/web/node_modules/dep/package.json",
+                    r#"{ "scripts": { "postinstall": "echo no" } }"#,
+                ),
+                ("packages/empty/README.md", "no package here\n"),
+            ],
+        );
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            labels(&tasks),
+            [
+                "npm run build",
+                "npm: build - packages/web",
+                "npm: dev - packages/web"
+            ]
+        );
+        assert_eq!(
+            default_build_task(&tasks).unwrap().label,
+            "npm run build",
+            "the root's build stays the default"
+        );
+        assert!(tasks.iter().filter(|t| t.is_build).count() == 1);
+    }
+
+    /// #1515: a tasks.json entry for a package script and the detected one
+    /// are the same task, listed once (tasks.json's, which comes first).
+    #[test]
+    fn a_tasks_json_package_script_is_not_listed_twice() {
+        let tmp = js_monorepo(
+            r#"{ "workspaces": ["packages/*"] }"#,
+            &[(
+                ".vscode/tasks.json",
+                r#"{ "tasks": [ { "type": "npm", "script": "build", "path": "packages/web" } ] }"#,
+            )],
+        );
+        let tasks = discover_tasks(tmp.path());
+        let builds: Vec<&Task> = tasks
+            .iter()
+            .filter(|t| t.label == "npm: build - packages/web")
+            .collect();
+        assert_eq!(builds.len(), 1, "{:?}", labels(&tasks));
+        assert_eq!(builds[0].source, "tasks.json");
+    }
+
+    /// A provider croft can't run, or a `dependsOn`-only compound task, is
+    /// listed and refused with the reason; as the default build it is the
+    /// one Run Build Task names, never a stand-in that runs something else.
+    #[test]
+    fn an_unsupported_provider_or_compound_task_is_listed_and_refused() {
+        let tmp = npm_workspace(
+            r#"{ "tasks": [
+                { "type": "typescript", "tsconfig": "tsconfig.json", "group": { "kind": "build", "isDefault": true } },
+                { "label": "Build all", "dependsOn": ["lint", "compile"] } ] }"#,
+        );
+        let tasks = discover_tasks(tmp.path());
+        let build = default_build_task(&tasks).unwrap();
+        assert_eq!(build.label, "typescript task");
+        let err = build.command_line(&ctx_at(tmp.path())).unwrap_err();
+        assert!(err.contains("type \"typescript\""), "{err}");
+        let all = tasks.iter().find(|t| t.label == "Build all").unwrap();
+        assert!(
+            all.command_line(&ctx_at(tmp.path()))
+                .unwrap_err()
+                .contains("dependsOn")
+        );
+    }
+
+    /// Negative: an entry that is neither a command nor a task croft can
+    /// name stays out, and a plain `command` entry runs exactly as before.
+    #[test]
+    fn a_command_entry_is_unchanged_and_a_bare_entry_is_still_skipped() {
+        let tmp = npm_workspace(
+            r#"{ "tasks": [ { "label": "nothing" }, { "label": "shell-only", "type": "shell" },
+                { "label": "lint", "type": "shell", "command": "eslint", "args": ["src"] } ] }"#,
+        );
+        let tasks = discover_tasks(tmp.path());
+        assert!(
+            !tasks
+                .iter()
+                .any(|t| t.label == "nothing" || t.label == "shell-only")
+        );
+        let lint = tasks.iter().find(|t| t.label == "lint").unwrap();
+        assert_eq!(
+            lint.command_line(&ctx_at(tmp.path())).unwrap(),
+            "eslint src"
+        );
+        assert_eq!(default_build_task(&tasks).unwrap().label, "npm run build");
+    }
+
+    #[test]
+    fn vscode_tasks_json_with_comments_is_honoured_and_wins_the_build_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A Makefile build target would normally claim the build slot…
+        std::fs::write(tmp.path().join("Makefile"), "build:\n\ttrue\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{
+  // VS Code allows comments here
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "full build",
+      "type": "shell",
+      "command": "nix",
+      "args": ["build"],
+      "group": { "kind": "build", "isDefault": true }, /* default */
+    },
+  ],
+}"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let t = tasks.iter().find(|t| t.label == "full build").unwrap();
+        assert_eq!(t.command, "nix build", "command joins args");
+        assert!(t.is_build);
+        // …but tasks.json comes first, so its default-build wins.
+        assert_eq!(
+            default_build_task(&tasks).unwrap().label,
+            "full build",
+            "the explicit VS Code default build outranks the Makefile target"
+        );
+    }
+
+    #[test]
+    fn empty_workspace_has_no_tasks() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(discover_tasks(tmp.path()).is_empty());
+    }
+
+    /// #1412: launch.json names auto-detected tasks the way VS Code labels
+    /// them. `npm: <script>` finds the package.json script whatever runner
+    /// runs it, and each root `tsconfig*.json` is a `tsc: build - <file>`
+    /// task running `tsc -p <file>` (the project's own tsc when installed).
+    #[test]
+    fn vs_code_task_labels_find_package_scripts_and_tsc_builds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        std::fs::write(
+            p.join("package.json"),
+            r#"{"name":"x","scripts":{"build":"tsc","test":"jest"}}"#,
+        )
+        .unwrap();
+        std::fs::write(p.join("pnpm-lock.yaml"), "").unwrap();
+        std::fs::write(p.join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(p.join("tsconfig.app.json"), "{}").unwrap();
+        let task = find_task(discover_tasks(p), "npm: build").unwrap();
+        assert_eq!(task.command, "pnpm run build");
+        assert_eq!(
+            find_task(discover_tasks(p), "npm: test").unwrap().command,
+            "pnpm run test"
+        );
+        let tsc = find_task(discover_tasks(p), "tsc: build - tsconfig.json").unwrap();
+        assert_eq!(tsc.command, "tsc -p tsconfig.json");
+        assert!(tsc.is_build);
+        assert_eq!(
+            tsc.problem_matcher,
+            Some(serde_json::Value::String(String::from("$tsc")))
+        );
+        assert_eq!(
+            find_task(discover_tasks(p), "tsc: build - tsconfig.app.json")
+                .unwrap()
+                .command,
+            "tsc -p tsconfig.app.json"
+        );
+        std::fs::create_dir_all(p.join("node_modules/.bin")).unwrap();
+        std::fs::write(p.join("node_modules/.bin/tsc"), "").unwrap();
+        assert_eq!(
+            find_task(discover_tasks(p), "tsc: build - tsconfig.json")
+                .unwrap()
+                .command,
+            "node_modules/.bin/tsc -p tsconfig.json",
+            "the project's own compiler"
+        );
+        let tasks = discover_tasks(p);
+        assert_eq!(
+            default_build_task(&tasks).map(|t| t.command.as_str()),
+            Some("pnpm run build"),
+            "the build script stays the default build"
+        );
+    }
+
+    /// #1412: a tsconfig filename with shell syntax goes to the shell as
+    /// one quoted word, and a config with project references (comments and
+    /// all) builds in `-b` mode so its dependencies build too.
+    #[test]
+    fn tsc_tasks_quote_filenames_and_build_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        let evil = "tsconfig$(touch${IFS}PWNED).json";
+        std::fs::write(p.join(evil), "{}").unwrap();
+        std::fs::write(
+            p.join("tsconfig.json"),
+            "{\n  // solution\n  \"files\": [],\n  \"references\": [{ \"path\": \"./a\" }],\n}\n",
+        )
+        .unwrap();
+        std::fs::write(p.join("tsconfig.empty.json"), r#"{"references": []}"#).unwrap();
+        let tasks = discover_tasks(p);
+        let cmd = |label: &str| {
+            tasks
+                .iter()
+                .find(|t| t.label == label)
+                .map(|t| t.command.clone())
+        };
+        assert_eq!(
+            cmd(&format!("tsc: build - {evil}")).as_deref(),
+            Some("tsc -p 'tsconfig$(touch${IFS}PWNED).json'")
+        );
+        assert_eq!(
+            cmd("tsc: build - tsconfig.json").as_deref(),
+            Some("tsc -b tsconfig.json")
+        );
+        assert_eq!(
+            cmd("tsc: build - tsconfig.empty.json").as_deref(),
+            Some("tsc -p tsconfig.empty.json")
+        );
+    }
+
+    /// #1412 negatives: an exact label wins over the alias; `npm:` does not
+    /// reach a Makefile target or a script that is not there (a near label
+    /// is only suggested); other json files and a tsconfig with a space in
+    /// its name are no tsc tasks.
+    #[test]
+    fn a_task_label_that_names_nothing_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        std::fs::write(p.join("Makefile"), "build:\n\tcc main.c\n").unwrap();
+        std::fs::write(p.join("jsconfig.json"), "{}").unwrap();
+        std::fs::write(p.join("tsconfig base.json"), "{}").unwrap();
+        let tasks = discover_tasks(p);
+        assert!(
+            !tasks.iter().any(|t| t.label.starts_with("tsc:")),
+            "{:?}",
+            tasks.iter().map(|t| &t.label).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            find_task(discover_tasks(p), "npm: build").map(|t| t.label),
+            Err(Some(String::from("make build"))),
+            "suggested, not run"
+        );
+        assert_eq!(
+            find_task(discover_tasks(p), "npm: deploy").map(|t| t.label),
+            Err(None)
+        );
+        std::fs::write(
+            p.join("package.json"),
+            r#"{"name":"x","scripts":{"build":"tsc"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(p.join(".vscode")).unwrap();
+        std::fs::write(
+            p.join(".vscode/tasks.json"),
+            r#"{"version":"2.0.0","tasks":[{"label":"npm: build","type":"shell","command":"echo mine"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_task(discover_tasks(p), "npm: build").unwrap().source,
+            "tasks.json",
+            "a declared label wins"
+        );
+    }
+}

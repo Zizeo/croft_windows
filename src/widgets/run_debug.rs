@@ -1,0 +1,2338 @@
+use ratatui::{
+    buffer::Buffer,
+    layout::{Alignment, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Paragraph, Widget, Wrap},
+};
+use std::path::PathBuf;
+
+const BODY_FG_RGB: (u8, u8, u8) = (0xb0, 0xb8, 0xc8);
+const TITLE_FG_RGB: (u8, u8, u8) = (0xff, 0xff, 0xff);
+const FOCUS_BORDER_RGB: (u8, u8, u8) = (0x4e, 0x9a, 0xff);
+
+// --- Debug-panel (Variant A "Darcula") palette. Fixed darks chosen to read
+// well on both the Black (#000) and Dark Blue (#1e222e) theme backgrounds. ---
+const DBG_BAR_BG: Color = Color::Rgb(0x1c, 0x27, 0x33); // section-header bar fill
+const DBG_BAR_FG: Color = Color::Rgb(0x8f, 0xd9, 0xcf); // section-header text
+const DBG_FRAME_BG: Color = Color::Rgb(0x20, 0x2a, 0x37); // selected-frame fill
+const DBG_ACCENT: Color = Color::Rgb(0x5c, 0xd6, 0xc8); // brand teal stripe / caret
+const DBG_SCOPE: Color = Color::Rgb(0xc8, 0xa0, 0x6a); // Locals / Globals (gold)
+const DBG_NAME: Color = Color::Rgb(0xbc, 0xbe, 0xc4); // identifiers / var names
+const DBG_EQ: Color = Color::Rgb(0x6b, 0x72, 0x80); // "="
+const DBG_TYPE: Color = Color::Rgb(0x78, 0x7c, 0x80); // ": type"
+const DBG_STR: Color = Color::Rgb(0x6a, 0xab, 0x73); // strings / collections
+const DBG_NUM: Color = Color::Rgb(0x2a, 0xac, 0xb8); // numbers
+const DBG_KW: Color = Color::Rgb(0xcf, 0x8e, 0x6d); // None / bool
+const DBG_CHEV: Color = Color::Rgb(0x5c, 0x66, 0x75); // expand chevrons
+const DBG_LOC: Color = Color::Rgb(0x6b, 0x76, 0x89); // file:line / dim console
+const DBG_PILL_BG: Color = Color::Rgb(0x0e, 0x7e, 0x76); // status pill
+const DBG_PILL_FG: Color = Color::Rgb(0xdf, 0xfd, 0xf7);
+const DBG_FRAME_SEL_FG: Color = Color::Rgb(0xff, 0xff, 0xff);
+const DBG_FIELD_BG: Color = Color::Rgb(0x0d, 0x11, 0x17); // REPL input field fill
+const DBG_PLACEHOLDER: Color = Color::Rgb(0x4b, 0x55, 0x63); // ghost hint text
+
+/// One button of the debug toolbar (#1545): VS Code's debug toolbar,
+/// docked at the top of the Run and Debug panel while a session is live,
+/// so a session can be driven by mouse when the F-keys never arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugControl {
+    Continue,
+    Pause,
+    StepOver,
+    StepInto,
+    StepOut,
+    Restart,
+    Stop,
+}
+
+impl DebugControl {
+    /// The toolbar left to right: Continue while paused, Pause while
+    /// running, then the steps, Restart and Stop.
+    pub fn toolbar(paused: bool) -> [DebugControl; 6] {
+        [
+            if paused {
+                DebugControl::Continue
+            } else {
+                DebugControl::Pause
+            },
+            DebugControl::StepOver,
+            DebugControl::StepInto,
+            DebugControl::StepOut,
+            DebugControl::Restart,
+            DebugControl::Stop,
+        ]
+    }
+
+    /// The codicon VS Code draws for it (`debug-continue`, `debug-pause`,
+    /// `debug-step-over`, `debug-step-into`, `debug-step-out`,
+    /// `debug-restart`, `debug-stop`).
+    pub fn glyph(self) -> char {
+        match self {
+            DebugControl::Continue => '\u{eacf}',
+            DebugControl::Pause => '\u{ead1}',
+            DebugControl::StepOver => '\u{ead6}',
+            DebugControl::StepInto => '\u{ead4}',
+            DebugControl::StepOut => '\u{ead5}',
+            DebugControl::Restart => '\u{ead2}',
+            DebugControl::Stop => '\u{ead7}',
+        }
+    }
+
+    /// The button's name and key, shown while the pointer is over it.
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            DebugControl::Continue => "Continue (F5)",
+            DebugControl::Pause => "Pause (F6)",
+            DebugControl::StepOver => "Step Over (F10)",
+            DebugControl::StepInto => "Step Into (F11)",
+            DebugControl::StepOut => "Step Out (Shift+F11)",
+            DebugControl::Restart => "Restart (Ctrl+Shift+F5)",
+            DebugControl::Stop => "Stop (Shift+F5)",
+        }
+    }
+
+    /// Whether it acts in this state: the steps need a paused thread.
+    pub fn enabled(self, paused: bool) -> bool {
+        paused
+            || !matches!(
+                self,
+                DebugControl::StepOver | DebugControl::StepInto | DebugControl::StepOut
+            )
+    }
+}
+
+/// Write `s` at `(x, y)` styled, clipped to the half-open column range
+/// `[x, right)`, and return the column just past what was drawn. Lets the
+/// renderer lay coloured segments left-to-right without overflowing the panel.
+fn put(buf: &mut Buffer, x: u16, y: u16, right: u16, s: &str, style: Style) -> u16 {
+    if x >= right {
+        return x;
+    }
+    let budget = (right - x) as usize;
+    let clipped: String = s.chars().take(budget).collect();
+    let drawn = clipped.chars().count() as u16;
+    buf.set_string(x, y, &clipped, style);
+    x + drawn
+}
+
+/// Add a background colour to `style` when `bg` is `Some` (so a selected frame's
+/// segments share its highlight fill).
+fn with_bg(style: Style, bg: Option<Color>) -> Style {
+    match bg {
+        Some(c) => style.bg(c),
+        None => style,
+    }
+}
+
+/// Word-wrap the panel's feedback line to rows at most `width` display
+/// columns wide (#944): a launch error is the message most worth reading and
+/// is usually far wider than the sidebar, so it gets as many rows as it
+/// needs instead of running across the border into the editor. A word wider
+/// than a row is split at the row's edge.
+fn wrap_feedback(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0;
+    for word in text.split_whitespace() {
+        let w: usize = word.chars().map(|c| c.width().unwrap_or(0)).sum();
+        if used > 0 && used + 1 + w > width {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        if used > 0 {
+            row.push(' ');
+            used += 1;
+        }
+        for c in word.chars() {
+            let cw = c.width().unwrap_or(0);
+            if used + cw > width && used > 0 {
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            row.push(c);
+            used += cw;
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+/// One wrapped console row: runs of text, each in the style its program
+/// output set (#1501).
+type ConsoleRow = Vec<(String, crate::ansi_text::AnsiStyle)>;
+
+/// Soft-wrap one console line into rows at most `width` display columns
+/// wide, the way a terminal wraps (#867): whitespace is kept, so a
+/// traceback's indentation survives, a wide glyph never straddles two rows,
+/// and a tab is four spaces. An empty line is one empty row. Each character
+/// keeps the colour its span gives it, so a coloured word wrapped across two
+/// rows is coloured on both (#1501).
+///
+/// Only the last `keep` rows are returned, oldest first, and only they are
+/// built: a row that scrolls out of the kept tail lends its buffer to the
+/// next, so a program printing one enormous line costs a scan of it per
+/// frame but never a string per row (#867 review).
+fn wrap_console_line_tail(
+    line: &crate::ansi_text::AnsiLine,
+    width: usize,
+    keep: usize,
+) -> Vec<ConsoleRow> {
+    use unicode_width::UnicodeWidthChar;
+    if keep == 0 {
+        return Vec::new();
+    }
+    let width = width.max(1);
+    let mut rows: std::collections::VecDeque<ConsoleRow> = std::collections::VecDeque::new();
+    let mut row = ConsoleRow::new();
+    let mut used = 0;
+    let mut span = 0;
+    for (at, c) in line.text.char_indices() {
+        while line.spans.get(span).is_some_and(|s| s.end <= at) {
+            span += 1;
+        }
+        let style = line
+            .spans
+            .get(span)
+            .filter(|s| s.start <= at)
+            .map(|s| s.style)
+            .unwrap_or_default();
+        // A tab is four spaces.
+        let (c, n) = if c == '\t' { (' ', 4) } else { (c, 1) };
+        let w = c.width().unwrap_or(0);
+        for _ in 0..n {
+            if used + w > width && !row.is_empty() {
+                rows.push_back(std::mem::take(&mut row));
+                // With the row in progress, `keep` rows are kept: once the
+                // finished ones reach `keep`, the oldest one's buffer becomes
+                // the next row instead of a fresh allocation.
+                if rows.len() >= keep {
+                    row = rows.pop_front().unwrap_or_default();
+                    row.clear();
+                }
+                used = 0;
+            }
+            match row.last_mut() {
+                Some((text, st)) if *st == style => text.push(c),
+                _ => row.push((c.to_string(), style)),
+            }
+            used += w;
+        }
+    }
+    rows.push_back(row);
+    rows.into()
+}
+
+/// The style a console run paints in: `base` (the line's own colour), with
+/// whatever the program's colour sequences set on top (#1501). Inverse is
+/// left to the terminal, which knows the pair it swaps.
+fn console_run_style(
+    base: Style,
+    st: crate::ansi_text::AnsiStyle,
+    theme: crate::theme::Theme,
+) -> Style {
+    use crate::widgets::editor::ansi_color_to_tui;
+    let mut style = base;
+    if let Some(c) = st.fg {
+        style = style.fg(ansi_color_to_tui(c, theme));
+    }
+    if let Some(c) = st.bg {
+        style = style.bg(ansi_color_to_tui(c, theme));
+    }
+    for (on, m) in [
+        (st.bold, Modifier::BOLD),
+        (st.dim, Modifier::DIM),
+        (st.italic, Modifier::ITALIC),
+        (st.underline, Modifier::UNDERLINED),
+        (st.inverse, Modifier::REVERSED),
+        (st.strikeout, Modifier::CROSSED_OUT),
+    ] {
+        if on {
+            style = style.add_modifier(m);
+        }
+    }
+    style
+}
+
+/// Colour a Python value by its `type_name` (PyCharm/Darcula-ish): strings and
+/// collections green, numbers cyan, None/bool orange, everything else (objects)
+/// the neutral name grey.
+fn value_color(type_name: &str, theme: crate::theme::Theme) -> Color {
+    match type_name {
+        "str" => theme.ui(DBG_STR),
+        "int" | "float" | "complex" => theme.ui(DBG_NUM),
+        "bool" | "NoneType" => theme.ui(DBG_KW),
+        "list" | "tuple" | "dict" | "set" | "frozenset" | "bytes" | "bytearray" => {
+            theme.ui(DBG_STR)
+        }
+        _ => theme.ui(DBG_NAME),
+    }
+}
+
+/// Cells reserved above the headline for the OSC-1337 debug-alt icon
+/// overlay. Six cells wide × three cells tall lands a roughly 60×60-pixel
+/// codicon at typical iTerm2 cell sizes (10×20 px), matching the VS Code
+/// empty-state proportions the user supplied. The image is painted post-
+/// frame by `App::flush_run_debug_icon_overlay`; on view change away from
+/// Run-Debug the App's `terminal.clear()` evicts the cached image cells
+/// (the same pipeline the welcome wordmark and editor preview use).
+pub const RUN_DEBUG_ICON_CELLS_W: u16 = 6;
+pub const RUN_DEBUG_ICON_CELLS_H: u16 = 3;
+
+/// What a [`DebugRow`] represents, so a click can act on it (navigate to a
+/// frame, expand a variable) and so the renderer can colour each part. Each
+/// variant carries the structured pieces the renderer styles independently
+/// (name vs value vs type), PyCharm-style.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DebugRowKind {
+    /// A section header ("CALL STACK", "VARIABLES") drawn as a filled bar.
+    Header { title: String },
+    /// A call-stack frame; `name` is the function, `location` is `file:line`.
+    Frame {
+        id: i64,
+        selected: bool,
+        name: String,
+        location: String,
+    },
+    /// A thread (a goroutine, under delve) in the CALL STACK when the
+    /// debuggee has more than one (#264); `selected` is the one whose frames
+    /// are listed and that stepping applies to.
+    Thread {
+        id: i64,
+        name: String,
+        selected: bool,
+    },
+    /// A scope container row ("Locals", "Globals"). `open` is `Some` for an
+    /// expensive scope (#1421), which opens on click and shows a chevron;
+    /// `None` for one that is always open. `index` is its position in the
+    /// session's scopes.
+    Scope {
+        name: String,
+        index: usize,
+        open: Option<bool>,
+    },
+    /// A variable. `reference > 0` means expandable; `value`/`type_name` are
+    /// coloured by type.
+    Variable {
+        reference: i64,
+        expandable: bool,
+        expanded: bool,
+        name: String,
+        value: String,
+        type_name: String,
+        /// The adapter's `evaluateName`, for Copy as Expression and Add to
+        /// Watch (#1546).
+        evaluate_name: Option<String>,
+    },
+    /// A watch expression (#112). `available` false renders `<not available>`
+    /// (the adapter rejected it); `changed` highlights a value that differs
+    /// from the previous stop; `pending` shows a placeholder until the
+    /// evaluate response lands.
+    Watch {
+        /// Index into the App's expression list — carried IN the row so the
+        /// remove `✕` maps to the right expression even when `debug_scroll`
+        /// has skipped earlier Watch rows (a render-order counter restarted
+        /// at the first VISIBLE row and removed the wrong one).
+        index: usize,
+        expression: String,
+        value: String,
+        available: bool,
+        changed: bool,
+        pending: bool,
+    },
+    /// The trailing "+ Add Expression" affordance row of the WATCH section.
+    WatchAdd,
+    /// A breakpoint (#250): `index` into [`RunDebugPanel::breakpoints`].
+    /// Clicking the row jumps to it; the `✕` removes it.
+    Breakpoint { index: usize },
+}
+
+/// One breakpoint as the BREAKPOINTS list shows it (#250), filled by the app
+/// from the editor's breakpoints on every refresh, running or not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakpointItem {
+    pub path: PathBuf,
+    /// 1-based, as the editor stores breakpoint lines.
+    pub line: usize,
+    /// `file.rs:12`.
+    pub label: String,
+    /// `if <condition>` or `log <message>` for a conditional breakpoint or a
+    /// logpoint; `None` for a plain one.
+    pub detail: Option<String>,
+}
+
+/// One rendered line of the paused-state debug tree. The app builds these from
+/// the session; the panel renders them and maps clicks back to them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugRow {
+    pub indent: u8,
+    pub kind: DebugRowKind,
+}
+
+pub struct RunDebugPanel {
+    pub focused: bool,
+    /// Active color theme; chrome colors route through `Theme::ui` so the
+    /// panel follows light themes. Set by the app's focus/theme sync.
+    pub theme: crate::theme::Theme,
+    /// True under the Black theme: overpaint the focused outer border with the
+    /// orange→green brand gradient instead of the legacy solid blue. Set by the
+    /// app's focus/theme sync.
+    pub focus_gradient: bool,
+    pub active_file: Option<PathBuf>,
+    /// Whether the active file is something croft can run or debug. When false
+    /// (e.g. an extensionless `.git/config`) the empty state shows a "can't run
+    /// this file" note instead of an actionable button. Set by the app.
+    pub runnable: bool,
+    /// Whether the button's action is debug (compiled source: build + lldb)
+    /// rather than run-in-terminal (scripts / executables). Drives both the
+    /// button verb ("Debug" vs "Run") and the click dispatch. Set by the app.
+    pub run_is_debug: bool,
+    pub last_area: Rect,
+    pub last_button_area: Rect,
+    /// How many launch.json configurations the workspace declares (#250) and
+    /// which one F5 starts (`None` = zero-config active file). Set by the
+    /// app's `refresh_run_debug` sync; drives the config row under the button.
+    pub config_count: usize,
+    pub selected_config: Option<String>,
+    /// Hit area of the config row painted this frame; clicking it opens the
+    /// Debug Configuration picker. Default when no row was painted.
+    pub last_config_area: Rect,
+    /// When a debug session is paused, the app fills these rows (call stack +
+    /// variables) and sets `debug_active`; the panel then renders the tree
+    /// instead of the empty-state Run button.
+    pub debug_active: bool,
+    /// Remove-`✕` hit cells for Watch rows painted this frame:
+    /// `(y, x, nth watch row)`. Cleared at every tree render.
+    watch_remove_rects: Vec<(u16, u16, usize)>,
+    /// Every breakpoint, for the BREAKPOINTS list (#250).
+    pub breakpoints: Vec<BreakpointItem>,
+    /// Painted breakpoint rows this frame: `(y, index)`, and their remove
+    /// `✕` cells `(y, x, index)`. Cleared at every render.
+    breakpoint_row_rects: Vec<(u16, usize)>,
+    breakpoint_remove_rects: Vec<(u16, u16, usize)>,
+    pub debug_status: String,
+    /// Whether the live session is paused (set by the app with the rows),
+    /// which decides Continue vs Pause and whether the steps act (#1545).
+    pub debug_paused: bool,
+    /// The debug toolbar's buttons this frame: `(y, x, control)`, each
+    /// button three cells wide from `x`. Cleared at every render.
+    debug_control_rects: Vec<(u16, u16, DebugControl)>,
+    pub debug_rows: Vec<DebugRow>,
+    pub debug_scroll: usize,
+    /// Screen y of the first rendered debug row and how many rows were drawn,
+    /// recorded each frame so a click can be mapped to a row index.
+    pub last_debug_row_y0: u16,
+    pub last_debug_rows_shown: usize,
+    /// Tail of the debug console (program output + REPL echoes/results), set by
+    /// the app each refresh; rendered below the variables tree.
+    pub console_tail: Vec<crate::ansi_text::AnsiLine>,
+    /// Current REPL input line, rendered as a `❯` prompt at the panel bottom.
+    pub repl_input: String,
+    /// Top-left cell of the OSC-1337 icon overlay block. The post-draw
+    /// flush in `App` reads this to emit the rasterised debug-alt PNG
+    /// above the headline. `None` when the panel hasn't been laid out,
+    /// or when the panel is too short for the icon to fit alongside
+    /// the rest of the cluster.
+    pub last_icon_cell: Option<(u16, u16)>,
+    pub feedback: Option<String>,
+    pub feedback_is_error: bool,
+    /// True from when a debug session ends until the next one starts. While set
+    /// (and `console_tail` is non-empty) the idle panel keeps the just-ended
+    /// session's console output on screen instead of wiping straight back to the
+    /// Run button, so a fast-exiting program's output/errors stay readable.
+    pub session_ended: bool,
+    /// The cell under the mouse pointer this frame, fed by the app like
+    /// every other side panel's, so the Run and Debug button lifts under it
+    /// the way Source Control's buttons do (a boxed theme ignores it).
+    pub hover_pointer: Option<(u16, u16)>,
+}
+
+impl RunDebugPanel {
+    pub fn new() -> Self {
+        Self {
+            focused: false,
+            theme: crate::theme::Theme::default(),
+            focus_gradient: false,
+            active_file: None,
+            runnable: false,
+            run_is_debug: false,
+            last_area: Rect::default(),
+            last_button_area: Rect::default(),
+            config_count: 0,
+            selected_config: None,
+            last_config_area: Rect::default(),
+            debug_active: false,
+            watch_remove_rects: Vec::new(),
+            breakpoints: Vec::new(),
+            breakpoint_row_rects: Vec::new(),
+            breakpoint_remove_rects: Vec::new(),
+            debug_status: String::new(),
+            debug_paused: false,
+            debug_control_rects: Vec::new(),
+            debug_rows: Vec::new(),
+            debug_scroll: 0,
+            last_debug_row_y0: 0,
+            last_debug_rows_shown: 0,
+            console_tail: Vec::new(),
+            repl_input: String::new(),
+            last_icon_cell: None,
+            feedback: None,
+            feedback_is_error: false,
+            session_ended: false,
+            hover_pointer: None,
+        }
+    }
+
+    /// Map a click to the watch row whose remove `✕` sits at `(x, y)` —
+    /// returns the index into the ORDER the Watch rows were rendered in,
+    /// which the app maps back to its expression list.
+    pub fn watch_remove_at(&self, x: u16, y: u16) -> Option<usize> {
+        self.watch_remove_rects
+            .iter()
+            .find(|&&(ry, rx, _)| ry == y && (x == rx || x == rx + 1))
+            .map(|&(_, _, idx)| idx)
+    }
+
+    /// The debug toolbar button painted at `(x, y)`, if it acts in the
+    /// session's state; a greyed-out step button is not one (#1545).
+    pub fn debug_control_at(&self, x: u16, y: u16) -> Option<DebugControl> {
+        self.debug_control_painted_at(x, y)
+            .filter(|c| c.enabled(self.debug_paused))
+    }
+
+    /// The debug toolbar button painted at `(x, y)`, greyed out or not: the
+    /// one whose name and key the pointer's tooltip shows.
+    pub fn debug_control_painted_at(&self, x: u16, y: u16) -> Option<DebugControl> {
+        self.debug_control_rects
+            .iter()
+            .find(|&&(ry, rx, _)| ry == y && (rx..rx + 3).contains(&x))
+            .map(|&(_, _, c)| c)
+    }
+
+    /// Map a click to a painted breakpoint (#250): the index into
+    /// `breakpoints`, and whether it landed on the remove `✕`.
+    pub fn breakpoint_at(&self, x: u16, y: u16) -> Option<(usize, bool)> {
+        if let Some(&(_, _, i)) = self
+            .breakpoint_remove_rects
+            .iter()
+            .find(|&&(ry, rx, _)| ry == y && (x == rx || x == rx + 1))
+        {
+            return Some((i, true));
+        }
+        self.breakpoint_row_rects
+            .iter()
+            .find(|&&(ry, _)| ry == y)
+            .map(|&(_, i)| (i, false))
+    }
+
+    /// Paint one breakpoint on row `y` between `x0` and `right`, recording
+    /// its click cells.
+    fn put_breakpoint(&mut self, buf: &mut Buffer, index: usize, x0: u16, y: u16, right: u16) {
+        let Some(bp) = self.breakpoints.get(index).cloned() else {
+            return;
+        };
+        let text_right = right.saturating_sub(3);
+        let mut x = put(
+            buf,
+            x0,
+            y,
+            text_right,
+            "\u{25cf} ",
+            Style::default().fg(self.theme.ui(Color::Rgb(0xe5, 0x14, 0x00))),
+        );
+        x = put(
+            buf,
+            x,
+            y,
+            text_right,
+            &bp.label,
+            Style::default().fg(self.theme.ui(DBG_NAME)),
+        );
+        if let Some(detail) = &bp.detail {
+            put(
+                buf,
+                x + 1,
+                y,
+                text_right,
+                detail,
+                Style::default()
+                    .fg(self.theme.ui(DBG_TYPE))
+                    .add_modifier(Modifier::ITALIC),
+            );
+        }
+        self.breakpoint_row_rects.push((y, index));
+        if right > x0 + 2 {
+            let rx = right - 2;
+            put(
+                buf,
+                rx,
+                y,
+                right,
+                "\u{2715}",
+                Style::default().fg(self.theme.ui(DBG_TYPE)),
+            );
+            self.breakpoint_remove_rects.push((y, rx, index));
+        }
+    }
+
+    /// Map a click at screen row `y` to the index of the debug row drawn there,
+    /// or `None` if the click missed the rendered rows.
+    pub fn debug_row_at(&self, y: u16) -> Option<usize> {
+        if !self.debug_active || self.last_debug_rows_shown == 0 || y < self.last_debug_row_y0 {
+            return None;
+        }
+        let offset = (y - self.last_debug_row_y0) as usize;
+        if offset < self.last_debug_rows_shown {
+            Some(self.debug_scroll + offset)
+        } else {
+            None
+        }
+    }
+
+    pub fn set_active_file(&mut self, path: Option<PathBuf>) {
+        self.active_file = path;
+    }
+
+    pub fn click_button(&self, x: u16, y: u16) -> bool {
+        let r = self.last_button_area;
+        r.width > 0
+            && r.height > 0
+            && x >= r.x
+            && x < r.x + r.width
+            && y >= r.y
+            && y < r.y + r.height
+    }
+
+    /// Whether a click lands on the config row under the button (#250).
+    pub fn click_config(&self, x: u16, y: u16) -> bool {
+        let r = self.last_config_area;
+        r.width > 0
+            && r.height > 0
+            && x >= r.x
+            && x < r.x + r.width
+            && y >= r.y
+            && y < r.y + r.height
+    }
+
+    /// The config row's text: the selected configuration's name, or an
+    /// invitation when configs exist but none is selected.
+    fn config_row_label(&self) -> Option<String> {
+        match (&self.selected_config, self.config_count) {
+            (Some(name), _) => Some(format!("⚙ {name} ▾")),
+            (None, 0) => None,
+            // "entries" rather than "configs": the count covers compounds too
+            // since #250, and the singular case read "1 debug configs".
+            (None, 1) => Some(String::from("⚙ 1 debug entry ▾")),
+            (None, n) => Some(format!("⚙ {n} debug entries ▾")),
+        }
+    }
+
+    /// The newest `max_rows` rows of the console tail, each line soft-wrapped
+    /// to `width` columns (#867), oldest first so they paint top-down with
+    /// the newest last. Each row says whether its line is a REPL echo
+    /// (`❯ expr`), drawn in the accent colour down all its rows.
+    fn console_rows(&self, width: usize, max_rows: usize) -> Vec<(ConsoleRow, bool)> {
+        let mut rows = Vec::new();
+        for line in self.console_tail.iter().rev() {
+            let echo = line.text.starts_with('❯');
+            let keep = max_rows.saturating_sub(rows.len());
+            for row in wrap_console_line_tail(line, width, keep).into_iter().rev() {
+                if rows.len() == max_rows {
+                    rows.reverse();
+                    return rows;
+                }
+                rows.push((row, echo));
+            }
+        }
+        rows.reverse();
+        rows
+    }
+
+    /// Paint one wrapped console row at (`x`, `y`), at most `width` columns,
+    /// each run in `base` overlaid with its own colours.
+    fn put_console_row(
+        &self,
+        buf: &mut Buffer,
+        x: u16,
+        y: u16,
+        row: &ConsoleRow,
+        width: u16,
+        base: Style,
+    ) {
+        let right = x.saturating_add(width);
+        let mut at = x;
+        for (text, st) in row {
+            if at >= right {
+                break;
+            }
+            let style = console_run_style(base, *st, self.theme);
+            let (end, _) = buf.set_stringn(at, y, text, (right - at) as usize, style);
+            at = end;
+        }
+    }
+
+    /// Render the paused-state tree (Variant A / Darcula): a status pill, the
+    /// call-stack + variables tree with type-coloured values, then the console
+    /// and a REPL bar pinned to the bottom. Records `last_debug_row_y0` /
+    /// `last_debug_rows_shown` for click mapping.
+    fn render_debug_tree(&mut self, inner: Rect, buf: &mut Buffer) {
+        self.watch_remove_rects.clear();
+        self.breakpoint_row_rects.clear();
+        self.breakpoint_remove_rects.clear();
+        self.debug_control_rects.clear();
+        let right = inner.x + inner.width;
+        let mut y = inner.y;
+
+        // The debug toolbar (#1545): Continue / Pause, Step Over, Step Into,
+        // Step Out, Restart, Stop, then the status pill, e.g.
+        // " Paused (breakpoint) ". Each button's name and key is its tooltip.
+        // A sidebar too narrow for all six wraps them onto further rows, so
+        // Stop and the rest stay clickable at the minimum width.
+        if !self.debug_status.is_empty() {
+            let bottom = inner.y + inner.height;
+            let mut x = inner.x + 1;
+            for control in DebugControl::toolbar(self.debug_paused) {
+                if x + 3 > right && x > inner.x + 1 {
+                    x = inner.x + 1;
+                    y += 1;
+                }
+                if x + 3 > right || y >= bottom {
+                    break;
+                }
+                let fg = if control.enabled(self.debug_paused) {
+                    self.theme.ui(DBG_PILL_FG)
+                } else {
+                    self.theme.ui(DBG_PLACEHOLDER)
+                };
+                let bg = self.theme.ui(DBG_BAR_BG);
+                buf.set_string(
+                    x,
+                    y,
+                    format!(" {} ", control.glyph()),
+                    Style::default().fg(fg).bg(bg),
+                );
+                self.debug_control_rects.push((y, x, control));
+                x += 3;
+            }
+            let text = format!(" {} ", self.debug_status);
+            put(
+                buf,
+                x + 1,
+                y,
+                right,
+                &text,
+                Style::default()
+                    .fg(self.theme.ui(DBG_PILL_FG))
+                    .bg(self.theme.ui(DBG_PILL_BG))
+                    .add_modifier(Modifier::BOLD),
+            );
+            y += 2;
+        }
+        if y >= inner.y + inner.height {
+            return;
+        }
+
+        // Reserve the bottom for the console + the REPL input area. The input
+        // area is 2 rows: a "DEBUG CONSOLE" label and the filled input field.
+        // The console is sized to its actual row count (capped at 6) so the
+        // newest line sits directly above the label and output grows UPWARD,
+        // like a terminal — never floating at the top of a fixed-height box.
+        // Lines wrap to the panel's width rather than clip at its edge (#867).
+        let bottom = inner.y + inner.height;
+        let input_h: u16 = 2;
+        let console_avail = bottom.saturating_sub(y).saturating_sub(input_h + 2);
+        let console_w = inner.width.saturating_sub(2);
+        let console_rows = self.console_rows(console_w as usize, console_avail.min(6) as usize);
+        let console_h = console_rows.len() as u16;
+        let rows_bottom = bottom.saturating_sub(input_h + console_h);
+        let rows_area_h = rows_bottom.saturating_sub(y) as usize;
+        self.last_debug_row_y0 = y;
+
+        let mut shown = 0usize;
+        // Breakpoint rows paint after the loop: `put_breakpoint` needs
+        // `&mut self` while the loop holds `debug_rows`.
+        let mut breakpoint_rows: Vec<(usize, u16, u16, u16)> = Vec::new();
+        for row in self
+            .debug_rows
+            .iter()
+            .skip(self.debug_scroll)
+            .take(rows_area_h)
+        {
+            let row_y = y + shown as u16;
+            match &row.kind {
+                DebugRowKind::Header { title } => {
+                    // Filled bar across the full width, title in teal.
+                    buf.set_style(
+                        Rect {
+                            x: inner.x,
+                            y: row_y,
+                            width: inner.width,
+                            height: 1,
+                        },
+                        Style::default().bg(self.theme.ui(DBG_BAR_BG)),
+                    );
+                    let t: String = title
+                        .chars()
+                        .take(inner.width.saturating_sub(2) as usize)
+                        .collect();
+                    buf.set_string(
+                        inner.x + 1,
+                        row_y,
+                        &t,
+                        Style::default()
+                            .fg(self.theme.ui(DBG_BAR_FG))
+                            .bg(self.theme.ui(DBG_BAR_BG))
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
+                DebugRowKind::Frame {
+                    selected,
+                    name,
+                    location,
+                    ..
+                } => {
+                    if *selected {
+                        buf.set_style(
+                            Rect {
+                                x: inner.x,
+                                y: row_y,
+                                width: inner.width,
+                                height: 1,
+                            },
+                            Style::default().bg(self.theme.ui(DBG_FRAME_BG)),
+                        );
+                        buf.set_string(
+                            inner.x,
+                            row_y,
+                            "▌",
+                            Style::default()
+                                .fg(self.theme.ui(DBG_ACCENT))
+                                .bg(self.theme.ui(DBG_FRAME_BG)),
+                        );
+                    }
+                    let bg = if *selected {
+                        Some(self.theme.ui(DBG_FRAME_BG))
+                    } else {
+                        None
+                    };
+                    let mut x = inner.x + 2;
+                    let name_style = if *selected {
+                        Style::default()
+                            .fg(self.theme.ui(DBG_FRAME_SEL_FG))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(self.theme.ui(DBG_NAME))
+                    };
+                    x = put(buf, x, row_y, right, name, with_bg(name_style, bg));
+                    x = put(buf, x, row_y, right, " ", with_bg(Style::default(), bg));
+                    put(
+                        buf,
+                        x,
+                        row_y,
+                        right,
+                        location,
+                        with_bg(Style::default().fg(self.theme.ui(DBG_LOC)), bg),
+                    );
+                }
+                DebugRowKind::Thread { name, selected, .. } => {
+                    // Open chevron on the thread whose frames follow.
+                    let text = format!("{} {name}", if *selected { "▾" } else { "▸" });
+                    let style = if *selected {
+                        Style::default()
+                            .fg(self.theme.ui(DBG_FRAME_SEL_FG))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(self.theme.ui(DBG_SCOPE))
+                    };
+                    put(buf, inner.x + 1, row_y, right, &text, style);
+                }
+                DebugRowKind::Scope { name, open, .. } => {
+                    let text = match open {
+                        Some(true) => format!("\u{25be} {name}"),
+                        Some(false) => format!("\u{25b8} {name}"),
+                        None => name.clone(),
+                    };
+                    put(
+                        buf,
+                        inner.x + 1,
+                        row_y,
+                        right,
+                        &text,
+                        Style::default()
+                            .fg(self.theme.ui(DBG_SCOPE))
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
+                DebugRowKind::Variable {
+                    expandable,
+                    expanded,
+                    name,
+                    value,
+                    type_name,
+                    ..
+                } => {
+                    let indent = (row.indent as u16) * 2;
+                    let mut x = inner.x + indent;
+                    let chev = if *expandable {
+                        if *expanded { "▾ " } else { "▸ " }
+                    } else {
+                        "  "
+                    };
+                    x = put(
+                        buf,
+                        x,
+                        row_y,
+                        right,
+                        chev,
+                        Style::default().fg(self.theme.ui(DBG_CHEV)),
+                    );
+                    x = put(
+                        buf,
+                        x,
+                        row_y,
+                        right,
+                        name,
+                        Style::default().fg(self.theme.ui(DBG_NAME)),
+                    );
+                    x = put(
+                        buf,
+                        x,
+                        row_y,
+                        right,
+                        " = ",
+                        Style::default().fg(self.theme.ui(DBG_EQ)),
+                    );
+                    x = put(
+                        buf,
+                        x,
+                        row_y,
+                        right,
+                        value,
+                        Style::default().fg(value_color(type_name, self.theme)),
+                    );
+                    if !type_name.is_empty() {
+                        put(
+                            buf,
+                            x,
+                            row_y,
+                            right,
+                            &format!(" : {type_name}"),
+                            Style::default()
+                                .fg(self.theme.ui(DBG_TYPE))
+                                .add_modifier(Modifier::ITALIC),
+                        );
+                    }
+                }
+                DebugRowKind::Watch {
+                    index,
+                    expression,
+                    value,
+                    available,
+                    changed,
+                    pending,
+                } => {
+                    let indent = (row.indent as u16) * 2;
+                    let mut x = inner.x + indent;
+                    // Text clips three cells early: the remove `\u{2715}` owns
+                    // the right edge, and a long value ran under it.
+                    let right = right.saturating_sub(3);
+                    x = put(
+                        buf,
+                        x,
+                        row_y,
+                        right,
+                        expression,
+                        Style::default().fg(self.theme.ui(DBG_NAME)),
+                    );
+                    x = put(
+                        buf,
+                        x,
+                        row_y,
+                        right,
+                        " = ",
+                        Style::default().fg(self.theme.ui(DBG_EQ)),
+                    );
+                    let (text, style) = if *pending {
+                        ("\u{2026}", Style::default().fg(self.theme.ui(DBG_TYPE)))
+                    } else if !*available {
+                        (
+                            "<not available>",
+                            Style::default()
+                                .fg(self.theme.ui(DBG_TYPE))
+                                .add_modifier(Modifier::ITALIC),
+                        )
+                    } else if *changed {
+                        (
+                            value.as_str(),
+                            Style::default()
+                                .fg(self.theme.ui(Color::Rgb(0xb6, 0xee, 0xc4)))
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        (
+                            value.as_str(),
+                            Style::default().fg(value_color("", self.theme)),
+                        )
+                    };
+                    put(buf, x, row_y, right, text, style);
+                    // Per-row remove ✕ pinned at the right edge, recorded for
+                    // the click map (cleared at render start — hit rects
+                    // always describe the painted frame).
+                    let right = right + 3;
+                    if right > inner.x + 2 {
+                        let rx = right - 2;
+                        put(
+                            buf,
+                            rx,
+                            row_y,
+                            right,
+                            "\u{2715}",
+                            Style::default().fg(self.theme.ui(DBG_TYPE)),
+                        );
+                        self.watch_remove_rects.push((row_y, rx, *index));
+                    }
+                }
+                DebugRowKind::Breakpoint { index } => {
+                    let indent = (row.indent as u16) * 2;
+                    breakpoint_rows.push((*index, inner.x + indent, row_y, right));
+                }
+                DebugRowKind::WatchAdd => {
+                    let indent = (row.indent as u16) * 2;
+                    put(
+                        buf,
+                        inner.x + indent,
+                        row_y,
+                        right,
+                        "+ Add Expression",
+                        Style::default()
+                            .fg(self.theme.ui(DBG_TYPE))
+                            .add_modifier(Modifier::ITALIC),
+                    );
+                }
+            }
+            shown += 1;
+        }
+        for (index, x, row_y, right) in breakpoint_rows {
+            self.put_breakpoint(buf, index, x, row_y, right);
+        }
+        self.last_debug_rows_shown = shown;
+
+        // Bottom-up: the input field is the last row, the "DEBUG CONSOLE" label
+        // the row above it, and any console output sits above that.
+        let field_y = bottom - 1;
+        let label_y = bottom - 2;
+
+        // Console: program output + REPL echoes, above the label.
+        let console_y0 = label_y.saturating_sub(console_h);
+        for (i, (row, echo)) in console_rows.iter().enumerate() {
+            let style = if *echo {
+                Style::default().fg(self.theme.ui(DBG_ACCENT))
+            } else {
+                Style::default().fg(self.theme.ui(DBG_LOC))
+            };
+            self.put_console_row(
+                buf,
+                inner.x + 1,
+                console_y0 + i as u16,
+                row,
+                console_w,
+                style,
+            );
+        }
+
+        // "DEBUG CONSOLE" label above the field.
+        put(
+            buf,
+            inner.x + 1,
+            label_y,
+            right,
+            "DEBUG CONSOLE",
+            Style::default()
+                .fg(self.theme.ui(DBG_LOC))
+                .add_modifier(Modifier::BOLD),
+        );
+
+        // The input field: a subtle full-width fill makes it read as a text box.
+        // A teal caret, then the input (or a dim-italic placeholder when empty),
+        // with a teal block cursor marking the insertion point.
+        buf.set_style(
+            Rect {
+                x: inner.x,
+                y: field_y,
+                width: inner.width,
+                height: 1,
+            },
+            Style::default().bg(self.theme.ui(DBG_FIELD_BG)),
+        );
+        let bg = Some(self.theme.ui(DBG_FIELD_BG));
+        let caret_end = put(
+            buf,
+            inner.x + 1,
+            field_y,
+            right,
+            "❯ ",
+            with_bg(
+                Style::default()
+                    .fg(self.theme.ui(DBG_ACCENT))
+                    .add_modifier(Modifier::BOLD),
+                bg,
+            ),
+        );
+        if self.repl_input.is_empty() {
+            // Block cursor at the insertion point, then the ghost placeholder.
+            let after_cursor = put(
+                buf,
+                caret_end,
+                field_y,
+                right,
+                " ",
+                Style::default().bg(self.theme.ui(DBG_ACCENT)),
+            );
+            put(
+                buf,
+                after_cursor,
+                field_y,
+                right,
+                "Evaluate expression",
+                with_bg(
+                    Style::default()
+                        .fg(self.theme.ui(DBG_PLACEHOLDER))
+                        .add_modifier(Modifier::ITALIC),
+                    bg,
+                ),
+            );
+        } else {
+            let input_end = put(
+                buf,
+                caret_end,
+                field_y,
+                right,
+                &self.repl_input,
+                with_bg(Style::default().fg(self.theme.ui(DBG_NAME)), bg),
+            );
+            put(
+                buf,
+                input_end,
+                field_y,
+                right,
+                " ",
+                Style::default().bg(self.theme.ui(DBG_ACCENT)),
+            );
+        }
+    }
+
+    pub fn button_label(&self) -> String {
+        match self.active_file.as_ref().and_then(|p| p.file_name()) {
+            Some(name) => {
+                // Compiled source builds + launches the debugger; scripts and
+                // executables run in a terminal.
+                let verb = if self.run_is_debug { "Debug" } else { "Run" };
+                format!("{verb} {}", name.to_string_lossy())
+            }
+            None => String::from("Run and Debug"),
+        }
+    }
+}
+
+impl Default for RunDebugPanel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Widget for &mut RunDebugPanel {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let border_style = if self.focused {
+            Style::default().fg(Color::Rgb(
+                FOCUS_BORDER_RGB.0,
+                FOCUS_BORDER_RGB.1,
+                FOCUS_BORDER_RGB.2,
+            ))
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let block = crate::widgets::surface::view_block(self.theme, true, border_style);
+        let inner = block.inner(area);
+        block.render(area, buf);
+        // Black theme: replace the solid focus border with the brand gradient.
+        // This panel has no border title, so nothing needs re-stamping.
+        crate::widgets::surface::paint_view_focus(
+            buf,
+            area,
+            self.theme,
+            self.focused,
+            self.focus_gradient,
+        );
+        self.last_area = area;
+        self.last_button_area = Rect::default();
+        self.last_config_area = Rect::default();
+        self.last_icon_cell = None;
+        self.last_debug_rows_shown = 0;
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
+        // Paused at a breakpoint: render the call-stack + variables tree instead
+        // of the empty-state Run button.
+        if self.debug_active {
+            self.render_debug_tree(inner, buf);
+            return;
+        }
+
+        // Vertical cluster, top-to-bottom: icon, gap, headline, gap, body, gap, button.
+        // Centre the cluster vertically so the panel feels balanced like the mockup.
+        const GAP_AFTER_ICON: u16 = 2;
+        const TITLE_H: u16 = 1;
+        const GAP_AFTER_TITLE: u16 = 1;
+        const BODY_MAX_H: u16 = 3;
+        const GAP_AFTER_BODY: u16 = 2;
+        const BUTTON_H: u16 = 3;
+
+        let icon_w = RUN_DEBUG_ICON_CELLS_W.min(inner.width);
+        let icon_h_full = RUN_DEBUG_ICON_CELLS_H;
+        let cluster_full = icon_h_full
+            + GAP_AFTER_ICON
+            + TITLE_H
+            + GAP_AFTER_TITLE
+            + BODY_MAX_H
+            + GAP_AFTER_BODY
+            + BUTTON_H;
+
+        // If the panel is too short for the full cluster, drop the icon
+        // first (it's decorative) before sacrificing the body or button.
+        let (icon_h, gap_after_icon, cluster) = if inner.height >= cluster_full {
+            (icon_h_full, GAP_AFTER_ICON, cluster_full)
+        } else {
+            (
+                0,
+                0,
+                TITLE_H + GAP_AFTER_TITLE + BODY_MAX_H + GAP_AFTER_BODY + BUTTON_H,
+            )
+        };
+
+        // After a session ends with output, anchor the cluster to the top so the
+        // retained console (rendered below the button) gets the lower region;
+        // otherwise centre it like the resting state.
+        let show_ended_console = self.session_ended && !self.console_tail.is_empty();
+        self.breakpoint_row_rects.clear();
+        self.breakpoint_remove_rects.clear();
+        self.debug_control_rects.clear();
+        let top_pad = if show_ended_console || !self.breakpoints.is_empty() {
+            0
+        } else if inner.height > cluster {
+            (inner.height - cluster) / 2
+        } else {
+            0
+        };
+        let mut y = inner.y + top_pad;
+
+        if icon_h > 0 && y + icon_h <= inner.y + inner.height {
+            let icon_x = inner.x + (inner.width.saturating_sub(icon_w)) / 2;
+            self.last_icon_cell = Some((icon_x, y));
+            // Glyph fallback: paint the cod-debug-alt codicon centred
+            // inside the reserved icon block so terminals without
+            // OSC-1337 image support still see a recognisable shape.
+            // On iTerm2 the post-draw `flush_run_debug_icon_overlay`
+            // overwrites these cells with the proper rasterised PNG.
+            let glyph_style = Style::default()
+                .fg(Color::Rgb(BODY_FG_RGB.0, BODY_FG_RGB.1, BODY_FG_RGB.2))
+                .add_modifier(Modifier::BOLD);
+            let glyph_x = icon_x + icon_w / 2;
+            let glyph_y = y + icon_h / 2;
+            buf.set_span(
+                glyph_x,
+                glyph_y,
+                &Span::styled(crate::icons::ACTIVITY_RUN_DEBUG.to_string(), glyph_style),
+                1,
+            );
+            y += icon_h + gap_after_icon;
+        }
+
+        if y + TITLE_H > inner.y + inner.height {
+            return;
+        }
+        let title = Paragraph::new(Line::from("RUN AND DEBUG"))
+            .alignment(Alignment::Center)
+            .style(
+                Style::default()
+                    .fg(Color::Rgb(TITLE_FG_RGB.0, TITLE_FG_RGB.1, TITLE_FG_RGB.2))
+                    .add_modifier(Modifier::BOLD),
+            );
+        title.render(
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: TITLE_H,
+            },
+            buf,
+        );
+        y += TITLE_H + GAP_AFTER_TITLE;
+
+        if y >= inner.y + inner.height {
+            return;
+        }
+        let body_text = match self.active_file.as_ref() {
+            Some(_) if self.runnable => {
+                "Press the button below to run the active file in a new terminal."
+            }
+            Some(_) => {
+                "This file can't be run or debugged. Open a Python, Rust, C/C++, or script file."
+            }
+            None => "Open a file that can be run or debugged, then press the button below.",
+        };
+        let body_h = BODY_MAX_H.min(inner.y + inner.height - y);
+        let body_x_pad = (inner.width / 12).clamp(1, 4);
+        let body_area = Rect {
+            x: inner.x + body_x_pad,
+            y,
+            width: inner.width.saturating_sub(body_x_pad * 2).max(1),
+            height: body_h,
+        };
+        let body = Paragraph::new(body_text)
+            .style(Style::default().fg(Color::Rgb(BODY_FG_RGB.0, BODY_FG_RGB.1, BODY_FG_RGB.2)))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
+        body.render(body_area, buf);
+        y += BODY_MAX_H + GAP_AFTER_BODY;
+
+        // A file is open but croft can't run/debug it: show only the note, no
+        // actionable button. (`last_button_area` stays default, so a click in
+        // the panel does nothing.) The no-file case still shows the generic
+        // "Run and Debug" button.
+        if self.active_file.is_some() && !self.runnable {
+            return;
+        }
+        if y + BUTTON_H > inner.y + inner.height {
+            return;
+        }
+        let label = self.button_label();
+        let label_chars = label.chars().count() as u16;
+        // Pin the button to the panel's interior so it can never be wider
+        // than the available space; without this clamp `inner.width -
+        // button_w` underflowed at narrow sidebar widths and ratatui
+        // panicked indexing the buffer at a wrapped-u16 column.
+        let button_w = (label_chars + 8).min(inner.width.saturating_sub(2));
+        if button_w < 4 {
+            return;
+        }
+        let button_x = inner.x + inner.width.saturating_sub(button_w) / 2;
+        let button_area = Rect {
+            x: button_x,
+            y,
+            width: button_w,
+            height: BUTTON_H,
+        };
+        self.last_button_area = button_area;
+        // Black theme: brand-teal button fill; Croft Dark keeps VS Code blue;
+        // Croft Loch draws the shared pill, lifted under the pointer.
+        let (button_bg, button_fg) =
+            crate::widgets::source_control::primary_button_colors(self.theme, self.focus_gradient);
+        crate::widgets::source_control::render_button(
+            buf,
+            button_area,
+            label.as_str(),
+            button_bg,
+            button_fg,
+            self.theme,
+            crate::widgets::hover::contains(button_area, self.hover_pointer),
+        );
+
+        let mut next_y = button_area.y + button_area.height + 1;
+        // The launch.json config row (#250): which configuration F5 starts,
+        // clickable to open the Debug Configuration picker.
+        if let Some(label) = self.config_row_label()
+            && next_y < inner.y + inner.height
+        {
+            let shown: String = label
+                .chars()
+                .take(inner.width.saturating_sub(2) as usize)
+                .collect();
+            let w = shown.chars().count() as u16;
+            let x = inner.x + inner.width.saturating_sub(w) / 2;
+            let style = Style::default().fg(self.theme.ui(Color::Rgb(0x8f, 0xd9, 0xcf)));
+            buf.set_string(x, next_y, &shown, style);
+            self.last_config_area = Rect {
+                x,
+                y: next_y,
+                width: w,
+                height: 1,
+            };
+            next_y = next_y.saturating_add(1);
+        }
+        if let Some(msg) = self.feedback.as_ref()
+            && next_y < inner.y + inner.height
+        {
+            let style = if self.feedback_is_error {
+                Style::default().fg(self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70)))
+            } else {
+                Style::default().fg(self.theme.ui(Color::Rgb(0xa3, 0xbe, 0x8c)))
+            };
+            let room = inner.width.saturating_sub(2) as usize;
+            for row in wrap_feedback(msg, room) {
+                if next_y >= inner.y + inner.height {
+                    break;
+                }
+                buf.set_stringn(inner.x + 1, next_y, &row, room, style);
+                next_y = next_y.saturating_add(1);
+            }
+        }
+        // BREAKPOINTS (#250): listed at rest too, so they can be found and
+        // cleared without starting a session.
+        if !self.breakpoints.is_empty() && next_y + 1 < inner.y + inner.height {
+            next_y = next_y.saturating_add(1);
+            buf.set_string(
+                inner.x + 1,
+                next_y,
+                "BREAKPOINTS",
+                Style::default()
+                    .fg(Color::Rgb(TITLE_FG_RGB.0, TITLE_FG_RGB.1, TITLE_FG_RGB.2))
+                    .add_modifier(Modifier::BOLD),
+            );
+            next_y = next_y.saturating_add(1);
+            let right = inner.x + inner.width;
+            for i in 0..self.breakpoints.len() {
+                if next_y >= inner.y + inner.height {
+                    break;
+                }
+                self.put_breakpoint(buf, i, inner.x + 2, next_y, right);
+                next_y = next_y.saturating_add(1);
+            }
+        }
+        // Retained console from the just-ended session: program output / errors
+        // stay readable after the run instead of being wiped to the Run button.
+        if show_ended_console && next_y + 1 < inner.y + inner.height {
+            next_y = next_y.saturating_add(1);
+            buf.set_string(
+                inner.x + 1,
+                next_y,
+                "DEBUG CONSOLE",
+                Style::default()
+                    .fg(Color::Rgb(TITLE_FG_RGB.0, TITLE_FG_RGB.1, TITLE_FG_RGB.2))
+                    .add_modifier(Modifier::BOLD),
+            );
+            next_y = next_y.saturating_add(1);
+            let bottom = inner.y + inner.height;
+            let avail = bottom.saturating_sub(next_y) as usize;
+            let max_w = inner.width.saturating_sub(2) as usize;
+            let line_style = Style::default().fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)));
+            for (row, _) in self.console_rows(max_w, avail) {
+                self.put_console_row(buf, inner.x + 1, next_y, &row, max_w as u16, line_style);
+                next_y = next_y.saturating_add(1);
+            }
+        }
+        let _ = next_y;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ansi_text::AnsiLine;
+
+    /// Every row of `line` wrapped to `width`.
+    fn wrap_console_line(line: &str, width: usize) -> Vec<String> {
+        wrap_console_line_tail(&AnsiLine::plain(line), width, usize::MAX)
+            .iter()
+            .map(row_text)
+            .collect()
+    }
+
+    /// A wrapped row's text, its runs joined.
+    fn row_text(row: &ConsoleRow) -> String {
+        row.iter().map(|(t, _)| t.as_str()).collect()
+    }
+
+    /// Console lines with no colour in them.
+    fn plain_lines<S: Into<String>>(lines: impl IntoIterator<Item = S>) -> Vec<AnsiLine> {
+        lines.into_iter().map(AnsiLine::plain).collect()
+    }
+
+    #[test]
+    fn paused_state_renders_call_stack_and_variables_and_maps_clicks() {
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_status = String::from("Paused (breakpoint)");
+        panel.debug_rows = vec![
+            DebugRow {
+                indent: 0,
+                kind: DebugRowKind::Header {
+                    title: "CALL STACK".into(),
+                },
+            },
+            DebugRow {
+                indent: 1,
+                kind: DebugRowKind::Frame {
+                    id: 1000,
+                    selected: true,
+                    name: "isValid".into(),
+                    location: "app.py:12".into(),
+                },
+            },
+            DebugRow {
+                indent: 0,
+                kind: DebugRowKind::Header {
+                    title: "VARIABLES".into(),
+                },
+            },
+            DebugRow {
+                indent: 1,
+                kind: DebugRowKind::Scope {
+                    name: "Locals".into(),
+                    index: 0,
+                    open: None,
+                },
+            },
+            DebugRow {
+                indent: 2,
+                kind: DebugRowKind::Variable {
+                    reference: 0,
+                    expandable: false,
+                    expanded: false,
+                    name: "x".into(),
+                    value: "1".into(),
+                    type_name: "int".into(),
+                    evaluate_name: None,
+                },
+            },
+            DebugRow {
+                indent: 2,
+                kind: DebugRowKind::Variable {
+                    reference: 9,
+                    expandable: true,
+                    expanded: false,
+                    name: "obj".into(),
+                    value: "<Foo>".into(),
+                    type_name: "Foo".into(),
+                    evaluate_name: None,
+                },
+            },
+        ];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(dump.contains("CALL STACK"), "call stack header:\n{dump}");
+        assert!(dump.contains("VARIABLES"), "variables header:\n{dump}");
+        assert!(dump.contains("isValid"), "frame name:\n{dump}");
+        assert!(dump.contains("app.py:12"), "frame location:\n{dump}");
+        assert!(dump.contains("x = 1"), "variable row:\n{dump}");
+        assert!(
+            dump.contains("▸ obj = <Foo>"),
+            "expandable chevron:\n{dump}"
+        );
+        // The empty-state Run button must NOT be laid out while debugging.
+        assert_eq!(panel.last_button_area, Rect::default());
+        // Click mapping: first row sits at last_debug_row_y0.
+        let y0 = panel.last_debug_row_y0;
+        assert_eq!(panel.debug_row_at(y0), Some(0));
+        assert_eq!(panel.debug_row_at(y0 + 1), Some(1));
+        assert_eq!(panel.debug_row_at(y0.saturating_sub(1)), None);
+    }
+
+    /// #867 review: only the rows the console shows are built. Wrapping
+    /// just a line's last `keep` rows gives exactly the tail of wrapping the
+    /// whole line, for tabs, wide glyphs, an empty line and any `keep`.
+    #[test]
+    fn wrapping_a_lines_tail_matches_the_tail_of_wrapping_it_whole() {
+        let wide = "界".repeat(9) + "x";
+        let lines = [
+            String::new(),
+            String::from("short"),
+            String::from("\tif x:\n"),
+            "y".repeat(30) + "END",
+            wide,
+            format!("\t{}\t{}", "a".repeat(17), "界b".repeat(7)),
+        ];
+        for line in &lines {
+            for width in [0, 1, 3, 8, 25] {
+                let whole = wrap_console_line(line, width);
+                for keep in 0..=whole.len() + 2 {
+                    let tail = &whole[whole.len().saturating_sub(keep)..];
+                    assert_eq!(
+                        wrap_console_line_tail(&AnsiLine::plain(line.as_str()), width, keep)
+                            .iter()
+                            .map(row_text)
+                            .collect::<Vec<_>>(),
+                        tail,
+                        "{line:?} at {width} keeping {keep}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #867 review guard: a single enormous line still shows its last rows,
+    /// and only those are built, however long the line is.
+    #[test]
+    fn a_huge_console_line_shows_its_last_rows() {
+        let mut panel = RunDebugPanel::default();
+        let huge = "a".repeat(2_000_000) + "THE END";
+        panel.console_tail = plain_lines([String::from("before"), huge]);
+        let rows = panel.console_rows(10, 3);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(row_text(&rows[2].0), "THE END");
+        assert_eq!(row_text(&rows[1].0), "a".repeat(10));
+    }
+
+    #[test]
+    fn paused_state_renders_console_tail_and_repl_prompt() {
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_status = String::from("Paused (breakpoint)");
+        panel.debug_rows = vec![DebugRow {
+            indent: 0,
+            kind: DebugRowKind::Header {
+                title: "CALL STACK".into(),
+            },
+        }];
+        panel.console_tail = plain_lines(["hello from program", "42"]);
+        panel.repl_input = String::from("x + 1");
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(
+            dump.contains("hello from program"),
+            "console output:\n{dump}"
+        );
+        assert!(dump.contains("❯ x + 1"), "repl prompt with input:\n{dump}");
+        assert!(
+            dump.contains("DEBUG CONSOLE"),
+            "input field must carry a label:\n{dump}"
+        );
+        // Bottom-anchored: the newest console line ("42") must sit on the row
+        // directly above the DEBUG CONSOLE label, with no gap floating it up.
+        let row_text = |y: u16| -> String {
+            (0..area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let label_y = (0..area.height)
+            .find(|&y| row_text(y).contains("DEBUG CONSOLE"))
+            .expect("label present");
+        assert!(
+            row_text(label_y - 1).contains("42"),
+            "newest console line must hug the label (row above it):\nlabel-1: {:?}",
+            row_text(label_y - 1)
+        );
+    }
+
+    /// #1501: the console paints the colours a program's SGR sequences set,
+    /// over the console's own colour, and a wrapped run keeps its colour on
+    /// both rows.
+    #[test]
+    fn console_rows_paint_program_colours() {
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_status = String::from("Paused");
+        let mut style = crate::ansi_text::AnsiStyle::default();
+        panel.console_tail = vec![crate::ansi_text::parse_line(
+            "\x1b[31mFAILED\x1b[0m ok \x1b[32mgreen-run-that-is-too-long-for-the-panel-TAIL\x1b[0m",
+            &mut style,
+        )];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let find = |text: &str| {
+            (0..area.height)
+                .find_map(|y| {
+                    let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
+                    row.find(text).map(|i| (row[..i].chars().count() as u16, y))
+                })
+                .unwrap_or_else(|| panic!("{text:?} on screen:\n{}", buffer_to_string(&buf)))
+        };
+        let ansi = |i: usize| {
+            let (r, g, b) = panel.theme.ansi()[i];
+            Color::Rgb(r, g, b)
+        };
+        let (x, y) = find("FAILED");
+        assert_eq!(buf[(x, y)].fg, ansi(1), "red");
+        assert_eq!(
+            buf[(x + 7, y)].fg,
+            panel.theme.ui(DBG_LOC),
+            "back to the console's own"
+        );
+        let (x, y) = find("green");
+        assert_eq!(buf[(x, y)].fg, ansi(2));
+        let (x2, y2) = find("TAIL");
+        assert!(y2 > y, "the green run wrapped");
+        assert_eq!(
+            buf[(x2, y2)].fg,
+            ansi(2),
+            "and is green on its next row too"
+        );
+    }
+
+    /// #867: program output wider than the sidebar was cut at its edge, with
+    /// no wrap and no scroll. A long line now wraps onto the rows above the
+    /// label, every character of it on screen, still anchored to the label.
+    #[test]
+    fn a_long_console_line_wraps_with_all_its_text_visible() {
+        let long = "ValueError: 12345 is not one of the permitted choices \
+                    (alpha, beta, gamma, delta) - END";
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_status = String::from("Paused (exception)");
+        panel.debug_rows = vec![DebugRow {
+            indent: 0,
+            kind: DebugRowKind::Header {
+                title: "CALL STACK".into(),
+            },
+        }];
+        panel.console_tail = plain_lines(["short", long]);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let cells = |y: u16, from: u16, to: u16| -> String {
+            (from..to).map(|x| buf[(x, y)].symbol()).collect::<String>()
+        };
+        let label_y = (0..area.height)
+            .find(|&y| cells(y, 0, area.width).contains("DEBUG CONSOLE"))
+            .expect("label present");
+        // Text runs from one cell inside the border for the inner width
+        // less a margin: columns 2..28 of a 30-wide panel.
+        let width = 26usize;
+        let rows = long.chars().count().div_ceil(width) as u16;
+        let wrapped: String = (label_y - rows..label_y).map(|y| cells(y, 2, 28)).collect();
+        assert_eq!(wrapped.trim_end(), long, "every character is on screen");
+        assert!(
+            cells(label_y - rows - 1, 0, area.width).contains("short"),
+            "the line before it sits above its first row"
+        );
+    }
+
+    /// #867: the idle panel's retained console wraps the same way.
+    #[test]
+    fn the_retained_console_wraps_too() {
+        let long = "x".repeat(60) + "END";
+        let mut panel = RunDebugPanel::new();
+        panel.session_ended = true;
+        panel.console_tail = plain_lines([long.clone()]);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 30,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(
+            dump.contains("END"),
+            "the line's tail is on screen:\n{dump}"
+        );
+        assert_eq!(dump.matches('x').count(), 60, "{dump}");
+    }
+
+    /// Wrapping counts display columns: a double-width glyph fills two, and
+    /// never straddles the edge.
+    #[test]
+    fn console_wrapping_measures_display_width() {
+        let wide = "界".repeat(20);
+        let rows = wrap_console_line(&wide, 25);
+        assert_eq!(
+            rows.iter().map(|r| r.chars().count()).collect::<Vec<_>>(),
+            vec![12, 8]
+        );
+        assert_eq!(rows.concat(), wide);
+        assert_eq!(
+            wrap_console_line("\tif x:", 8),
+            vec![String::from("    if x"), String::from(":")],
+            "a tab is four columns and indentation is kept"
+        );
+        assert_eq!(wrap_console_line("", 8), vec![String::new()]);
+    }
+
+    /// #867 guard: a line that fits is left alone. One exactly as wide as
+    /// the console is a single row, not a row and an empty one, and a
+    /// zero-width console still ends (a character per row) instead of
+    /// looping.
+    #[test]
+    fn a_console_line_that_fits_is_not_wrapped() {
+        assert_eq!(wrap_console_line("short", 26), vec![String::from("short")]);
+        assert_eq!(
+            wrap_console_line("12345678", 8),
+            vec![String::from("12345678")]
+        );
+        assert_eq!(
+            wrap_console_line("ab", 0),
+            vec![String::from("a"), String::from("b")]
+        );
+    }
+
+    /// #867 guard: wrapping does not grow the paused console past its cap.
+    /// The newest rows are the ones kept, the long line's tail among them,
+    /// and older lines give way first.
+    #[test]
+    fn wrapped_console_rows_keep_the_newest_within_the_cap() {
+        let mut panel = RunDebugPanel::new();
+        panel.console_tail = plain_lines([String::from("older"), "y".repeat(30) + "END"]);
+        let rows = panel.console_rows(10, 3);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        // 33 columns at width 10: three full rows of `y`, then `END`.
+        assert_eq!(
+            rows.last().map(|(r, _)| row_text(r)),
+            Some(String::from("END"))
+        );
+        assert!(
+            !rows.iter().any(|(r, _)| row_text(r).contains("older")),
+            "{rows:?}"
+        );
+        // A REPL echo keeps its accent on every one of its rows.
+        panel.console_tail = plain_lines([format!("❯ {}", "e".repeat(20))]);
+        let rows = panel.console_rows(10, 6);
+        assert!(
+            rows.len() > 1 && rows.iter().all(|(_, echo)| *echo),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn empty_repl_shows_a_ghost_placeholder() {
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_status = String::from("Paused");
+        panel.debug_rows = vec![DebugRow {
+            indent: 0,
+            kind: DebugRowKind::Header {
+                title: "VARIABLES".into(),
+            },
+        }];
+        // repl_input left empty
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(
+            dump.contains("Evaluate expression"),
+            "empty REPL must show a placeholder hint:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn button_label_says_run_and_debug_when_no_file_is_active() {
+        let panel = RunDebugPanel::new();
+        assert_eq!(panel.button_label(), "Run and Debug");
+    }
+
+    #[test]
+    fn button_label_includes_filename_when_a_file_is_active() {
+        let mut panel = RunDebugPanel::new();
+        panel.set_active_file(Some(PathBuf::from("/work/script.py")));
+        assert_eq!(panel.button_label(), "Run script.py");
+    }
+
+    #[test]
+    fn button_label_says_debug_for_compiled_source() {
+        let mut panel = RunDebugPanel::new();
+        panel.set_active_file(Some(PathBuf::from("/work/main.rs")));
+        panel.run_is_debug = true;
+        assert_eq!(panel.button_label(), "Debug main.rs");
+    }
+
+    #[test]
+    fn config_row_label_names_the_selection_or_counts_the_configs() {
+        let mut panel = RunDebugPanel::new();
+        assert_eq!(panel.config_row_label(), None, "no configs, no row");
+        panel.config_count = 2;
+        assert_eq!(
+            panel.config_row_label().as_deref(),
+            Some("⚙ 2 debug entries ▾")
+        );
+        panel.config_count = 1;
+        assert_eq!(
+            panel.config_row_label().as_deref(),
+            Some("⚙ 1 debug entry ▾"),
+            "singular reads correctly rather than \"1 debug configs\""
+        );
+        panel.config_count = 2;
+        panel.selected_config = Some(String::from("Run API"));
+        assert_eq!(panel.config_row_label().as_deref(), Some("⚙ Run API ▾"));
+    }
+
+    #[test]
+    fn click_button_is_inside_recorded_button_area() {
+        let mut panel = RunDebugPanel::new();
+        panel.last_button_area = Rect {
+            x: 10,
+            y: 5,
+            width: 12,
+            height: 3,
+        };
+        assert!(panel.click_button(10, 5));
+        assert!(panel.click_button(21, 7));
+        assert!(!panel.click_button(22, 5));
+        assert!(!panel.click_button(15, 8));
+    }
+
+    #[test]
+    fn rendering_lays_out_button_area_inside_panel() {
+        let mut panel = RunDebugPanel::new();
+        panel.set_active_file(Some(PathBuf::from("/work/run_me.rs")));
+        panel.runnable = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let b = panel.last_button_area;
+        assert!(b.width > 0 && b.height > 0, "button area must be laid out");
+        assert!(b.x >= area.x && b.x + b.width <= area.x + area.width);
+        assert!(b.y >= area.y && b.y < area.y + area.height);
+    }
+
+    #[test]
+    fn non_runnable_file_shows_a_note_and_no_button() {
+        // An open file croft can't run/debug (e.g. .git/config) must not offer a
+        // Run button that would just fail.
+        let mut panel = RunDebugPanel::new();
+        panel.set_active_file(Some(PathBuf::from("/repo/.git/config")));
+        panel.runnable = false;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        assert_eq!(
+            panel.last_button_area,
+            Rect::default(),
+            "no Run button for a non-runnable file"
+        );
+        let mut dump = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                dump.push_str(buf[(x, y)].symbol());
+            }
+        }
+        // The note wraps across rows in the narrow panel, so assert an
+        // intra-line fragment rather than the whole phrase.
+        assert!(
+            dump.contains("can't be run") && dump.contains("debugged"),
+            "must explain why there's no button: {dump:?}"
+        );
+    }
+
+    fn buffer_to_string(buf: &Buffer) -> String {
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(buf.area.x + x, buf.area.y + y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn empty_state_renders_centred_title_and_description_and_chunky_button() {
+        let mut panel = RunDebugPanel::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 36,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(
+            dump.contains("RUN AND DEBUG"),
+            "headline must be present: \n{dump}"
+        );
+        assert!(
+            dump.contains("Open a file"),
+            "body copy must be present: \n{dump}"
+        );
+        assert!(
+            !dump.lines().next().unwrap().contains("RUN AND DEBUG"),
+            "title bar must NOT sit on the top border row (mockup has no title bar): \n{dump}"
+        );
+        let button = panel.last_button_area;
+        assert!(
+            button.height >= 3,
+            "button must be at least 3 rows tall to feel chunky like the mockup; got height={}",
+            button.height
+        );
+        // The OSC-1337 icon block must be reserved ABOVE the button.
+        let icon = panel.last_icon_cell.expect("icon block must be reserved");
+        assert!(
+            button.y > icon.1,
+            "button must sit below the icon (icon top y={}, button.y={})",
+            icon.1,
+            button.y
+        );
+    }
+
+    #[test]
+    fn icon_block_reserves_an_osc_1337_overlay_cell_with_a_glyph_fallback() {
+        // The headline icon is a 6x3-cell OSC-1337 image overlay (the
+        // codicon `debug-alt` PNG, same one the activity-bar slot uses),
+        // emitted post-frame by App::flush_run_debug_icon_overlay. The
+        // widget's job is to (1) reserve the icon block via
+        // last_icon_cell and (2) paint the codicon glyph as a text
+        // fallback for terminals without OSC-1337 support; iTerm2
+        // overwrites those cells with the rasterised image.
+        let mut panel = RunDebugPanel::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 36,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let (ix, iy) = panel
+            .last_icon_cell
+            .expect("icon overlay cell must be reserved on a tall enough panel");
+        let icon_w = RUN_DEBUG_ICON_CELLS_W;
+        let icon_h = RUN_DEBUG_ICON_CELLS_H;
+        let glyph_x = ix + icon_w / 2;
+        let glyph_y = iy + icon_h / 2;
+        let cell = buf[(glyph_x, glyph_y)].symbol().to_string();
+        assert_eq!(
+            cell,
+            crate::icons::ACTIVITY_RUN_DEBUG.to_string(),
+            "glyph fallback must be the cod-debug-alt codicon at the centre of the icon block"
+        );
+    }
+
+    #[test]
+    fn run_and_debug_button_uses_rounded_border_corners() {
+        // The line-art corners are the boxed themes'; Croft Loch's soft
+        // slab is checked below.
+        let mut panel = RunDebugPanel::new();
+        panel.theme = crate::theme::Theme::BLACK;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 36,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let b = panel.last_button_area;
+        assert!(b.height >= 3 && b.width >= 4, "button must be laid out");
+        let tl = buf[(b.x, b.y)].symbol().to_string();
+        let tr = buf[(b.x + b.width - 1, b.y)].symbol().to_string();
+        let bl = buf[(b.x, b.y + b.height - 1)].symbol().to_string();
+        let br = buf[(b.x + b.width - 1, b.y + b.height - 1)]
+            .symbol()
+            .to_string();
+        assert_eq!(
+            tl, "╭",
+            "top-left button corner must be rounded; got {tl:?}"
+        );
+        assert_eq!(
+            tr, "╮",
+            "top-right button corner must be rounded; got {tr:?}"
+        );
+        assert_eq!(
+            bl, "╰",
+            "bottom-left button corner must be rounded; got {bl:?}"
+        );
+        assert_eq!(
+            br, "╯",
+            "bottom-right button corner must be rounded; got {br:?}"
+        );
+    }
+
+    /// Croft Loch: the Run and Debug button is the shared one-row pill, the
+    /// brand teal face on its middle row between half-block caps, the rows
+    /// above and below left as the panel's surface, rather than `╭╮╰╯` arcs
+    /// on the chrome; the pointer anywhere on its three-row target lifts it.
+    #[test]
+    fn croft_loch_run_and_debug_button_is_a_one_row_pill() {
+        let mut panel = RunDebugPanel::new();
+        panel.theme = crate::theme::Theme::LOCH;
+        let area = Rect::new(0, 0, 36, 24);
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let b = panel.last_button_area;
+        assert!(b.height == 3 && b.width >= 4, "button must be laid out");
+        let teal = crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG);
+        let face_y = b.y + 1;
+        assert_eq!(buf[(b.x, face_y)].symbol(), "\u{2590}");
+        assert_eq!(buf[(b.x, face_y)].fg, teal);
+        assert_eq!(buf[(b.right() - 1, face_y)].symbol(), "\u{258c}");
+        assert_eq!(buf[(b.x + b.width / 2, face_y)].bg, teal);
+        for y in [b.y, b.bottom() - 1] {
+            for x in b.x..b.right() {
+                assert_eq!(buf[(x, y)].symbol(), " ", "no band at ({x}, {y})");
+                assert_ne!(buf[(x, y)].bg, teal, "no slab at ({x}, {y})");
+            }
+        }
+        panel.hover_pointer = Some((b.x + 1, b.y));
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        assert_ne!(buf[(b.x + b.width / 2, face_y)].bg, teal, "the face lifts");
+    }
+
+    #[test]
+    fn rendering_at_narrow_widths_does_not_panic() {
+        // Repro for the user-reported crash: dragging the sidebar
+        // splitter all the way to the left squeezed Run-and-Debug to a
+        // few cells wide and ratatui panicked with `index outside of
+        // buffer`. The cause was `inner.width - button_w` wrapping to a
+        // huge u16 when the "Run and Debug" label (13 chars) was wider
+        // than `inner.width`. Render the panel at every width from 0 up
+        // to a reasonable maximum and assert nothing crashes.
+        for width in 0u16..40 {
+            for height in 0u16..30 {
+                let mut panel = RunDebugPanel::new();
+                panel.set_active_file(Some(PathBuf::from("/work/run_me.rs")));
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                };
+                if area.width == 0 || area.height == 0 {
+                    continue;
+                }
+                let mut buf = Buffer::empty(area);
+                Widget::render(&mut panel, area, &mut buf);
+            }
+        }
+    }
+
+    /// #944: a feedback message wider than the panel wraps onto as many
+    /// rows as it needs, and nothing is painted past the panel's right edge
+    /// into the editor beside it.
+    #[test]
+    fn long_feedback_wraps_inside_the_panel() {
+        let msg =
+            "config \"Run server\": a go launch needs a \"program\" (a package directory or file)";
+        let mut panel = RunDebugPanel::new();
+        panel.set_active_file(Some(PathBuf::from("/work/run_me.py")));
+        panel.runnable = true;
+        panel.feedback = Some(String::from(msg));
+        panel.feedback_is_error = true;
+        let panel_area = Rect {
+            x: 0,
+            y: 0,
+            width: 28,
+            height: 40,
+        };
+        // A wider buffer stands in for the editor to the panel's right.
+        let mut buf = Buffer::empty(Rect {
+            width: 60,
+            ..panel_area
+        });
+        Widget::render(&mut panel, panel_area, &mut buf);
+        let row_text = |y: u16, xs: std::ops::Range<u16>| -> String {
+            xs.map(|x| buf[(x, y)].symbol().to_string()).collect()
+        };
+        for y in 0..40 {
+            assert_eq!(
+                row_text(y, 28..60).trim(),
+                "",
+                "row {y} painted past the panel"
+            );
+        }
+        let shown: Vec<String> = (0..40)
+            .map(|y| row_text(y, 0..28))
+            .filter(|r| r.contains("config") || r.contains("launch") || r.contains("file)"))
+            .collect();
+        assert!(shown.len() >= 2, "the message wraps: {shown:?}");
+        let words: String = (0..40)
+            .map(|y| row_text(y, 1..27).trim().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            words.contains("directory or file)"),
+            "the end is shown: {words}"
+        );
+    }
+
+    #[test]
+    fn feedback_wraps_on_words_and_splits_a_word_wider_than_a_row() {
+        assert_eq!(wrap_feedback("aa bb cc", 5), vec!["aa bb", "cc"]);
+        assert_eq!(wrap_feedback("abcdefgh", 3), vec!["abc", "def", "gh"]);
+        assert_eq!(wrap_feedback("", 10), Vec::<String>::new());
+    }
+
+    #[test]
+    fn small_panel_skips_icon_block_to_keep_button_visible() {
+        let mut panel = RunDebugPanel::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 12,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        assert!(
+            panel.last_button_area.height >= 3,
+            "button must remain laid out when the panel collapses the icon block"
+        );
+    }
+    /// #250: the BREAKPOINTS list shows at rest (no session) under the
+    /// button, and a click maps to the row or to its remove `✕`.
+    #[test]
+    fn idle_panel_lists_breakpoints_and_maps_row_and_remove_clicks() {
+        let mut panel = RunDebugPanel::new();
+        panel.breakpoints = vec![
+            BreakpointItem {
+                path: PathBuf::from("/w/a.rs"),
+                line: 3,
+                label: "a.rs:3".into(),
+                detail: None,
+            },
+            BreakpointItem {
+                path: PathBuf::from("/w/b.rs"),
+                line: 9,
+                label: "b.rs:9".into(),
+                detail: Some("if x > 1".into()),
+            },
+        ];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 44,
+            height: 30,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(dump.contains("BREAKPOINTS"), "header:\n{dump}");
+        assert!(dump.contains("a.rs:3"), "first row:\n{dump}");
+        assert!(dump.contains("b.rs:9 if x > 1"), "detail shown:\n{dump}");
+        assert_eq!(panel.breakpoint_row_rects.len(), 2);
+        let (y, idx) = panel.breakpoint_row_rects[1];
+        assert_eq!(idx, 1);
+        assert_eq!(panel.breakpoint_at(3, y), Some((1, false)), "a row click");
+        let (ry, rx, ridx) = panel.breakpoint_remove_rects[0];
+        assert_eq!(panel.breakpoint_at(rx, ry), Some((ridx, true)), "the ✕");
+        assert_eq!(panel.breakpoint_at(3, y + 10), None);
+    }
+
+    #[test]
+    fn watch_section_renders_states_and_maps_remove_clicks() {
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_status = String::from("Paused (breakpoint)");
+        panel.debug_rows = vec![
+            DebugRow {
+                indent: 0,
+                kind: DebugRowKind::Header {
+                    title: "WATCH".into(),
+                },
+            },
+            DebugRow {
+                indent: 1,
+                kind: DebugRowKind::Watch {
+                    index: 0,
+                    expression: "t".into(),
+                    value: "9.99".into(),
+                    available: true,
+                    changed: true,
+                    pending: false,
+                },
+            },
+            DebugRow {
+                indent: 1,
+                kind: DebugRowKind::Watch {
+                    index: 1,
+                    expression: "self.missing".into(),
+                    value: "NameError".into(),
+                    available: false,
+                    changed: false,
+                    pending: false,
+                },
+            },
+            DebugRow {
+                indent: 1,
+                kind: DebugRowKind::Watch {
+                    index: 2,
+                    expression: "len(cart)".into(),
+                    value: String::new(),
+                    available: true,
+                    changed: false,
+                    pending: true,
+                },
+            },
+            DebugRow {
+                indent: 1,
+                kind: DebugRowKind::WatchAdd,
+            },
+        ];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 44,
+            height: 20,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(dump.contains("WATCH"), "watch header:\n{dump}");
+        assert!(dump.contains("t = 9.99"), "watched value:\n{dump}");
+        assert!(
+            dump.contains("self.missing = <not available>"),
+            "a rejected expression must degrade, not show the adapter error:\n{dump}"
+        );
+        assert!(
+            !dump.contains("NameError"),
+            "the raw adapter error must not leak into the row:\n{dump}"
+        );
+        assert!(dump.contains("+ Add Expression"), "add affordance:\n{dump}");
+        // Every watch row recorded a remove ✕ at the right edge, mapped by
+        // render order.
+        assert_eq!(panel.watch_remove_rects.len(), 3);
+        let (y, x, idx) = panel.watch_remove_rects[1];
+        assert_eq!(idx, 1, "the second watch row maps to index 1");
+        assert_eq!(panel.watch_remove_at(x, y), Some(1));
+        assert_eq!(panel.watch_remove_at(x, y + 5), None);
+
+        // Scrolled: the header and the first watch row are skipped. The
+        // first VISIBLE watch row must still map to expression index 1 —
+        // a render-order counter restarted at 0 here and the ✕ removed
+        // the wrong expression (#113 review).
+        panel.debug_scroll = 2;
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let (y, x, idx) = panel.watch_remove_rects[0];
+        assert_eq!(
+            idx, 1,
+            "after scrolling past the first watch row, the first visible one keeps its true index"
+        );
+        assert_eq!(panel.watch_remove_at(x, y), Some(1));
+    }
+}

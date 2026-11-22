@@ -1,0 +1,656 @@
+use std::collections::HashMap;
+
+use crate::lsp::config::{Language, ServerConfig};
+use crate::lsp::manifest;
+
+pub struct ServerRegistry {
+    by_language: HashMap<Language, Vec<ServerConfig>>,
+}
+
+impl ServerRegistry {
+    pub fn new() -> Self {
+        Self {
+            by_language: HashMap::new(),
+        }
+    }
+
+    /// Build the registry from the bundled extension manifests. The manifests
+    /// encode the same policy the hardcoded version did: ty (Astral) is
+    /// registered first (priority 0) so every per-capability selector picks it
+    /// for the features it advertises (completion, hover, definition,
+    /// declaration, type-definition, references, rename, semantic tokens,
+    /// diagnostics) — ty answers in tens of ms even on a huge cold workspace
+    /// where basedpyright pays a slow whole-tree enumeration. basedpyright
+    /// (priority 1) is the fallback for what ty doesn't advertise yet
+    /// (go-to-implementation, inlay hints); ruff (priority 2) lints. Servers are
+    /// registered in ascending priority so the registry's first-registered-wins
+    /// rule matches that policy.
+    #[cfg(test)]
+    pub fn with_defaults() -> Self {
+        Self::with_user_extensions(&[])
+    }
+
+    /// Build the registry from the bundled manifests plus user extension
+    /// sources (read from `~/.config/croft/extensions`). User servers register
+    /// after the bundled ones at equal priority, so a user extension extends
+    /// the language coverage without displacing a first-party server.
+    #[cfg(test)]
+    pub fn with_user_extensions(user_sources: &[&str]) -> Self {
+        let mut sources: Vec<&str> = manifest::BUNDLED_MANIFESTS.to_vec();
+        sources.extend_from_slice(user_sources);
+        Self::from_manifest_sources(&sources)
+    }
+
+    /// Like [`with_user_extensions`], but skip the servers contributed by any
+    /// extension whose id is in `disabled` (the Extensions panel's disable set).
+    /// Only server *registration* is gated: the language table is built
+    /// separately and keeps every language identity, so a disabled `lsp-rust`
+    /// still recognises `.rs` (and its highlighting) while no rust-analyzer
+    /// spawns. An unparseable bundled source is kept rather than silently
+    /// dropped, so it fails loudly; a user's serves nothing, as the language
+    /// table and the installed set already skip it, since the registry is
+    /// rebuilt mid-session whenever an extension changes (#1842).
+    pub fn with_user_extensions_filtered(
+        user_sources: &[&str],
+        disabled: &std::collections::BTreeSet<String>,
+    ) -> Self {
+        let mut enabled: Vec<&str> = manifest::BUNDLED_MANIFESTS
+            .iter()
+            .copied()
+            .filter(|s| {
+                manifest::parse(s)
+                    .map(|m| !disabled.contains(&m.id))
+                    .unwrap_or(true)
+            })
+            .collect();
+        enabled.extend(
+            user_sources
+                .iter()
+                .copied()
+                .filter(|s| manifest::parse(s).is_ok_and(|m| !disabled.contains(&m.id))),
+        );
+        Self::from_manifest_sources(&enabled)
+    }
+
+    /// Build a registry from a set of `extension.toml` sources. Servers are
+    /// registered per language in ascending `priority` (stable within a
+    /// priority, so a manifest's declaration order breaks ties).
+    pub fn from_manifest_sources(sources: &[&str]) -> Self {
+        let mut entries: Vec<manifest::ServerEntry> = Vec::new();
+        for src in sources {
+            let parsed = manifest::parse(src).expect("bundled manifest must parse");
+            entries.extend(manifest::entries(&parsed));
+        }
+        entries.sort_by_key(|e| e.priority);
+        let mut r = Self::new();
+        for entry in entries {
+            r.register(entry.language, entry.config);
+        }
+        r
+    }
+
+    pub fn register(&mut self, language: Language, config: ServerConfig) {
+        self.by_language.entry(language).or_default().push(config);
+    }
+
+    pub fn for_language(&self, language: Language) -> &[ServerConfig] {
+        self.by_language
+            .get(&language)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    #[cfg(test)]
+    pub fn for_extension(&self, ext: &str) -> &[ServerConfig] {
+        match Language::from_extension(ext) {
+            Some(lang) => self.for_language(lang),
+            None => &[],
+        }
+    }
+
+    /// Every language with at least one server registered.
+    pub fn languages(&self) -> impl Iterator<Item = Language> + '_ {
+        self.by_language.keys().copied()
+    }
+}
+
+impl Default for ServerRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_registry_returns_no_servers() {
+        let r = ServerRegistry::new();
+        assert!(r.for_extension("py").is_empty());
+        assert!(r.for_language(Language::PYTHON).is_empty());
+    }
+
+    #[test]
+    fn defaults_cover_python() {
+        let r = ServerRegistry::with_defaults();
+        let servers = r.for_extension("py");
+        let names: Vec<_> = servers.iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["ty", "basedpyright", "ruff"]);
+    }
+
+    #[test]
+    fn defaults_cover_tsx_via_vtsls() {
+        let r = ServerRegistry::with_defaults();
+        let servers = r.for_extension("tsx");
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "vtsls");
+    }
+
+    #[test]
+    fn defaults_cover_rust_and_go() {
+        let r = ServerRegistry::with_defaults();
+        assert_eq!(r.for_extension("rs")[0].name, "rust-analyzer");
+        assert_eq!(r.for_extension("go")[0].name, "gopls");
+    }
+
+    #[test]
+    fn unknown_extension_yields_empty() {
+        let r = ServerRegistry::with_defaults();
+        assert!(r.for_extension("xyz").is_empty());
+        assert!(r.for_extension("").is_empty());
+    }
+
+    #[test]
+    fn register_appends_to_language() {
+        let mut r = ServerRegistry::new();
+        r.register(Language::PYTHON, ServerConfig::pyright());
+        r.register(Language::PYTHON, ServerConfig::ruff());
+        assert_eq!(r.for_language(Language::PYTHON).len(), 2);
+    }
+
+    #[test]
+    fn bundled_manifests_reproduce_the_hardcoded_configs_exactly() {
+        // The whole point of phase B1: loading the bundled manifests must yield
+        // byte-for-byte the same `ServerConfig`s the factory methods produce, so
+        // the move from Rust to TOML is provably behaviour-preserving. (Interned
+        // manifest strings compare equal to the `&'static` literals by value.)
+        let r = ServerRegistry::with_defaults();
+        assert_eq!(
+            r.for_language(Language::PYTHON),
+            &[
+                ServerConfig::ty(),
+                ServerConfig::basedpyright(),
+                ServerConfig::ruff(),
+            ]
+        );
+        // vtsls serves all four TS/JS languages; each key holds the identical
+        // config (language field = TypeScript), as the old loop produced.
+        for lang in [
+            Language::TYPESCRIPT,
+            Language::TSX,
+            Language::JAVASCRIPT,
+            Language::JSX,
+        ] {
+            assert_eq!(r.for_language(lang), &[ServerConfig::vtsls()]);
+        }
+        assert_eq!(
+            r.for_language(Language::RUST),
+            &[ServerConfig::rust_analyzer()]
+        );
+        assert_eq!(r.for_language(Language::GO), &[ServerConfig::gopls()]);
+        assert_eq!(
+            r.for_language(Language::LUA),
+            &[ServerConfig::lua_language_server()]
+        );
+    }
+
+    #[test]
+    fn bundled_manifests_register_yaml_language_server() {
+        // YAML is the first npm-provisioned language added after the founding
+        // four. The bundled set must register yaml-language-server for .yaml/.yml
+        // (provisioned from npm), proving a new language ships as data alone.
+        let r = ServerRegistry::with_defaults();
+        let servers = r.for_language(Language::YAML);
+        assert_eq!(servers.len(), 1, "exactly one server for YAML");
+        let yls = &servers[0];
+        assert_eq!(yls.name, "yaml-language-server");
+        assert_eq!(yls.command, "yaml-language-server");
+        assert_eq!(yls.args, vec!["--stdio".to_string()]);
+        assert!(
+            matches!(
+                yls.provision,
+                Some(crate::lsp::install::Provision::Npm {
+                    bin: "yaml-language-server",
+                    ..
+                })
+            ),
+            "yaml-language-server is npm-provisioned"
+        );
+        // Resolves by both file extensions.
+        assert_eq!(r.for_extension("yaml")[0].name, "yaml-language-server");
+        assert_eq!(r.for_extension("yml")[0].name, "yaml-language-server");
+    }
+
+    /// #1532: the CSS server parses SCSS and LESS too, so `.scss` and
+    /// `.less` files get it (lint, outline, colours), the same managed
+    /// install as CSS. `.sass` is indented syntax it cannot parse: no server.
+    #[test]
+    fn the_css_server_serves_scss_and_less_but_not_sass() {
+        let r = ServerRegistry::with_defaults();
+        for ext in ["scss", "less"] {
+            let servers = r.for_extension(ext);
+            assert_eq!(servers.len(), 1, "one server for .{ext}");
+            assert_eq!(servers[0].name, "vscode-css-language-server", ".{ext}");
+            let lang = Language::from_extension(ext).unwrap();
+            assert_eq!(
+                lang.lsp_id(),
+                ext,
+                "didOpen says {ext}, so the server picks its parser"
+            );
+            assert_eq!(
+                lang.server_family(),
+                Language::CSS,
+                ".{ext} is in the CSS server's family"
+            );
+        }
+        assert!(r.for_extension("sass").is_empty(), ".sass gets no server");
+        assert_eq!(Language::CSS.server_family(), Language::CSS);
+    }
+
+    #[test]
+    fn bundled_manifests_register_json_html_css_language_servers() {
+        // JSON, HTML and CSS each get their own extension/server, all three
+        // provisioned from the single maintained `@t1ckbase/vscode-langservers-extracted`
+        // npm package (one bin per language). Distinct server names keep their
+        // managed installs and re-probe signals independent.
+        let r = ServerRegistry::with_defaults();
+        for (lang, ext, server_bin) in [
+            (Language::JSON, "json", "vscode-json-language-server"),
+            (Language::HTML, "html", "vscode-html-language-server"),
+            (Language::CSS, "css", "vscode-css-language-server"),
+        ] {
+            let servers = r.for_language(lang);
+            assert_eq!(servers.len(), 1, "exactly one server for {ext}");
+            let s = &servers[0];
+            assert_eq!(s.name, server_bin);
+            assert_eq!(s.command, server_bin);
+            assert_eq!(s.args, vec!["--stdio".to_string()]);
+            assert!(
+                matches!(
+                    s.provision,
+                    Some(crate::lsp::install::Provision::Npm {
+                        package: "@t1ckbase/vscode-langservers-extracted",
+                        ..
+                    })
+                ),
+                "{ext} server installs from @t1ckbase/vscode-langservers-extracted"
+            );
+            assert_eq!(r.for_extension(ext)[0].name, server_bin);
+            // #1083: without it the server has no formatter, and Format
+            // Document says "No formatter available for this file".
+            assert_eq!(
+                s.initialization_options,
+                Some(serde_json::json!({ "provideFormatter": true })),
+                "{ext} server is asked for its formatter"
+            );
+        }
+    }
+
+    /// #1084: JSON with comments is served by the JSON server, `.jsonc`
+    /// files included, which no language claimed before.
+    #[test]
+    fn the_json_server_serves_json_with_comments() {
+        let r = ServerRegistry::with_defaults();
+        let jsonc = Language::from_lsp_id("jsonc").expect("jsonc is a language");
+        let servers = r.for_language(jsonc);
+        assert_eq!(servers.len(), 1, "exactly one server for jsonc");
+        assert_eq!(servers[0].name, "vscode-json-language-server");
+        assert_eq!(
+            r.for_extension("jsonc")[0].name,
+            "vscode-json-language-server"
+        );
+        assert_eq!(
+            r.for_extension("json")[0].name,
+            "vscode-json-language-server"
+        );
+        assert_eq!(r.for_language(Language::JSON).len(), 1);
+    }
+
+    #[test]
+    fn bundled_manifests_register_bash_language_server() {
+        // Bash (the `shellscript` language id, .sh/.bash) gets bash-language-server,
+        // npm-provisioned. Note its invocation is the `start` subcommand, not the
+        // `--stdio` flag the other servers use.
+        let r = ServerRegistry::with_defaults();
+        let servers = r.for_language(Language::BASH);
+        assert_eq!(servers.len(), 1, "exactly one server for bash");
+        let s = &servers[0];
+        assert_eq!(s.name, "bash-language-server");
+        assert_eq!(s.command, "bash-language-server");
+        assert_eq!(s.args, vec!["start".to_string()]);
+        assert!(
+            matches!(
+                s.provision,
+                Some(crate::lsp::install::Provision::Npm {
+                    package: "bash-language-server",
+                    ..
+                })
+            ),
+            "bash-language-server is npm-provisioned"
+        );
+        assert_eq!(r.for_extension("sh")[0].name, "bash-language-server");
+        assert_eq!(r.for_extension("bash")[0].name, "bash-language-server");
+    }
+
+    #[test]
+    fn bundled_manifests_register_toml_and_cpp_binary_servers() {
+        use crate::lsp::install::{ArchiveKind, Provision};
+        let r = ServerRegistry::with_defaults();
+
+        // TOML -> taplo, provisioned as a single gzipped binary.
+        let toml = r.for_language(Language::TOML);
+        assert_eq!(toml.len(), 1, "one server for toml");
+        assert_eq!(toml[0].name, "taplo");
+        assert_eq!(toml[0].command, "taplo");
+        assert_eq!(toml[0].args, vec!["lsp".to_string(), "stdio".to_string()]);
+        assert!(
+            matches!(
+                toml[0].provision,
+                Some(Provision::Binary {
+                    bin: "taplo",
+                    archive: ArchiveKind::Gz,
+                    ..
+                })
+            ),
+            "taplo is a gz binary download"
+        );
+        assert_eq!(r.for_extension("toml")[0].name, "taplo");
+
+        // C and C++ -> clangd (one server serves both), provisioned as a zip.
+        for (lang, ext) in [(Language::C, "c"), (Language::CPP, "cpp")] {
+            let s = r.for_language(lang);
+            assert_eq!(s.len(), 1, "one server for {ext}");
+            assert_eq!(s[0].name, "clangd");
+            assert!(
+                matches!(
+                    s[0].provision,
+                    Some(Provision::Binary {
+                        bin: "clangd",
+                        archive: ArchiveKind::Zip,
+                        ..
+                    })
+                ),
+                "clangd is a zip binary download"
+            );
+        }
+        assert_eq!(r.for_extension("c")[0].name, "clangd");
+        assert_eq!(r.for_extension("cpp")[0].name, "clangd");
+    }
+
+    #[test]
+    fn bundled_manifest_registers_marksman_for_markdown_as_a_pinned_raw_binary() {
+        // #834: Markdown had no server. marksman ships bare per-platform
+        // binaries and upstream publishes no checksums, so every download
+        // target must carry a pinned digest: a target without one is refused
+        // at install, and a map with none would install unverified.
+        use crate::lsp::install::{ArchiveKind, Provision};
+        let r = ServerRegistry::with_defaults();
+        let md = r.for_language(Language::MARKDOWN);
+        let names: Vec<&str> = md.iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            ["marksman", "rumdl"],
+            "marksman first, so it keeps the capabilities the two share"
+        );
+        assert_eq!(md[0].name, "marksman");
+        assert_eq!(md[0].command, "marksman");
+        assert_eq!(md[0].args, vec!["server".to_string()]);
+        let Some(Provision::Binary {
+            bin,
+            archive,
+            bin_path,
+            termux_pkg,
+            targets,
+            sha256,
+        }) = &md[0].provision
+        else {
+            panic!("marksman must carry a Binary provision");
+        };
+        assert_eq!(*bin, "marksman");
+        assert_eq!(*archive, ArchiveKind::Raw, "the asset is the executable");
+        assert_eq!(*bin_path, None, "a raw asset lands at <name>/<bin>");
+        assert_eq!(
+            *termux_pkg,
+            Some("marksman"),
+            "Termux reroutes to `pkg install marksman`"
+        );
+        let keys: Vec<&str> = targets.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, ["linux-aarch64", "linux-x86_64", "macos"]);
+        for (key, _) in targets.iter() {
+            let digest = sha256.iter().find(|(k, _)| k == key).map(|(_, d)| *d);
+            assert!(
+                digest.is_some_and(|d| d.len() == 64 && d.chars().all(|c| c.is_ascii_hexdigit())),
+                "{key} must pin a sha256: {digest:?}"
+            );
+        }
+        assert_eq!(
+            sha256.len(),
+            targets.len(),
+            "no digest for a platform without a download"
+        );
+        for ext in ["md", "markdown"] {
+            assert_eq!(r.for_extension(ext)[0].name, "marksman");
+        }
+    }
+
+    #[test]
+    fn bundled_manifest_adds_rumdl_beside_marksman_as_a_pinned_uv_tool() {
+        // #851: rumdl lints (markdownlint's rules and more), offers quick
+        // fixes and formats. It is a binary wheel on PyPI, so uv installs it
+        // pinned; Termux packages no rumdl, so there it must not be sent to
+        // `pkg install` (it is left to a copy on PATH).
+        use crate::lsp::install::Provision;
+        let r = ServerRegistry::with_defaults();
+        let rumdl = r
+            .for_language(Language::MARKDOWN)
+            .iter()
+            .find(|s| s.name == "rumdl")
+            .expect("rumdl is registered for markdown");
+        assert_eq!(rumdl.command, "rumdl");
+        assert_eq!(rumdl.args, vec!["server".to_string()]);
+        assert_eq!(rumdl.name, crate::markdown_lint::SUPERSEDED_BY);
+        assert_eq!(
+            rumdl.provision,
+            Some(Provision::Uv {
+                package: "rumdl",
+                version: Some("0.2.77"),
+                bin: "rumdl",
+                termux_pkg: None,
+            })
+        );
+    }
+
+    /// #1158: Markdown prose is not held to 80 columns. rumdl is started
+    /// with no global line length (0 is its "no limit"), which turns off
+    /// MD013, and with the files on disk first, so a project's own
+    /// `.rumdl.toml` or `.markdownlint.*` line length still applies.
+    #[test]
+    fn rumdl_starts_with_no_line_length_unless_the_project_sets_one() {
+        let r = ServerRegistry::with_defaults();
+        let servers = r.for_language(Language::MARKDOWN);
+        let rumdl = servers
+            .iter()
+            .find(|s| s.name == "rumdl")
+            .expect("rumdl is registered for markdown");
+        assert_eq!(
+            rumdl.initialization_options,
+            Some(serde_json::json!({
+                "configurationPreference": "filesystemFirst",
+                "settings": { "lineLength": 0 }
+            }))
+        );
+        // Only rumdl's line length changes: marksman starts as before.
+        let marksman = servers
+            .iter()
+            .find(|s| s.name == "marksman")
+            .expect("marksman is registered for markdown");
+        assert_eq!(marksman.initialization_options, None);
+    }
+
+    #[test]
+    fn bundled_manifest_provisions_rust_analyzer_as_gz_binary_with_termux_fallback() {
+        // rust-analyzer used to be PATH-only (provision: None), so on a box
+        // without it on PATH — most of all Termux, where there is no rustup —
+        // Rust LSP silently never started. It now carries a gz-binary provision
+        // (the asset VS Code downloads) plus a Termux `pkg` fallback for Android,
+        // where the linux-gnu build can't run on bionic libc. Guard both.
+        use crate::lsp::install::{ArchiveKind, Provision};
+        let r = ServerRegistry::with_defaults();
+        let rust = r.for_language(Language::RUST);
+        assert_eq!(rust.len(), 1, "one server for rust");
+        assert_eq!(rust[0].name, "rust-analyzer");
+        assert_eq!(rust[0].command, "rust-analyzer");
+        let Some(Provision::Binary {
+            bin,
+            archive,
+            bin_path,
+            termux_pkg,
+            targets,
+            ..
+        }) = &rust[0].provision
+        else {
+            panic!("rust-analyzer must carry a Binary provision");
+        };
+        assert_eq!(*bin, "rust-analyzer");
+        assert_eq!(*archive, ArchiveKind::Gz, "single gzipped binary");
+        assert_eq!(*bin_path, None, "gz decompresses straight to the binary");
+        assert_eq!(
+            *termux_pkg,
+            Some("rust-analyzer"),
+            "Termux reroutes to `pkg install rust-analyzer`"
+        );
+        // Desktop platforms croft can download for; Android is intentionally
+        // absent (handled by the Termux pkg fallback above).
+        for key in [
+            "macos-aarch64",
+            "macos-x86_64",
+            "linux-x86_64",
+            "linux-aarch64",
+        ] {
+            assert!(
+                targets
+                    .iter()
+                    .any(|(k, url)| *k == key && url.ends_with(".gz")),
+                "rust-analyzer must have a .gz target for {key}"
+            );
+        }
+        assert!(
+            !targets.iter().any(|(k, _)| k.starts_with("android")),
+            "android must not be a download target (uses pkg instead)"
+        );
+    }
+
+    #[test]
+    fn a_user_manifest_registers_a_new_language_server_with_zero_rust() {
+        // The phase-B payoff: a Zig extension declared purely as data registers
+        // zls for .zig with no Rust change. (Hermetic: the manifest is passed
+        // as a source, not read from disk.)
+        const ZIG: &str = r#"
+id = "lsp-zig"
+name = "Zig"
+api_version = 1
+[[languages]]
+id = "zig"
+extensions = ["zig", "zon"]
+root_markers = ["build.zig", "build.zig.zon"]
+[[language_servers]]
+name = "zls"
+command = "zls"
+args = []
+language = "zig"
+priority = 0
+"#;
+        let r = ServerRegistry::from_manifest_sources(&[ZIG]);
+        let servers = r.for_language(Language("zig"));
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "zls");
+        assert_eq!(servers[0].command, "zls");
+        // The bundled languages still resolve when a user manifest is mixed in.
+        let mixed = ServerRegistry::with_user_extensions(&[ZIG]);
+        assert_eq!(mixed.for_language(Language("zig"))[0].name, "zls");
+        assert_eq!(mixed.for_language(Language::RUST)[0].name, "rust-analyzer");
+    }
+
+    const CODEQL: &str = crate::mcp::registry_index::CODEQL_MANIFEST;
+
+    /// #578: once CodeQL is added, `.ql`/`.qll` files get the CodeQL CLI's
+    /// language server from PATH, with errors checked as the buffer changes.
+    #[test]
+    fn codeql_sources_use_the_codeql_cli_language_server() {
+        let r = ServerRegistry::with_user_extensions(&[CODEQL]);
+        let servers = r.for_language(Language("ql"));
+        assert_eq!(servers.len(), 1, "exactly one server for ql");
+        let s = &servers[0];
+        assert_eq!(s.name, "codeql");
+        assert_eq!(s.command, "codeql");
+        assert_eq!(
+            s.args,
+            ["execute", "language-server", "--check-errors", "ON_CHANGE"]
+                .map(String::from)
+                .to_vec()
+        );
+        assert!(s.provision.is_none(), "the CodeQL CLI is PATH-only");
+    }
+
+    #[test]
+    fn disabling_the_codeql_extension_drops_its_language_server() {
+        let mut disabled = std::collections::BTreeSet::new();
+        disabled.insert("codeql".to_string());
+        let r = ServerRegistry::with_user_extensions_filtered(&[CODEQL], &disabled);
+        assert!(r.for_language(Language("ql")).is_empty());
+    }
+
+    /// #1842: CodeQL is not built in, so until it is added no QL language
+    /// server registers.
+    #[test]
+    fn codeql_registers_no_language_server_until_it_is_added() {
+        let r = ServerRegistry::with_user_extensions(&[]);
+        assert!(r.for_language(Language("ql")).is_empty());
+        assert!(r.for_extension("ql").is_empty());
+    }
+
+    /// A hand-written manifest that does not parse adds no server and takes
+    /// none away. The registry is rebuilt whenever an extension changes
+    /// (#1842), so it must not panic on one, mid-session or at launch.
+    #[test]
+    fn a_user_manifest_that_does_not_parse_serves_nothing() {
+        let r = ServerRegistry::with_user_extensions_filtered(
+            &["id = \"half-written\"\n[[language_servers]"],
+            &Default::default(),
+        );
+        let names: Vec<_> = r
+            .for_language(Language::PYTHON)
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["ty", "basedpyright", "ruff"]);
+    }
+
+    #[test]
+    fn a_disabled_lsp_extension_registers_no_server_for_its_language() {
+        let mut disabled = std::collections::BTreeSet::new();
+        disabled.insert("lsp-python".to_string());
+        let r = ServerRegistry::with_user_extensions_filtered(&[], &disabled);
+        assert!(
+            r.for_language(Language::PYTHON).is_empty(),
+            "a disabled lsp-python must register no server for Python"
+        );
+        // A language whose extension is still enabled is unaffected.
+        assert_eq!(
+            r.for_language(Language::RUST)[0].name,
+            "rust-analyzer",
+            "disabling one LSP extension must not gate the others"
+        );
+    }
+}

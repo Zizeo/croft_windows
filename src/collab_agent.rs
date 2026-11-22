@@ -1,0 +1,702 @@
+//! Headless collab participant exposed as an MCP server (docs/MULTIPLAYER.md,
+//! Phase D). `croft collab-agent --workspace <path>` joins the workspace's
+//! collab relay as a regular guest and serves five `collab_*` tools over
+//! JSON-RPC 2.0 on stdio, so an external agent (e.g. Claude Code, registered
+//! with `claude mcp add`) co-edits with a live named caret. It speaks both MCP
+//! eras: `server/discover` and per-request `_meta` (2026-07-28, what Claude
+//! Code now opens with on stdio) and the legacy `initialize` handshake.
+//!
+//! Croft stays free of LLM code: the intelligence is whatever drives the
+//! tools; this module is just a seat at the table, and it inherits every
+//! guest property for free — owner-only disk writes, per-file site ids,
+//! convergence via the CRDT.
+//!
+//! Concurrency: one background thread pumps the session (drains the socket,
+//! integrates remote ops, tracks peer carets) so the replica is always fresh
+//! when a tool call diffs against it; the main thread blocks on stdin. Both
+//! share the state behind a mutex that is never held across a sleep.
+
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use serde_json::{Value, json};
+
+use crate::collab::{CollabChannel, CollabEvent, CollabRole, CollabSession};
+use crate::mcp::client as mcp;
+
+/// How long `collab_open` waits for the owner's snapshot before reporting
+/// that nobody serves this workspace: a hair past the session's own 3s
+/// bootstrap deadline, so the session's verdict always lands first.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// The guest session plus peers' last-seen carets (for `collab_status`).
+struct AgentState {
+    session: CollabSession,
+    peers: HashMap<u64, PeerCaret>,
+    /// The workspace the seat was started for, named in errors that tell
+    /// the user how to serve it.
+    workspace: std::path::PathBuf,
+}
+
+struct PeerCaret {
+    name: String,
+    file: String,
+    row: usize,
+    col: usize,
+}
+
+/// Connect to the relay as a guest, retrying briefly (the dispatch just
+/// ensured the relay, but its accept loop may still be coming up).
+fn connect_state(socket: &Path, workspace: &Path, name: &str) -> Result<AgentState> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let channel = loop {
+        if let Some(ch) = CollabChannel::connect(socket, CollabRole::Guest) {
+            break ch;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "collab relay never came up at {}",
+            socket.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    Ok(AgentState {
+        session: CollabSession::new(channel, name.to_string()),
+        peers: HashMap::new(),
+        workspace: workspace.to_path_buf(),
+    })
+}
+
+/// One session pump: drain the socket and fold peer carets into the map.
+/// Remote edits need nothing further — the replica inside the session is
+/// already updated, and the agent has no editor buffers to patch.
+fn pump(state: &Mutex<AgentState>) {
+    let mut st = state.lock().unwrap();
+    let events = st.session.poll(|_| None);
+    for event in events {
+        if let CollabEvent::Caret {
+            file,
+            site,
+            row,
+            col,
+            name,
+        } = event
+        {
+            st.peers.insert(
+                site,
+                PeerCaret {
+                    name,
+                    file,
+                    row,
+                    col,
+                },
+            );
+        }
+    }
+}
+
+/// This seat's name and version, as MCP `Implementation`.
+fn server_info() -> Value {
+    json!({ "name": "croft-collab", "version": env!("CARGO_PKG_VERSION") })
+}
+
+/// A JSON-RPC error: code, message, and optional `data`.
+type RpcError = (i64, String, Option<Value>);
+
+/// Check a modern request's `_meta`: the version and capabilities are
+/// required, and the version must be one this seat serves statelessly.
+fn check_modern_meta(meta: Option<&Value>) -> Result<(), RpcError> {
+    let field = |key| meta.and_then(|m| m.get(key));
+    let (Some(version), Some(_)) = (
+        field(mcp::PROTOCOL_VERSION_KEY).and_then(Value::as_str),
+        field(mcp::CLIENT_CAPABILITIES_KEY).filter(|caps| caps.is_object()),
+    ) else {
+        return Err((
+            -32602,
+            format!(
+                "_meta needs {} as a string and {} as an object",
+                mcp::PROTOCOL_VERSION_KEY,
+                mcp::CLIENT_CAPABILITIES_KEY
+            ),
+            None,
+        ));
+    };
+    if version != mcp::MODERN_VERSION {
+        return Err((
+            mcp::UNSUPPORTED_PROTOCOL_VERSION,
+            String::from("Unsupported protocol version"),
+            Some(json!({ "supported": mcp::SUPPORTED_VERSIONS, "requested": version })),
+        ));
+    }
+    Ok(())
+}
+
+/// Answer one inbound JSON-RPC message; `None` for notifications (and for
+/// malformed lines with no `id` to answer to).
+///
+/// The seat is dual-era. A request carrying a protocol version in its
+/// `_meta`, and the `server/discover` probe, are modern: served statelessly,
+/// and the result names its type and this server. Anything else (an
+/// `initialize` handshake and the plain requests after it) is legacy and
+/// answered as before.
+fn handle(state: &Mutex<AgentState>, msg: &Value) -> Option<Value> {
+    let method = msg
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if matches!(
+        method,
+        "notifications/initialized" | "notifications/cancelled"
+    ) {
+        return None;
+    }
+    let meta = msg.pointer("/params/_meta");
+    let modern = method == "server/discover"
+        || meta.is_some_and(|m| m.get(mcp::PROTOCOL_VERSION_KEY).is_some());
+    let checked = if modern {
+        check_modern_meta(meta)
+    } else {
+        Ok(())
+    };
+    let result = checked.and_then(|()| match method {
+        "server/discover" => Ok(json!({
+            "supportedVersions": mcp::SUPPORTED_VERSIONS,
+            "capabilities": { "tools": {} },
+        })),
+        "initialize" => Ok(json!({
+            "protocolVersion": mcp::LEGACY_VERSION,
+            "capabilities": { "tools": {} },
+            "serverInfo": server_info(),
+        })),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({ "tools": tool_definitions() })),
+        "tools/call" => {
+            let name = msg
+                .pointer("/params/name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let args = msg
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            match call_tool(state, &name, &args) {
+                Some(result) => Ok(result),
+                None => Err((-32602, format!("unknown tool: {name}"), None)),
+            }
+        }
+        _ => Err((-32601, format!("method not found: {method}"), None)),
+    });
+    let id = msg.get("id").cloned()?;
+    Some(match result {
+        Ok(mut result) => {
+            if let (true, Some(fields)) = (modern, result.as_object_mut()) {
+                fields.insert("resultType".into(), json!("complete"));
+                fields.insert(
+                    "_meta".into(),
+                    json!({ mcp::SERVER_INFO_KEY: server_info() }),
+                );
+            }
+            json!({ "jsonrpc": "2.0", "id": id, "result": result })
+        }
+        Err((code, message, data)) => {
+            let mut error = json!({ "code": code, "message": message });
+            if let Some(data) = data {
+                error["data"] = data;
+            }
+            json!({ "jsonrpc": "2.0", "id": id, "error": error })
+        }
+    })
+}
+
+/// A successful `tools/call` result: one text content block.
+fn text_result(text: impl Into<String>) -> Value {
+    json!({ "content": [{ "type": "text", "text": text.into() }] })
+}
+
+/// A failed tool execution: per MCP, an `isError` result (the model reads
+/// and recovers from it), not a JSON-RPC protocol error.
+fn error_result(text: impl Into<String>) -> Value {
+    json!({ "content": [{ "type": "text", "text": text.into() }], "isError": true })
+}
+
+/// Run one collab tool; `None` means the tool name is unknown.
+fn call_tool(state: &Mutex<AgentState>, tool: &str, args: &Value) -> Option<Value> {
+    let file = args
+        .get("file")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let needs_file = tool != "collab_status";
+    if needs_file && file.is_empty() {
+        return Some(error_result("missing required argument: file"));
+    }
+    let not_live = || error_result(format!("{file} is not live; call collab_open first"));
+    Some(match tool {
+        "collab_open" => {
+            // rejoin, not request: an earlier open that timed out latched
+            // the file local-only, and a plain request respects the latch —
+            // the caller retrying after starting croft would never join.
+            state.lock().unwrap().session.rejoin_file(&file);
+            let deadline = Instant::now() + OPEN_TIMEOUT;
+            loop {
+                {
+                    let st = state.lock().unwrap();
+                    if let Some(text) = st.session.doc_text(&file) {
+                        break text_result(text);
+                    }
+                    if !st.session.is_bootstrapping(&file) || Instant::now() >= deadline {
+                        // Only a session croft hosts serves the seat, so a
+                        // plain window open on the workspace answers nobody
+                        // (#1289): say what does, not "start croft".
+                        let ws = st.workspace.display();
+                        break error_result(format!(
+                            "no croft session is sharing {ws}, so nobody served {file}: \
+                             open the workspace with `croft attach {ws}` (a plain `croft` \
+                             window does not host agents), then retry"
+                        ));
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        "collab_read" => match state.lock().unwrap().session.doc_text(&file) {
+            Some(text) => text_result(text),
+            None => not_live(),
+        },
+        "collab_replace" => {
+            let Some(text) = args.get("text").and_then(Value::as_str) else {
+                return Some(error_result("missing required argument: text"));
+            };
+            let mut st = state.lock().unwrap();
+            if !st.session.is_live(&file) {
+                not_live()
+            } else {
+                st.session.local_change(&file, text);
+                text_result(st.session.doc_text(&file).unwrap_or_default())
+            }
+        }
+        "collab_caret" => {
+            let row = args.get("row").and_then(Value::as_u64);
+            let col = args.get("col").and_then(Value::as_u64);
+            let (Some(row), Some(col)) = (row, col) else {
+                return Some(error_result("row and col are required integers (0-based)"));
+            };
+            let mut st = state.lock().unwrap();
+            if !st.session.is_live(&file) {
+                not_live()
+            } else {
+                st.session.send_caret(&file, row as usize, col as usize);
+                text_result(format!("caret at {row}:{col} in {file}"))
+            }
+        }
+        "collab_status" => {
+            let st = state.lock().unwrap();
+            let files: serde_json::Map<String, Value> = st
+                .session
+                .tracked_files()
+                .into_iter()
+                .map(|(f, live)| (f, Value::from(if live { "live" } else { "bootstrapping" })))
+                .collect();
+            let peers: Vec<Value> = st
+                .peers
+                .iter()
+                .map(|(site, p)| {
+                    json!({
+                        "site": site,
+                        "name": p.name,
+                        "file": p.file,
+                        "row": p.row,
+                        "col": p.col,
+                    })
+                })
+                .collect();
+            text_result(json!({ "files": files, "peers": peers }).to_string())
+        }
+        _ => return None,
+    })
+}
+
+/// The five tools this server advertises. Coordinates are 0-based character
+/// positions, matching the collab wire protocol.
+fn tool_definitions() -> Value {
+    let file_prop = json!({
+        "type": "string",
+        "description": "Workspace-relative path, e.g. src/main.rs",
+    });
+    json!([
+        {
+            "name": "collab_open",
+            "description": "Join a workspace file in the live croft session and \
+                return its current text. Call this once per file before reading \
+                or editing it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "file": file_prop },
+                "required": ["file"],
+            },
+        },
+        {
+            "name": "collab_read",
+            "description": "The file's current text, including edits other \
+                participants just made.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "file": file_prop },
+                "required": ["file"],
+            },
+        },
+        {
+            "name": "collab_replace",
+            "description": "Replace the file's entire text; the diff is broadcast \
+                to every participant as live edits (the session owner persists them \
+                to disk). Returns the post-apply text. Read or open first so the \
+                replacement builds on the latest text.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file": file_prop,
+                    "text": { "type": "string", "description": "The complete new file text" },
+                },
+                "required": ["file", "text"],
+            },
+        },
+        {
+            "name": "collab_caret",
+            "description": "Move this agent's visible caret so humans see where it \
+                is working (a named colored caret in their editors). 0-based row \
+                and character column. Move it near each edit you make.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file": file_prop,
+                    "row": { "type": "integer", "description": "0-based line" },
+                    "col": { "type": "integer", "description": "0-based character column" },
+                },
+                "required": ["file", "row", "col"],
+            },
+        },
+        {
+            "name": "collab_status",
+            "description": "Session overview: every tracked file with its state \
+                (live or bootstrapping) and each peer's last-seen caret.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+    ])
+}
+
+/// Serve the MCP loop on stdio until the driving client hangs up (EOF).
+pub fn run(socket: &Path, workspace: &Path, name: String) -> Result<()> {
+    let state = std::sync::Arc::new(Mutex::new(connect_state(socket, workspace, &name)?));
+    {
+        let state = std::sync::Arc::clone(&state);
+        std::thread::spawn(move || {
+            loop {
+                pump(&state);
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        });
+    }
+    let mut decoder = crate::mcp::transport::LineDecoder::new();
+    let mut stdin = std::io::stdin().lock();
+    let stdout = std::io::stdout();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = stdin.read(&mut buf).context("reading MCP stdin")?;
+        if n == 0 {
+            return Ok(()); // the driver hung up; this seat leaves the session
+        }
+        decoder.feed(&buf[..n]);
+        while let Some(msg) = decoder.next_message() {
+            if let Some(resp) = handle(&state, &msg) {
+                let mut bytes = serde_json::to_vec(&resp).unwrap_or_default();
+                bytes.push(b'\n');
+                let mut out = stdout.lock();
+                let _ = out.write_all(&bytes);
+                let _ = out.flush();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collab::{CollabChannel, CollabEvent, CollabRole, CollabSession, relay_serve};
+    use serde_json::{Value, json};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn rpc(id: i64, method: &str, params: Value) -> Value {
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+    }
+
+    fn call(state: &Mutex<AgentState>, id: i64, tool: &str, args: Value) -> Value {
+        handle(
+            state,
+            &rpc(id, "tools/call", json!({ "name": tool, "arguments": args })),
+        )
+        .expect("tools/call always answers")
+    }
+
+    fn text_of(resp: &Value) -> String {
+        crate::mcp::client::tool_result_text(&resp["result"])
+    }
+
+    /// A live relay plus a connected agent state, ready to drive `handle`.
+    fn agent_over_relay() -> (tempfile::TempDir, std::path::PathBuf, Mutex<AgentState>) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("a.collab.sock");
+        {
+            let s = socket.clone();
+            std::thread::spawn(move || {
+                let _ = relay_serve(&s);
+            });
+        }
+        let state = connect_state(&socket, std::path::Path::new("/work/space"), "claude")
+            .expect("agent connects");
+        (dir, socket, Mutex::new(state))
+    }
+
+    /// The MCP surface: initialize/tools-list shapes mirror what croft's own
+    /// client sends, unknown methods get JSON-RPC errors, and tools on files
+    /// that are not live fail as tool errors (isError), not protocol errors.
+    #[test]
+    fn collab_agent_answers_the_mcp_surface() {
+        let (_dir, _socket, state) = agent_over_relay();
+
+        let init = handle(&state, &rpc(1, "initialize", json!({}))).unwrap();
+        assert_eq!(init["result"]["protocolVersion"], mcp::LEGACY_VERSION);
+        assert_eq!(init["result"]["serverInfo"]["name"], "croft-collab");
+        assert!(
+            init["result"].get("resultType").is_none(),
+            "a legacy answer stays legacy"
+        );
+        assert!(
+            handle(
+                &state,
+                &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
+            )
+            .is_none(),
+            "notifications draw no response"
+        );
+
+        let tools = handle(&state, &rpc(2, "tools/list", json!({}))).unwrap();
+        let names: Vec<&str> = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "collab_open",
+                "collab_read",
+                "collab_replace",
+                "collab_caret",
+                "collab_status"
+            ]
+        );
+
+        let unknown = handle(&state, &rpc(3, "bogus/method", json!({}))).unwrap();
+        assert_eq!(unknown["error"]["code"], -32601);
+
+        let read = call(&state, 4, "collab_read", json!({ "file": "src/f.rs" }));
+        assert_eq!(read["result"]["isError"], true);
+        assert!(
+            text_of(&read).contains("collab_open"),
+            "the error teaches the fix: {}",
+            text_of(&read)
+        );
+    }
+
+    /// A modern request: `params` with croft's own client `_meta` at `version`.
+    fn modern(id: i64, method: &str, params: Value, version: &str) -> Value {
+        let mut meta = mcp::request_meta("claude-code", "test");
+        meta.insert(mcp::PROTOCOL_VERSION_KEY.into(), json!(version));
+        rpc(id, method, mcp::with_meta(params, &meta))
+    }
+
+    /// The 2026-07-28 surface, as Claude Code now opens it on stdio: the
+    /// discover probe answers with both eras' versions (and croft's own
+    /// client reads it as modern), and a request carrying `_meta` is served
+    /// with no `initialize`, its result typed and naming this server.
+    #[test]
+    fn collab_agent_answers_a_modern_client_without_a_handshake() {
+        let (_dir, _socket, state) = agent_over_relay();
+
+        let probe = modern(1, "server/discover", json!({}), mcp::MODERN_VERSION);
+        let discovered = handle(&state, &probe).unwrap();
+        let result = &discovered["result"];
+        assert_eq!(result["supportedVersions"], json!(mcp::SUPPORTED_VERSIONS));
+        assert_eq!(result["capabilities"]["tools"], json!({}));
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(
+            result["_meta"][mcp::SERVER_INFO_KEY]["name"],
+            "croft-collab"
+        );
+        assert_eq!(mcp::classify_probe(&discovered).unwrap(), mcp::Era::Modern);
+
+        let list = modern(2, "tools/list", json!({}), mcp::MODERN_VERSION);
+        let tools = handle(&state, &list).unwrap();
+        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(tools["result"]["resultType"], "complete");
+
+        let read = modern(
+            3,
+            "tools/call",
+            json!({ "name": "collab_read", "arguments": { "file": "src/f.rs" } }),
+            mcp::MODERN_VERSION,
+        );
+        let read = handle(&state, &read).unwrap();
+        assert_eq!(read["result"]["isError"], true);
+        assert_eq!(read["result"]["resultType"], "complete");
+    }
+
+    /// A modern request at a version the seat does not serve gets the
+    /// versions it does, and one missing the required `_meta` fields is
+    /// invalid params rather than a silent legacy answer.
+    #[test]
+    fn collab_agent_rejects_unservable_modern_requests() {
+        let (_dir, _socket, state) = agent_over_relay();
+
+        let probe = modern(1, "server/discover", json!({}), "1900-01-01");
+        let unsupported = handle(&state, &probe).unwrap();
+        assert_eq!(
+            unsupported["error"]["code"],
+            mcp::UNSUPPORTED_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            unsupported["error"]["data"]["supported"],
+            json!(mcp::SUPPORTED_VERSIONS)
+        );
+        assert_eq!(unsupported["error"]["data"]["requested"], "1900-01-01");
+        // A dual-era client retries at a version from that list.
+        assert_eq!(mcp::classify_probe(&unsupported).unwrap(), mcp::Era::Modern);
+
+        let bare = json!({ "_meta": { mcp::PROTOCOL_VERSION_KEY: mcp::MODERN_VERSION } });
+        let invalid = handle(&state, &rpc(2, "tools/list", bare)).unwrap();
+        assert_eq!(invalid["error"]["code"], -32602);
+        let not_an_object = json!({ "_meta": {
+            mcp::PROTOCOL_VERSION_KEY: mcp::MODERN_VERSION,
+            mcp::CLIENT_CAPABILITIES_KEY: null,
+        } });
+        let invalid = handle(&state, &rpc(3, "tools/list", not_an_object)).unwrap();
+        assert_eq!(invalid["error"]["code"], -32602);
+    }
+
+    /// No owner on the relay: `collab_open` fails with what the user has to
+    /// do, not "start croft" (#1289). A plain `croft` window is running in
+    /// the workspace in that case and serves nobody, so the error names
+    /// `croft attach` and the workspace it was given.
+    #[test]
+    fn opening_with_no_owner_says_the_workspace_needs_croft_attach() {
+        let (_dir, _socket, state) = agent_over_relay();
+        let opened = call(&state, 1, "collab_open", json!({ "file": "src/m.rs" }));
+        assert_eq!(opened["result"]["isError"], true);
+        let msg = text_of(&opened);
+        assert!(
+            msg.contains("croft attach /work/space"),
+            "names the command and the workspace: {msg}"
+        );
+        assert!(
+            msg.contains("a plain `croft` window does not host agents"),
+            "says why the open window is not enough: {msg}"
+        );
+        assert!(!msg.contains("start croft in this workspace"), "{msg}");
+    }
+
+    /// End to end over a real relay: the agent opens a file served by a live
+    /// owner, replaces its text, and moves its caret; the owner's replica
+    /// converges and its events carry the caret under the agent's name.
+    #[test]
+    fn collab_agent_opens_edits_and_carets_through_the_relay() {
+        let (_dir, socket, state) = agent_over_relay();
+        let state = Arc::new(state);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let owner = loop {
+            if let Some(ch) = CollabChannel::connect(&socket, CollabRole::Owner) {
+                break CollabSession::new(ch, "owner".into());
+            }
+            assert!(Instant::now() < deadline, "relay never came up");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let owner = Arc::new(Mutex::new(owner));
+        let owner_events: Arc<Mutex<Vec<CollabEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Owner pump: serves one file's text and collects events.
+        let owner_pump = {
+            let (owner, events, stop) = (owner.clone(), owner_events.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    {
+                        let mut o = owner.lock().unwrap();
+                        let ev = o.poll(|_| Some("hello world".to_string()));
+                        events.lock().unwrap().extend(ev);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        // Agent pump, exactly as `run` spawns it.
+        let agent_pump = {
+            let (state, stop) = (state.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    pump(&state);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+
+        let opened = call(&state, 1, "collab_open", json!({ "file": "src/f.rs" }));
+        assert_eq!(text_of(&opened), "hello world");
+
+        let replaced = call(
+            &state,
+            2,
+            "collab_replace",
+            json!({ "file": "src/f.rs", "text": "hello brave world" }),
+        );
+        assert_eq!(text_of(&replaced), "hello brave world");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while owner.lock().unwrap().doc_text("src/f.rs") != Some("hello brave world") {
+            assert!(Instant::now() < deadline, "owner never converged");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        call(
+            &state,
+            3,
+            "collab_caret",
+            json!({ "file": "src/f.rs", "row": 0, "col": 6 }),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let seen = owner_events.lock().unwrap().iter().any(|e| {
+                matches!(e, CollabEvent::Caret { name, row: 0, col: 6, .. } if name == "claude")
+            });
+            if seen {
+                break;
+            }
+            assert!(Instant::now() < deadline, "owner never saw the agent caret");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let status = call(&state, 4, "collab_status", json!({}));
+        let status_text = text_of(&status);
+        assert!(status_text.contains("src/f.rs"), "status lists the file");
+        assert!(status_text.contains("live"), "status shows the live state");
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = (owner_pump.join(), agent_pump.join());
+    }
+}

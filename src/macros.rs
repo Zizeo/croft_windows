@@ -1,0 +1,636 @@
+//! Keyboard macro record/replay (#255): vim's `q`/`@` registers, plus
+//! palette commands for users who never touch modal editing.
+//!
+//! **What a step is.** croft dispatches a keystroke three ways — a palette
+//! selection and a user-rebound chord both resolve to a
+//! [`Command`](crate::widgets::command_palette::Command), but the built-in
+//! default chords (`Cmd+S`, `Alt+Up`, the debugger keys) call their app
+//! methods straight from `handle_key` and never construct one. Recording at
+//! the command funnel would therefore capture palette work and silently drop
+//! most editing, so a step is a KEY, captured at the single keyboard entry
+//! point, with consecutive plain typing collapsed into one [`Step::Text`].
+//!
+//! Replay pushes those keys back through the same entry point, so a macro
+//! behaves exactly as the keystrokes did — including auto-close pairs,
+//! completion popups, and vim's own state machine, none of which a
+//! command-level replay reproduces faithfully.
+//!
+//! A terminal paste (bracketed paste, a middle click, Cmd+V where the
+//! terminal handles it) reaches croft as one paste event, not keys, so it is
+//! a step of its own, [`Step::Paste`], and replays as a paste (#1464).
+//!
+//! **What it deliberately does not record.** Recording control itself (so a
+//! macro cannot contain its own `q`), and anything typed while the focus is
+//! not the editor — a macro that replayed terminal input or window management
+//! would do something different every time it ran.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// One recorded step. Typing collapses into `Text` runs so a replayed burst
+/// is one undo step (consecutive `InsertChar` edits coalesce), while every
+/// other key is kept verbatim as the chord that produced it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// A run of plain characters typed with no modifiers.
+    Text { text: String },
+    /// Any other key: a named code plus its modifier bits.
+    Key { code: String, mods: u8 },
+    /// A terminal paste, replayed as a paste rather than typed: its
+    /// newlines must not pick up auto-indent, and it is one undo step,
+    /// as the original was (#1464).
+    Paste { text: String },
+    /// A step kind this build does not know, from a macros.json written by a
+    /// newer croft. Without a catch-all, serde fails the WHOLE file on one
+    /// unknown tag, so a single future step would make every register
+    /// unloadable and permanently block saves — the store refuses to
+    /// overwrite what it cannot parse.
+    ///
+    /// Every field is kept (key order is not preserved, since the payload
+    /// round-trips through a JSON object), because `update_json_store`
+    /// re-serialises the ENTIRE map on every save: a fieldless catch-all
+    /// would rewrite a newer croft's steps as `{"kind":"Unknown"}` the first
+    /// time any unrelated register was stored, silently destroying them.
+    /// Replays as nothing.
+    ///
+    /// Deliberately NOT `#[serde(untagged)]`: an untagged catch-all is
+    /// greedy and would also swallow a MALFORMED known step — a `Text` that
+    /// lost its `text` field, or a bare `42` — turning a hard parse error
+    /// into a silently inert macro and dissolving the refuse-a-corrupt-store
+    /// guarantee this module inherits from `workspace.rs`. The custom
+    /// deserialiser below accepts only an object whose `kind` is a tag this
+    /// build does not know.
+    Unknown(serde_json::Map<String, serde_json::Value>),
+}
+
+impl<'de> serde::Deserialize<'de> for Step {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let v = serde_json::Value::deserialize(d)?;
+        let obj = v
+            .as_object()
+            .ok_or_else(|| D::Error::custom("a macro step must be an object"))?;
+        let kind = obj
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| D::Error::custom("a macro step needs a string \"kind\""))?;
+        match kind {
+            // Known kinds must parse properly: a malformed one is a corrupt
+            // store, which the caller refuses rather than silently repairs.
+            "Text" => {
+                let text = obj
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| D::Error::missing_field("text"))?;
+                Ok(Step::Text {
+                    text: text.to_string(),
+                })
+            }
+            "Paste" => {
+                let text = obj
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| D::Error::missing_field("text"))?;
+                Ok(Step::Paste {
+                    text: text.to_string(),
+                })
+            }
+            "Key" => {
+                let code = obj
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| D::Error::missing_field("code"))?;
+                let mods = match obj.get("mods") {
+                    None => return Err(D::Error::missing_field("mods")),
+                    // Reported apart from "missing" so a negative or huge
+                    // value says what is actually wrong with it.
+                    Some(v) => v
+                        .as_u64()
+                        .ok_or_else(|| D::Error::custom("mods must be a non-negative integer"))?,
+                };
+                Ok(Step::Key {
+                    code: code.to_string(),
+                    mods: u8::try_from(mods).map_err(|_| D::Error::custom("mods out of range"))?,
+                })
+            }
+            // Anything else is a step from a newer croft: keep it whole.
+            _ => Ok(Step::Unknown(obj.clone())),
+        }
+    }
+}
+
+impl serde::Serialize for Step {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+        match self {
+            // An unknown step writes back exactly the fields it arrived with,
+            // so a save from this build does not damage a newer one's macro.
+            Step::Unknown(obj) => obj.serialize(s),
+            // Emitted through `serialize_struct` rather than a
+            // `serde_json::Map`, which is a BTreeMap here and would sort the
+            // keys — `code` ahead of `kind`. That still LOADS fine, but it
+            // rewrites every line of every existing macros.json on first
+            // save, so the on-disk shape stays exactly what the old derive
+            // wrote. `a_known_step_keeps_the_on_disk_shape` pins it.
+            Step::Text { text } => {
+                let mut st = s.serialize_struct("Step", 2)?;
+                st.serialize_field("kind", "Text")?;
+                st.serialize_field("text", text)?;
+                st.end()
+            }
+            Step::Paste { text } => {
+                let mut st = s.serialize_struct("Step", 2)?;
+                st.serialize_field("kind", "Paste")?;
+                st.serialize_field("text", text)?;
+                st.end()
+            }
+            Step::Key { code, mods } => {
+                let mut st = s.serialize_struct("Step", 3)?;
+                st.serialize_field("kind", "Key")?;
+                st.serialize_field("code", code)?;
+                st.serialize_field("mods", mods)?;
+                st.end()
+            }
+        }
+    }
+}
+
+impl Step {
+    /// The key a `Key` step replays, or `None` when the recorded name is not
+    /// one this build knows — a macros.json written by a newer croft must
+    /// skip the step rather than abort the whole macro.
+    fn to_key_event(&self) -> Option<KeyEvent> {
+        let Step::Key { code, mods } = self else {
+            return None;
+        };
+        let code = parse_code(code)?;
+        Some(KeyEvent::new(code, KeyModifiers::from_bits_truncate(*mods)))
+    }
+}
+
+/// One thing a replay feeds back: a key through `handle_key`, or a paste
+/// through `handle_paste`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Replay {
+    Key(KeyEvent),
+    Paste(String),
+}
+
+/// A named recording. `steps` is replayed in order; an empty macro is legal
+/// (recording started and stopped with nothing between) and replays as a
+/// no-op rather than an error.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Macro {
+    pub steps: Vec<Step>,
+}
+
+impl Macro {
+    /// Append a key, folding plain typing into the trailing `Text` run.
+    /// `Char` with no modifiers is typing; everything else is a chord.
+    pub fn push_key(&mut self, key: KeyEvent) {
+        let plain = matches!(key.code, KeyCode::Char(_))
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        if let (KeyCode::Char(c), true) = (key.code, plain) {
+            if let Some(Step::Text { text }) = self.steps.last_mut() {
+                text.push(c);
+                return;
+            }
+            self.steps.push(Step::Text {
+                text: c.to_string(),
+            });
+            return;
+        }
+        if let Some(code) = code_name(key.code) {
+            self.steps.push(Step::Key {
+                code,
+                mods: key.modifiers.bits(),
+            });
+        }
+    }
+
+    /// Append a terminal paste as a step of its own (#1464). An empty
+    /// paste changes nothing, so it records nothing.
+    pub fn push_paste(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.steps.push(Step::Paste {
+                text: text.to_string(),
+            });
+        }
+    }
+
+    /// What this macro replays, in order. Steps naming a key this build does
+    /// not know are skipped, not fatal.
+    pub fn replay_steps(&self) -> Vec<Replay> {
+        let mut out = Vec::new();
+        for step in &self.steps {
+            match step {
+                Step::Text { text } => {
+                    for c in text.chars() {
+                        out.push(Replay::Key(KeyEvent::new(
+                            KeyCode::Char(c),
+                            KeyModifiers::NONE,
+                        )));
+                    }
+                }
+                Step::Key { .. } => {
+                    if let Some(k) = step.to_key_event() {
+                        out.push(Replay::Key(k));
+                    }
+                }
+                Step::Paste { text } => out.push(Replay::Paste(text.clone())),
+                Step::Unknown(_) => {}
+            }
+        }
+        out
+    }
+
+    /// The keys among [`Macro::replay_steps`].
+    #[cfg(test)]
+    pub fn key_events(&self) -> Vec<KeyEvent> {
+        self.replay_steps()
+            .into_iter()
+            .filter_map(|r| match r {
+                Replay::Key(k) => Some(k),
+                Replay::Paste(_) => None,
+            })
+            .collect()
+    }
+
+    /// Total keys a replay will feed, for the step budget.
+    pub fn len(&self) -> usize {
+        self.steps
+            .iter()
+            .map(|s| match s {
+                Step::Text { text } | Step::Paste { text } => text.chars().count().max(1),
+                Step::Key { .. } => 1,
+                Step::Unknown(_) => 0,
+            })
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+}
+
+/// Serialise a key code to the name stored on disk. Returns `None` for codes
+/// with no stable spelling, which are dropped at record time rather than
+/// written as something a later croft would misread.
+fn code_name(code: KeyCode) -> Option<String> {
+    Some(match code {
+        KeyCode::Char(c) => format!("char:{c}"),
+        KeyCode::F(n) => format!("f{n}"),
+        KeyCode::Backspace => "backspace".into(),
+        KeyCode::Enter => "enter".into(),
+        KeyCode::Left => "left".into(),
+        KeyCode::Right => "right".into(),
+        KeyCode::Up => "up".into(),
+        KeyCode::Down => "down".into(),
+        KeyCode::Home => "home".into(),
+        KeyCode::End => "end".into(),
+        KeyCode::PageUp => "pageup".into(),
+        KeyCode::PageDown => "pagedown".into(),
+        KeyCode::Tab => "tab".into(),
+        KeyCode::BackTab => "backtab".into(),
+        KeyCode::Delete => "delete".into(),
+        KeyCode::Insert => "insert".into(),
+        KeyCode::Esc => "esc".into(),
+        _ => return None,
+    })
+}
+
+/// The inverse of [`code_name`].
+fn parse_code(name: &str) -> Option<KeyCode> {
+    if let Some(rest) = name.strip_prefix("char:") {
+        let mut it = rest.chars();
+        let c = it.next()?;
+        if it.next().is_some() {
+            return None;
+        }
+        return Some(KeyCode::Char(c));
+    }
+    if let Some(n) = name.strip_prefix('f')
+        && let Ok(n) = n.parse::<u8>()
+    {
+        return Some(KeyCode::F(n));
+    }
+    Some(match name {
+        "backspace" => KeyCode::Backspace,
+        "enter" => KeyCode::Enter,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "pageup" => KeyCode::PageUp,
+        "pagedown" => KeyCode::PageDown,
+        "tab" => KeyCode::Tab,
+        "backtab" => KeyCode::BackTab,
+        "delete" => KeyCode::Delete,
+        "insert" => KeyCode::Insert,
+        "esc" => KeyCode::Esc,
+        _ => return None,
+    })
+}
+
+/// Live recording state. `None` on `App` means "not recording"; the register
+/// is `None` for the palette recorder and `Some(c)` for vim's `q{a-z}`.
+#[derive(Clone, Debug)]
+pub struct Recording {
+    pub register: Option<char>,
+    pub recorded: Macro,
+    /// Keys that opened or went into the Command Palette, held back until it
+    /// closes (#952). A palette session that runs a command joins the macro
+    /// whole, chord, query and Enter, so it replays; one that stops the
+    /// recording is dropped with it instead of leaving the chord and the
+    /// typed query in the macro, which replay would type into a palette.
+    pub palette_keys: Vec<KeyEvent>,
+}
+
+/// The store: `~/.config/croft/macros.json`, a register name → macro map,
+/// which is exactly the shape [`crate::workspace::update_json_store`] takes.
+pub fn macros_path() -> PathBuf {
+    crate::paths::config_dir().join("macros.json")
+}
+
+/// Load for READING: any failure reads empty, since a read-only consumer can
+/// do nothing better with a corrupt store.
+pub fn load(path: &Path) -> HashMap<String, Macro> {
+    load_checked(path).unwrap_or_default()
+}
+
+/// Load for WRITING: a missing store is `Ok(empty)`, but an unreadable or
+/// unparsable one is an error — treating a corrupt store as empty would let
+/// one save wipe every other register (the `workspace.rs` precedent).
+fn load_checked(path: &Path) -> Result<HashMap<String, Macro>, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+/// Store one register, atomically and under the shared store lock. An empty
+/// macro removes the key rather than persisting a no-op.
+pub fn save_register(path: &Path, name: &str, mac: Macro) -> Result<(), String> {
+    crate::workspace::update_json_store::<Macro, _>(path, |map| {
+        if mac.is_empty() {
+            map.remove(name);
+        } else {
+            map.insert(name.to_string(), mac);
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ch(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn typing_collapses_into_one_text_run_and_chords_stay_separate() {
+        let mut m = Macro::default();
+        for c in "abc".chars() {
+            m.push_key(ch(c));
+        }
+        m.push_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        for c in "de".chars() {
+            m.push_key(ch(c));
+        }
+        assert_eq!(
+            m.steps,
+            vec![
+                Step::Text { text: "abc".into() },
+                Step::Key {
+                    code: "down".into(),
+                    mods: 0
+                },
+                Step::Text { text: "de".into() },
+            ],
+            "a typing burst is one step so its replay coalesces to one undo"
+        );
+        assert_eq!(m.len(), 6, "the budget counts keys, not steps");
+    }
+
+    #[test]
+    fn a_modified_char_is_a_chord_not_typing() {
+        let mut m = Macro::default();
+        m.push_key(ch('a'));
+        m.push_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        m.push_key(ch('b'));
+        assert_eq!(
+            m.steps,
+            vec![
+                Step::Text { text: "a".into() },
+                Step::Key {
+                    code: "char:s".into(),
+                    mods: KeyModifiers::CONTROL.bits()
+                },
+                Step::Text { text: "b".into() },
+            ],
+            "Ctrl+S must not fold into the surrounding typing"
+        );
+    }
+
+    #[test]
+    fn a_macro_round_trips_through_its_key_events() {
+        let mut m = Macro::default();
+        for c in "hi".chars() {
+            m.push_key(ch(c));
+        }
+        m.push_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        m.push_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+        let keys = m.key_events();
+        assert_eq!(keys.len(), 4, "a Text run expands back to one key per char");
+        assert_eq!(keys[0], ch('h'));
+        assert_eq!(keys[2], KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            keys[3],
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)
+        );
+    }
+
+    #[test]
+    fn an_unknown_step_is_skipped_not_fatal() {
+        // A macros.json written by a newer croft naming a key this build has
+        // no spelling for must lose that step, not the whole macro.
+        let m = Macro {
+            steps: vec![
+                Step::Text { text: "a".into() },
+                Step::Key {
+                    code: "keypad_frobnicate".into(),
+                    mods: 0,
+                },
+                Step::Text { text: "b".into() },
+            ],
+        };
+        let keys = m.key_events();
+        assert_eq!(keys, vec![ch('a'), ch('b')], "the known steps still run");
+    }
+
+    #[test]
+    fn a_register_round_trips_through_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("macros.json");
+        let mut m = Macro::default();
+        for c in "xy".chars() {
+            m.push_key(ch(c));
+        }
+        save_register(&path, "a", m.clone()).unwrap();
+        assert_eq!(load(&path).get("a"), Some(&m));
+
+        // An empty macro prunes its key rather than persisting a no-op.
+        save_register(&path, "a", Macro::default()).unwrap();
+        assert!(!load(&path).contains_key("a"), "the register was removed");
+    }
+
+    #[test]
+    fn a_known_step_keeps_the_on_disk_shape() {
+        // The hand-written serialiser must emit exactly what the old derive
+        // did. A `serde_json::Map` is a BTreeMap here and would sort `code`
+        // ahead of `kind` — harmless to load, but it rewrites every line of
+        // every existing macros.json on first save.
+        let key = Step::Key {
+            code: "char:z".into(),
+            mods: 0,
+        };
+        assert_eq!(
+            serde_json::to_string(&key).unwrap(),
+            r#"{"kind":"Key","code":"char:z","mods":0}"#,
+            "field order matches what shipped before"
+        );
+        let text = Step::Text { text: "hi".into() };
+        assert_eq!(
+            serde_json::to_string(&text).unwrap(),
+            r#"{"kind":"Text","text":"hi"}"#
+        );
+        // And both still round-trip.
+        for step in [key, text] {
+            let raw = serde_json::to_string(&step).unwrap();
+            assert_eq!(serde_json::from_str::<Step>(&raw).unwrap(), step);
+        }
+    }
+
+    #[test]
+    fn a_malformed_known_step_is_still_a_corrupt_store() {
+        // The unknown-kind catch-all must not be greedy. A `Text` that lost
+        // its `text` field (a truncated write) is corruption, not a step from
+        // the future: swallowing it would turn a hard parse error into a
+        // silently shorter macro and dissolve the refuse-a-corrupt-store
+        // guarantee this module inherits from `workspace.rs`.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("macros.json");
+        std::fs::write(&path, r#"{"a":{"steps":[{"kind":"Text"}]}}"#).unwrap();
+        assert!(
+            load(&path).is_empty(),
+            "a structurally corrupt step reads as empty, not as a usable macro"
+        );
+        assert!(
+            save_register(&path, "b", Macro::default()).is_err(),
+            "and a save is refused rather than rewriting the corruption"
+        );
+
+        // Non-objects are corruption too, not future steps.
+        for junk in [r#"{"a":{"steps":[42]}}"#, r#"{"a":{"steps":["hi"]}}"#] {
+            std::fs::write(&path, junk).unwrap();
+            assert!(
+                load(&path).is_empty(),
+                "a non-object step is refused: {junk}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_kind_keeps_every_field_through_a_save() {
+        // `update_json_store` re-serialises the whole map on every save, so a
+        // newer croft's step must survive an unrelated register being stored.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("macros.json");
+        std::fs::write(
+            &path,
+            r#"{"b":{"steps":[{"kind":"Mouse","button":"left","x":3,"nested":{"a":1}}]}}"#,
+        )
+        .unwrap();
+        let mut mine = Macro::default();
+        mine.push_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        save_register(&path, "c", mine).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        for needle in ["\"button\"", "\"left\"", "\"x\"", "\"nested\""] {
+            assert!(raw.contains(needle), "{needle} survived the save: {raw}");
+        }
+        // And it stays inert rather than replaying as something.
+        assert_eq!(
+            load(&path).get("b").map(|m| m.key_events().len()),
+            Some(0),
+            "an unknown step replays as nothing"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_store_is_refused_not_silently_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("macros.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(
+            save_register(&path, "a", Macro::default()).is_err(),
+            "a save must not treat an unparsable store as empty and wipe it"
+        );
+        assert!(load(&path).is_empty(), "but a read degrades to empty");
+    }
+
+    /// #1464: a paste is a step of its own, stored as `Paste` with its text
+    /// whole, and it round-trips through the store.
+    #[test]
+    fn a_paste_step_has_its_own_shape_and_round_trips() {
+        let mut m = Macro::default();
+        m.push_key(ch('a'));
+        m.push_paste("x\n  y");
+        m.push_key(ch('b'));
+        assert_eq!(
+            m.steps,
+            vec![
+                Step::Text { text: "a".into() },
+                Step::Paste {
+                    text: "x\n  y".into()
+                },
+                Step::Text { text: "b".into() },
+            ],
+            "the paste splits the typing around it"
+        );
+        assert_eq!(
+            serde_json::to_string(&m.steps[1]).unwrap(),
+            r#"{"kind":"Paste","text":"x\n  y"}"#
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("macros.json");
+        save_register(&path, "p", m.clone()).unwrap();
+        assert_eq!(load(&path).get("p"), Some(&m));
+        assert_eq!(m.len(), 7, "the budget counts the paste's characters too");
+    }
+
+    /// #1464 negative: a `Paste` that lost its text is a corrupt store, not
+    /// a step from the future, and an empty paste records nothing.
+    #[test]
+    fn a_malformed_paste_is_corrupt_and_an_empty_one_is_not_recorded() {
+        assert!(serde_json::from_str::<Step>(r#"{"kind":"Paste"}"#).is_err());
+        let mut m = Macro::default();
+        m.push_paste("");
+        assert!(m.is_empty());
+    }
+}

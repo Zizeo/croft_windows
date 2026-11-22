@@ -1,0 +1,320 @@
+[package]
+name = "croft-software"
+version = "0.2.159"
+edition = "2024"
+description = "VSCode-style TUI written in Rust"
+license = "MIT"
+repository = "https://github.com/vitali87/croft"
+homepage = "https://croft.software"
+# crates.io refuses a package over 10 MiB, and the docs' GIFs alone are ~3 MB
+# of it. Nothing the build reads lives in these (`include_str!` and
+# `include_bytes!` reach into assets/, docs/*.md and src/ only).
+# The screen goldens are test data that only `cargo test` reads, from disk.
+exclude = ["/docs/images/", "/.github/", "/scripts/", "/sonar-project.properties", "/greptile.json", "/.coderabbit.yaml", "/src/app/tests/golden/"]
+
+# Prebuilt binaries for `cargo binstall croft-software` (#376). The release
+# workflow publishes one tar.gz per target holding a single `croft` at the
+# root of a directory named for the target, so the template and `bin-dir`
+# below must stay in step with .github/workflows/release.yml's Package step:
+# they are two halves of one contract and nothing checks them against each
+# other at build time.
+#
+# `{ name }` is the CRATE name (croft-software) and `{ bin }` the binary
+# (croft); the archives are named for the binary, which is why the template
+# spells `croft-` literally rather than interpolating `{ name }`.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/croft-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "croft-{ target }/{ bin }{ binary-ext }"
+
+# The binary stays `croft` — the package is the suite name, the command is
+# the tool. `cargo install croft-software` puts `croft` on PATH.
+[[bin]]
+name = "croft"
+path = "src/main.rs"
+
+# Versions verified against crates.io max_stable_version on 2026-05-02.
+[dependencies]
+# Unix process control: `setsid` to detach a probe subprocess from croft's
+# controlling terminal so it can never hijack the tty (see lsp/install.rs).
+libc = "0.2"
+# Text codec for the status-bar "Reopen / Save with Encoding": decode non-UTF-8
+# files (UTF-16, Windows-1252, Shift-JIS, …) and re-encode on save. Firefox's
+# engine; already in the tree transitively.
+encoding_rs = "0.8"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+portable-pty = "0.9"
+# Embedded-shell terminal emulator. Production-grade engine from
+# alacritty + zed; bounded scrollback, no allocation churn under
+# heavy alt-screen TUI workloads (vt100 0.16 leaks tens of GB
+# under multi-hour `claude`-style streams; this does not).
+alacritty_terminal = "0.26"
+
+# Tree-sitter core + per-language grammars.  Direct deps, no dynamic loading.
+tree-sitter = "0.26"
+tree-sitter-highlight = "0.26"
+# Trait for tree-sitter 0.26's `QueryMatches`, which is a streaming (not std)
+# iterator; needed to walk outline-query matches in `outline_syntax`.
+streaming-iterator = "0.1"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-json = "0.24"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
+tree-sitter-md = "0.5"
+tree-sitter-go = "0.25"
+tree-sitter-html = "0.23"
+# XML syntax highlighting (#197): dedicated grammar (the HTML grammar
+# chokes on declarations, CDATA, and processing instructions).
+# 0.7.0 verified current on crates.io 2026-08-19.
+tree-sitter-xml = "0.7"
+tree-sitter-css = "0.25"
+tree-sitter-bash = "0.25"
+tree-sitter-lua = "0.5"
+# CodeQL `.ql` / `.qll` highlighting and outline (#578). MIT, same
+# `LanguageFn` shape as the other 0.23+ grammars.
+tree-sitter-ql = "0.23"
+# CodeQL `.dbscheme` highlighting (#578). MIT; ships no highlights query,
+# so croft carries its own.
+tree-sitter-ql-dbscheme = "0.23"
+# Grammars for files most repositories carry even when written in another
+# language (#1226): Java, Ruby, C#, SQL, Makefiles and Dockerfiles.
+tree-sitter-java = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-sequel = "0.3"
+tree-sitter-make = "1.1"
+tree-sitter-containerfile = "0.9"
+
+# CommonMark parser behind the rendered Markdown preview (Cmd+Shift+V).
+# rustdoc / mdBook's engine; parser only, no HTML output needed.
+# 0.13.4 verified current on crates.io 2026-07-11.
+pulldown-cmark = { version = "0.13", default-features = false }
+# Display width of a char (CJK and most emoji take two cells) for the
+# rendered-log painter and its cell-to-column mapping (#404). Already in the
+# tree transitively via ratatui.
+unicode-width = "0.2"
+# Grapheme boundaries for the same map: ratatui paints by grapheme, so the
+# map must count the way it does. Already in the tree via ratatui.
+unicode-segmentation = "1"
+# NFC normalisation for `croft theme-import` ids: canonically equivalent
+# theme names must mint one id, not two (#407). No transitive weight.
+unicode-normalization = "0.1"
+
+ignore = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
+# Look-around and backreferences in Search (#1552); already built for
+# umya-spreadsheet, so no new code is compiled.
+fancy-regex = "0.18"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "time", "process"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+
+# LSP client stack. async-lsp 0.2.4 (Apr 2026) pins lsp-types ^0.95
+# because of gluon-lang/lsp-types#284, so we follow that pin. 0.95
+# already covers LSP 3.17. tower is needed for ServiceBuilder layers.
+# default-features = false drops the `client-monitor` default feature: it is
+# a server-side helper (waitpid on the parent client) that croft never uses,
+# and its `waitpid-any` dep fails to compile on android (target_os = "android"
+# is not "linux", so waitpid-any has no backend module). Dropping it lets
+# croft build under Termux while changing nothing on macOS/Linux.
+async-lsp = { version = "0.2", default-features = false, features = ["omni-trait", "stdio", "tracing", "tokio"] }
+lsp-types = { version = "0.95", features = ["proposed"] }
+tower = "0.5"
+tui-input = "0.15"
+plist = "1.9"
+notify = "8.2"
+notify-debouncer-full = "0.7"
+base64 = "0.22"
+# Integrity for the remote extension index (src/mcp/registry_index.rs): `ring`
+# verifies the ed25519 signature over `index.json` against a baked public key,
+# and `sha2` checks each fetched manifest against the sha256 recorded in the
+# signed index. Both are already in the tree transitively (ring via ureq's TLS
+# backend, sha2 via several deps), so promoting them to direct deps adds no new
+# version to the lock and no new build surface — ring already compiles on every
+# croft target, Termux included.
+ring = "0.17"
+# TLS for `croft web --tls` (#343). Already in the graph through ureq, with
+# the same ring provider; no default features so aws-lc never comes in.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.10"
+regex = "1.12"
+# Log highlighting for the rendered log view (#466): tailspin as a library,
+# CLI feature off so none of clap/rayon/signal-hook/toml come along.
+tailspin = { version = "7.0", default-features = false }
+# Already in the tree via regex; taken directly for the log index, whose
+# newline scan is the one hot loop in opening a multi-gigabyte file.
+memchr = "2.8"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "ico", "tiff"] }
+# NeuQuant colour quantiser, already in the tree via image's gif feature. Used
+# directly by the hand-rolled sixel encoder (src/iterm2_inline.rs) to fit an
+# overlay's pixels into sixel's <=256 palette registers; avoids pulling a whole
+# SIMD/proc-macro sixel crate for what are mostly two-colour codicons.
+color_quant = "1.1"
+# SVG rasteriser for the activity-bar codicons AND the editor's SVG file
+# preview (#175). resvg re-exports `usvg` and `tiny_skia`, so it is the only
+# direct dep needed. The codicons are pure `<path>` glyphs and never touch a
+# font, but real-world SVG FILES carry <text> and embedded <image>, so the
+# preview needs text + system-fonts (fontdb/rustybuzz) and raster-image
+# (gif/jpeg/png decoding for <image> hrefs). The fontdb is built lazily on
+# the FIRST file preview (src/svg.rs), so the startup critical path
+# (init_graphics baking icons) never pays for font enumeration.
+resvg = { version = "0.47", default-features = false, features = [
+    "text",
+    "system-fonts",
+    "raster-images",
+    "gif",
+    "image-webp",
+] }
+ureq = { version = "2", default-features = false, features = ["tls"] }
+# The local-model navigator transport only (src/pair/local.rs). Version 3's
+# phased timeouts check the remaining budget before EVERY socket read, so one
+# per-request global timeout enforces the turn deadline at the socket layer
+# and a deadline cut drops the response and closes the socket. Version 2's
+# only knob is a fixed per-read timeout, which parked a blocked read (plus a
+# helper thread and the socket) long past the deadline on a silent peer.
+# The rest of the tree stays on ureq 2 until those call sites migrate.
+# 3.3.0 verified current on crates.io 2026-07-31.
+ureq3 = { package = "ureq", version = "3", default-features = false, features = ["rustls"] }
+# The trust store every download uses (src/net.rs, #872): the OS's CA store
+# (where a TLS-inspecting proxy's CA lives) on top of the Mozilla roots ureq
+# compiles in, which stay as the fallback. webpki-roots is already in the tree
+# via ureq; rustls-native-certs reads the platform store (files on Linux and
+# Android, the keychain on macOS) and honours SSL_CERT_FILE / SSL_CERT_DIR.
+rustls-native-certs = "0.8"
+webpki-roots = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+# Text CRDT for multiplayer Phase D (independent viewports): tracks concurrent
+# edit positions so two participants can edit the same buffer without a central
+# authority. Operation-based, byte-offset model, app owns the text (croft keeps
+# its Vec<String> editor buffer; cola only tracks positions). Fastest of the
+# Rust text CRDTs benchmarked (cola vs diamond-types/yrs/automerge). `serde`
+# feature makes Insertion/Deletion wire-serializable for the control channel.
+# 0.5.1 verified current on crates.io 2026-07-13.
+cola = { version = "0.5", features = ["serde"] }
+# POSIX shell tokenizer, already in the tree transitively. Used to split a
+# terminal command line (`rg -w "two words"`) into args when seeding Search
+# from the last grep/rg command (src/quickfix.rs).
+shlex = "1.3"
+# rg's own regex parser, already in the tree via regex and grep-regex. Its AST
+# tells which letters of a seeded `rg -S` pattern are literals, the test rg's
+# smart case applies (src/quickfix.rs), so `\W` doesn't count as uppercase.
+regex-syntax = "0.8"
+# URL parsing for the pair endpoint (--base-url validation, and the
+# loopback/https gate that keeps the gateway credential off cleartext remote
+# hops). Already in the tree transitively via ureq, so promoting it to a
+# direct dep adds no new version to the lock.
+url = "2"
+csv = "1.4"
+calamine = "0.38"
+# xlsx WRITE path for the sheet grid's workbook editing (#178): calamine
+# stays the fast read side; on save the workbook is re-read through umya,
+# the user's cell edits are applied, and umya writes the file back with
+# styles, widths, and untouched formulas preserved. Pure Rust.
+# Pinned to 4.0.0-beta.1: it is the only release on zip 9.0.5+, and every
+# 3.x line pulls zip 8.x with the extraction/parser advisories fixed in
+# 9.0.5 (GHSA-m665-v7pm-7grj and friends). Move to 4.0.0 once it ships.
+umya-spreadsheet = { version = "=4.0.0-beta.1", default-features = false }
+# Decompression for the `Provision::Binary` LSP backend (src/lsp/install.rs):
+# release binaries ship as a single gzipped executable (taplo) or a zip with
+# sibling files (clangd). Both crates are already in the tree transitively
+# (flate2 via the png/gzip paths, zip via calamine), so promoting them to
+# direct deps adds no new version to the lock. zip needs only `deflate` (the
+# standard GitHub-release compression); its heavier default codecs are dropped.
+flate2 = "1"
+# xz for cargo-dist release archives (csvlens ships tar.xz only, #465).
+lzma-rs = "0.3"
+# zstd and bzip2 for the archive browser's `.tar.zst` and `.tar.bz2` (#1645).
+# Both decode in pure Rust, so the musl and Android cross builds need no C
+# compiler: ruzstd is decode-only (`std` for its `io::Read` decoder, frame
+# hashing dropped), and bzip2's one default feature is the libbz2-rs-sys port
+# of libbzip2, not the bzip2-sys C build. Verified current on crates.io
+# 2026-11-08 (ruzstd 0.9.1, bzip2 0.6.1).
+ruzstd = { version = "0.9", default-features = false, features = ["std"] }
+bzip2 = "0.6"
+# Tar walking for the archive browser (#179): list members and extract
+# one on demand (tar/tar.gz/tgz); zip rides the existing zip crate.
+# 0.4.46 verified current on crates.io 2026-08-18.
+tar = "0.4"
+# XML pull parsing for the docx/odt read-only preview (#181): walk
+# word/document.xml / content.xml paragraph runs. Already in the tree
+# transitively (calamine, umya-spreadsheet), so no new lock version.
+quick-xml = "0.39"
+# OLE compound files for the Word 97-2003 `.doc` preview (#1979): a `.doc`
+# keeps its text in the WordDocument and table streams of one. Already in
+# the tree through calamine's `.xls` reader, so no new lock version.
+cfb = "0.14"
+# Read-only SQLite browser (#182): tables page through the sheet grid.
+# `bundled` compiles sqlite3 in, so no system dependency on any target;
+# opened with SQLITE_OPEN_READONLY so a live application database is
+# never locked or mutated. 0.40.2 verified current on crates.io
+# 2026-08-19. `hooks` (no extra crates) gives the progress handler that stops
+# a view's query past its time budget instead of freezing the open (#1002).
+rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
+# Read-only TOML parser for the Explorer DEPENDENCIES view: extracts the
+# dependency list from `pyproject.toml` (PEP 621 `[project].dependencies` or
+# `[tool.poetry.dependencies]`). `parse` + `serde` give `toml::Table`/`Value`
+# (the dynamic `Value` type is gated behind `serde` in toml 1.x); `display` is
+# dropped since croft never writes TOML. Rust deps still come from `cargo
+# metadata`, so Cargo.toml is never hand-parsed.
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
+similar = "3.1"
+rayon = "1.12"
+# Process enumeration for the DAP "Attach to Python Process" discovery
+# (lists running interpreters); only the `system` feature is needed.
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+tree-sitter-cpp = "0.23.4"
+tree-sitter-c = "0.24.2"
+globset = "0.4.18"
+
+# `trash` has no android backend: its freedesktop backend is gated
+# `not(target_os = "android")`, so on android the crate fails to compile
+# (no `platform` module). croft implements the freedesktop home-trash spec
+# itself for android (see widgets::file_tree::move_to_trash), so the crate
+# is only a dependency off-android.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+trash = "5.2"
+
+[dev-dependencies]
+tempfile = "3.27"
+pretty_assertions = "1.4"
+assert_cmd = "2.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Profile used by the local cross-build fast path in `croft <host>`. Drops
+# thin-LTO and bumps codegen-units back to 16 so the croft crate's codegen
+# parallelises and the link step is a no-op merge instead of a full LTO
+# pass; opt-level 2 keeps the resulting binary close-enough in runtime
+# perf for a TUI tool while cutting incremental compile time roughly in
+# half versus release.
+[profile.remote-fast]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+debug = false
+strip = "symbols"
+
+# async-lsp 0.2.4 as published, with one change to how it reads a message
+# from a language server (vendor/async-lsp/PATCHED.md). Published, it parsed
+# every reply three times over before croft saw it; a big file's semantic
+# tokens alone briefly took ~90 MB. Drop this once upstream reads messages
+# the same way. `cargo publish` leaves [patch] out of the published manifest,
+# so `cargo install croft-software` builds against the crates.io release.
+[patch.crates-io]
+async-lsp = { path = "vendor/async-lsp" }

@@ -1,0 +1,344 @@
+name: CI
+
+# The gates that used to exist only as habit on one Mac.
+#
+# The cross-build jobs are the point. `croft <host>` cross-compiles a static
+# binary locally and ships it; when the pinned toolchain lacks a target, that
+# path silently degrades to a full `cargo install` on the user's box, with
+# nothing but a line in ~/.cache/croft/install.log to say so. Rustup targets
+# belong to ONE toolchain, so bumping rust-toolchain.toml orphans every one of
+# them - which is what the 1.95.0 -> 1.97.1 bump did, unnoticed for four days.
+#
+# These jobs run the REAL build (zig for musl, the NDK for Android), not
+# `cargo check`: croft's tree-sitter grammars are C, so their build scripts
+# need a working cross C compiler and a check alone fails before it can prove
+# anything useful.
+
+on:
+  push:
+    branches: [main]
+  # No `labeled` type here, on purpose: every job below would re-run each time
+  # any label is added. macos.yml, which a label does start, says more.
+  pull_request:
+
+# Every job here only reads the checkout; none writes to the repo, its issues
+# or its PRs. Without this the token gets the repository default, which can be
+# read-write. A job that ever needs more asks for it in its own block.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # The branch this pull request lands on: the checks below diff against it.
+  # Not GITHUB_BASE_REF. For a pull request in a stack, GitHub sets that to
+  # the branch the whole stack targets (main), so a check read every pull
+  # request below this one as part of it, and a split declaring
+  # `pure-move: true` failed on a doc fix made in the one under it (#2390).
+  PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+
+jobs:
+  release-hygiene:
+    # Every merge that changes what ships carries release notes (#281), so
+    # the welcome panel's card describes the binary it is in. A pull request
+    # writes them to a fragment of its own, src/release_notes/unreleased/<name>.md,
+    # and never touches `version`: after the merge, version-bump.yml folds the
+    # pending fragments into src/release_notes/<next>.md and bumps the
+    # version once, on main. When each PR bumped the version and wrote that
+    # version's notes itself, every open PR edited the same line, so each
+    # merge put all the others in conflict.
+    # Docs / CI / test-only changes ship nothing and are exempt, including a
+    # diff confined to a `#[cfg(test)]` module inside a shipped file (#461).
+    # So is a change to dependency versions alone, a Dependabot PR's shape:
+    # version-bump.yml notes the crates that moved itself.
+    name: release notes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # This job runs a SCRIPT from the submitted branch, so it takes the same
+    # posture the doc-ownership job below documents: only what it needs to
+    # read the diff, and no checkout token left in the local git config for
+    # that script to reach.
+    #
+    # Pinning the script to the base revision instead would buy nothing on
+    # this trigger: `pull_request` runs the workflow file from the merge of
+    # the branch, so a PR that wanted to neuter the gate would edit the job
+    # rather than the helper it calls. What is worth removing is the
+    # CREDENTIAL, not the ability to run branch code.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so the merge-base with the PR base resolves.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Shipped changes add release notes and leave the version alone
+        # scripts/release.py holds the rules and their tests
+        # (scripts/tests/test_release.py): a shipped change adds at least one
+        # fragment with a highlight in it; no PR changes `version` or any
+        # src/release_notes/<version>.md, whether or not it ships.
+        run: |
+          set -euo pipefail
+          base="$(git merge-base "origin/$PR_BASE_REF" HEAD)"
+          python3 scripts/release.py check "$base" HEAD
+
+  doc-ownership:
+    # Rust attaches a `///` block to whatever item FOLLOWS it, so inserting a
+    # function between an existing one and its doc silently hands that prose to
+    # the newcomer (#314). Nothing else here reports it: the build stays green,
+    # clippy is silent, and the rendered rustdoc is confidently WRONG rather
+    # than absent - which stops a reader looking, where absent docs would have
+    # sent them to the code. It has happened twice on one branch, and a sweep
+    # of recent history found four more that had shipped.
+    #
+    # The snapshot is undetectable (well-formed prose above a plausible
+    # function) but the diff is not: a function that had a doc and now has none
+    # is the exact fingerprint. Validated against both known instances.
+    name: doc comments stay with their function
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # This job runs a script FROM the submitted branch, so a PR can change what
+    # executes here. Give it only what it needs to read the diff, and keep the
+    # checkout token out of the local git config where that script could reach
+    # it.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so the merge-base with the PR base resolves.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: No function may lose its doc comment
+        run: |
+          set -euo pipefail
+          base="$(git merge-base "origin/$PR_BASE_REF" HEAD)"
+          python3 scripts/check_doc_ownership.py "$base" HEAD
+      # The pure-move check asks the pinned rustfmt whether an item that a
+      # wider visibility made too long was only laid out anew.
+      - name: Install the pinned toolchain
+        run: rustup show
+      # A file split moves thousands of lines nobody can review by reading.
+      # A branch that declares `pure-move: true` in a commit message gets
+      # proof instead: every Rust item it touched moved byte for byte. Without
+      # the declaration it prints what moved and changed, without diffs, and
+      # passes.
+      - name: A declared pure move only moves code
+        run: |
+          set -euo pipefail
+          base="$(git merge-base "origin/$PR_BASE_REF" HEAD)"
+          python3 scripts/check_pure_move.py --if-declared "$base" HEAD
+      # ARCHITECTURE.md's tree carries the reasons behind each module, and a
+      # rewrite can cut a line's rationale away while the row and its
+      # identifiers survive - which is what a row-level or identifier-level
+      # check sees as a pass. This one compares per-module description
+      # length and asks for a `### <module>` section wherever one shrank.
+      - name: No module may lose its reasoning
+        run: |
+          set -euo pipefail
+          base="$(git merge-base "origin/$PR_BASE_REF" HEAD)"
+          python3 scripts/check_arch_content.py "$base"
+
+      - name: binstall metadata must match what release.yml builds
+        # Cargo.toml's pkg-url and bin-dir are resolved by `cargo binstall` at
+        # INSTALL time, so drift between them and the release workflow is
+        # invisible to every other job here and lands on users as a 404 or a
+        # "corrupt download". Nothing else compares the two files (#376).
+        run: python3 scripts/check_binstall_contract.py
+
+  test:
+    name: clippy + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The suite's terminal tests drive /bin/zsh (the shim they exist to
+      # cover) and the PDF tests rasterise through poppler's pdftoppm - the
+      # same binaries croft needs at runtime on a Linux box. The runner
+      # ships neither.
+      - name: Install suite runtime dependencies
+        # The chmod keeps compinit's "insecure directories" interactive
+        # prompt from wedging every spawned zsh before its first prompt
+        # (croft never calls compinit; the runner's own zsh startup does).
+        run: |
+          set -euo pipefail
+          # `apt-get update && apt-get install` looked equivalent and was not
+          # (#549). A command on the LEFT of an `&&` is exempt from `set -e`
+          # by design, so when `update` failed on a THIRD-PARTY index the
+          # runner image ships and croft does not need (a Chrome repo hash
+          # mismatch), the install was skipped, this step still went green,
+          # and eight PDF tests failed minutes later with "these tests need a
+          # PDF rasteriser" on a PR that touches no PDF code.
+          #
+          # A partial index failure must not decide whether the install runs:
+          # apt resolves these two packages from the indexes it did fetch.
+          # A transient mirror hiccup is what set #549 off in the first
+          # place, and the install below is what actually gates the step, so
+          # retry before giving up on the index refresh.
+          for attempt in 1 2 3; do
+            sudo apt-get update && break
+            echo "::warning::apt-get update failed (attempt $attempt)"
+            sleep 5
+          done
+          sudo apt-get install -y --no-install-recommends zsh poppler-utils
+          # Without this the step can only report that it RAN, not that it
+          # worked, and those are the same colour.
+          #
+          # Each tool is probed the way ITS CONSUMER resolves it, which is not
+          # the same question for the two of them. `pdf::which` walks PATH, so
+          # `command -v` is right (and stricter: it also wants the executable
+          # bit). The terminal tests take `/bin/zsh` by literal path and SKIP
+          # when it is missing, so a zsh present only elsewhere on PATH would
+          # pass a `command -v` probe and leave those tests silently
+          # uncovered - the same false green this step exists to remove, moved
+          # one level up. It holds today only because usrmerge symlinks /bin.
+          command -v pdftoppm >/dev/null \
+            || { echo "::error::pdftoppm is missing after the install step"; exit 1; }
+          [ -x /bin/zsh ] \
+            || { echo "::error::/bin/zsh is missing after the install step"; exit 1; }
+          for d in /usr/share/zsh /usr/local/share/zsh; do
+            if [ -d "$d" ]; then sudo chmod -R go-w "$d"; fi
+          done
+      # rust-toolchain.toml is the single source of truth; `rustup show`
+      # installs exactly the pinned channel and its components.
+      - name: Install the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Formatting (pinned rustfmt, zero diffs)
+        run: cargo fmt --check
+      - name: Package stays under crates.io's 10 MiB limit
+        # crates.io refuses a .crate over 10 MiB (10485760 bytes), and only
+        # the upload finds out: publish-crate.yml uploads last, after the
+        # tag and the GitHub release are out, and its dry run before them
+        # never reaches the upload. The package was 9308884 bytes when this
+        # gate went in, so it fails at 9.5 MiB, while there is still room to
+        # choose what to drop. --no-verify: this measures the archive only,
+        # in seconds; that dry run is what proves it builds. Early in the
+        # job so a failing test cannot skip it.
+        run: |
+          set -euo pipefail
+          # Exactly one .crate may be measured, so none is left from an
+          # earlier version in a restored target/.
+          rm -rf target/package
+          cargo package --locked --no-verify --allow-dirty
+          crates=(target/package/croft-software-*.crate)
+          [ "${#crates[@]}" -eq 1 ] && [ -f "${crates[0]}" ] \
+            || { echo "::error::expected one croft-software .crate in target/package"; exit 1; }
+          size="$(stat -c %s "${crates[0]}")"
+          limit=9961472
+          echo "${crates[0]} is $size bytes; this gate fails above $limit, crates.io above 10485760"
+          if [ "$size" -gt "$limit" ]; then
+            echo "::error::the crate is $size bytes, over the $limit-byte gate. Add files the build never reads to \`exclude\` in Cargo.toml (include_str! and include_bytes! read only assets/, src/, docs/*.md and README.md), or shrink an included asset. \`cargo package --list\` shows what ships; the largest files (uncompressed) follow."
+            # sed, not head: head stops reading early, sort then dies of
+            # SIGPIPE, and pipefail ends the step before the `exit 1`.
+            tar -tvzf "${crates[0]}" | sort -k3,3nr | sed -n '1,15p'
+            exit 1
+          fi
+      - name: Clippy (zero warnings)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Issue-vetting script tests (stdlib, no venv)
+        run: python3 -m unittest discover -s scripts/tests -v
+      - name: Tests
+        # The suite spawns PTYs and real shells; keep the thread count modest
+        # so the timing-sensitive terminal tests are not starved.
+        run: cargo test --locked
+        env:
+          RUST_TEST_THREADS: 4
+      - name: Tests of the patched async-lsp (vendor/async-lsp/PATCHED.md)
+        # `cargo test` above runs croft's own tests only, not those of a
+        # dependency built from vendor/, which pin the patched message decode.
+        run: cargo test --locked -p async-lsp --lib
+      - name: fs-sync 200 ms invariant (serial, wall clock)
+        # The #[ignore]d wall-clock test (see
+        # fs_sync_reflects_external_changes_within_200ms_wall_clock in
+        # src/app/tests/files.rs for why it runs alone, #483). The filter is coupled
+        # to that name by nothing but convention, and a filter that selects
+        # no test exits 0, so the step requires the bin target to report
+        # exactly one test before it counts as run.
+        run: |
+          set -euo pipefail
+          cargo test --locked --bin croft fs_sync_reflects -- --ignored --test-threads=1 2>&1 | tee target/fs-sync.log
+          grep -q '^running 1 test$' target/fs-sync.log \
+            || { echo "::error::fs_sync_reflects selected no test: the filter and the test name have drifted"; exit 1; }
+
+  cross-musl:
+    name: ship-path build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # CROSS_TARGETS in src/cli.rs: the triples `croft <host>` ships.
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned toolchain
+        run: rustup show
+      - name: Add the target to the PINNED toolchain
+        # Run from the checkout so rust-toolchain.toml resolves the channel.
+        # Adding to the default toolchain instead is precisely the bug this
+        # job exists to catch.
+        run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+      - name: Install zig and cargo-zigbuild
+        # cargo-zigbuild probes `python3 -m ziglang` before looking for a zig
+        # binary on PATH. Recent runner images mark the system Python as
+        # externally managed, so pip needs the override.
+        run: |
+          python3 -m pip install --break-system-packages ziglang \
+            || python3 -m pip install ziglang
+          python3 -m ziglang version
+          cargo install cargo-zigbuild --locked
+      # Byte-for-byte the command src/remote.rs runs for a remote install.
+      - name: cargo zigbuild --profile remote-fast
+        run: cargo zigbuild --profile remote-fast --locked --bin croft --target ${{ matrix.target }}
+      - name: The shipped artifact must exist and be a Linux ELF for its target
+        # The architecture, not only the container format: `ELF 64-bit LSB`
+        # is true of both musl legs, so an aarch64 build that fell back to the
+        # host would pass as x86-64 (#556). Same recipe as release.yml's check.
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/remote-fast/croft"
+          test -x "$bin" || { echo "::error::no artifact at $bin"; exit 1; }
+          file "$bin"
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)  file "$bin" | grep -qE 'ELF 64-bit LSB.*x86-64' ;;
+            aarch64-unknown-linux-musl) file "$bin" | grep -qE 'ELF 64-bit LSB.*aarch64' ;;
+            # A `case` with no match exits 0; a new matrix target must add
+            # its own assertion rather than pass unchecked.
+            *) echo "::error::no artifact-kind assertion for ${{ matrix.target }}"; exit 1 ;;
+          esac
+
+  android:
+    name: Android build (aarch64-linux-android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned toolchain
+        run: rustup show
+      - name: Add the Android target to the PINNED toolchain
+        run: rustup target add aarch64-linux-android
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: aarch64-linux-android
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      # Termux builds croft natively on the phone, so nothing ships this
+      # artifact. Compiling it here is what catches code that cannot build on
+      # Android at all - otherwise the only way to find out is on the device,
+      # by hand, after the fact. cargo-ndk wires the runner's NDK into the C
+      # build scripts the tree-sitter grammars need.
+      - name: cargo ndk build
+        # ANDROID_NDK_LATEST_HOME is exported by the runner image into the
+        # process environment, which the `env` context does NOT see - so it
+        # has to be expanded by the shell, not by an expression.
+        # --platform 24: bionic only exports openpty/forkpty from API 23,
+        # and cargo-ndk's default level is older, so the link dies on
+        # `undefined symbol: openpty`. 24 is what Termux itself targets.
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          echo "Using NDK at $ANDROID_NDK_HOME"
+          test -d "$ANDROID_NDK_HOME"
+          cargo ndk --target arm64-v8a --platform 24 build --locked --bin croft

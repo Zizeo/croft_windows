@@ -1,0 +1,458 @@
+# Settings
+
+croft's settings are JSON files merged as a chain of layers. Later layers win,
+key by key:
+
+1. **Built-in defaults** — what a fresh install behaves like.
+2. **User** — `~/.config/croft/config.json` (or `$XDG_CONFIG_HOME/croft/`).
+   The file every toggle and the theme picker write to.
+   - **Synced** — `~/.config/croft/config.synced.json`. Written by config
+     sync when you `croft remote` here from another machine (see below): that
+     machine's theme and editor toggles, limited to the same allowlist as a
+     workspace layer. It wins over this machine's `config.json`, so your
+     theme follows you, and loses to `config.local.json`.
+3. **User, machine-local** — `~/.config/croft/config.local.json`. Overrides
+   for this machine only; keep `config.json` in your dotfiles repo and put
+   the per-box exceptions here.
+4. **`.vscode/settings.json`** — a small mapped subset (see below), so a repo
+   configured for VS Code behaves sensibly without duplication.
+5. **Workspace** — `<root>/.croft/config.json`, committed. Team settings
+   every collaborator gets on opening the repo.
+6. **Workspace, local** — `<root>/.croft/config.local.json`, never committed.
+   croft writes `config.local.json` into `.croft/.gitignore` before it ever
+   creates the file.
+
+Open any layer from **Preferences: Open Settings** (the hub lists all four
+editable layers) or the palette commands "Preferences: Open Settings (JSON)"
+and "Preferences: Open Workspace Settings (JSON) / — Local (JSON)". Saving a
+layer file applies live: theme, editor toggles, save behavior, and host
+accents re-merge on the spot; the few startup-read settings (layout,
+terminal scrollback) still need a relaunch. A layer, or a file one
+`extends`, changed outside croft (a `git pull`, an edit in the terminal, a
+dotfiles sync, another croft window) applies the same way within about two
+seconds. The hub shows where a value came
+from (`· workspace`, `· user-local`, …) whenever a layer other than your own
+user config decided it.
+
+The **Preferences: Open Settings** hub is also a searchable editor over the
+settings themselves. Type to filter, Enter flips a toggle or asks for a
+value, and Tab switches which layer the change is written to: your user
+config or the workspace. Del resets the selected setting: it removes the key
+from that layer's file, so the value falls back to the layers below it or
+croft's default. A dot marks every setting whose value differs from croft's
+default.
+
+![Settings editor: search a setting, flip a toggle, set a number, then write to the workspace layer](images/settings-editor.gif)
+
+In a multi-root workspace the workspace layers come from the **primary**
+root. Re-rooting re-merges against the new primary.
+
+## Merge rules
+
+- **Objects deep-merge.** `{"explorer_views": {"timeline": false}}` in one
+  layer and `{"explorer_views": {"outline": false}}` in a later one yields
+  both; untouched keys keep their earlier values.
+- **Arrays and scalars replace.** A later `host_accents` list replaces the
+  whole earlier list; lists never concatenate, so a layer can narrow as well
+  as extend. The two exclusion lists are the exception (see
+  [Project exclusions](#project-exclusions)).
+- **Comments are fine.** All layer files tolerate `//` and `/* */` comments
+  and trailing commas (JSONC), like `.vscode/tasks.json`.
+- **A mistyped value only loses itself.** `"terminal_scrollback": "lots"`
+  drops that one key with a warning; every other setting still applies.
+
+Warnings — refused keys, parse failures, `extends` cycles — go to the
+**OUTPUT · Settings** channel, and the status bar counts them on reload.
+
+## `extends`
+
+Any croft layer may compose other JSON files:
+
+```jsonc
+{
+  "extends": ["~/dotfiles/croft-base.json", "./theme-overrides.json"],
+  "format_on_save": true
+}
+```
+
+Bases merge first, in listed order; the file's own keys win over them.
+Paths resolve relative to the extending file, `~/` expands to your home
+directory, and a cycle stops with a warning instead of hanging.
+
+## Platform scopes
+
+Top-level `"macos"`, `"linux"`, and `"android"` blocks merge over the layer's
+flat keys on the matching platform only:
+
+```jsonc
+{
+  "theme": "black",
+  "linux": { "theme": "nord" }
+}
+```
+
+Because a remote croft is a real Linux build, the `"linux"` block is also
+what applies over `croft remote`.
+
+## What workspace layers may set
+
+Workspace files (4–6 above) are repo-controlled input: cloning a repo must
+never change what croft trusts or executes. They are limited to an explicit
+allowlist — appearance and editor/terminal behavior:
+
+`theme`, `format_on_save`, `insert_final_newline`, `trim_trailing_whitespace`, `trim_final_newlines`, `format_on_type`, `auto_save`, `auto_save_on_focus_change`,
+`render_whitespace`, `rulers`, `word_based_suggestions`, `disable_inline_blame`, `disable_auto_close_pairs`, `disable_paste_reindent`, `disable_quick_suggestions`,
+`disable_inline_values`, `disable_save_before_debug`, `disable_bracket_colors`, `disable_indent_guides`, `line_numbers`,
+`disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`,
+`disable_compact_folders`, `files_exclude`, `search_exclude`, `files_associations`, `languages` (only its
+per-language editor keys; see below), `files_encoding`.
+
+Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `config_sync_excluded_hosts`, `config_sync_excluded_files`, `fleet_groups`, `code_scanning`, `lane_agent`,
+`mcp_tool_fingerprints`, `host_accents`, `notifications`, `screen_reader`, `screen_reader_command`, `codeql_cli_path`, `locale`, `terminal_multiline_paste_warning`, and any future key not explicitly
+allowlisted — is ignored from workspace layers with a visible warning.
+Extending the allowlist is a deliberate review decision, not a default.
+
+## The `.vscode/settings.json` subset
+
+When present, croft maps the keys below (and nothing more: broad VS Code
+settings compatibility is a non-goal). This is the same table
+`croft import-vscode` uses for your user-level `settings.json`, filtered to
+the keys a workspace layer is allowed to set, so a given VS Code setting
+means the same thing whichever path reads it.
+
+| VS Code | croft |
+|---------|-------|
+| `editor.formatOnSave` | `format_on_save` |
+| `editor.formatOnType` | `format_on_type` |
+| `files.insertFinalNewline` | `insert_final_newline` |
+| `files.trimTrailingWhitespace` | `trim_trailing_whitespace` |
+| `files.trimFinalNewlines` | `trim_final_newlines` |
+| `files.autoSave: "afterDelay"` | `auto_save: true` |
+| `files.autoSave: "onFocusChange"` / `"onWindowChange"` | `auto_save_on_focus_change: true` |
+| `files.autoSave: "off"` | both auto-save modes off |
+| `editor.renderWhitespace` | `render_whitespace` (`none` / `selection` / `all`; VS Code's `boundary` and `trailing` have no croft mode and map to `none`) |
+| `editor.rulers` | `rulers` (columns such as `[80, 100]`; the object form `{ "column": 100, "color": … }` keeps its column, and croft draws every ruler in one colour) |
+| `editor.wordBasedSuggestions` | `word_based_suggestions` (`off` / `currentDocument` / `matchingDocuments` / `allDocuments`; the older `true` / `false` map to `matchingDocuments` / `off`) |
+| `editor.bracketPairColorization.enabled` | `disable_bracket_colors` (negated) |
+| `editor.guides.indentation` | `disable_indent_guides` (negated) |
+| `editor.lineNumbers` | `line_numbers` (`on` / `relative` / `interval` / `off`) |
+| `editor.inlayHints.enabled` | `disable_inlay_hints` (negated) |
+| `editor.autoClosingBrackets: "never"` | `disable_auto_close_pairs` |
+| `debug.saveBeforeStart: "none"` | `disable_save_before_debug` (every other value saves before a launch, a task or a Testing run) |
+| `terminal.integrated.copyOnSelection` | `copy_on_select` |
+| `explorer.compactFolders` | `disable_compact_folders` (negated) |
+| `files.exclude` | `files_exclude` (the globs set to `true`; a glob set to `false` becomes `!glob`, which takes it back from an earlier layer; `when` clauses are left out). VS Code reads a bare glob such as `build` from the workspace root, so it arrives anchored, as `/build`, and `scripts/build/` stays visible |
+| `search.exclude` | `search_exclude` (same) |
+| `files.associations` | `files_associations` (ids normalised, so `jsonc` becomes `json`; an entry naming a language croft has neither a grammar nor a server for is left out) |
+| `files.encoding` | `files_encoding` (when croft knows the encoding) |
+
+Keys croft honours only as user config (a terminal scrollback, say) are
+mapped by `croft import-vscode` but ignored here, since a workspace may not
+set them.
+
+The mapped values sit **below** `.croft/config.json` in the chain, so a
+croft-native workspace file always wins over the VS Code one.
+
+## Per-language settings
+
+`languages` overrides a few editor settings for one language, keyed by VS
+Code's language id (`python`, `c`, `cpp`, `rust`, `markdown`,
+`shellscript`, `typescriptreact`, `makefile`, …). A value set there wins
+over the global one for a file in that language; anything a block leaves
+out falls back to the global setting.
+
+```json
+{
+  "format_on_save": true,
+  "languages": {
+    "markdown": { "format_on_save": false },
+    "python": { "render_whitespace": "all", "disable_inlay_hints": true }
+  }
+}
+```
+
+A block may set `format_on_save`, `format_on_type`, `render_whitespace`,
+`disable_inlay_hints` and `disable_auto_close_pairs`; any other key in it
+is ignored. Blocks merge across layers a setting at a time, so a
+workspace's `languages.python.format_on_save` leaves your own
+`languages.python.render_whitespace` in place.
+
+VS Code's `"[python]": { … }` blocks map here, from a repo's
+`.vscode/settings.json` and in `croft import-vscode`, with the table above
+applied to the keys inside. `"[javascript][typescript]"` sets both. A key
+inside a block that croft has only globally, or not at all, is listed by
+`import-vscode` with its block, as `[python] editor.rulers`.
+
+## Clean-up on save
+
+Three settings, all off by default as in VS Code, act on every save
+(explicit, auto-save, format-on-save, Save All), with no `.editorconfig`
+needed:
+
+| Setting | Effect |
+|---------|--------|
+| `insert_final_newline` | ends the file with a newline |
+| `trim_trailing_whitespace` | strips trailing spaces and tabs, sparing the lines a caret is on so auto-save never eats a space just typed |
+| `trim_final_newlines` | drops the empty lines after the last line of text, keeping the newline that ends it and any line a caret is on |
+
+A `.editorconfig` `insert_final_newline` or `trim_trailing_whitespace`
+wins over the setting for its files, whether it turns the clean-up on or
+off. All three appear in **Preferences: Open Settings (UI)**.
+
+## Project exclusions
+
+`files_exclude` and `search_exclude` are lists of globs, matched against
+workspace-relative paths; a glob that matches a folder hides everything
+inside it, and a pattern with no `/` matches at any depth, as in the
+Search panel's exclude box. A leading `/` anchors a glob to the workspace
+root, as in `.gitignore`: `/build` hides the top-level `build/` only, and
+its `*` stays within one folder.
+
+```json
+{ "files_exclude": ["**/generated"], "search_exclude": ["**/tests/fixtures"] }
+```
+
+| Setting | Explorer | Go to File | Search and Replace All |
+|---------|----------|------------|------------------------|
+| `files_exclude` | hidden | skipped | skipped |
+| `search_exclude` | listed | skipped | skipped |
+
+Every layer adds to these two lists instead of replacing them, as VS Code
+merges `files.exclude` across user and workspace: a user `**/tests`, a
+`.vscode` `"**/dist": true` and a `.croft` `**/generated` all apply. To take
+an earlier layer's glob back, list it with a leading `!` (`"!**/tests"`), or
+set it to `false` in `.vscode/settings.json`; a later layer can add it again.
+A glob that really starts with `!` is escaped with a backslash: `\!draft`,
+which is `"\\!draft"` in JSON.
+
+Search adds what you type in "files to exclude" to these. With the box
+open, a `[x] project excludes: ...` row under it names the active globs;
+click it to search every folder for a while (VS Code's "Use Exclude
+Settings and Ignore Files"), and again to turn them back on.
+
+## File associations
+
+`files_associations` maps a glob to the language a file opens in (VS Code's
+`files.associations`), for templates and configs with an extension croft
+does not know, or knows as something else:
+
+```json
+{ "files_associations": { "*.tpl": "html", "**/templates/*.txt": "html", "*.json5": "json" } }
+```
+
+A glob without a `/` matches the file name; one with a `/` matches the path
+from the workspace root. When several match, a path glob beats a name glob
+and a longer glob beats a shorter one. Values are VS Code language ids
+(`html`, `typescriptreact`, `shellscript`); `plaintext` turns highlighting
+off. The language server follows the same choice. User and workspace
+entries merge glob by glob, the workspace winning. Open tabs follow a
+change, except one whose language was picked from the status bar.
+
+## File encoding
+
+A file with a byte-order mark always opens in the encoding the mark names.
+A file without one opens in, first to last:
+
+1. the encoding last picked for that file with the status bar's encoding
+   menu (Reopen with Encoding), remembered in `~/.cache/croft/encodings.json`;
+2. the `.editorconfig` `charset` for the file (`latin1`, `utf-8`,
+   `utf-8-bom`, `utf-16le`, `utf-16be`);
+3. `files_encoding`, VS Code's `files.encoding` ids such as `windows1252`,
+   `iso88591`, `shiftjis`, `gbk`, `utf16le` or `utf8bom`;
+4. UTF-8.
+
+```json
+{ "files_encoding": "windows1252" }
+```
+
+`latin1` and `iso88591` decode as windows-1252, as browsers and
+`encoding_rs` do. `utf-8-bom` and `utf8bom` also add the mark on the next
+save. A value croft has no encoding for is ignored. Changing the setting
+applies to files opened afterwards; open tabs keep their encoding.
+
+## Config sync to remotes
+
+`croft remote <host>` pushes your `keybindings.json`, `snippets.json`,
+`triggers.json`, `matchers.json` and `macros.json` to the remote's
+`~/.config/croft/` on connect, only when their content differs (#262).
+
+Your theme and editor toggles travel too, but `config.json` itself never
+does: it carries MCP consent and tool fingerprints, which must be granted
+per machine. croft sends its projection instead: the keys a workspace layer
+may set (see the allowlist above), read from your `config.json`'s top level,
+landing as the remote's `config.synced.json`. That is a layer of its own, so
+it never touches the remote's `config.json` and whatever was granted there,
+and the remote refuses any other key in it. It applies on arrival and is
+re-sent when you change `config.json` during the session. To keep a
+different theme on one box, set it in that box's `config.local.json`, or
+exclude `config.synced.json` for everyone. Two user-layer settings opt out:
+
+```jsonc
+{
+  // Never push to these hosts (ssh config aliases, case-insensitive).
+  "config_sync_excluded_hosts": ["shared-box"],
+  // Never push these files to any host.
+  "config_sync_excluded_files": ["keybindings.json"]
+}
+```
+
+The connect output says what was pushed, what was skipped and why.
+
+A file edited on the remote since croft last pushed it is never overwritten.
+It is left alone, and the output names it along with the commands that settle it:
+
+```sh
+croft sync-config devbox --diff keybindings.json         # remote vs local, + is what a push brings
+croft sync-config devbox --take-local keybindings.json   # push yours over it
+croft sync-config devbox --keep-remote keybindings.json  # keep theirs until either side changes
+```
+
+`croft sync-config <host>` on its own pushes now, as a connect does. The
+**Remote: Sync Config Now** palette command runs it in a terminal pane. What
+was last pushed to each host is recorded in croft's cache dir. If that record
+is lost, the next push asks about any remote copy that differs rather than
+replacing it.
+
+## GitHub code scanning
+
+`code_scanning` controls whether croft loads the repository's GitHub code
+scanning results into the SARIF viewer by itself, through `gh`:
+
+```jsonc
+{
+  // "off" (default): only when asked. "on": load the current branch's
+  // results, and again after checking out another branch or a detached
+  // HEAD. "prompt": say they are there and wait.
+  "code_scanning": "prompt"
+}
+```
+
+It loads the newest analysis per tool at the nearest scanned commit in the
+branch's history, so a branch whose latest commits are not scanned yet still
+gets results. **SARIF: Load Code Scanning Results for This Branch** loads them
+whatever the setting. **SARIF: Open GitHub Code Scanning Analysis** picks any
+one analysis by hand.
+
+## The CodeQL CLI
+
+CodeQL is not built in: add it from the Extensions view, where it waits under
+AVAILABLE, to get its side bar and "CodeQL:" commands.
+
+`codeql_cli_path` names the CodeQL CLI croft runs, such as
+`"~/tools/codeql/codeql"`. When it is unset or not a file, croft uses
+`codeql` on `PATH`, then the newest CLI it downloaded itself into
+`~/.cache/croft/codeql/cli/<version>/`, else plain `codeql`.
+
+**CodeQL: Download CLI** downloads GitHub's release for this platform
+(Linux x64, macOS or Windows x64) and switches to it, unless
+`codeql_cli_path` is set: that one always wins. **CodeQL: Check for CLI
+Updates** compares the latest release with the CLI in use; a newer one is
+what the next download installs. User config only: it names a program to
+run.
+
+## Persistent terminal panes
+
+`"terminal_persistent_panes": true` keeps each terminal pane's shell in a
+process of its own, `croft pane-host` (#694), instead of in croft. When croft
+is killed or crashes (the OOM killer tends to pick it, being the largest
+process), the shells and whatever they are running carry on, and the next
+croft in the workspace reattaches to them: the same shell, with its screen and
+recent scrollback redrawn, including what it printed while croft was down.
+
+- Closing a pane, or quitting croft normally, still ends its shell.
+- A host no croft has reattached to for a week ends its shell.
+- It applies to shell panes opened after the change, not to task or run
+  panes, on Linux and macOS.
+- A pane whose host cannot start is an ordinary pane.
+
+## Multi-line paste warning
+
+A paste with a line break in it, into a terminal pane whose program has not
+turned on bracketed paste (sh/dash, Python's REPL before 3.13, psql, a remote
+bash with it off), would run each line the moment it lands. croft asks first
+(#1274): **Y**/Enter pastes as is, **L** pastes the lines joined by spaces
+with no final line break, **N**/Esc cancels. A shell that brackets pastes
+(croft's default bash and zsh) gets the paste straight away, since nothing in
+it runs until you press Enter.
+
+```json
+{
+  "terminal_multiline_paste_warning": "auto"
+}
+```
+
+`"auto"` (the default) asks only in that case, `"always"` asks before every
+multi-line paste, and `"never"` never asks. User config only: a cloned repo
+cannot turn the warning off.
+
+## Notification sinks
+
+A `notifications` list forwards events croft already notices to somewhere
+you will see them away from the terminal. Each entry names a sink and,
+optionally, which events it takes:
+
+```json
+{
+  "notifications": [
+    { "kind": "ntfy", "topic": "my-croft", "events": ["command_finished", "tests_failed"], "min_duration_secs": 30 },
+    { "kind": "webhook", "url": "https://hooks.example.org/croft", "headers": { "authorization": "Bearer …" } },
+    { "kind": "termux" },
+    { "kind": "command", "argv": ["/usr/bin/osascript", "-e", "display notification (system attribute \"CROFT_BODY\")"] }
+  ]
+}
+```
+
+Events are `command_finished` (a command in a pane you are not focused on,
+lasting at least `min_duration_secs`, default 10), `tests_failed` (once per
+red Test Explorer run), `osc9` (a terminal's own notification),
+`approval_pending` (an agent's edit waits in the approval popup), and
+`agent_waiting` (reserved). An empty `events` takes all of them.
+`ntfy` posts to `server` (default `https://ntfy.sh`) under `topic`; both `ntfy` and `webhook` endpoints must be `https`, or `http` only to localhost — a plain-http endpoint across a network is refused and named in the channel;
+`webhook` posts JSON `{event, title, body, workspace, host, link, actions}` with your
+`headers`; `termux` runs `termux-notification`; `command` runs `argv` with
+the notification in `CROFT_TITLE`, `CROFT_BODY`, `CROFT_LINK`, and
+`CROFT_EVENT`. Delivery is off the render path on one worker with a bounded
+queue and one retry for transient failures; what finally fails appears in
+the **Notifications** OUTPUT channel, naming only a URL's host. The key is
+user-config only, and a webhook's headers belong in `config.local.json`.
+
+An `approval_pending` notification can be answered from the phone. Its link
+(`croft://attach?…&focus=approval`) opens the session with the popup up.
+Its **Approve** and **Deny** buttons (ntfy action buttons, termux
+`--button1`/`--button2`, a webhook's `actions` array,
+`CROFT_APPROVE_LINK`/`CROFT_DENY_LINK` for a command) are
+`croft://decide?host=…&path=…&token=…&decision=allow|deny` links.
+`croft open-link` runs `croft decide` for them, over ssh when the host is
+not this machine. That answers the agent without attaching. The token is
+random, belongs to that one edit, and stops working once the edit is
+answered anywhere or its 120 s window passes. Links open through
+`croft install-link-handler`, as for attach links.
+
+## Profiles
+
+A profile is a named set of settings, keybindings and snippets you can switch between (for example "Python" and "Writing"). **Profiles: Switch Profile** in the palette lists them:
+
+* **New Profile from Current Setup** copies the settings, keybindings and snippets now in effect into a new profile and switches to it.
+* Choosing a profile (or **Default**) switches to it. Keybindings and snippets apply at once; settings apply the next time croft starts.
+* **Use the Active Profile for This Workspace** writes `.croft/profile`, so this folder always opens with that profile, whatever the global choice.
+
+Profiles live in `~/.config/croft/profiles/<name>/`. History, macros and sessions are shared by every profile.
+
+
+## Accessibility and language
+
+* `"screen_reader": true` (or **Accessibility: Toggle Screen Reader Mode**, also in Settings) stops the caret blinking and keeps the real cursor on the focused text: the editor caret, the shell cursor in a terminal, or the status bar when a picker, menu, dialog or the Explorer has focus. The status bar then describes each change in one line: the line the caret moved to, the diagnostic under it, the highlighted completion, palette entry or file, focus changes and status messages, and, whatever has focus, each debugger pause (why, file, line and its text) and how a finished test run went. A dialog that waits for a key (Unsaved Changes, Discard Changes, Replace All, the Settings editor, a one-line prompt) is read when it opens: its title, what it says, and which key does what. Terminal screen readers (VoiceOver, Orca, NVDA over WSL) read it from there.
+* `"screen_reader_command": "spd-say"` (or `"say"` on macOS) also speaks each line through that program, with the line as its last argument.
+* `"locale": "de"` picks the UI language; unset, croft follows `LC_ALL`, `LC_MESSAGES` or `LANG`, but only into a language whose built-in catalog translates at least 95% of the strings `croft locale-template` lists, or one you have a `locales/<lang>.json` for, so a partial catalog never mixes two languages on screen unasked. Menus, palette titles, status messages and the side bar, panel and prompt titles are translated where the catalog has an entry, and the palette matches queries in either language. German (`de`) and Spanish (`es`) ship as starter catalogs, so they are opt-in: set `"locale"` to use them. For another language or to fix a translation, run `croft locale-template <lang> --write` and fill in the values it leaves empty in `~/.config/croft/locales/<lang>.json`; entries there override the built-in ones. Run it again after an upgrade to add new strings: it keeps every value you already wrote. Don't redirect the plain command onto that file, since the shell empties the file before croft can read it. A key with `{}` is a pattern: `"Saved {}": "Gespeichert: {}"`.
+
+All three are user-config only.
+
+## Terminal colour depth
+
+Themes are written in 24-bit colour. On a terminal that only understands 256 or 16 colours, croft converts every colour to the nearest one the terminal can show, so the screen stays readable instead of turning into stray escape codes or wrong colours.
+
+croft picks the depth on its own: 24-bit when `COLORTERM` is `truecolor` or `24bit`, when `TERM_PROGRAM` names a terminal known to support it (iTerm2, WezTerm, Ghostty, VS Code, tmux and others) or `TERM` does (kitty, alacritty, foot and others); otherwise 256 colours when `TERM` contains `256color`, else 16. When the guess is wrong, for example inside an ssh session or `screen` that drops `COLORTERM`, set it yourself:
+
+* `"color_depth": "truecolor"` (also `"24bit"`), `"256"` or `"16"`.
+
+User-config only; it is read at startup.

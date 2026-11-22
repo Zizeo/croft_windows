@@ -1,0 +1,42 @@
+# Bundled croft extension: CSS language support.
+# The JSON/HTML/CSS servers all ship in one npm package, one bin per language.
+# croft uses the actively-maintained @t1ckbase fork (the original
+# hrsh7th/vscode-langservers-extracted has been stale since 2024-05); it tracks
+# the upstream VS Code servers weekly, so a pinned version is required (it
+# auto-publishes after smoke tests only). croft owns an npm-installed copy
+# pinned for local/remote parity; a global vscode-css-language-server on PATH
+# is the fallback (see src/lsp/install.rs).
+id = "lsp-css"
+name = "CSS (vscode-css-language-server)"
+description = "CSS language support via vscode-css-language-server."
+builtin = true
+api_version = 1
+
+[[languages]]
+id = "css"
+extensions = ["css"]
+
+# The same server parses SCSS and LESS, choosing the parser from the
+# `languageId` sent in `didOpen` (VS Code's ids, `scss` and `less`), so both
+# use the CSS server's managed install. `.sass` (indented syntax) is not one it
+# parses and stays on highlighting only.
+[[languages]]
+id = "scss"
+extensions = ["scss"]
+family = "css"
+
+[[languages]]
+id = "less"
+extensions = ["less"]
+family = "css"
+
+[[language_servers]]
+name = "vscode-css-language-server"
+command = "vscode-css-language-server"
+args = ["--stdio"]
+languages = ["css", "scss", "less"]
+priority = 0
+provision = { kind = "npm", package = "@t1ckbase/vscode-langservers-extracted", version = "2.0.1", bin = "vscode-css-language-server" }
+# The server only offers Format Document when asked to, as VS Code's own
+# extension does (#1083).
+initialization_options = { provideFormatter = true }

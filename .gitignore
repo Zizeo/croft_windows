@@ -1,0 +1,60 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local previews
+preview*.svg
+
+
+# Added by cargo
+
+/target
+
+# Per-machine cargo build-jobs cap; local-only, never committed. Capping jobs
+# (half the cores is a reasonable default) keeps a build from pinning a shared
+# machine, but the right number is per-machine, so it stays ignored rather than
+# committed. Test threads are separate: RUST_TEST_THREADS for `cargo test`,
+# /.config/nextest.toml for nextest. See CONTRIBUTING.md.
+/.cargo/config.toml
+
+# Per-machine nextest thread cap; same rule as /.cargo/config.toml above
+# (nextest reads test-threads from here, not from RUST_TEST_THREADS).
+/.config/nextest.toml
+
+# macOS
+.DS_Store
+
+# Local caches and scratch
+.cgr-hash-cache.json
+.cgr-dir-mtimes.json
+.cgr-parser-fingerprint
+.cgr-exclusion-state.json
+.qdrant_code_embeddings/
+.tmp/
+
+# Debugger build artifacts (build_debuggable_binary drops <stem>.dbg next to source)
+*.dbg
+*.dbg.dSYM/
+
+# Local secrets (Codeberg token, etc.) — never commit
+.env
+.env.*
+
+# SonarQube Cloud scan artifacts (see .github/workflows/sonarcloud.yml)
+/clippy-report.json
+/.scannerwork/
+
+# Agent instruction file: local to each clone, not shared through the repo.
+# Anchored, so it scopes to the root file the guide describes rather than any
+# CLAUDE.md a subdirectory might later want tracked.
+/CLAUDE.md
+# ...and any local backup of it. A `git add -A` swept a `.bak-` copy into a
+# commit once; the pattern is here so the next one cannot.
+/CLAUDE.md.*

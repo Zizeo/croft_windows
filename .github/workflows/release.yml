@@ -1,0 +1,437 @@
+# Prebuilt release binaries (#376).
+#
+# `cargo install croft-software` compiles for ten minutes on a laptop and needs
+# a Rust toolchain first. This publishes four archives per tag so
+# `cargo binstall croft-software` is a download instead, and so the Homebrew
+# formula (#375) has something to point at.
+#
+# The build recipe is deliberately the same one ci.yml's `ship-path build` job
+# proved for the musl targets, including its two non-obvious fixes: `rustup
+# target add` runs from the checkout so rust-toolchain.toml resolves the
+# channel (adding to the default toolchain instead is the bug that job exists
+# to catch), and cargo-zigbuild needs `pip install --break-system-packages`
+# because recent runner images mark the system Python externally managed.
+#
+# The profile is `release`, NOT the `remote-fast` profile ci.yml builds.
+# remote-fast trades LTO and codegen-units for build speed because a user is
+# waiting on it during `croft <host>`; a published artifact is built once and
+# run many times, so it takes the slow, fully-optimised profile.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Dispatched on a branch, this builds the matrix without publishing, to
+  # prove a tag would work before cutting one. Dispatched on a tag ref, what
+  # publish-crate.yml does every PUBLISH_EVERY versions because a tag pushed
+  # with github.token never fires the `push: tags` trigger above, github.ref
+  # is that tag and the release publishes as if the tag push had triggered it,
+  # except for crates.io, which publish-crate.yml uploads once it is out.
+  workflow_dispatch:
+
+# Read at the top level; only the publish job needs write, and only to
+# create the release. A build job that can write contents is a build job that
+# can rewrite the repo if any step it runs is compromised.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple targets need a macOS runner: zigbuild does not cross to them
+          # without an SDK, and shipping an unsigned SDK copy is not something
+          # a release job should be doing.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          # The musl pair is what ci.yml already builds and what the remote
+          # install fast path (#261) consumes.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The token is not needed after the fetch; leaving it
+          # in .git/config lets any later step push with it.
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - name: Add the target to the PINNED toolchain
+        # From the checkout, so rust-toolchain.toml resolves the channel.
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install zig and cargo-zigbuild
+        if: matrix.cross
+        run: |
+          python3 -m pip install --break-system-packages ziglang \
+            || python3 -m pip install ziglang
+          python3 -m ziglang version
+          cargo install cargo-zigbuild --locked
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cargo zigbuild --profile release --locked --bin croft \
+              --target ${{ matrix.target }}
+          else
+            cargo build --profile release --locked --bin croft \
+              --target ${{ matrix.target }}
+          fi
+
+      - name: The artifact must exist and be the right kind of binary
+        # A cross build that silently produced a host binary is the failure
+        # this catches, and catching it means reading the ARCHITECTURE `file`
+        # names, not only the container format. Matching `ELF 64-bit LSB` on
+        # both musl legs let an x86-64 binary pass as aarch64 - the comment
+        # claimed an assertion the check did not make, which is the same
+        # false green as the missing arm below (#551).
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/croft"
+          test -x "$bin" || { echo "::error::no artifact at $bin"; exit 1; }
+          file "$bin"
+          # Exact triples, not suffixes: a typo in a matrix target then reaches
+          # the catch-all rather than silently matching `*-linux-musl`.
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)  file "$bin" | grep -qE 'ELF 64-bit LSB.*x86-64' ;;
+            aarch64-unknown-linux-musl) file "$bin" | grep -qE 'ELF 64-bit LSB.*aarch64' ;;
+            x86_64-apple-darwin)        file "$bin" | grep -qE 'Mach-O 64-bit.*(x86_64|x86-64)' ;;
+            aarch64-apple-darwin)       file "$bin" | grep -qE 'Mach-O 64-bit.*arm64e?' ;;
+            # A `case` with no match exits 0, so without this arm the whole
+            # assertion becomes a silent no-op for any target the list does
+            # not name - green step, unchecked artifact (#551). Adding a
+            # target now has to add its assertion.
+            *) echo "::error::no artifact-kind assertion for ${{ matrix.target }}"; exit 1 ;;
+          esac
+
+      - name: Package
+        # The archive layout binstall resolves against: a single `croft` at the
+        # root of a tar.gz named for the target. The crate is croft-software
+        # and the binary is croft, so the two names differ on purpose.
+        id: package
+        run: |
+          name="croft-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/croft" "dist/$name/croft"
+          cp README.md LICENSE "dist/$name/" 2>/dev/null || true
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: SBOM
+        # A CycloneDX SBOM of the crates compiled into THIS target's binary,
+        # named for the archive it describes. `--target` resolves the graph
+        # for the triple the Build step compiled, with the same default
+        # features, so the macOS SBOMs list core-foundation and the musl ones
+        # inotify, rather than every platform's entries in Cargo.lock.
+        run: |
+          cargo install cargo-cyclonedx --locked --version 0.5.9
+          cargo cyclonedx --format json --spec-version 1.5 \
+            --target ${{ matrix.target }} \
+            --override-filename "croft-${{ matrix.target }}.cdx"
+          mv "croft-${{ matrix.target }}.cdx.json" dist/
+
+      - name: Checksum
+        # Per-file sums here, concatenated into one SHA256SUMS by the publish
+        # job. Computing them on the runner that built the artifact means the
+        # sum covers the bytes that were actually produced.
+        run: |
+          cd dist
+          for f in "croft-${{ matrix.target }}.tar.gz" "croft-${{ matrix.target }}.cdx.json"; do
+            if command -v sha256sum >/dev/null; then
+              sha256sum "$f" > "$f.sha256"
+            else
+              shasum -a 256 "$f" > "$f.sha256"
+            fi
+            cat "$f.sha256"
+          done
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: croft-${{ matrix.target }}
+          path: |
+            dist/croft-${{ matrix.target }}.tar.gz
+            dist/croft-${{ matrix.target }}.tar.gz.sha256
+            dist/croft-${{ matrix.target }}.cdx.json
+            dist/croft-${{ matrix.target }}.cdx.json.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Keyless signing: cosign exchanges the job's OIDC token for a
+      # short-lived Sigstore certificate naming this workflow and tag, so
+      # there is no signing key to store, rotate or leak.
+      id-token: write
+    # Only a tag ref publishes. A workflow_dispatch on a branch builds and
+    # stops, which is how you prove the matrix works without cutting a
+    # release; a dispatch on a tag ref (as publish-crate.yml sends) carries
+    # that tag here and publishes.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The token is not needed after the fetch; leaving it
+          # in .git/config lets any later step push with it.
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: staged
+
+      - name: Collect the archives and SBOMs and build SHA256SUMS
+        run: |
+          mkdir -p dist
+          find staged \( -name 'croft-*.tar.gz' -o -name 'croft-*.cdx.json' \) -exec cp {} dist/ \;
+          cd dist
+          # Four archives, or the release is incomplete. Publishing three and
+          # a checksum file that says three is worse than failing: binstall
+          # would resolve for some users and 404 for others.
+          count=$(ls -1 croft-*.tar.gz | wc -l | tr -d ' ')
+          if [ "$count" -ne 4 ]; then
+            echo "expected 4 archives, found $count:"
+            ls -1
+            exit 1
+          fi
+          # Each archive ships with the SBOM its own build leg generated; an
+          # archive without one would be the one platform nobody can audit.
+          for a in croft-*.tar.gz; do
+            if [ ! -f "${a%.tar.gz}.cdx.json" ]; then
+              echo "::error::no SBOM for $a"
+              exit 1
+            fi
+          done
+          # Build SHA256SUMS from the sums the BUILD runners computed, not
+          # by re-hashing what arrived here. Re-hashing and then checking
+          # compares the downloaded bytes against themselves: it passes on a
+          # corrupted archive, which is the one thing it exists to catch.
+          # The per-target .sha256 files are the only independent evidence,
+          # so they are the input.
+          cat ../staged/*/croft-*.sha256 > SHA256SUMS
+          cat SHA256SUMS
+          # `sha256sum -c` verifies the lines that ARE there; it cannot report
+          # one that is missing. A leg whose .sha256 never arrived would ship
+          # its archive with no sum and this step would stay green (#557).
+          # So every archive and SBOM must be named by exactly one line, and
+          # there must be no other lines. A bare line count is not enough: one
+          # duplicated sum plus one missing sum still counts to eight.
+          fail=0
+          files=0
+          for a in croft-*.tar.gz croft-*.cdx.json; do
+            files=$((files + 1))
+            n=$(awk -v f="$a" '$2 == f || $2 == "*" f' SHA256SUMS | wc -l | tr -d ' ')
+            if [ "$n" -ne 1 ]; then
+              echo "::error::SHA256SUMS names $a $n times, expected once"
+              fail=1
+            fi
+          done
+          lines=$(wc -l < SHA256SUMS | tr -d ' ')
+          if [ "$lines" -ne "$files" ]; then
+            echo "::error::SHA256SUMS has $lines lines for $files files"
+            fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          # Now the check has something to disagree with: these sums were
+          # produced on the machine that built each artifact, and this runner
+          # hashes the bytes that actually arrived.
+          sha256sum -c SHA256SUMS
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      # Sign the checksum file, not each archive: every archive and SBOM is
+      # bound to SHA256SUMS by its sum, so one signature covers all eight.
+      # The bundle carries the signature, the certificate and the
+      # transparency-log proof, which is everything `cosign verify-blob`
+      # needs offline.
+      - name: Sign SHA256SUMS
+        run: |
+          cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS
+          # Verify with the same identity a user will check, so a signature
+          # that would not verify for them never ships.
+          cosign verify-blob \
+            --bundle dist/SHA256SUMS.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            dist/SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#v}"
+          # A release goes out every PUBLISH_EVERY versions (publish-crate.yml),
+          # so its body is the notes of every version since the newest release
+          # already out, not this version's alone. release.py refuses a tag
+          # with no src/release_notes/<version>.md: version-bump.yml writes one
+          # in the commit that sets every version, and before that ci.yml's
+          # release-notes gate required one, so a missing one means the tag
+          # does not match any version. It says so rather than inventing a body.
+          gh release list --exclude-drafts --limit 1000 --json tagName --jq '.[].tagName' \
+            > "$RUNNER_TEMP/released.txt"
+          python3 scripts/release.py notes "$version" < "$RUNNER_TEMP/released.txt" \
+            > "$RUNNER_TEMP/notes.md"
+          gh release create "$tag" --title "$tag" --notes-file "$RUNNER_TEMP/notes.md" \
+            dist/croft-*.tar.gz dist/croft-*.cdx.json dist/SHA256SUMS dist/SHA256SUMS.sigstore.json
+
+  crates:
+    name: publish to crates.io
+    # Only for a `v*` tag pushed by hand, so that release still reaches
+    # crates.io too (#1579). A release publish-crate.yml dispatches leaves
+    # crates.io to it: that workflow waits for this release and uploads the
+    # version after it, and uploading here as well would race it.
+    #
+    # `cargo binstall croft-software` asks crates.io for the newest version
+    # and then downloads that version's release archive. With no publish
+    # here crates.io stayed on 0.2.3, whose tag has no release, so binstall
+    # failed for everyone (#1680). After publish, so the archives the new
+    # version points at already exist.
+    needs: publish
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    permissions:
+      contents: read
+      # The OIDC token crates.io exchanges for a short-lived publish token,
+      # as in publish-crate.yml, so no long-lived crates.io token is stored.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - name: Check the tag against Cargo.toml and crates.io
+        id: index
+        run: |
+          version="${GITHUB_REF#refs/tags/v}"
+          manifest=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$manifest" != "$version" ]; then
+            echo "::error::Cargo.toml says $manifest but the tag is v$version"
+            exit 1
+          fi
+          if curl -fsS -o /dev/null -A "croft release workflow" \
+              "https://crates.io/api/v1/crates/croft-software/$version"; then
+            echo "croft-software $version is already on crates.io"
+            echo "uploaded=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mint a crates.io token
+        # Needs its own trusted publisher on crates.io (crate settings ->
+        # Trusted Publishing: owner vitali87, repository croft, workflow
+        # release.yml, no environment), beside publish-crate.yml's. Until
+        # it exists the exchange fails; the release still ships, and the
+        # next step says what is missing instead of failing a release whose
+        # archives are already public.
+        if: steps.index.outputs.uploaded != 'true'
+        id: auth
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
+      - name: Publish the crate
+        if: steps.index.outputs.uploaded != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          version="${GITHUB_REF#refs/tags/v}"
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::warning::no crates.io token could be minted (is release.yml a trusted publisher on crates.io?); croft-software $version was not published, so cargo binstall still installs the last published version"
+            exit 0
+          fi
+          # --no-verify: the build jobs above already compiled this exact
+          # commit for every target; verifying would build it once more.
+          cargo publish --locked --no-verify
+
+  homebrew:
+    name: bump the Homebrew formula
+    # After publish, so the archives the formula points at already exist.
+    needs: publish
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Render the formula from the published SHA256SUMS
+        # The release's own SHA256SUMS, the file cosign signed, so the formula
+        # cannot vouch for bytes the release does not. The generator refuses
+        # a SHA256SUMS missing any of the four archives (#375).
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release download "$tag" --pattern SHA256SUMS --dir dist
+          python3 scripts/homebrew_formula.py "${tag#v}" dist/SHA256SUMS > croft.rb
+          ruby -c croft.rb
+          cat croft.rb
+
+      - name: Open and merge a pull request against the tap
+        # The tap is its own repository, so github.token cannot push to it:
+        # HOMEBREW_TAP_TOKEN is a fine-grained token with contents and pull
+        # requests write on vitali87/homebrew-croft only. Until it is set the
+        # release still ships; this says what is missing instead of failing
+        # a release whose archives are already public.
+        #
+        # The pull request is merged as soon as it is open, so `brew upgrade`
+        # sees the release without anyone visiting the tap. It still goes
+        # through a pull request rather than a push to the default branch so
+        # every bump leaves a record there; the formula itself was already
+        # checked above (generator refuses an incomplete SHA256SUMS, `ruby -c`).
+        env:
+          TAP: vitali87/homebrew-croft
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set; the formula for ${GITHUB_REF#refs/tags/} was rendered above but not proposed to $TAP"
+            exit 0
+          fi
+          version="${GITHUB_REF#refs/tags/v}"
+          branch="croft-$version"
+          gh repo clone "$TAP" tap -- --depth 1
+          cd tap
+          mkdir -p Formula
+          cp ../croft.rb Formula/croft.rb
+          if git diff --quiet -- Formula/croft.rb && git ls-files --error-unmatch Formula/croft.rb >/dev/null 2>&1; then
+            echo "Formula/croft.rb already describes $version"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add Formula/croft.rb
+          git commit -m "croft $version"
+          # gh's credential helper, not a token in the remote URL, so the
+          # token never lands in .git/config or the log.
+          gh auth setup-git
+          git push origin "$branch"
+          gh pr create --repo "$TAP" --head "$branch" \
+            --title "croft $version" \
+            --body "Formula for croft $version, rendered by vitali87/croft's release workflow from the release's signed SHA256SUMS."
+          gh pr merge "$branch" --repo "$TAP" --squash --delete-branch

@@ -1,0 +1,1061 @@
+//! User snippets, loaded from `~/.config/croft/snippets.json`.
+//!
+//! Format mirrors VS Code's global snippets file: a JSON object keyed by a
+//! human name, each value carrying a `prefix`, a `body` (string or array of
+//! lines), an optional `description`, and an optional comma-separated `scope`
+//! of language ids the snippet applies to (empty = every language).
+//!
+//! ```json
+//! {
+//!   "Print to console": {
+//!     "prefix": "log",
+//!     "body": "console.log($1)$0",
+//!     "scope": "javascript,typescript"
+//!   }
+//! }
+//! ```
+//!
+//! The body is a VS Code snippet string: `$1`, `$2`, … are tab stops, `$0` the
+//! final caret, `${1:name}` a placeholder. [`parse_body`] turns it into the
+//! literal text to insert plus the ordered stop positions the editor drives.
+//!
+//! ponytail: supported syntax is `$N`, `${N}`, nested `${N:placeholder}`,
+//! choices `${N|a,b|}` (the first option is inserted), the `\$` / `\}` /
+//! `\\` escapes, and variables `$NAME`, `${NAME}`, `${NAME:default}` (#914).
+//! Not supported (name the ceiling, add on demand): transforms
+//! (`${1/(.*)/$1/}`), a picker for choices, and live mirroring of a repeated
+//! `$N` (the placeholder text is duplicated, but only the first occurrence is
+//! a navigable stop).
+
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+/// One resolved tab stop within an expanded snippet body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabStop {
+    /// The stop number (`$1` -> 1, `$0` -> 0).
+    pub num: u32,
+    /// Char offset of the stop within the resolved text.
+    pub offset: usize,
+    /// Length in chars of the placeholder selected on landing (0 for a bare stop).
+    pub len: usize,
+}
+
+/// The literal text an expanded snippet inserts, plus its ordered tab stops
+/// (ascending by number, with `$0` last).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedBody {
+    pub text: String,
+    pub stops: Vec<TabStop>,
+}
+
+/// Unknown variables number their placeholders from here while the body is
+/// read, and after the snippet's own stops once it has been (#914).
+const FIRST_UNKNOWN: u32 = 1 << 31;
+
+/// Parse a VS Code snippet body into the text to insert and its tab stops.
+///
+/// Language servers send the same syntax for snippet completions, so it
+/// follows the LSP grammar: placeholders nest (`${1:foo(${2:x})}`), a choice
+/// inserts its first option (`${1|one,two|}`), and only `\$`, `\}` and `\\`
+/// are escapes - any other backslash is text, as in `printf("%d\n", $1)`.
+///
+/// `vars` resolves a variable such as `$TM_FILENAME` (#914): `Some` for one
+/// croft knows, empty when it has no value here, and `None` for one it does
+/// not. As in VS Code, an empty variable inserts its default, and an unknown
+/// one without a default becomes a placeholder holding its name.
+pub fn parse_body(body: &str, vars: &dyn Fn(&str) -> Option<String>) -> ParsedBody {
+    let mut p = Parser::new(vars);
+    let mut chars = body.chars().peekable();
+    p.seq(&mut chars, false);
+    let mut stops = p.stops;
+    let top = stops
+        .iter()
+        .map(|s| s.num)
+        .filter(|&n| n < FIRST_UNKNOWN)
+        .max();
+    for s in stops.iter_mut().filter(|s| s.num >= FIRST_UNKNOWN) {
+        s.num = s.num - FIRST_UNKNOWN + top.unwrap_or(0) + 1;
+    }
+    // Ascending by number, but `$0` (the final caret) always sorts last.
+    stops.sort_by_key(|s| if s.num == 0 { u32::MAX } else { s.num });
+    ParsedBody {
+        text: p.text,
+        stops,
+    }
+}
+
+type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
+
+struct Parser<'v> {
+    text: String,
+    /// Char offset into `text`.
+    pos: usize,
+    stops: Vec<TabStop>,
+    seen: Vec<u32>,
+    /// The unknown variables met so far: the placeholder of the one at
+    /// index `i` is numbered `FIRST_UNKNOWN + i`.
+    unknown: Vec<String>,
+    vars: &'v dyn Fn(&str) -> Option<String>,
+}
+
+impl<'v> Parser<'v> {
+    fn new(vars: &'v dyn Fn(&str) -> Option<String>) -> Self {
+        Parser {
+            text: String::new(),
+            pos: 0,
+            stops: Vec::new(),
+            seen: Vec::new(),
+            unknown: Vec::new(),
+            vars,
+        }
+    }
+
+    fn push(&mut self, c: char) {
+        self.text.push(c);
+        self.pos += 1;
+    }
+
+    /// A stop at `offset` spanning `len` chars. A repeated `$N` duplicates
+    /// its text, but only the first occurrence is a navigable stop.
+    fn stop(&mut self, num: u32, offset: usize, len: usize) {
+        if !self.seen.contains(&num) {
+            self.seen.push(num);
+            self.stops.push(TabStop { num, offset, len });
+        }
+    }
+
+    /// Text up to the end, or inside a placeholder up to its closing `}`
+    /// (consumed).
+    fn seq(&mut self, chars: &mut Chars, in_placeholder: bool) {
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => match chars.peek() {
+                    Some(&n) if matches!(n, '$' | '}' | '\\') => {
+                        chars.next();
+                        self.push(n);
+                    }
+                    _ => self.push('\\'),
+                },
+                '}' if in_placeholder => return,
+                '$' => self.dollar(chars),
+                _ => self.push(c),
+            }
+        }
+    }
+
+    /// What follows a `$`: a stop, a placeholder, a choice, a variable, or a
+    /// literal `$`.
+    fn dollar(&mut self, chars: &mut Chars) {
+        let mut look = chars.clone();
+        let braced = look.peek() == Some(&'{');
+        if braced {
+            look.next();
+        }
+        if look
+            .peek()
+            .is_some_and(|c| c.is_ascii_alphabetic() || *c == '_')
+        {
+            self.variable(chars, look, braced);
+            return;
+        }
+        let mut digits = String::new();
+        while let Some(&d) = look.peek().filter(|d| d.is_ascii_digit()) {
+            digits.push(d);
+            look.next();
+        }
+        let Some(num) = digits.parse::<u32>().ok().filter(|&n| n < FIRST_UNKNOWN) else {
+            self.push('$');
+            return;
+        };
+        if !braced {
+            *chars = look;
+            self.stop(num, self.pos, 0);
+            return;
+        }
+        match look.next() {
+            Some('}') => {
+                *chars = look;
+                self.stop(num, self.pos, 0);
+            }
+            Some(':') => {
+                *chars = look;
+                let start = self.pos;
+                self.seq(chars, true);
+                self.stop(num, start, self.pos - start);
+            }
+            Some('|') => {
+                let Some(first) = choice_first(&mut look) else {
+                    self.push('$');
+                    return;
+                };
+                *chars = look;
+                let start = self.pos;
+                for c in first.chars() {
+                    self.push(c);
+                }
+                self.stop(num, start, self.pos - start);
+            }
+            // Malformed `${N…`: not a stop, the `$` is literal.
+            _ => self.push('$'),
+        }
+    }
+
+    /// `$NAME`, `${NAME}` or `${NAME:default}`, with `look` just past the
+    /// `$` or `${` (#914). A transform (`${NAME/…/…/}`) is not read: its
+    /// `$` stays literal.
+    fn variable<'c>(&mut self, chars: &mut Chars<'c>, mut look: Chars<'c>, braced: bool) {
+        let mut name = String::new();
+        while let Some(&c) = look
+            .peek()
+            .filter(|c| c.is_ascii_alphanumeric() || **c == '_')
+        {
+            name.push(c);
+            look.next();
+        }
+        let default = braced && look.peek() == Some(&':');
+        if braced && !matches!(look.next(), Some('}' | ':')) {
+            self.push('$');
+            return;
+        }
+        *chars = look;
+        let (value, start) = ((self.vars)(&name), self.pos);
+        match value {
+            Some(value) if !value.is_empty() => {
+                if default {
+                    // Read past the default, keeping none of it and looking
+                    // up nothing in it: a variable there (`$CLIPBOARD`) can
+                    // be slow to read, and its value would go nowhere.
+                    Parser::new(&|_| Some(String::new())).seq(chars, true);
+                }
+                value.chars().for_each(|c| self.push(c));
+            }
+            _ if default => self.seq(chars, true),
+            Some(_) => {}
+            None => {
+                let index = self.unknown.iter().position(|n| *n == name);
+                let index = index.unwrap_or_else(|| {
+                    self.unknown.push(name.clone());
+                    self.unknown.len() - 1
+                });
+                name.chars().for_each(|c| self.push(c));
+                self.stop(FIRST_UNKNOWN + index as u32, start, self.pos - start);
+            }
+        }
+    }
+}
+
+/// The variables that depend only on the clock and chance (#914): the
+/// `CURRENT_*` date and time parts in local time, `RANDOM`, `RANDOM_HEX` and
+/// `UUID`, in VS Code's formats. `None` for any other name.
+pub fn clock_var(name: &str) -> Option<String> {
+    use ring::rand::SecureRandom;
+    let mut bytes = [0u8; 16];
+    if matches!(name, "RANDOM" | "RANDOM_HEX" | "UUID") {
+        // A failed RNG leaves zeros: an id in a snippet, not a secret.
+        let _ = ring::rand::SystemRandom::new().fill(&mut bytes);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    }
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let part = match name {
+        "RANDOM" => {
+            return Some(format!(
+                "{:06}",
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 1_000_000
+            ));
+        }
+        "RANDOM_HEX" => return Some(hex[..6].to_string()),
+        "UUID" => {
+            let parts = [
+                &hex[..8],
+                &hex[8..12],
+                &hex[12..16],
+                &hex[16..20],
+                &hex[20..],
+            ];
+            return Some(parts.join("-"));
+        }
+        "CURRENT_SECONDS_UNIX" => return Some(secs.to_string()),
+        _ => name.strip_prefix("CURRENT_")?,
+    };
+    // libc's localtime, as the terminal's timestamps take it: no date crate.
+    // The alias is deprecated on musl; see `widgets::terminal::hhmmss`.
+    #[allow(deprecated)]
+    let secs = secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers are to live locals of the types it takes.
+    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+        return None;
+    }
+    let month =
+        "January February March April May June July August September October November December";
+    let month = month.split(' ').nth(tm.tm_mon as usize).unwrap_or_default();
+    let day = "Sunday Monday Tuesday Wednesday Thursday Friday Saturday";
+    let day = day.split(' ').nth(tm.tm_wday as usize).unwrap_or_default();
+    let offset = tm.tm_gmtoff / 60;
+    let sign = if offset < 0 { '-' } else { '+' };
+    Some(match part {
+        "YEAR" => (tm.tm_year + 1900).to_string(),
+        "YEAR_SHORT" => format!("{:02}", (tm.tm_year + 1900) % 100),
+        "MONTH" => format!("{:02}", tm.tm_mon + 1),
+        "MONTH_NAME" => month.to_string(),
+        "MONTH_NAME_SHORT" => month.chars().take(3).collect(),
+        "DATE" => format!("{:02}", tm.tm_mday),
+        "DAY_NAME" => day.to_string(),
+        "DAY_NAME_SHORT" => day.chars().take(3).collect(),
+        "HOUR" => format!("{:02}", tm.tm_hour),
+        "MINUTE" => format!("{:02}", tm.tm_min),
+        "SECOND" => format!("{:02}", tm.tm_sec),
+        "TIMEZONE_OFFSET" => format!("{sign}{:02}:{:02}", offset.abs() / 60, offset.abs() % 60),
+        _ => return None,
+    })
+}
+
+/// The first option of a choice, reading past its closing `|}`. `\,`,
+/// `\|` and `\\` escape inside it. `None` when the choice is unterminated.
+fn choice_first(chars: &mut Chars) -> Option<String> {
+    let mut first = String::new();
+    let mut in_first = true;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                let n = match chars.peek() {
+                    Some(&n) if matches!(n, ',' | '|' | '\\') => {
+                        chars.next();
+                        n
+                    }
+                    _ => '\\',
+                };
+                if in_first {
+                    first.push(n);
+                }
+            }
+            ',' => in_first = false,
+            '|' if chars.peek() == Some(&'}') => {
+                chars.next();
+                return Some(first);
+            }
+            _ if in_first => first.push(c),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Convert a char offset within a block of text to a (line delta, column)
+/// relative to the block's start. Column is chars since the last newline.
+pub fn offset_to_line_col(text: &str, offset: usize) -> (usize, usize) {
+    let mut line = 0usize;
+    let mut col = 0usize;
+    for (i, c) in text.chars().enumerate() {
+        if i == offset {
+            break;
+        }
+        if c == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+/// One user snippet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snippet {
+    pub prefix: String,
+    pub body: String,
+    pub scope: Vec<String>,
+}
+
+impl Snippet {
+    /// Whether this snippet applies to `language` (its scope is empty or names it).
+    ///
+    /// A `.jsx` file is `javascriptreact` and a `.jsonc` file `jsonc`, as in
+    /// VS Code (#1641), so their own snippets apply there. Snippets scoped to
+    /// the base language still apply too: before, croft called those files
+    /// `javascript` and `json`, and a user's existing snippets keep working.
+    fn applies_to(&self, language: &str) -> bool {
+        let base = match language {
+            "javascriptreact" => "javascript",
+            "jsonc" => "json",
+            other => other,
+        };
+        self.scope.is_empty() || self.scope.iter().any(|s| s == language || s == base)
+    }
+}
+
+/// The loaded set of user snippets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnippetSet {
+    snippets: Vec<Snippet>,
+    /// What could not be loaded: the file itself, or one entry by name. The
+    /// rest still loads (#1483).
+    warnings: Vec<String>,
+    /// The file did not parse at all, so nothing was loaded from it (#1191).
+    broken: bool,
+}
+
+/// The on-disk value shape: `prefix` is a string or an array of them (VS Code
+/// allows both); `body` is a string or an array of lines; `scope` is an
+/// optional comma-separated language list.
+#[derive(Debug, Deserialize)]
+struct RawSnippet {
+    #[serde(default)]
+    prefix: Prefix,
+    #[serde(default)]
+    body: Body,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+/// A snippet's trigger words. VS Code lets one snippet answer to several
+/// (`"prefix": ["for", "fori"]`), and to none when it is only meant for
+/// Insert Snippet.
+#[derive(Debug, Deserialize, Default)]
+#[serde(untagged)]
+enum Prefix {
+    #[default]
+    Missing,
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Prefix {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Prefix::Missing => Vec::new(),
+            Prefix::One(p) => vec![p],
+            Prefix::Many(ps) => ps,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(untagged)]
+enum Body {
+    #[default]
+    Missing,
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Body {
+    fn joined(&self) -> String {
+        match self {
+            Body::Missing => String::new(),
+            Body::One(s) => s.clone(),
+            Body::Many(lines) => lines.join("\n"),
+        }
+    }
+}
+
+impl SnippetSet {
+    pub fn load(path: &Path) -> Self {
+        let Ok(json) = std::fs::read_to_string(path) else {
+            return Self::default();
+        };
+        Self::from_json(&json)
+    }
+
+    pub fn from_json(json: &str) -> Self {
+        Self::parse(json).0
+    }
+
+    /// The snippets in `json`, read as JSONC like VS Code's snippet files
+    /// and croft's settings (comments and trailing commas, #1191), entry by
+    /// entry, so one snippet croft cannot read is skipped and named in
+    /// [`warnings`](Self::warnings) instead of taking every other snippet
+    /// with it (#1483). The second half is why none were loaded when the
+    /// file does not parse at all; it is in the warnings too.
+    pub fn parse(json: &str) -> (Self, Option<String>) {
+        let stripped = crate::jsonc::strip_jsonc(json);
+        if stripped.trim().is_empty() {
+            return (Self::default(), None);
+        }
+        let entries: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(
+            &stripped,
+        ) {
+            Ok(entries) => entries,
+            Err(e) => {
+                let why = format!(
+                    "snippets.json could not be read: the file does not parse ({e}); NO snippets were loaded from it"
+                );
+                let set = Self {
+                    snippets: Vec::new(),
+                    warnings: vec![why.clone()],
+                    broken: true,
+                };
+                return (set, Some(why));
+            }
+        };
+        let mut snippets = Vec::new();
+        let mut warnings = Vec::new();
+        for (name, value) in entries {
+            let raw: RawSnippet = match serde_json::from_value(value) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    warnings.push(format!("snippet {name:?} skipped: {e}"));
+                    continue;
+                }
+            };
+            let body = raw.body.joined();
+            let scope: Vec<String> = raw
+                .scope
+                .map(|s| {
+                    s.split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for prefix in raw.prefix.into_vec() {
+                if prefix.is_empty() {
+                    continue;
+                }
+                snippets.push(Snippet {
+                    prefix,
+                    body: body.clone(),
+                    scope: scope.clone(),
+                });
+            }
+        }
+        let set = Self {
+            snippets,
+            warnings,
+            broken: false,
+        };
+        (set, None)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.snippets.is_empty()
+    }
+
+    /// Add `other`'s snippets after these, so on a shared prefix the ones
+    /// already here win Tab expansion (#1484: the user's own over a
+    /// project's). Its warnings are kept; whether this set is broken is not
+    /// changed, since that describes the user's own file.
+    pub fn append(&mut self, other: SnippetSet) {
+        self.snippets.extend(other.snippets);
+        self.warnings.extend(other.warnings);
+    }
+
+    /// What could not be loaded, one line each, for OUTPUT · Snippets.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// Whether the file did not parse at all, so nothing was loaded (#1191).
+    pub fn is_broken(&self) -> bool {
+        self.broken
+    }
+
+    /// Snippets in `language` whose prefix begins with `word` (case-sensitive,
+    /// like VS Code); for injecting into the completion popup. An empty `word`
+    /// still filters by language but matches every prefix.
+    pub fn matching(&self, word: &str, language: &str) -> Vec<&Snippet> {
+        self.snippets
+            .iter()
+            .filter(|s| s.applies_to(language) && s.prefix.starts_with(word))
+            .collect()
+    }
+
+    /// The single snippet whose prefix exactly equals `word` in `language`, if
+    /// any — the Tab-to-expand lookup.
+    pub fn exact(&self, word: &str, language: &str) -> Option<&Snippet> {
+        self.snippets
+            .iter()
+            .find(|s| s.prefix == word && s.applies_to(language))
+    }
+}
+
+pub fn snippets_path() -> PathBuf {
+    crate::profiles::file("snippets.json")
+}
+
+/// A workspace folder's own snippets (#1484), the files a team commits:
+/// every `.vscode/*.code-snippets` (VS Code's project snippets), in name
+/// order, then croft's `.croft/snippets.json`. Only files that exist.
+pub fn project_files(root: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(root.join(".vscode"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|p| is_project_file(p) && p.is_file())
+        .collect();
+    files.sort();
+    let croft = root.join(".croft").join("snippets.json");
+    if croft.is_file() {
+        files.push(croft);
+    }
+    files
+}
+
+/// Whether `path` is a project snippets file by its name and folder: a
+/// `*.code-snippets` in a `.vscode` folder, or `.croft/snippets.json`.
+pub fn is_project_file(path: &Path) -> bool {
+    let parent = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str());
+    match parent {
+        Some(".vscode") => path.extension().is_some_and(|e| e == "code-snippets"),
+        Some(".croft") => path.file_name().is_some_and(|n| n == "snippets.json"),
+        _ => false,
+    }
+}
+
+/// Seeded on first "Configure User Snippets" so the user starts from a working
+/// example rather than a blank buffer.
+pub const TEMPLATE: &str = r#"// croft user snippets. Keyed by name; each has a "prefix" (or an array of
+// them) you type then expand with Tab, a "body" (string or array of lines), and an optional "scope"
+// (comma-separated language ids; omit for all languages).
+// Tab stops: $1, $2 … in order, $0 final caret, ${1:placeholder} with default text.
+{
+  "Print to console": {
+    "prefix": "log",
+    "body": "console.log($1)$0",
+    "scope": "javascript,typescript"
+  },
+  "Python main guard": {
+    "prefix": "main",
+    "body": [
+      "if __name__ == \"__main__\":",
+      "    ${1:main()}$0"
+    ],
+    "scope": "python"
+  }
+}
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `parse_body` with no variable known, the case most tests here pin.
+    fn parse_body(body: &str) -> ParsedBody {
+        super::parse_body(body, &|_| None)
+    }
+
+    /// #1641: `javascriptreact` and `jsonc` snippets apply to their own
+    /// language; snippets scoped to the base language still apply there,
+    /// and not the other way round.
+    #[test]
+    fn react_and_jsonc_scopes_take_their_base_language_too() {
+        let set = SnippetSet::from_json(
+            r#"{
+              "rfc": { "prefix": "rfc", "body": "x", "scope": "javascriptreact" },
+              "clg": { "prefix": "clg", "body": "y", "scope": "javascript" },
+              "key": { "prefix": "key", "body": "z", "scope": "json" }
+            }"#,
+        );
+        assert!(set.exact("rfc", "javascriptreact").is_some());
+        assert!(set.exact("clg", "javascriptreact").is_some());
+        assert!(set.exact("key", "jsonc").is_some());
+        assert!(set.exact("rfc", "javascript").is_none());
+        assert!(set.exact("clg", "typescriptreact").is_none());
+    }
+
+    #[test]
+    fn snippets_with_a_trailing_comma_or_block_comment_still_load() {
+        // #1191: VS Code's snippet files are JSONC, and a pasted one has both.
+        let set = SnippetSet::from_json(
+            "{\n  /* logging */\n  \"log\": { \"prefix\": \"log\", \"body\": \"console.log($1);\" },\n  \"todo\": { \"prefix\": \"todo\", \"body\": [\"// TODO: $1\",], },\n}\n",
+        );
+        assert_eq!(set.matching("log", "javascript").len(), 1);
+        let todo = set.matching("todo", "javascript");
+        assert_eq!(todo.len(), 1);
+        assert_eq!(
+            todo[0].body, "// TODO: $1",
+            "a comment marker inside a string stays"
+        );
+    }
+
+    #[test]
+    fn snippet_bodies_keep_what_only_looks_like_jsonc() {
+        // Negative: commas before a brace and comment markers inside strings
+        // are the snippet's text, not JSONC to strip.
+        let set =
+            SnippetSet::from_json(r#"{"c": {"prefix": "cm", "body": "/* $1 */ f(a, }) // end"}}"#);
+        assert_eq!(set.matching("cm", "c")[0].body, "/* $1 */ f(a, }) // end");
+    }
+
+    #[test]
+    fn a_snippets_file_that_does_not_parse_says_so() {
+        // A file that is broken (not merely JSONC) loads nothing, as before,
+        // but no longer silently: the reason comes back for OUTPUT.
+        let (set, warning) = SnippetSet::parse(r#"{"log": {"prefix": "log" "body": "x"}}"#);
+        assert!(set.matching("log", "javascript").is_empty());
+        let warning = warning.expect("a warning");
+        assert!(warning.contains("does not parse"), "{warning}");
+        let (_, none) = SnippetSet::parse("{}");
+        assert_eq!(none, None, "an empty file is fine");
+    }
+
+    #[test]
+    fn lsp_snippets_keep_backslashes_nest_placeholders_and_pick_a_choice() {
+        let p = parse_body(r#"printf("%d\n", $1)"#);
+        assert_eq!(p.text, r#"printf("%d\n", )"#);
+        let p = parse_body("${1:foo(${2:x})}$0");
+        assert_eq!(p.text, "foo(x)");
+        assert_eq!(
+            p.stops[0],
+            TabStop {
+                num: 1,
+                offset: 0,
+                len: 6
+            }
+        );
+        assert_eq!(
+            p.stops[1],
+            TabStop {
+                num: 2,
+                offset: 4,
+                len: 1
+            }
+        );
+        let p = parse_body(r"${1|one,two|} \$5 \} a\b");
+        assert_eq!(p.text, "one $5 } a\\b");
+        assert_eq!(
+            p.stops[0],
+            TabStop {
+                num: 1,
+                offset: 0,
+                len: 3
+            }
+        );
+    }
+
+    #[test]
+    fn parses_single_bare_stop() {
+        let p = parse_body("console.log($1)");
+        assert_eq!(p.text, "console.log()");
+        assert_eq!(
+            p.stops,
+            vec![TabStop {
+                num: 1,
+                offset: 12,
+                len: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn placeholder_text_is_inserted_and_measured() {
+        let p = parse_body("for ${1:i} in ${2:range}:");
+        assert_eq!(p.text, "for i in range:");
+        assert_eq!(
+            p.stops,
+            vec![
+                TabStop {
+                    num: 1,
+                    offset: 4,
+                    len: 1
+                },
+                TabStop {
+                    num: 2,
+                    offset: 9,
+                    len: 5
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn final_zero_stop_sorts_last_regardless_of_position() {
+        let p = parse_body("try:\n    $0\nexcept $1:");
+        let nums: Vec<u32> = p.stops.iter().map(|s| s.num).collect();
+        assert_eq!(nums, vec![1, 0], "$0 must be visited last");
+    }
+
+    #[test]
+    fn repeated_number_duplicates_text_but_only_first_is_a_stop() {
+        let p = parse_body("$1 = $1 + 1");
+        assert_eq!(p.text, " =  + 1");
+        assert_eq!(p.stops.len(), 1, "mirror occurrences are not extra stops");
+        assert_eq!(p.stops[0].offset, 0);
+    }
+
+    #[test]
+    fn escaped_dollar_is_literal() {
+        let p = parse_body("cost is \\$5 for $1");
+        assert_eq!(p.text, "cost is $5 for ");
+        assert_eq!(p.stops.len(), 1);
+    }
+
+    /// #914: as in VS Code, an unknown variable becomes a placeholder
+    /// holding its name, numbered after the snippet's own stops. A
+    /// transform is not read: its `$` stays literal.
+    #[test]
+    fn an_unknown_variable_becomes_a_placeholder_after_the_stops() {
+        let p = parse_body("$foo and ${bar} $1 $foo$0");
+        assert_eq!(p.text, "foo and bar  foo");
+        let stops: Vec<_> = p.stops.iter().map(|s| (s.num, s.offset, s.len)).collect();
+        assert_eq!(stops, [(1, 12, 0), (2, 0, 3), (3, 8, 3), (0, 16, 0)]);
+        assert_eq!(parse_body("${foo/a/b/} $").text, "${foo/a/b/} $");
+    }
+
+    /// #914: a known variable inserts its value, dropping its default (and
+    /// the stops in it); an empty one inserts its default, stops and all.
+    #[test]
+    fn a_variable_inserts_its_value_or_else_its_default() {
+        let vars = |name: &str| match name {
+            "TM_FILENAME" => Some("t.py".to_string()),
+            "TM_SELECTED_TEXT" => Some(String::new()),
+            _ => None,
+        };
+        let body = "# $TM_FILENAME ${TM_FILENAME:x$1} ${TM_SELECTED_TEXT:pass$2}$TM_SELECTED_TEXT${NOPE:d}";
+        let p = super::parse_body(body, &vars);
+        assert_eq!(p.text, "# t.py t.py passd");
+        let stop = TabStop {
+            num: 2,
+            offset: 16,
+            len: 0,
+        };
+        assert_eq!(p.stops, [stop]);
+    }
+
+    /// #914: the default of a variable with a value is skipped unread: a
+    /// variable inside it is never looked up, so `${TM_FILENAME:$CLIPBOARD}`
+    /// does not wait on a clipboard read for a value it drops.
+    #[test]
+    fn a_skipped_default_looks_up_none_of_its_variables() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let vars = |name: &str| {
+            asked.borrow_mut().push(name.to_string());
+            (name == "TM_FILENAME").then(|| String::from("t.py"))
+        };
+        let p = super::parse_body("${TM_FILENAME:${CLIPBOARD:$UUID}}", &vars);
+        assert_eq!(p.text, "t.py");
+        assert_eq!(*asked.borrow(), ["TM_FILENAME"]);
+    }
+
+    #[test]
+    fn clock_variables_take_vs_code_s_formats() {
+        let year = clock_var("CURRENT_YEAR").unwrap();
+        assert!(year.len() == 4 && year.parse::<u32>().is_ok(), "{year}");
+        assert_eq!(clock_var("CURRENT_MONTH").unwrap().len(), 2);
+        assert_eq!(clock_var("CURRENT_TIMEZONE_OFFSET").unwrap().len(), 6);
+        let uuid = clock_var("UUID").unwrap();
+        assert_eq!((uuid.len(), &uuid[14..15], &uuid[8..9]), (36, "4", "-"));
+        assert_ne!(uuid, clock_var("UUID").unwrap());
+        assert_eq!(clock_var("RANDOM_HEX").unwrap().len(), 6);
+        assert!(clock_var("CURRENT_NOPE").is_none() && clock_var("TM_FILENAME").is_none());
+    }
+
+    #[test]
+    fn offset_to_line_col_spans_newlines() {
+        assert_eq!(offset_to_line_col("ab\ncd", 0), (0, 0));
+        assert_eq!(offset_to_line_col("ab\ncd", 2), (0, 2));
+        assert_eq!(offset_to_line_col("ab\ncd", 4), (1, 1));
+    }
+
+    #[test]
+    fn loads_string_and_array_bodies_with_scope() {
+        let json = r#"{
+            "Log": { "prefix": "log", "body": "console.log($1)", "scope": "javascript, typescript" },
+            "Guard": { "prefix": "main", "body": ["line1", "line2"] }
+        }"#;
+        let set = SnippetSet::from_json(json);
+        // Scope with a space after the comma still matches typescript.
+        assert!(set.exact("log", "typescript").is_some());
+        assert!(set.exact("log", "python").is_none());
+        // Array body joined with newlines; no scope -> every language.
+        let guard = set
+            .exact("main", "python")
+            .expect("no-scope snippet is universal");
+        assert_eq!(guard.body, "line1\nline2");
+    }
+
+    #[test]
+    fn scope_filters_by_language() {
+        let json = r#"{ "Log": { "prefix": "log", "body": "x", "scope": "javascript" } }"#;
+        let set = SnippetSet::from_json(json);
+        assert!(set.exact("log", "python").is_none());
+        assert!(set.exact("log", "javascript").is_some());
+    }
+
+    #[test]
+    fn matching_filters_by_prefix_and_scope_for_the_popup() {
+        let json = r#"{
+            "Log": { "prefix": "log", "body": "x", "scope": "javascript" },
+            "Loop": { "prefix": "loop", "body": "y" }
+        }"#;
+        let set = SnippetSet::from_json(json);
+        // Prefix "lo" matches both in JS (Loop has no scope -> universal).
+        let js: Vec<&str> = set
+            .matching("lo", "javascript")
+            .iter()
+            .map(|s| s.prefix.as_str())
+            .collect();
+        assert_eq!(js.len(), 2);
+        // In Python only the unscoped "loop" survives.
+        let py: Vec<&str> = set
+            .matching("lo", "python")
+            .iter()
+            .map(|s| s.prefix.as_str())
+            .collect();
+        assert_eq!(py, vec!["loop"]);
+    }
+
+    #[test]
+    fn exact_requires_full_prefix_match() {
+        let json = r#"{ "Log": { "prefix": "log", "body": "x" } }"#;
+        let set = SnippetSet::from_json(json);
+        assert!(set.exact("lo", "javascript").is_none());
+        assert!(set.exact("log", "javascript").is_some());
+    }
+
+    #[test]
+    fn template_is_valid_and_expands() {
+        let set = SnippetSet::from_json(TEMPLATE);
+        assert!(!set.is_empty());
+        let log = set
+            .exact("log", "javascript")
+            .expect("template log snippet");
+        let parsed = parse_body(&log.body);
+        assert_eq!(parsed.text, "console.log()");
+    }
+
+    #[test]
+    fn junk_json_is_empty_not_fatal() {
+        assert!(SnippetSet::from_json("not json").is_empty());
+        assert!(SnippetSet::from_json("").is_empty());
+    }
+
+    #[test]
+    fn an_array_prefix_expands_from_each_of_its_words() {
+        let json = r#"{
+            "For loop": {
+                "prefix": ["for", "fori"],
+                "body": ["for ${1:i} in range(${2:10}):", "    $0"],
+                "scope": "python"
+            }
+        }"#;
+        let set = SnippetSet::from_json(json);
+        for word in ["for", "fori"] {
+            let s = set
+                .exact(word, "python")
+                .unwrap_or_else(|| panic!("{word} must expand"));
+            assert_eq!(s.body, "for ${1:i} in range(${2:10}):\n    $0");
+        }
+        assert!(set.exact("fori", "rust").is_none(), "scope still applies");
+        assert!(set.warnings().is_empty());
+    }
+
+    #[test]
+    fn an_array_prefix_does_not_hide_the_other_snippets() {
+        let json = format!(
+            "{}, \"For loop\": {{ \"prefix\": [\"for\", \"fori\"], \"body\": \"x\" }} }}",
+            TEMPLATE.trim_end().trim_end_matches('}').trim_end()
+        );
+        let set = SnippetSet::from_json(&json);
+        assert!(
+            set.exact("log", "javascript").is_some(),
+            "template snippets stay"
+        );
+        assert!(set.exact("fori", "python").is_some());
+    }
+
+    #[test]
+    fn a_malformed_entry_is_skipped_and_named_while_the_rest_load() {
+        let json = r#"{
+            "Log": { "prefix": "log", "body": "console.log($1)" },
+            "Broken": { "prefix": 42, "body": "x" },
+            "Main": { "prefix": "main", "body": "if __name__ == '__main__':" }
+        }"#;
+        let set = SnippetSet::from_json(json);
+        assert!(set.exact("log", "javascript").is_some());
+        assert!(set.exact("main", "python").is_some());
+        assert_eq!(set.warnings().len(), 1, "{:?}", set.warnings());
+        assert!(
+            set.warnings()[0].contains("\"Broken\""),
+            "{:?}",
+            set.warnings()
+        );
+    }
+
+    #[test]
+    fn an_entry_with_no_prefix_is_not_an_error() {
+        // Legal in VS Code: such a snippet is only reachable from Insert Snippet.
+        let json = r##"{
+            "Header": { "body": "# header" },
+            "Log": { "prefix": "log", "body": "x" }
+        }"##;
+        let set = SnippetSet::from_json(json);
+        assert!(set.exact("log", "javascript").is_some());
+        assert!(set.warnings().is_empty(), "{:?}", set.warnings());
+    }
+
+    #[test]
+    fn an_unreadable_file_reports_an_error_instead_of_loading_nothing_silently() {
+        let set = SnippetSet::from_json("{ \"Log\": { \"prefix\": \"log\", ");
+        assert!(set.is_empty());
+        assert_eq!(set.warnings().len(), 1);
+        assert!(set.warnings()[0].starts_with("snippets.json could not be read"));
+    }
+
+    /// Negative: an empty or comment-only file is not a mistake.
+    #[test]
+    fn an_empty_file_has_no_warnings() {
+        assert!(SnippetSet::from_json("").warnings().is_empty());
+        assert!(
+            SnippetSet::from_json("// nothing yet\n")
+                .warnings()
+                .is_empty()
+        );
+        assert!(SnippetSet::from_json("{}").warnings().is_empty());
+    }
+
+    /// #1484: on a prefix both define, the snippet already in the set (the
+    /// user's) wins Tab; the appended one still shows in completion.
+    #[test]
+    fn appended_snippets_lose_a_shared_prefix_but_still_complete() {
+        let mut set = SnippetSet::from_json(r#"{ "Mine": { "prefix": "tlog", "body": "mine" } }"#);
+        set.append(SnippetSet::from_json(
+            r#"{ "Team": { "prefix": "tlog", "body": "team" }, "Other": { "prefix": "tdb", "body": "db" } }"#,
+        ));
+        assert_eq!(set.exact("tlog", "python").unwrap().body, "mine");
+        assert_eq!(set.exact("tdb", "python").unwrap().body, "db");
+        assert_eq!(set.matching("tlog", "python").len(), 2);
+    }
+
+    #[test]
+    fn project_files_are_the_vscode_code_snippets_then_croft_s_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".vscode")).unwrap();
+        std::fs::create_dir_all(root.join(".croft")).unwrap();
+        for f in [
+            ".vscode/z.code-snippets",
+            ".vscode/a.code-snippets",
+            ".vscode/settings.json",
+            ".croft/snippets.json",
+            "loose.code-snippets",
+        ] {
+            std::fs::write(root.join(f), "{}").unwrap();
+        }
+        std::fs::create_dir_all(root.join(".vscode/dir.code-snippets")).unwrap();
+        let names: Vec<_> = project_files(root)
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ".vscode/a.code-snippets",
+                ".vscode/z.code-snippets",
+                ".croft/snippets.json"
+            ]
+        );
+        assert!(project_files(&root.join("nothing-here")).is_empty());
+    }
+}

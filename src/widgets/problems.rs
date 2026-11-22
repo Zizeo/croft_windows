@@ -1,0 +1,1712 @@
+//! The bottom panel's PROBLEMS tab: aggregated workspace diagnostics, grouped
+//! by file exactly like VS Code's Problems view. Each file is a collapsible
+//! header (file icon + name + relative dir + a count badge); under it sits one
+//! row per diagnostic (severity glyph + message + source server), and under
+//! that an indented row per related location its server named (#1523).
+//! Clicking a diagnostic or a related row jumps the editor to that line;
+//! clicking a header collapses the group. The rows are a pure projection of
+//! the app's per-file diagnostics store, refreshed whenever a language server
+//! republishes.
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Paragraph, Widget},
+};
+
+use crate::lsp::manager::DiagnosticSeverity;
+use crate::theme::Theme;
+use crate::widgets::scrollbar;
+
+const COLOR_HEADER: Color = Color::Rgb(0xE8, 0xEE, 0xF8);
+const COLOR_DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
+const COLOR_MSG: Color = Color::Rgb(0xCC, 0xCC, 0xCC);
+
+/// Severity colours, matching the editor's diagnostic underline palette.
+const COLOR_ERROR: Color = Color::Rgb(0xf1, 0x4c, 0x4c);
+const COLOR_WARNING: Color = Color::Rgb(0xcc, 0xa7, 0x00);
+const COLOR_INFO: Color = Color::Rgb(0x3b, 0x9e, 0xff);
+
+/// Codicon severity glyphs, verified against the upstream codicon
+/// `mapping.json` on 2026-06-28: `error` = 60039 (U+EA87), `warning` = 60012
+/// (U+EA6C), `info` = 60020 (U+EA74). Nerd Fonts preserve codicon codepoints
+/// (cross-checked against the activity-bar glyphs in `crate::icons`).
+const GLYPH_ERROR: char = '\u{ea87}';
+const GLYPH_WARNING: char = '\u{ea6c}';
+const GLYPH_INFO: char = '\u{ea74}';
+
+/// One diagnostic in the Problems list, projected from a language server's
+/// published set or a build tool's output. Positions are zero-based (LSP),
+/// shown one-based in the row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProblemItem {
+    pub line: u32,
+    pub col: u32,
+    /// Whether `col` counts UTF-16 code units (a language server's
+    /// `Position.character`) or characters (a build tool's column — rustc
+    /// counts code points, and the matchers only rebase 1-based to 0-based).
+    /// The two sources share this list, so the unit has to travel with the
+    /// item: jumping to it needs to know which conversion to apply.
+    pub col_utf16: bool,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+    /// The server that produced it (e.g. `rust-analyzer`, `ruff`), shown dim
+    /// at the end of the row like VS Code's diagnostic source.
+    pub source: String,
+    /// The rule it reports (#1540), shown as `source(code)` after the
+    /// message so it can be silenced or looked up.
+    pub code: Option<crate::lsp::manager::DiagnosticCode>,
+    /// The places its server points at to explain it (#1523), each a row
+    /// of its own under it.
+    pub related: Vec<ProblemRelated>,
+}
+
+/// A related location under a diagnostic (#1523): "immutable borrow occurs
+/// here", "'foo' is declared here". Zero-based, the column in UTF-16 (LSP).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProblemRelated {
+    pub path: PathBuf,
+    /// `path` relative to the workspace root, as the row names it.
+    pub rel_path: String,
+    pub line: u32,
+    pub col: u32,
+    pub message: String,
+}
+
+/// All diagnostics for one file, the unit the Problems view groups by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProblemGroup {
+    pub path: PathBuf,
+    /// File basename shown in the header.
+    pub name: String,
+    /// Directory of the file relative to the workspace root, shown dim after
+    /// the name (empty for a file at the root).
+    pub rel_dir: String,
+    pub items: Vec<ProblemItem>,
+}
+
+/// A rendered line in the panel, used to map a click row back to an action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RenderRow {
+    Header(usize),
+    Diag(usize, usize),
+    /// A diagnostic's related location: group, item, index into `related`.
+    Related(usize, usize, usize),
+}
+
+/// Which files the panel lists (#256). `OpenFiles` matches the pre-#256
+/// behaviour in spirit — only what the user has open — while `WholeProject`
+/// shows everything the servers and build tools have reported, including
+/// files that were never opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProblemScope {
+    /// Only files with an open buffer.
+    OpenFiles,
+    /// Every file any source has reported a diagnostic for.
+    #[default]
+    WholeProject,
+}
+
+impl ProblemScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenFiles => "Open Files",
+            Self::WholeProject => "Whole Project",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::OpenFiles => Self::WholeProject,
+            Self::WholeProject => Self::OpenFiles,
+        }
+    }
+
+    /// The config token for this scope. Distinct from [`Self::label`], which
+    /// is display text ("Open Files") — writing that back would produce a
+    /// value `from_config` only accepts by accident.
+    pub fn to_config(self) -> &'static str {
+        match self {
+            Self::OpenFiles => "open_files",
+            Self::WholeProject => "whole_project",
+        }
+    }
+
+    pub fn from_config(s: &str) -> Self {
+        // Collapse whitespace so a user who pastes the palette label
+        // ("Open Files") gets what they plainly meant.
+        let norm = s.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+        match norm.as_str() {
+            "open" | "open_files" | "openfiles" => Self::OpenFiles,
+            "whole_project" | "wholeproject" | "project" | "all" => Self::WholeProject,
+            // Anything unrecognised shows MORE rather than silently hiding
+            // diagnostics, which is the safe direction for a typo.
+            _ => Self::WholeProject,
+        }
+    }
+}
+
+/// The severity filter applied to the list, cycled from the toolbar. `Warnings`
+/// keeps errors and warnings (VS Code's "Show Errors & Warnings"); `Errors`
+/// keeps only errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProblemFilter {
+    All,
+    Errors,
+    Warnings,
+}
+
+impl ProblemFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Errors,
+            Self::Errors => Self::Warnings,
+            Self::Warnings => Self::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Errors => "Errors",
+            Self::Warnings => "Errors & Warnings",
+        }
+    }
+
+    fn keeps(self, sev: DiagnosticSeverity) -> bool {
+        match self {
+            Self::All => true,
+            Self::Errors => sev == DiagnosticSeverity::Error,
+            Self::Warnings => {
+                matches!(sev, DiagnosticSeverity::Error | DiagnosticSeverity::Warning)
+            }
+        }
+    }
+}
+
+/// The action a click on a Problems row resolves to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProblemHit {
+    /// A file header: collapse/expand its group.
+    Header(PathBuf),
+    /// A diagnostic, or one of its related locations (#1523): jump the
+    /// editor to `(path, line, col)` (zero-based). `col_utf16` carries the
+    /// column's unit through from [`ProblemItem`].
+    Diagnostic {
+        path: PathBuf,
+        line: u32,
+        col: u32,
+        col_utf16: bool,
+    },
+}
+
+/// What a related row starts with: two cells deeper than its diagnostic's
+/// message (`   {glyph} `), so it reads as that row's child (#1523).
+const RELATED_INDENT: &str = "       ";
+
+/// How many trailing characters of the free-text filter the toolbar
+/// chip shows. The filter itself is unbounded; only its display is.
+const FILTER_CHIP_CHARS: usize = 24;
+
+pub struct ProblemsPanel {
+    groups: Vec<ProblemGroup>,
+    collapsed: HashSet<PathBuf>,
+    scroll: usize,
+    /// Severity filter, cycled from the toolbar (VS Code's funnel menu).
+    filter: ProblemFilter,
+    /// Free-text filter (VS Code's Problems filter box): a case-insensitive
+    /// substring matched against each diagnostic's message and its file's
+    /// path, composing with the severity filter. Typed directly while the
+    /// panel is focused; Backspace pops, Esc clears.
+    pub text_filter: String,
+    /// Group diagnostics under a file header (VS Code default) or show a flat,
+    /// file-annotated list. Toggled from the toolbar.
+    group_by_file: bool,
+    /// Which files the list covers (#256). Filtering happens where the groups
+    /// are BUILT, not here, so the panel's counts and rows stay one
+    /// projection of one list; this field only records the choice.
+    pub scope: ProblemScope,
+
+    pub focus_gradient: bool,
+    pub theme: Theme,
+    pub focused: bool,
+    pub hover_pointer: Option<(u16, u16)>,
+
+    pub last_area: Rect,
+    pub last_scrollbar: Rect,
+    /// The diagnostic a Fix with Navigator turn is streaming for, as
+    /// `(file, line)` (#374). Its row wears the spinner until the turn
+    /// ends; the app clears it on the turn's end, cancel, or unseat.
+    pub fixing: Option<(PathBuf, u32)>,
+    /// The spinner frame to paint on that row this frame. The app picks it
+    /// from its own clock so every spinner in the UI runs in step.
+    pub fix_glyph: &'static str,
+
+    // Toolbar hit rects, recomputed each render.
+    filter_rect: Rect,
+    group_rect: Rect,
+
+    rows: Vec<RenderRow>,
+    first_row_y: u16,
+    visible_rows: u16,
+    viewport_rows: u16,
+}
+
+impl ProblemsPanel {
+    pub fn new() -> Self {
+        Self {
+            groups: Vec::new(),
+            collapsed: HashSet::new(),
+            scroll: 0,
+            filter: ProblemFilter::All,
+            text_filter: String::new(),
+            group_by_file: true,
+            scope: ProblemScope::default(),
+            focus_gradient: false,
+            theme: Theme::default(),
+            focused: false,
+            hover_pointer: None,
+            last_area: Rect::default(),
+            last_scrollbar: Rect::default(),
+            fixing: None,
+            fix_glyph: "",
+            filter_rect: Rect::default(),
+            group_rect: Rect::default(),
+            rows: Vec::new(),
+            first_row_y: 0,
+            visible_rows: 0,
+            viewport_rows: 0,
+        }
+    }
+
+    /// The current grouped projection (read-only; tests and counters).
+    pub fn groups(&self) -> &[ProblemGroup] {
+        &self.groups
+    }
+
+    /// Replace the grouped diagnostics, returning whether anything changed so
+    /// the caller only forces a redraw on a real update (never once per tick).
+    /// Drops collapse state for files that no longer have diagnostics.
+    pub fn set_groups(&mut self, groups: Vec<ProblemGroup>) -> bool {
+        if self.groups == groups {
+            return false;
+        }
+        self.collapsed
+            .retain(|p| groups.iter().any(|g| &g.path == p));
+        self.groups = groups;
+        self.scroll = self.scroll.min(self.max_scroll());
+        true
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    /// Total diagnostics across all files, for the tab badge.
+    pub fn total_count(&self) -> usize {
+        self.groups.iter().map(|g| g.items.len()).sum()
+    }
+
+    /// The first diagnostic the list shows from its scroll position down,
+    /// with its file: what screen reader mode reads out for the panel
+    /// (#1295), which has no row selection of its own yet.
+    pub fn top_diagnostic(&self) -> Option<(&ProblemGroup, &ProblemItem)> {
+        self.layout()
+            .into_iter()
+            .skip(self.scroll)
+            .find_map(|row| match row {
+                RenderRow::Diag(g, i) => Some((&self.groups[g], &self.groups[g].items[i])),
+                _ => None,
+            })
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.severity_count(DiagnosticSeverity::Error)
+    }
+
+    pub fn warning_count(&self) -> usize {
+        self.severity_count(DiagnosticSeverity::Warning)
+    }
+
+    fn severity_count(&self, want: DiagnosticSeverity) -> usize {
+        self.groups
+            .iter()
+            .flat_map(|g| g.items.iter())
+            .filter(|i| i.severity == want)
+            .count()
+    }
+
+    pub fn toggle_collapse(&mut self, path: &PathBuf) {
+        if !self.collapsed.remove(path) {
+            self.collapsed.insert(path.clone());
+        }
+        // A collapse changes total row count, so a stale scroll could strand
+        // the viewport past the new end.
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    pub fn scroll_down(&mut self, n: usize) {
+        self.scroll = (self.scroll + n).min(self.max_scroll());
+    }
+
+    pub fn scroll_up(&mut self, n: usize) {
+        self.scroll = self.scroll.saturating_sub(n);
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.total_rows()
+            .saturating_sub(self.viewport_rows as usize)
+    }
+
+    /// True when `it` in `group` passes BOTH the severity cycle and the
+    /// free-text filter (case-insensitive substring of the message or the
+    /// file path, or of a related row's, which keeps the diagnostic with all
+    /// its related rows, #1523).
+    fn keeps_item(&self, group: &ProblemGroup, it: &ProblemItem) -> bool {
+        if !self.filter.keeps(it.severity) {
+            return false;
+        }
+        if self.text_filter.is_empty() {
+            return true;
+        }
+        let needle = self.text_filter.to_lowercase();
+        it.message.to_lowercase().contains(&needle)
+            || it
+                .code
+                .as_ref()
+                .is_some_and(|c| c.label(&it.source).to_lowercase().contains(&needle))
+            || group
+                .path
+                .to_string_lossy()
+                .to_lowercase()
+                .contains(&needle)
+            || it.related.iter().any(|r| {
+                r.message.to_lowercase().contains(&needle)
+                    || r.rel_path.to_lowercase().contains(&needle)
+            })
+    }
+
+    pub fn push_filter_char(&mut self, c: char) {
+        self.text_filter.push(c);
+        self.scroll = 0;
+    }
+
+    pub fn pop_filter_char(&mut self) {
+        self.text_filter.pop();
+        self.scroll = 0;
+    }
+
+    /// Clear the text filter, reporting whether there was one (so Esc can
+    /// clear first and only leave the panel when already clear).
+    pub fn clear_text_filter(&mut self) -> bool {
+        if self.text_filter.is_empty() {
+            return false;
+        }
+        self.text_filter.clear();
+        self.scroll = 0;
+        true
+    }
+
+    /// The visible groups after the active severity and free-text filters:
+    /// `(group index, indices of
+    /// its items that pass the filter)`. Groups with no passing item are
+    /// dropped so a filtered-away file shows no header. Indices are into
+    /// `self.groups`, so `hit_at` / `*_spans` need no remapping.
+    fn visible_groups(&self) -> Vec<(usize, Vec<usize>)> {
+        self.groups
+            .iter()
+            .enumerate()
+            .filter_map(|(g, group)| {
+                let items: Vec<usize> = group
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, it)| self.keeps_item(group, it))
+                    .map(|(i, _)| i)
+                    .collect();
+                (!items.is_empty()).then_some((g, items))
+            })
+            .collect()
+    }
+
+    /// The number of laid-out rows for the current filter, collapse state, and
+    /// grouping.
+    fn total_rows(&self) -> usize {
+        self.layout().len()
+    }
+
+    pub fn scroll_to_bar_y(&mut self, y: u16) -> bool {
+        let Some(metrics) = scrollbar::vertical_metrics(
+            self.last_scrollbar,
+            self.total_rows(),
+            self.viewport_rows as usize,
+            self.scroll,
+        ) else {
+            return false;
+        };
+        let target = scrollbar::scroll_for_y(metrics, y);
+        let moved = target != self.scroll;
+        self.scroll = target;
+        moved
+    }
+
+    /// Resolve a click at row `y` to a header (collapse) or diagnostic (jump).
+    pub fn hit_at(&self, y: u16) -> Option<ProblemHit> {
+        if self.visible_rows == 0 || y < self.first_row_y {
+            return None;
+        }
+        let offset = (y - self.first_row_y) as usize;
+        if offset >= self.visible_rows as usize {
+            return None;
+        }
+        match self.rows.get(self.scroll + offset)? {
+            RenderRow::Header(g) => {
+                let group = self.groups.get(*g)?;
+                Some(ProblemHit::Header(group.path.clone()))
+            }
+            RenderRow::Diag(g, i) => {
+                let group = self.groups.get(*g)?;
+                let item = group.items.get(*i)?;
+                Some(ProblemHit::Diagnostic {
+                    path: group.path.clone(),
+                    line: item.line,
+                    col: item.col,
+                    col_utf16: item.col_utf16,
+                })
+            }
+            RenderRow::Related(g, i, r) => {
+                let related = self.groups.get(*g)?.items.get(*i)?.related.get(*r)?;
+                Some(ProblemHit::Diagnostic {
+                    path: related.path.clone(),
+                    line: related.line,
+                    col: related.col,
+                    col_utf16: true,
+                })
+            }
+        }
+    }
+
+    /// The diagnostic on the row painted at `y`, with its file, for actions
+    /// that need the whole item rather than a jump target (#374).
+    pub fn diagnostic_at(&self, y: u16) -> Option<(PathBuf, ProblemItem)> {
+        if self.visible_rows == 0 || y < self.first_row_y {
+            return None;
+        }
+        let offset = (y - self.first_row_y) as usize;
+        if offset >= self.visible_rows as usize {
+            return None;
+        }
+        match self.rows.get(self.scroll + offset)? {
+            RenderRow::Header(_) => None,
+            // A related row stands for the diagnostic it explains.
+            RenderRow::Diag(g, i) | RenderRow::Related(g, i, _) => {
+                let group = self.groups.get(*g)?;
+                let item = group.items.get(*i)?;
+                Some((group.path.clone(), item.clone()))
+            }
+        }
+    }
+
+    /// The rows for the current filter, collapse state, and grouping.
+    /// Grouped: a header per visible file, then, unless it is collapsed, a
+    /// row per shown diagnostic. Flat: the diagnostic rows only. Either way
+    /// each diagnostic's related locations follow it (#1523).
+    fn layout(&self) -> Vec<RenderRow> {
+        let mut rows = Vec::new();
+        for (g, items) in self.visible_groups() {
+            if self.group_by_file {
+                rows.push(RenderRow::Header(g));
+                if self.collapsed.contains(&self.groups[g].path) {
+                    continue;
+                }
+            }
+            for i in items {
+                rows.push(RenderRow::Diag(g, i));
+                let related = self.groups[g].items[i].related.len();
+                rows.extend((0..related).map(|r| RenderRow::Related(g, i, r)));
+            }
+        }
+        rows
+    }
+
+    /// Rebuild the row list. Called at the top of `render` so `rows` always
+    /// matches what was painted.
+    fn build_rows(&mut self) {
+        self.rows = self.layout();
+    }
+
+    /// Cycle the severity filter (toolbar funnel). Resets scroll so the
+    /// viewport can't strand past a now-shorter list.
+    fn cycle_filter(&mut self) {
+        self.filter = self.filter.next();
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    /// Toggle grouping diagnostics by file (toolbar). Resets scroll.
+    fn toggle_group_by_file(&mut self) {
+        self.group_by_file = !self.group_by_file;
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    /// Handle a click at `(x, y)`. Returns true if it landed on a toolbar
+    /// button (and was consumed); false if the caller should resolve it as a
+    /// row click via [`ProblemsPanel::hit_at`].
+    pub fn click(&mut self, x: u16, y: u16) -> bool {
+        if rect_has(self.filter_rect, x, y) {
+            self.cycle_filter();
+            return true;
+        }
+        if rect_has(self.group_rect, x, y) {
+            self.toggle_group_by_file();
+            return true;
+        }
+        false
+    }
+}
+
+fn rect_has(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+impl Default for ProblemsPanel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The instruction a Fix with Navigator turn carries (#374). The ask turn's
+/// composer appends the whole numbered buffer, so this does not repeat the
+/// code: it names what was reported, by whom, and where, hands over the
+/// server's own quick fixes as hints, and bounds the edit.
+pub fn fix_prompt(item: &ProblemItem, rel_path: &str, hints: &[String]) -> String {
+    let kind = match item.severity {
+        DiagnosticSeverity::Error => "error",
+        DiagnosticSeverity::Warning => "warning",
+        DiagnosticSeverity::Information | DiagnosticSeverity::Hint => "diagnostic",
+    };
+    let source = if item.source.is_empty() {
+        String::from("a diagnostic tool")
+    } else {
+        item.source.clone()
+    };
+    let rule = item
+        .code
+        .as_ref()
+        .map(|c| format!(" (rule {})", c.value))
+        .unwrap_or_default();
+    let mut text = format!(
+        "Fix the {kind} reported by {source}{rule} at {rel_path}:{}:{}: {}",
+        item.line + 1,
+        item.col + 1,
+        item.message.trim().replace('\n', " ")
+    );
+    if !hints.is_empty() {
+        text.push_str("\nThe server offers these quick fixes; apply one if it is the right fix: ");
+        text.push_str(&hints.join("; "));
+    }
+    text.push_str(
+        "\nEdit the buffer with the smallest change that resolves the diagnostic and \
+         keeps the code's behaviour. If it cannot be fixed safely, say why in a note \
+         instead of editing.",
+    );
+    text
+}
+
+fn severity_glyph(severity: DiagnosticSeverity, theme: crate::theme::Theme) -> (char, Color) {
+    match severity {
+        DiagnosticSeverity::Error => (GLYPH_ERROR, theme.ui(COLOR_ERROR)),
+        DiagnosticSeverity::Warning => (GLYPH_WARNING, theme.ui(COLOR_WARNING)),
+        DiagnosticSeverity::Information | DiagnosticSeverity::Hint => {
+            (GLYPH_INFO, theme.ui(COLOR_INFO))
+        }
+    }
+}
+
+impl Widget for &mut ProblemsPanel {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        self.last_area = area;
+        self.last_scrollbar = Rect::default();
+        self.filter_rect = Rect::default();
+        self.group_rect = Rect::default();
+        self.visible_rows = 0;
+        self.build_rows();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        // Paint the panel background so the previous frame's terminal cells
+        // can't ghost through the gaps between rows.
+        buf.set_style(area, Style::default().bg(self.theme.editor_bg()));
+
+        if self.groups.is_empty() {
+            // Under Open Files the list is scoped, so "in the workspace" would
+            // be a lie: unopened files may well have errors. Say what was
+            // actually searched (#256).
+            let empty_msg = match self.scope {
+                ProblemScope::WholeProject => "No problems have been detected in the workspace.",
+                ProblemScope::OpenFiles => {
+                    "No problems in the open files. Switch scope to Whole Project to see the rest."
+                }
+            };
+            Paragraph::new(Line::from(Span::styled(
+                empty_msg,
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
+            )))
+            .render(
+                Rect {
+                    x: area.x + 1,
+                    y: area.y,
+                    width: area.width.saturating_sub(1),
+                    height: 1,
+                },
+                buf,
+            );
+            return;
+        }
+
+        // Reserve the top row for the toolbar (filter funnel + group toggle);
+        // the diagnostic list scrolls in the remaining rows below it.
+        let toolbar = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        };
+        self.render_toolbar(toolbar, buf);
+        let body = Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: area.width,
+            height: area.height.saturating_sub(1),
+        };
+        if body.height == 0 {
+            return;
+        }
+        if self.rows.is_empty() {
+            Paragraph::new(Line::from(Span::styled(
+                "No problems match the current filter.",
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
+            )))
+            .render(
+                Rect {
+                    x: body.x + 1,
+                    y: body.y,
+                    width: body.width.saturating_sub(1),
+                    height: 1,
+                },
+                buf,
+            );
+            return;
+        }
+
+        self.first_row_y = body.y;
+        self.viewport_rows = body.height;
+        let total = self.total_rows();
+        self.scroll = self.scroll.min(total.saturating_sub(body.height as usize));
+
+        let bar = scrollbar::vertical_metrics(
+            Rect {
+                x: body.x + body.width.saturating_sub(1),
+                y: body.y,
+                width: 1,
+                height: body.height,
+            },
+            total,
+            body.height as usize,
+            self.scroll,
+        );
+        let content_w = body.width.saturating_sub(u16::from(bar.is_some()));
+
+        let visible = (body.height as usize).min(self.rows.len().saturating_sub(self.scroll));
+        self.visible_rows = visible as u16;
+        // Croft Loch keeps a one-cell gutter, so a row's text starts on the
+        // column a terminal's text does and switching tabs doesn't jog the
+        // content sideways. The hover fill still spans the whole row.
+        let gutter = u16::from(self.theme.surfaces().is_some());
+
+        for row in 0..visible {
+            let render_row = self.rows[self.scroll + row].clone();
+            let y = body.y + row as u16;
+            let row_rect = Rect {
+                x: body.x,
+                y,
+                width: content_w,
+                height: 1,
+            };
+            if let Some(bg) =
+                crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
+            {
+                buf.set_style(row_rect, Style::default().bg(bg));
+            }
+            let spans = match render_row {
+                RenderRow::Header(g) => self.header_spans(g),
+                RenderRow::Diag(g, i) => self.diag_spans(g, i),
+                RenderRow::Related(g, i, r) => self.related_spans(g, i, r),
+            };
+            let text_rect = Rect {
+                x: row_rect.x + gutter.min(row_rect.width),
+                width: row_rect.width.saturating_sub(gutter),
+                ..row_rect
+            };
+            Paragraph::new(Line::from(spans)).render(text_rect, buf);
+        }
+
+        if let Some(metrics) = bar {
+            self.last_scrollbar = metrics.area;
+            scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+        }
+    }
+}
+
+impl ProblemsPanel {
+    /// Paint the toolbar row, right-aligned like VS Code's panel filter: a
+    /// severity-filter control (`<label> ▾`) and a grouping toggle
+    /// (`Grouped`/`Flat`). Both are plain muted text at their default state;
+    /// when off-default they get a soft translucent accent chip so a lit filter
+    /// or flat view reads at a glance. Clickable (hit rects recorded for
+    /// [`ProblemsPanel::click`]).
+    fn render_toolbar(&mut self, area: Rect, buf: &mut Buffer) {
+        let muted = self.theme.ignored_fg();
+        let accent = self.theme.accent();
+        let chip = self.theme.accent_chip_bg();
+
+        // The chip carries user-typed text, so bound what it shows: the
+        // last FILTER_CHIP_CHARS characters (the tail is what the user is
+        // typing). Unbounded, a long filter would push the toolbar's other
+        // control off the row, and a wide-glyph filter would measure short
+        // against the codebase's chars()-count convention (see
+        // `sheet::display_width`) and be clipped mid-render.
+        let shown_filter: String = {
+            let n = self.text_filter.chars().count();
+            self.text_filter
+                .chars()
+                .skip(n.saturating_sub(FILTER_CHIP_CHARS))
+                .collect()
+        };
+        let filter_label = if self.text_filter.is_empty() {
+            format!(" {} \u{25be} ", self.filter.label())
+        } else {
+            format!(
+                " {} \u{25be} \u{eb85} {} ",
+                self.filter.label(),
+                shown_filter
+            )
+        };
+        let group_label = format!(
+            " {} ",
+            if self.group_by_file {
+                "Grouped"
+            } else {
+                "Flat"
+            }
+        );
+        let fw = filter_label.chars().count() as u16;
+        let gw = group_label.chars().count() as u16;
+        // A one-cell gap between the two controls and one trailing cell of
+        // breathing room at the right edge.
+        let total = fw + 1 + gw + 1;
+
+        let mut x = area.x + area.width.saturating_sub(total.min(area.width));
+        let mut control = |label: String, active: bool, buf: &mut Buffer| -> Rect {
+            let w = (label.chars().count() as u16).min(area.right().saturating_sub(x));
+            let r = Rect {
+                x,
+                y: area.y,
+                width: w,
+                height: 1,
+            };
+            let style = if active {
+                Style::default().fg(accent).bg(chip)
+            } else {
+                Style::default().fg(muted)
+            };
+            Paragraph::new(Line::from(Span::styled(label, style))).render(r, buf);
+            x += w + 1;
+            r
+        };
+        self.filter_rect = control(
+            filter_label,
+            self.filter != ProblemFilter::All || !self.text_filter.is_empty(),
+            buf,
+        );
+        self.group_rect = control(group_label, !self.group_by_file, buf);
+    }
+
+    fn header_spans(&self, g: usize) -> Vec<Span<'static>> {
+        let group = &self.groups[g];
+        let chevron = if self.collapsed.contains(&group.path) {
+            crate::icons::CHEVRON_CLOSED
+        } else {
+            crate::icons::CHEVRON_OPEN
+        };
+        let suffix = group
+            .name
+            .rfind('.')
+            .map(|i| group.name[i..].to_string())
+            .unwrap_or_default();
+        let icon = crate::icons::for_path(&group.name, &suffix);
+        let mut spans = vec![
+            Span::styled(
+                format!("{chevron} "),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
+            ),
+            Span::styled(
+                format!("{} ", icon.glyph),
+                Style::default().fg(self.theme.ui(icon.color)),
+            ),
+            Span::styled(
+                group.name.clone(),
+                Style::default()
+                    .fg(self.theme.ui(COLOR_HEADER))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if !group.rel_dir.is_empty() {
+            spans.push(Span::styled(
+                format!(" {}", group.rel_dir),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
+            ));
+        }
+        // Count what the filter actually shows beneath this header, not the
+        // group's raw size — "Errors" over 1 error + 5 warnings reads 1.
+        let shown = group
+            .items
+            .iter()
+            .filter(|it| self.keeps_item(group, it))
+            .count();
+        spans.push(Span::styled(
+            format!("  {shown}"),
+            Style::default().fg(self.theme.ui(COLOR_DIM)),
+        ));
+        spans
+    }
+
+    fn diag_spans(&self, g: usize, i: usize) -> Vec<Span<'static>> {
+        let item = &self.groups[g].items[i];
+        let (glyph, color) = severity_glyph(item.severity, self.theme);
+        // The message can span several lines on the wire; collapse to one row.
+        let message = item.message.replace('\n', " ");
+        // A row the navigator is fixing wears the spinner in place of its
+        // severity glyph (#374): the fix is a live stream, and the row is
+        // where the user looks for it.
+        let fixing = self
+            .fixing
+            .as_ref()
+            .is_some_and(|(path, line)| *path == self.groups[g].path && *line == item.line);
+        let lead = if fixing && !self.fix_glyph.is_empty() {
+            Span::styled(
+                format!("   {} ", self.fix_glyph),
+                Style::default().fg(self.theme.ui(COLOR_INFO)),
+            )
+        } else {
+            Span::styled(format!("   {glyph} "), Style::default().fg(color))
+        };
+        let mut spans = vec![
+            lead,
+            Span::styled(message, Style::default().fg(self.theme.ui(COLOR_MSG))),
+        ];
+        let source = match &item.code {
+            Some(code) => code.label(&item.source),
+            None => item.source.clone(),
+        };
+        if !source.is_empty() {
+            spans.push(Span::styled(
+                format!(" {source} "),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
+            ));
+        }
+        spans.push(Span::styled(
+            format!("[Ln {}, Col {}]", item.line + 1, item.col + 1),
+            Style::default().fg(self.theme.ui(COLOR_DIM)),
+        ));
+        // Flat list has no file header, so name the file on the row itself.
+        if !self.group_by_file {
+            spans.push(Span::styled(
+                format!(" {}", self.groups[g].name),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
+            ));
+        }
+        spans
+    }
+
+    /// A related location's row (#1523), indented under its diagnostic's
+    /// message and read as VS Code's: `file [Ln, Col]: message`.
+    fn related_spans(&self, g: usize, i: usize, r: usize) -> Vec<Span<'static>> {
+        let related = &self.groups[g].items[i].related[r];
+        vec![
+            Span::styled(
+                format!(
+                    "{RELATED_INDENT}{} [Ln {}, Col {}]: ",
+                    related.rel_path,
+                    related.line + 1,
+                    related.col + 1
+                ),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
+            ),
+            Span::styled(
+                crate::lsp::manager::one_line(&related.message),
+                Style::default().fg(self.theme.ui(COLOR_MSG)),
+            ),
+        ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn diag(line: u32, severity: DiagnosticSeverity, msg: &str) -> ProblemItem {
+        ProblemItem {
+            line,
+            col: 0,
+            // The helper's source is a build tool, so its column is a
+            // character column.
+            col_utf16: false,
+            severity,
+            message: msg.to_string(),
+            source: "rustc".to_string(),
+            code: None,
+            related: Vec::new(),
+        }
+    }
+
+    fn group(name: &str, items: Vec<ProblemItem>) -> ProblemGroup {
+        ProblemGroup {
+            path: PathBuf::from(format!("/repo/src/{name}")),
+            name: name.to_string(),
+            rel_dir: "src".to_string(),
+            items,
+        }
+    }
+
+    fn render(p: &mut ProblemsPanel, w: u16, h: u16) -> String {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        };
+        let mut buf = Buffer::empty(area);
+        p.render(area, &mut buf);
+        let mut out = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn the_top_diagnostic_follows_the_scroll_filters_and_folds() {
+        use DiagnosticSeverity::{Error, Warning};
+        let mut p = ProblemsPanel::new();
+        assert!(p.top_diagnostic().is_none(), "no problems, no top row");
+        p.set_groups(vec![
+            group("a.rs", vec![diag(1, Warning, "w1"), diag(2, Error, "e1")]),
+            group("b.rs", vec![diag(5, Error, "e2")]),
+        ]);
+        let top = |p: &ProblemsPanel| {
+            p.top_diagnostic()
+                .map(|(g, it)| (g.name.clone(), it.message.clone()))
+        };
+        assert_eq!(top(&p), Some(("a.rs".into(), "w1".into())));
+        // Rows: a.rs header, w1, e1, b.rs header, e2. Scrolled past w1.
+        p.scroll_down(2);
+        assert_eq!(top(&p), Some(("a.rs".into(), "e1".into())));
+        // Scrolled onto b.rs's header: its first row below.
+        p.scroll_down(1);
+        assert_eq!(top(&p), Some(("b.rs".into(), "e2".into())));
+        p.scroll_up(10);
+        // Errors only: the warning is not shown, so not read.
+        p.cycle_filter();
+        assert_eq!(top(&p), Some(("a.rs".into(), "e1".into())));
+        p.cycle_filter();
+        p.cycle_filter();
+        // A folded file's rows are not shown, so not read.
+        p.toggle_collapse(&PathBuf::from("/repo/src/a.rs"));
+        assert_eq!(top(&p), Some(("b.rs".into(), "e2".into())));
+    }
+
+    /// Review round 1: the toolbar chip carries user text, so a long or
+    /// wide-glyph filter must not push the group toggle off the row or
+    /// overflow the panel. The chip shows a bounded tail and both
+    /// controls still render inside the area.
+    #[test]
+    fn a_long_or_wide_filter_keeps_the_toolbar_inside_the_panel() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group(
+            "a.rs",
+            vec![diag(0, DiagnosticSeverity::Error, "boom")],
+        )]);
+        for c in "\u{5e83}\u{3044}\u{6587}\u{5b57}".repeat(20).chars() {
+            p.push_filter_char(c);
+        }
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        // Every painted cell stays inside the buffer (a render that ran
+        // past `area` would have panicked above), and the severity label
+        // is still visible on the toolbar row beside the bounded filter.
+        let row: String = (0..area.width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(
+            row.contains("All"),
+            "the severity control must survive a long filter, got {row:?}"
+        );
+        assert!(
+            p.text_filter.chars().count() > FILTER_CHIP_CHARS,
+            "the filter itself stays unbounded; only its display is capped"
+        );
+    }
+
+    /// Issue #212: the free-text filter narrows by message AND path
+    /// substring, case-insensitively, composing with the severity cycle.
+    #[test]
+    fn text_filter_narrows_by_message_and_path() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![
+            group(
+                "alpha.rs",
+                vec![
+                    diag(0, DiagnosticSeverity::Error, "Mismatched types"),
+                    diag(1, DiagnosticSeverity::Warning, "unused variable"),
+                ],
+            ),
+            group("beta.rs", vec![diag(0, DiagnosticSeverity::Error, "boom")]),
+        ]);
+        assert_eq!(p.total_rows(), 5, "2 headers + 3 diagnostics");
+        // Message substring, case-insensitive.
+        for c in "MISMATCH".chars() {
+            p.push_filter_char(c.to_ascii_lowercase());
+        }
+        assert_eq!(p.total_rows(), 2, "one header + the one matching row");
+        // Backspace back to empty restores everything.
+        while !p.text_filter.is_empty() {
+            p.pop_filter_char();
+        }
+        assert_eq!(p.total_rows(), 5);
+        // Path substring: "beta" keeps the beta.rs group only.
+        for c in "beta".chars() {
+            p.push_filter_char(c);
+        }
+        assert_eq!(p.total_rows(), 2);
+        // Composes with the severity cycle. Narrow the text to alpha's
+        // WARNING, then cycle to Errors-only: nothing survives both.
+        // (`Warnings` here means "Errors & Warnings", so Errors is the
+        // filter that actually excludes a warning.)
+        while !p.text_filter.is_empty() {
+            p.pop_filter_char();
+        }
+        for c in "unused".chars() {
+            p.push_filter_char(c);
+        }
+        assert_eq!(p.total_rows(), 2, "the warning matches on its own");
+        while p.filter != ProblemFilter::Errors {
+            p.cycle_filter();
+        }
+        assert_eq!(p.total_rows(), 0, "text and severity filters compose");
+        assert!(p.clear_text_filter(), "clearing reports it had text");
+        assert!(!p.clear_text_filter(), "second clear is a no-op");
+    }
+
+    /// #1540: the rule label a row shows is matched by the text filter.
+    #[test]
+    fn text_filter_matches_the_displayed_rule_code() {
+        let mut coded = diag(0, DiagnosticSeverity::Warning, "`os` imported but unused");
+        coded.code = Some(crate::lsp::manager::DiagnosticCode {
+            value: String::from("F401"),
+            source: Some(String::from("Ruff")),
+            href: None,
+        });
+        let plain = diag(1, DiagnosticSeverity::Warning, "unused variable");
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group("app.py", vec![coded, plain])]);
+        for c in "f401".chars() {
+            p.push_filter_char(c);
+        }
+        assert_eq!(p.total_rows(), 2, "one header + the coded row");
+        p.clear_text_filter();
+        for c in "ruff(".chars() {
+            p.push_filter_char(c);
+        }
+        assert_eq!(p.total_rows(), 2, "the source(code) label matches");
+        p.clear_text_filter();
+        // Negative: the server name the label replaced, and an uncoded
+        // row's source, are not matched.
+        for c in "rustc".chars() {
+            p.push_filter_char(c);
+        }
+        assert_eq!(p.total_rows(), 0, "no row shows `rustc`");
+    }
+
+    /// #1523: text only a related row shows, its message or its file, finds
+    /// the diagnostic, which stays listed with all its related rows.
+    #[test]
+    fn text_filter_matches_a_related_rows_message_and_file() {
+        let related = |rel_path: &str, message: &str| ProblemRelated {
+            path: PathBuf::from("/repo").join(rel_path),
+            rel_path: rel_path.to_string(),
+            line: 1,
+            col: 2,
+            message: message.to_string(),
+        };
+        let mut missing = diag(3, DiagnosticSeverity::Error, "Property 'foo' is missing");
+        missing.related = vec![
+            related("src/bar.ts", "'foo' is declared here."),
+            related("src/other.ts", "and used here."),
+        ];
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group(
+            "a.ts",
+            vec![missing, diag(9, DiagnosticSeverity::Warning, "meh")],
+        )]);
+        for c in "declared here".chars() {
+            p.push_filter_char(c);
+        }
+        assert_eq!(p.total_rows(), 4, "header, diagnostic, both related rows");
+        p.clear_text_filter();
+        for c in "other.ts".chars() {
+            p.push_filter_char(c);
+        }
+        assert_eq!(p.total_rows(), 4, "a related row's file matches too");
+    }
+
+    /// The file header's count badge must reflect the ACTIVE severity
+    /// filter: with "Errors" selected, a file with 1 error and 2 warnings
+    /// used to still show 3 over a single listed row.
+    #[test]
+    fn the_header_count_follows_the_severity_filter() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group(
+            "a.rs",
+            vec![
+                diag(0, DiagnosticSeverity::Error, "boom"),
+                diag(1, DiagnosticSeverity::Warning, "meh1"),
+                diag(2, DiagnosticSeverity::Warning, "meh2"),
+            ],
+        )]);
+        while p.filter != ProblemFilter::Errors {
+            p.cycle_filter();
+        }
+        let text: String = p
+            .header_spans(0)
+            .iter()
+            .map(|s| s.content.clone())
+            .collect();
+        assert!(
+            text.ends_with(" 1"),
+            "the badge must count only diagnostics passing the filter, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn counts_aggregate_across_files() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![
+            group(
+                "a.rs",
+                vec![
+                    diag(0, DiagnosticSeverity::Error, "boom"),
+                    diag(1, DiagnosticSeverity::Warning, "meh"),
+                ],
+            ),
+            group("b.rs", vec![diag(2, DiagnosticSeverity::Error, "kaboom")]),
+        ]);
+        assert_eq!(p.total_count(), 3);
+        assert_eq!(p.error_count(), 2);
+        assert_eq!(p.warning_count(), 1);
+    }
+
+    #[test]
+    fn header_then_diag_rows_map_to_hits() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group(
+            "a.rs",
+            vec![
+                diag(4, DiagnosticSeverity::Error, "boom"),
+                diag(9, DiagnosticSeverity::Warning, "meh"),
+            ],
+        )]);
+        render(&mut p, 60, 6);
+        // Row 0 is the toolbar; the file header and diagnostics start at row 1.
+        assert_eq!(p.hit_at(0), None, "row 0 is the toolbar, not a list row");
+        assert_eq!(
+            p.hit_at(1),
+            Some(ProblemHit::Header(PathBuf::from("/repo/src/a.rs"))),
+            "row 1 is the file header",
+        );
+        assert_eq!(
+            p.hit_at(2),
+            Some(ProblemHit::Diagnostic {
+                path: PathBuf::from("/repo/src/a.rs"),
+                line: 4,
+                col: 0,
+                col_utf16: false,
+            }),
+        );
+        assert_eq!(
+            p.hit_at(3),
+            Some(ProblemHit::Diagnostic {
+                path: PathBuf::from("/repo/src/a.rs"),
+                line: 9,
+                col: 0,
+                col_utf16: false,
+            }),
+        );
+        assert_eq!(p.hit_at(4), None, "below the last row");
+    }
+
+    /// #288: the list mixes language-server diagnostics (UTF-16 columns) with
+    /// build-tool diagnostics (character columns), so the unit has to reach the
+    /// jump. If the hit dropped it, every build diagnostic on a line with an
+    /// astral character would be converted a second time and land left of its
+    /// real column.
+    #[test]
+    fn hit_carries_the_column_unit_of_each_source() {
+        let mut lsp_item = diag(4, DiagnosticSeverity::Error, "from a server");
+        lsp_item.col = 7;
+        lsp_item.col_utf16 = true;
+        let mut build_item = diag(9, DiagnosticSeverity::Error, "from cargo");
+        build_item.col = 7;
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group("a.rs", vec![lsp_item, build_item])]);
+        render(&mut p, 60, 6);
+        let utf16_of = |hit| match hit {
+            Some(ProblemHit::Diagnostic { col_utf16, .. }) => Some(col_utf16),
+            _ => None,
+        };
+        assert_eq!(
+            utf16_of(p.hit_at(2)),
+            Some(true),
+            "the server's diagnostic keeps its UTF-16 column"
+        );
+        assert_eq!(
+            utf16_of(p.hit_at(3)),
+            Some(false),
+            "the build tool's identical column is NOT UTF-16"
+        );
+    }
+
+    /// #1523: a diagnostic's related locations are indented rows under it,
+    /// in the flat list too, counted for scrolling, and a click on one jumps
+    /// to its own place, its column in UTF-16 like any server position.
+    #[test]
+    fn related_locations_are_rows_under_their_diagnostic_that_jump_there() {
+        let mut borrow = diag(3, DiagnosticSeverity::Error, "cannot borrow `v`");
+        borrow.related = vec![ProblemRelated {
+            path: PathBuf::from("/repo/src/lib.rs"),
+            rel_path: String::from("src/lib.rs"),
+            line: 2,
+            col: 17,
+            message: String::from("immutable borrow\r\noccurs here"),
+        }];
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group(
+            "a.rs",
+            vec![borrow, diag(9, DiagnosticSeverity::Warning, "meh")],
+        )]);
+        let row = |screen: &str, n| screen.lines().nth(n).unwrap_or_default().to_string();
+        let screen = render(&mut p, 80, 6);
+        assert!(row(&screen, 2).contains("cannot borrow `v`"), "{screen}");
+        // The default theme (Croft Loch) sets every row one gutter cell in.
+        assert!(
+            row(&screen, 3).starts_with(&format!(
+                " {RELATED_INDENT}src/lib.rs [Ln 3, Col 18]: immutable borrow occurs here"
+            )),
+            "{screen}"
+        );
+        assert!(
+            row(&screen, 4).contains("meh"),
+            "the next diagnostic follows"
+        );
+        assert_eq!(
+            p.hit_at(3),
+            Some(ProblemHit::Diagnostic {
+                path: PathBuf::from("/repo/src/lib.rs"),
+                line: 2,
+                col: 17,
+                col_utf16: true,
+            })
+        );
+        // Three list rows show four: the scroll reaches the last one.
+        render(&mut p, 80, 4);
+        p.scroll_down(10);
+        assert!(row(&render(&mut p, 80, 4), 3).contains("meh"));
+        p.toggle_group_by_file();
+        assert!(row(&render(&mut p, 80, 6), 2).contains("src/lib.rs [Ln 3"));
+    }
+
+    /// Croft Loch keeps a one-cell gutter left of every row, so the list's
+    /// text starts on the same column as a terminal's; a boxed theme's rows
+    /// stay flush, as they always were.
+    #[test]
+    fn croft_loch_rows_keep_a_one_cell_gutter_and_black_stays_flush() {
+        let rows = |theme: crate::theme::Theme| {
+            let mut p = ProblemsPanel::new();
+            p.theme = theme;
+            p.set_groups(vec![group(
+                "a.rs",
+                vec![diag(3, DiagnosticSeverity::Error, "boom")],
+            )]);
+            render(&mut p, 60, 4)
+                .lines()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        };
+        let loch = rows(crate::theme::Theme::LOCH);
+        let black = rows(crate::theme::Theme::BLACK);
+        assert!(loch[1].starts_with(' '), "{loch:?}");
+        assert_eq!(loch[1][1..].trim_end(), black[1].trim_end(), "header row");
+        assert_eq!(
+            loch[2][1..].trim_end(),
+            black[2].trim_end(),
+            "diagnostic row"
+        );
+        assert!(!black[1].starts_with(' '), "{black:?}");
+    }
+
+    /// #1540: a row shows its rule as `source(code)`, with the diagnostic's
+    /// own source when it named one and the server's otherwise.
+    #[test]
+    fn a_row_shows_the_rule_code_after_the_message() {
+        let code = |source: Option<&str>| crate::lsp::manager::DiagnosticCode {
+            value: String::from("F401"),
+            source: source.map(String::from),
+            href: Some(String::from(
+                "https://docs.astral.sh/ruff/rules/unused-import",
+            )),
+        };
+        let mut named = diag(0, DiagnosticSeverity::Warning, "`os` imported but unused");
+        named.source = String::from("ruff");
+        named.code = Some(code(Some("Ruff")));
+        let mut unnamed = diag(1, DiagnosticSeverity::Error, "bad argument");
+        unnamed.source = String::from("ty");
+        unnamed.code = Some(crate::lsp::manager::DiagnosticCode {
+            value: String::from("invalid-argument-type"),
+            source: None,
+            href: None,
+        });
+        let plain = diag(2, DiagnosticSeverity::Error, "no code here");
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group("app.py", vec![named, unnamed, plain])]);
+        let screen = render(&mut p, 120, 8);
+        assert!(
+            screen.contains("`os` imported but unused Ruff(F401) [Ln 1"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("bad argument ty(invalid-argument-type) [Ln 2"),
+            "{screen}"
+        );
+        // Negative: without a code the row is as before.
+        assert!(screen.contains("no code here rustc [Ln 3"), "{screen}");
+        assert!(!screen.contains("rustc("), "{screen}");
+    }
+
+    /// #1540: Fix with Navigator names the rule too.
+    #[test]
+    fn the_fix_prompt_names_the_rule() {
+        let mut item = diag(0, DiagnosticSeverity::Warning, "`os` imported but unused");
+        item.source = String::from("ruff");
+        assert!(!fix_prompt(&item, "app.py", &[]).contains("rule"));
+        item.code = Some(crate::lsp::manager::DiagnosticCode {
+            value: String::from("F401"),
+            source: Some(String::from("Ruff")),
+            href: None,
+        });
+        assert!(
+            fix_prompt(&item, "app.py", &[])
+                .starts_with("Fix the warning reported by ruff (rule F401) at app.py:1:1")
+        );
+    }
+
+    #[test]
+    fn collapse_hides_diagnostic_rows() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group(
+            "a.rs",
+            vec![diag(0, DiagnosticSeverity::Error, "boom")],
+        )]);
+        let path = PathBuf::from("/repo/src/a.rs");
+        render(&mut p, 60, 6);
+        assert_eq!(p.total_rows(), 2, "header + one diagnostic");
+        p.toggle_collapse(&path);
+        render(&mut p, 60, 6);
+        assert_eq!(p.total_rows(), 1, "collapsed: header only");
+        // Row 0 is the toolbar; the header sits at row 1 and has no diag below.
+        assert_eq!(p.hit_at(2), None, "no diagnostic row when collapsed");
+        assert_eq!(p.hit_at(1), Some(ProblemHit::Header(path)));
+    }
+
+    /// #256: with the list scoped to open files, an empty panel must not
+    /// claim the WORKSPACE is clean — unopened files may well have errors,
+    /// and that message would send the reader away believing there is
+    /// nothing to fix.
+    #[test]
+    fn the_empty_state_names_the_scope_it_actually_searched() {
+        let mut p = ProblemsPanel::new();
+        p.scope = ProblemScope::OpenFiles;
+        let text = render(&mut p, 90, 6);
+        assert!(
+            text.contains("open files"),
+            "scoped empty state must say so: {text:?}"
+        );
+        assert!(
+            !text.contains("in the workspace"),
+            "and must not claim the workspace is clean: {text:?}"
+        );
+        p.scope = ProblemScope::WholeProject;
+        let text = render(&mut p, 90, 6);
+        assert!(text.contains("workspace"), "unscoped keeps its wording");
+    }
+
+    #[test]
+    fn empty_shows_no_problems_message() {
+        let mut p = ProblemsPanel::new();
+        let text = render(&mut p, 60, 3);
+        assert!(text.contains("No problems"), "empty state: {text:?}");
+    }
+
+    #[test]
+    fn severity_glyphs_are_the_verified_codicons() {
+        assert_eq!(
+            severity_glyph(DiagnosticSeverity::Error, crate::theme::Theme::default()).0,
+            '\u{ea87}'
+        );
+        assert_eq!(
+            severity_glyph(DiagnosticSeverity::Warning, crate::theme::Theme::default()).0,
+            '\u{ea6c}'
+        );
+        assert_eq!(
+            severity_glyph(
+                DiagnosticSeverity::Information,
+                crate::theme::Theme::default()
+            )
+            .0,
+            '\u{ea74}'
+        );
+        assert_eq!(
+            severity_glyph(DiagnosticSeverity::Hint, crate::theme::Theme::default()).0,
+            '\u{ea74}'
+        );
+    }
+
+    #[test]
+    fn severity_filter_hides_lower_severities_and_empty_groups() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![
+            group(
+                "a.rs",
+                vec![
+                    diag(0, DiagnosticSeverity::Error, "boom"),
+                    diag(1, DiagnosticSeverity::Warning, "meh"),
+                ],
+            ),
+            group(
+                "b.rs",
+                vec![diag(2, DiagnosticSeverity::Warning, "only warn")],
+            ),
+        ]);
+        // All: 2 headers + 3 diags = 5 rows.
+        assert_eq!(p.total_rows(), 5);
+        // Errors only: b.rs has no error, so it drops entirely; a.rs keeps its
+        // one error. 1 header + 1 diag = 2 rows.
+        p.cycle_filter();
+        assert_eq!(p.filter, ProblemFilter::Errors);
+        assert_eq!(p.total_rows(), 2);
+        // Tab badge counts stay unfiltered.
+        assert_eq!(p.total_count(), 3);
+        assert_eq!(p.error_count(), 1);
+    }
+
+    #[test]
+    fn group_by_file_toggle_flattens_to_diagnostics_only() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![
+            group("a.rs", vec![diag(0, DiagnosticSeverity::Error, "boom")]),
+            group("b.rs", vec![diag(2, DiagnosticSeverity::Error, "kaboom")]),
+        ]);
+        // Grouped: 2 headers + 2 diags.
+        assert_eq!(p.total_rows(), 4);
+        p.toggle_group_by_file();
+        assert!(!p.group_by_file);
+        // Flat: 2 diags, no headers.
+        assert_eq!(p.total_rows(), 2);
+        render(&mut p, 80, 6);
+        // Row 1 (below the toolbar) is a diagnostic, not a header.
+        assert!(matches!(p.hit_at(1), Some(ProblemHit::Diagnostic { .. })));
+    }
+
+    #[test]
+    fn active_toolbar_control_gets_the_accent_chip_default_is_plain() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group(
+            "a.rs",
+            vec![diag(0, DiagnosticSeverity::Error, "boom")],
+        )]);
+        // Default: filter All, grouped — neither control is chipped.
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(area);
+        p.render(area, &mut buf);
+        let chip = p.theme.accent_chip_bg();
+        let cell_bg = |b: &Buffer, r: Rect| b[(r.x, r.y)].style().bg;
+        assert_ne!(
+            cell_bg(&buf, p.filter_rect),
+            Some(chip),
+            "All filter is plain, no chip",
+        );
+
+        // Turn the filter off-default: it lights up with the accent chip.
+        p.cycle_filter();
+        let mut buf = Buffer::empty(area);
+        p.render(area, &mut buf);
+        assert_eq!(
+            cell_bg(&buf, p.filter_rect),
+            Some(chip),
+            "a non-default filter is chipped with the theme accent",
+        );
+        assert_ne!(
+            cell_bg(&buf, p.group_rect),
+            Some(chip),
+            "grouping is still default, so its control stays plain",
+        );
+    }
+
+    #[test]
+    fn toolbar_click_cycles_filter_then_toggles_grouping() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group(
+            "a.rs",
+            vec![diag(0, DiagnosticSeverity::Error, "boom")],
+        )]);
+        render(&mut p, 80, 6);
+        let fr = p.filter_rect;
+        assert!(fr.width > 0, "filter button rect recorded");
+        assert!(p.click(fr.x, fr.y), "filter button consumes the click");
+        assert_eq!(p.filter, ProblemFilter::Errors);
+        let gr = p.group_rect;
+        assert!(p.click(gr.x, gr.y), "group button consumes the click");
+        assert!(!p.group_by_file);
+        // A click in the empty body is not consumed by the toolbar.
+        assert!(!p.click(0, 5));
+    }
+
+    #[test]
+    fn diag_row_shows_message_and_one_based_position() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group(
+            "a.rs",
+            vec![diag(
+                4,
+                DiagnosticSeverity::Error,
+                "function `run` is never used",
+            )],
+        )]);
+        let text = render(&mut p, 80, 4);
+        assert!(text.contains("function `run` is never used"), "{text:?}");
+        assert!(text.contains("Ln 5"), "one-based line: {text:?}");
+    }
+
+    /// #374: the fix instruction names the diagnostic precisely and carries
+    /// the server's quick fixes as hints; it never repeats the buffer, which
+    /// the turn composer appends itself.
+    #[test]
+    fn fix_prompt_names_the_diagnostic_and_carries_the_servers_hints() {
+        let mut item = diag(
+            6,
+            DiagnosticSeverity::Error,
+            "unused import: `std::io`\nremove it",
+        );
+        item.col = 4;
+        let text = fix_prompt(&item, "src/lib.rs", &[]);
+        assert!(
+            text.starts_with("Fix the error reported by rustc at src/lib.rs:7:5: unused import")
+        );
+        assert!(
+            text.contains("unused import: `std::io` remove it"),
+            "a multi-line message collapses to one line: {text}"
+        );
+        assert!(!text.contains("quick fixes"), "no hints, no hint line");
+        assert!(text.contains("smallest change"));
+
+        let hinted = fix_prompt(
+            &item,
+            "src/lib.rs",
+            &[
+                String::from("Remove unused import"),
+                String::from("Fix all"),
+            ],
+        );
+        assert!(hinted.contains("quick fixes"));
+        assert!(hinted.contains("Remove unused import; Fix all"));
+
+        item.source.clear();
+        item.severity = DiagnosticSeverity::Hint;
+        let anon = fix_prompt(&item, "a.py", &[]);
+        assert!(anon.starts_with("Fix the diagnostic reported by a diagnostic tool at a.py:7:5"));
+    }
+
+    /// #374: the row being fixed wears the spinner instead of its severity
+    /// glyph, and only that row.
+    #[test]
+    fn the_row_being_fixed_wears_the_spinner() {
+        let mut p = ProblemsPanel::new();
+        let path = PathBuf::from("/w/src/a.rs");
+        p.set_groups(vec![ProblemGroup {
+            path: path.clone(),
+            name: "a.rs".into(),
+            rel_dir: "src".into(),
+            items: vec![
+                diag(3, DiagnosticSeverity::Error, "first"),
+                diag(9, DiagnosticSeverity::Error, "second"),
+            ],
+        }]);
+        let before = render(&mut p, 60, 6);
+        assert!(
+            !before.contains('\u{25DC}'),
+            "no spinner while nothing is being fixed"
+        );
+
+        p.fixing = Some((path.clone(), 9));
+        p.fix_glyph = "\u{25DC}";
+        let out = render(&mut p, 60, 6);
+        let rows: Vec<&str> = out.lines().collect();
+        let first = rows.iter().find(|r| r.contains("first")).unwrap();
+        let second = rows.iter().find(|r| r.contains("second")).unwrap();
+        assert!(
+            !first.contains('\u{25DC}'),
+            "the other row keeps its glyph: {first}"
+        );
+        assert!(
+            second.contains('\u{25DC}'),
+            "the fixing row shows the spinner: {second}"
+        );
+        assert!(
+            !second.contains(GLYPH_ERROR),
+            "in place of its severity glyph: {second}"
+        );
+
+        assert_eq!(
+            p.diagnostic_at(2).map(|(pth, item)| (pth, item.line)),
+            Some((path, 3)),
+            "the row under the pointer resolves to its whole diagnostic"
+        );
+    }
+}

@@ -1,0 +1,3717 @@
+use std::path::{Path, PathBuf};
+
+use crate::widgets::editor_find::line_matches;
+use crate::widgets::search::SearchOpts;
+
+/// Max selected-text length that still drives occurrence highlighting,
+/// matching VS Code's default `editor.selectionHighlightMaxLength`. Kept in
+/// sync with the plain editor's constant of the same purpose.
+const SELECTION_HIGHLIGHT_MAX_LEN: usize = 200;
+
+/// How the diff view treats whitespace-only differences (VS Code's
+/// `diffEditor.ignoreTrimWhitespace`, made explicit with two levels).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DiffWhitespace {
+    /// Every byte counts; the diff is exactly what git reports.
+    #[default]
+    Off,
+    /// Ignore indentation: lines that differ only in their leading
+    /// whitespace read as unchanged. The common case — a block wrapped in
+    /// an `if`, or a function extracted and re-indented.
+    Leading,
+    /// Ignore all whitespace: leading, trailing, and internal runs.
+    All,
+}
+
+impl DiffWhitespace {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Leading => "leading",
+            Self::All => "all",
+        }
+    }
+
+    /// Cycle for the header toggle and the palette command.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Leading,
+            Self::Leading => Self::All,
+            Self::All => Self::Off,
+        }
+    }
+
+    pub fn from_config(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "leading" => Self::Leading,
+            "all" => Self::All,
+            _ => Self::Off,
+        }
+    }
+
+    /// The comparison key for one line under this mode. Two lines are
+    /// "the same" to the differ exactly when their keys match.
+    fn key(self, line: &str) -> String {
+        match self {
+            // `Off` never reaches here (no normalised pass is run), but map
+            // it to identity so the function is total.
+            Self::Off => line.to_string(),
+            Self::Leading => line.trim_start().to_string(),
+            // Collapse every whitespace run to a single space and trim the
+            // ends, so `a  +  b` and `a+b` compare equal while `ab` does not
+            // collapse into `a b`.
+            Self::All => line.split_whitespace().collect::<Vec<_>>().join(" "),
+        }
+    }
+}
+
+/// Where a diff view's two sides come from, recorded at open so the view can
+/// be rebuilt when either side moves (#471): an agent or a save rewrites the
+/// working file, a commit moves HEAD, the index changes under a staged view.
+/// `App::refresh_open_diff_views` reads this; the openers set it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiffSource {
+    /// Nothing to re-read (a deletion tombstone, a one-off text diff).
+    Static,
+    /// Source Control's HEAD-vs-working-tree view: the left side is
+    /// `git show HEAD:<rel>` in `root`, the right side is `right_path` on
+    /// disk. Both can move.
+    HeadVsWorking { root: PathBuf, rel: String },
+    /// A fixed left text (a TIMELINE local snapshot) against `right_path` on
+    /// disk. Only the right side can move.
+    FixedLeft { left_text: String },
+    /// Two real files (`left_path`, `right_path`), both re-read from disk.
+    TwoFiles,
+    /// A raw `git diff` re-run in `root`; the whole view is rebuilt from
+    /// the command's output.
+    GitCommand { root: PathBuf, kind: GitDiffKind },
+}
+
+/// Which `git diff` a [`DiffSource::GitCommand`] view shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitDiffKind {
+    Staged,
+    AgainstBranch(String),
+    PreviousCommit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffData {
+    pub left_path: PathBuf,
+    pub right_path: PathBuf,
+    /// True only when `left_path` is a real file on disk (a two-file
+    /// `open_diff`), so Enter on a `Removed` row can open it at that line.
+    /// False for synthetic-left diffs (the HEAD-vs-working view, where the
+    /// left side is a `"foo (HEAD)"` label) so a `Removed` row falls back to
+    /// the real working file on the right instead of a path that ENOENTs.
+    pub left_is_real_file: bool,
+    pub left_lines: Vec<String>,
+    pub right_lines: Vec<String>,
+    /// The REAL diff: rows computed from the untouched line text. This is the
+    /// single source of truth for staging — `hunk_range_at` and `hunk_patch`
+    /// read it and nothing else, so what reaches the index never depends on
+    /// how the view is currently classified. See [`Self::display_rows`].
+    pub rows: Vec<DiffRow>,
+    /// How the view classifies whitespace-only differences. Affects rendering
+    /// and hunk *navigation* only; never staging.
+    pub ws_mode: DiffWhitespace,
+    /// Rows recomputed over whitespace-normalised text, present only when
+    /// `ws_mode` is not `Off`. A line that differs from its counterpart only
+    /// under the active normalisation classifies `Equal` here and paints as
+    /// unchanged, while `rows` still records the real change.
+    ///
+    /// Deliberately a SEPARATE field rather than an in-place reclassification:
+    /// `hunk_patch` emits an `Equal` row as a context line taken from the LEFT
+    /// side, so folding a real change into `Equal` in the staging input would
+    /// emit HEAD's bytes as context for a line the working tree spells
+    /// differently — a patch `git apply` rejects or, worse, misapplies.
+    display_rows: Option<Vec<DiffRow>>,
+    /// Top-most row index visible in the viewport. Mirrors `Editor.scroll_y`
+    /// for non-diff tabs.
+    pub scroll: usize,
+    /// Number of leading characters to skip on each rendered row so the
+    /// user can pan horizontally past long lines. Same value applies to
+    /// both columns so the side-by-side rows stay aligned.
+    pub scroll_x: usize,
+    /// True when the raw byte contents differ but `build_diff_rows`
+    /// produced zero non-Equal rows — meaning the difference is invisible
+    /// at the line level (trailing newline, CRLF↔LF, BOM, or whitespace
+    /// the `.lines()` splitter normalises). Surfaces in the diff header
+    /// so the user understands why no red/green bands are painted even
+    /// though git reports the file as modified.
+    pub bytes_differ_but_lines_equal: bool,
+    /// True when the line diff ran out of [`DIFF_DEADLINE`] (#1152): the
+    /// rows are exact but coarser than the smallest diff, and the header
+    /// says so, as VS Code does when it stops a diff early.
+    pub coarse: bool,
+    /// True when the diff should render as a single-column unified view
+    /// instead of the two-column side-by-side. Set by
+    /// `build_unified_deletion` so a tombstone for a file the source-
+    /// control panel reports as deleted can show every removed line with
+    /// a `-` sign and a red band — visually identical to `git diff` for a
+    /// removed file.
+    pub unified: bool,
+    /// Active drag-select on one of the two columns. None when no
+    /// selection is in flight; anchor==head is a zero-area selection
+    /// (just a click). Side stays fixed for the lifetime of the
+    /// selection so dragging across the seam doesn't flip sides
+    /// mid-stream.
+    pub selection: Option<DiffSelection>,
+    /// Inline-find state for the diff view. Holds the active needle, its
+    /// search options, and the currently-selected match so the renderer
+    /// can light up every occurrence and paint the active one in a
+    /// stronger colour, mirroring the plain-text editor's Cmd+F highlight.
+    pub find: DiffFindState,
+    /// Row of the hunk the last `‹`/`›` (or Shift+F7 / F7) jump landed on.
+    /// Hunk-to-hunk navigation anchors on THIS, not on `scroll`, because
+    /// `render_diff` clamps `scroll` to `max_scroll` and writes it back:
+    /// once the last hunk sits in the bottom-clamped region, a
+    /// scroll-derived anchor lands below it and the forward arrow re-selects
+    /// the same hunk forever instead of wrapping. Cleared on any manual
+    /// vertical scroll so the next jump re-anchors on what the user is
+    /// actually looking at.
+    pub nav_anchor: Option<usize>,
+    /// True only for the Source Control HEAD-vs-working-tree view, the one
+    /// diff whose left side is the git blob hunk patches are verified
+    /// against. Gates stage/unstage/revert: a Timeline snapshot diff is
+    /// built by the same opener and must not reach the git index.
+    pub left_is_git_head: bool,
+    /// True when the right side is an open tab's unsaved text rather than
+    /// the file on disk (#1572). Hunk actions patch the saved file, so they
+    /// refuse this view until a save (whose disk write rebuilds it) lines the
+    /// two up again.
+    pub right_is_unsaved: bool,
+
+    /// The encoding both sides were decoded with: UTF-8 unless the file's tab
+    /// was reopened with another (#1242). Hunk patches are built from the
+    /// decoded text, so stage/unstage/revert are refused for any other.
+    pub text_encoding: &'static encoding_rs::Encoding,
+    /// Per-line CRLF flags and final-newline facts for byte-exact hunk
+    /// patches: the display lines are `str::lines()`-cleaned, which erases
+    /// both. Empty/false when raw text was not supplied (hunk actions are
+    /// gated to the builder that supplies it).
+    pub left_crlf: Vec<bool>,
+    pub right_crlf: Vec<bool>,
+    pub left_no_final_nl: bool,
+    pub right_no_final_nl: bool,
+    /// How to rebuild this view when a side changes (#471). `Static` for
+    /// builders that have nothing to re-read; the openers overwrite it.
+    pub source: DiffSource,
+    /// Who typed each line of the RIGHT side (#349), for the group-by-seat
+    /// lens: the working tree's provenance map, keyed on the same 0-based
+    /// line index `DiffRow`'s `right` carries. Empty for every diff whose
+    /// right side is not the working tree, and empty when nothing is
+    /// recorded - an added line with no seat reads as unrecorded, never as
+    /// anyone's.
+    pub seats: crate::provenance::Provenance,
+    /// Whether the group-by-seat lens is on for this view.
+    pub group_by_seat: bool,
+    /// `(mtime, len)` of each side's file when the view was last built, so
+    /// the per-tick refresh can tell "moved on disk" from a stat instead of
+    /// re-reading and re-diffing the file. `None` for a side that is not a
+    /// file (a HEAD blob, a snapshot, a git command's output).
+    pub left_stamp: Option<(std::time::SystemTime, u64)>,
+    pub right_stamp: Option<(std::time::SystemTime, u64)>,
+    /// Each side's syntax colours (#2020), worked out on a worker thread the
+    /// first time the view is painted. See [`Self::colour_syntax`].
+    pub syntax: crate::widgets::diff_syntax::DiffSyntax,
+}
+
+/// A single occurrence of the find needle inside a diff, located by the
+/// visual row index (into `rows`), the column it lives in, and the
+/// character span it covers. `col_chars`/`len_chars` are character
+/// offsets into that side's source line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiffMatch {
+    pub row: usize,
+    pub side: DiffSide,
+    pub col_chars: usize,
+    pub len_chars: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiffFindState {
+    pub needle: Option<String>,
+    pub opts: SearchOpts,
+    pub active: Option<DiffMatch>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffSide {
+    Left,
+    Right,
+}
+
+/// The file and one-based line a diff row points at, used by Enter in the
+/// diff view to open the underlying file at the right place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffJump {
+    pub path: PathBuf,
+    pub line: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiffSelection {
+    pub side: DiffSide,
+    pub anchor_row: usize,
+    pub anchor_col: usize,
+    pub head_row: usize,
+    pub head_col: usize,
+}
+
+impl DiffSelection {
+    pub fn has_area(&self) -> bool {
+        !(self.anchor_row == self.head_row && self.anchor_col == self.head_col)
+    }
+
+    pub fn normalized(&self) -> ((usize, usize), (usize, usize)) {
+        let a = (self.anchor_row, self.anchor_col);
+        let h = (self.head_row, self.head_col);
+        if a <= h { (a, h) } else { (h, a) }
+    }
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Background of the changed characters within a removed line (#1351),
+/// stronger than the line's own tint, as VS Code's
+/// `diffEditor.removedTextBackground`.
+pub const INTRALINE_REMOVED_BG: (u8, u8, u8) = (0x8c, 0x2f, 0x2f);
+/// Background of the changed characters within an added line (#1351), as
+/// VS Code's `diffEditor.insertedTextBackground`.
+pub const INTRALINE_ADDED_BG: (u8, u8, u8) = (0x2f, 0x7a, 0x45);
+
+/// The changed characters of a replaced line against its new version
+/// (#1351), as `(start, end)` char ranges for the old and the new line:
+/// what is left once the common prefix and suffix are trimmed, which marks
+/// the usual edit (a value, a name, an inserted argument) exactly. `None`
+/// when the lines are equal, or share under 30% of the longer one, so a
+/// rewritten line keeps its plain tint rather than turning into confetti.
+pub fn changed_char_ranges(old: &str, new: &str) -> Option<((usize, usize), (usize, usize))> {
+    let a: Vec<char> = old.chars().collect();
+    let b: Vec<char> = new.chars().collect();
+    if a == b {
+        return None;
+    }
+    let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let suffix = a[prefix..]
+        .iter()
+        .rev()
+        .zip(b[prefix..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let longer = a.len().max(b.len());
+    if (prefix + suffix) * 10 < longer * 3 {
+        return None;
+    }
+    Some(((prefix, a.len() - suffix), (prefix, b.len() - suffix)))
+}
+
+/// One visual row in a side-by-side diff view. The left column shows
+/// `left_lines[left]` (or blank when `Added`) and the right column shows
+/// `right_lines[right]` (or blank when `Removed`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffRow {
+    Equal {
+        left: usize,
+        right: usize,
+    },
+    Removed {
+        left: usize,
+    },
+    Added {
+        right: usize,
+    },
+    /// A line that was replaced: both columns paint, left in `left_lines`
+    /// and right in `right_lines`. Produced by pairing consecutive
+    /// Delete + Insert hunks so the visual rows align without forcing a
+    /// pure-add or pure-remove zigzag.
+    Replaced {
+        left: usize,
+        right: usize,
+    },
+}
+
+impl DiffData {
+    pub fn build(
+        left_path: PathBuf,
+        right_path: PathBuf,
+        left_lines: Vec<String>,
+        right_lines: Vec<String>,
+    ) -> Self {
+        Self::build_with_byte_check(left_path, right_path, left_lines, right_lines, None, None)
+    }
+
+    /// Like `build`, but also takes the raw byte contents so the
+    /// constructor can detect the "byte-different but line-identical"
+    /// case (trailing newline, CRLF, BOM, etc.) and set
+    /// `bytes_differ_but_lines_equal` accordingly. Pass `None` for the
+    /// raw texts when the caller doesn't have them (synthetic / test
+    /// diffs); the flag stays false and the renderer behaves as before.
+    pub fn build_with_byte_check(
+        left_path: PathBuf,
+        right_path: PathBuf,
+        left_lines: Vec<String>,
+        right_lines: Vec<String>,
+        left_raw: Option<&str>,
+        right_raw: Option<&str>,
+    ) -> Self {
+        let (mut rows, coarse) = build_diff_rows_within(&left_lines, &right_lines, DIFF_DEADLINE);
+        // `str::lines()` (the display split) strips `\r` and forgets whether
+        // the file ended in a newline; record both so `hunk_patch` can emit
+        // byte-exact lines and the `\ No newline at end of file` marker.
+        let side_meta = |raw: Option<&str>, lines: usize| -> (Vec<bool>, bool) {
+            match raw {
+                Some(t) => (
+                    t.split('\n')
+                        .take(lines)
+                        .map(|l| l.ends_with('\r'))
+                        .collect(),
+                    !t.is_empty() && !t.ends_with('\n'),
+                ),
+                None => (Vec::new(), false),
+            }
+        };
+        let (left_crlf, left_no_final_nl) = side_meta(left_raw, left_lines.len());
+        let (right_crlf, right_no_final_nl) = side_meta(right_raw, right_lines.len());
+        // A line that is the unterminated last line of ONE side only differs
+        // by its newline; git counts it as changed (`-x` / `\ No newline` /
+        // `+x`), and a patch carrying it as context never applies (#1232).
+        for row in &mut rows {
+            if let DiffRow::Equal { left, right } = *row {
+                let left_open = left_no_final_nl && left + 1 == left_lines.len();
+                let right_open = right_no_final_nl && right + 1 == right_lines.len();
+                if left_open != right_open {
+                    *row = DiffRow::Replaced { left, right };
+                }
+            }
+        }
+        let bytes_differ_but_lines_equal = match (left_raw, right_raw) {
+            (Some(l), Some(r)) => l != r && rows.iter().all(|r| matches!(r, DiffRow::Equal { .. })),
+            _ => false,
+        };
+        Self {
+            source: DiffSource::Static,
+            seats: crate::provenance::Provenance::new(),
+            group_by_seat: false,
+            left_stamp: None,
+            right_stamp: None,
+            left_path,
+            right_path,
+            left_is_real_file: false,
+            left_lines,
+            right_lines,
+            rows,
+            ws_mode: DiffWhitespace::Off,
+            display_rows: None,
+            scroll: 0,
+            scroll_x: 0,
+            bytes_differ_but_lines_equal,
+            coarse,
+            unified: false,
+            selection: None,
+            find: DiffFindState::default(),
+            nav_anchor: None,
+            left_is_git_head: false,
+            right_is_unsaved: false,
+
+            text_encoding: encoding_rs::UTF_8,
+            left_crlf,
+            right_crlf,
+            left_no_final_nl,
+            right_no_final_nl,
+            syntax: Default::default(),
+        }
+    }
+
+    /// Build a single-column unified diff that represents a fully-deleted
+    /// file: every line of `text` becomes a `Removed` row keyed off
+    /// `left_lines`. The right side is empty; the renderer keys off
+    /// `unified == true` to draw a one-column view instead of two.
+    pub fn build_unified_deletion(label: PathBuf, text: &str) -> Self {
+        let left_lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let rows: Vec<DiffRow> = (0..left_lines.len())
+            .map(|i| DiffRow::Removed { left: i })
+            .collect();
+        Self {
+            source: DiffSource::Static,
+            seats: crate::provenance::Provenance::new(),
+            group_by_seat: false,
+            left_stamp: None,
+            right_stamp: None,
+            left_path: label,
+            right_path: PathBuf::from("/dev/null"),
+            left_is_real_file: false,
+            left_lines,
+            right_lines: Vec::new(),
+            rows,
+            ws_mode: DiffWhitespace::Off,
+            display_rows: None,
+            scroll: 0,
+            scroll_x: 0,
+            bytes_differ_but_lines_equal: false,
+            coarse: false,
+            unified: true,
+            selection: None,
+            find: DiffFindState::default(),
+            nav_anchor: None,
+            left_is_git_head: false,
+            right_is_unsaved: false,
+
+            text_encoding: encoding_rs::UTF_8,
+            left_crlf: Vec::new(),
+            right_crlf: Vec::new(),
+            left_no_final_nl: false,
+            right_no_final_nl: false,
+            syntax: Default::default(),
+        }
+    }
+
+    /// Build a side-by-side diff from the raw stdout of `git diff` (or
+    /// `git diff --staged`, etc.) by separating the parsed text into a
+    /// left (old) and right (new) stream and emitting the same
+    /// Equal/Removed/Added/Replaced rows the two-column renderer uses
+    /// for file-vs-file diffs. The result has `unified = false` so the
+    /// editor pane renders it through the standard side-by-side path.
+    ///
+    /// Parsing rules per line of `raw`:
+    /// * `diff --git …` and `@@ … @@` → Equal row in both columns
+    ///   (acts as a visible file / hunk header).
+    /// * `index …`, `--- …`, `+++ …`, `\ No newline at end of file`
+    ///   → skipped (redundant after the `diff --git` header).
+    /// * `-xxx` → push body to `left_lines`, buffer as pending removed.
+    /// * `+xxx` → push body to `right_lines`, buffer as pending added.
+    /// * any other line (context, blank) → flush buffered runs (pairing
+    ///   removed+added into Replaced rows), then push the body to both
+    ///   sides as an Equal row.
+    ///
+    /// Empty `raw` produces a single Equal row carrying "(no changes)"
+    /// so the renderer always has something to paint.
+    pub fn build_side_by_side_from_git_text(label: PathBuf, raw: &str) -> Self {
+        let mut left_lines: Vec<String> = Vec::new();
+        let mut right_lines: Vec<String> = Vec::new();
+        let mut rows: Vec<DiffRow> = Vec::new();
+        if raw.trim().is_empty() {
+            left_lines.push(String::from("(no changes)"));
+            right_lines.push(String::from("(no changes)"));
+            rows.push(DiffRow::Equal { left: 0, right: 0 });
+            return Self {
+                source: DiffSource::Static,
+                seats: crate::provenance::Provenance::new(),
+                group_by_seat: false,
+                left_stamp: None,
+                right_stamp: None,
+                left_path: label,
+                right_path: PathBuf::new(),
+                left_is_real_file: false,
+                left_lines,
+                right_lines,
+                rows,
+                ws_mode: DiffWhitespace::Off,
+                display_rows: None,
+                scroll: 0,
+                scroll_x: 0,
+                bytes_differ_but_lines_equal: false,
+                coarse: false,
+                unified: false,
+                selection: None,
+                find: DiffFindState::default(),
+                nav_anchor: None,
+                left_is_git_head: false,
+                right_is_unsaved: false,
+
+                text_encoding: encoding_rs::UTF_8,
+                left_crlf: Vec::new(),
+                right_crlf: Vec::new(),
+                left_no_final_nl: false,
+                right_no_final_nl: false,
+                // The placeholder is not code.
+                syntax: crate::widgets::diff_syntax::DiffSyntax::with_runs(Vec::new(), Vec::new()),
+            };
+        }
+        let mut pending_remove: Vec<usize> = Vec::new();
+        let mut pending_add: Vec<usize> = Vec::new();
+        let flush = |pending_remove: &mut Vec<usize>,
+                     pending_add: &mut Vec<usize>,
+                     rows: &mut Vec<DiffRow>| {
+            let pair = pending_remove.len().min(pending_add.len());
+            for k in 0..pair {
+                rows.push(DiffRow::Replaced {
+                    left: pending_remove[k],
+                    right: pending_add[k],
+                });
+            }
+            for &left in pending_remove.iter().skip(pair) {
+                rows.push(DiffRow::Removed { left });
+            }
+            for &right in pending_add.iter().skip(pair) {
+                rows.push(DiffRow::Added { right });
+            }
+            pending_remove.clear();
+            pending_add.clear();
+        };
+        // `---` / `+++` / `index` are file headers only before a file's
+        // first hunk. Inside one, `--- x` is a removed `-- x` (an SQL, Lua
+        // or Haskell comment) and must be shown, not skipped as noise.
+        let mut in_header = true;
+        // The language of the file whose hunks follow (#2020), and each
+        // side's line's language: `None` for a header, a commit message or
+        // a file with no grammar, so each hunk is coloured on its own.
+        let mut lang: Option<crate::highlight::LangKind> = None;
+        let mut left_langs: Vec<Option<crate::highlight::LangKind>> = Vec::new();
+        let mut right_langs: Vec<Option<crate::highlight::LangKind>> = Vec::new();
+        for line in raw.split('\n') {
+            // A merge commit's combined diff (`git show <merge>`) starts each
+            // file with `diff --cc` / `diff --combined`: headers follow it too.
+            // Its lines carry a sign per parent, so they are not coloured.
+            if line.starts_with("diff --cc ") || line.starts_with("diff --combined ") {
+                in_header = true;
+                lang = None;
+            }
+            if line.starts_with("diff --git") {
+                // `diff.noprefix`, `diff.mnemonicPrefix` and custom prefixes
+                // write the paths without `a/` and `b/`; the header's last
+                // word still ends in the new file's name.
+                let last_word = line.rsplit(' ').next().map(|w| w.trim_matches('"'));
+                lang = parse_diff_git_new_path(line)
+                    .and_then(|p| crate::highlight::lang_for_path(Path::new(&p)))
+                    .or_else(|| crate::highlight::lang_for_path(Path::new(last_word?)));
+            }
+            let code = if in_header { None } else { lang };
+            if line.starts_with("diff --git") || line.starts_with("@@") {
+                in_header = line.starts_with("diff --git");
+                flush(&mut pending_remove, &mut pending_add, &mut rows);
+                let i = left_lines.len();
+                let j = right_lines.len();
+                left_lines.push(line.to_string());
+                right_lines.push(line.to_string());
+                left_langs.push(None);
+                right_langs.push(None);
+                rows.push(DiffRow::Equal { left: i, right: j });
+            } else if line.starts_with("\\ No newline")
+                || (in_header
+                    && (line.starts_with("index ")
+                        || line.starts_with("--- ")
+                        || line.starts_with("+++ ")
+                        || line == "---"
+                        || line == "+++"
+                        || line.starts_with("new file mode")
+                        || line.starts_with("deleted file mode")
+                        || line.starts_with("similarity index")
+                        || line.starts_with("rename from")
+                        || line.starts_with("rename to")))
+            {
+                // Header / metadata noise — skip; the `diff --git` line
+                // already names the file pair.
+                continue;
+            } else if let Some(rest) = line.strip_prefix('-') {
+                let i = left_lines.len();
+                left_lines.push(rest.to_string());
+                left_langs.push(code);
+                pending_remove.push(i);
+            } else if let Some(rest) = line.strip_prefix('+') {
+                let j = right_lines.len();
+                right_lines.push(rest.to_string());
+                right_langs.push(code);
+                pending_add.push(j);
+            } else {
+                flush(&mut pending_remove, &mut pending_add, &mut rows);
+                let body = line.strip_prefix(' ').unwrap_or(line);
+                let i = left_lines.len();
+                let j = right_lines.len();
+                left_lines.push(body.to_string());
+                right_lines.push(body.to_string());
+                left_langs.push(code);
+                right_langs.push(code);
+                rows.push(DiffRow::Equal { left: i, right: j });
+            }
+        }
+        flush(&mut pending_remove, &mut pending_add, &mut rows);
+        Self {
+            source: DiffSource::Static,
+            seats: crate::provenance::Provenance::new(),
+            group_by_seat: false,
+            left_stamp: None,
+            right_stamp: None,
+            left_path: label,
+            right_path: PathBuf::new(),
+            left_is_real_file: false,
+            left_lines,
+            right_lines,
+            rows,
+            ws_mode: DiffWhitespace::Off,
+            display_rows: None,
+            scroll: 0,
+            scroll_x: 0,
+            bytes_differ_but_lines_equal: false,
+            coarse: false,
+            unified: false,
+            selection: None,
+            find: DiffFindState::default(),
+            nav_anchor: None,
+            left_is_git_head: false,
+            right_is_unsaved: false,
+
+            text_encoding: encoding_rs::UTF_8,
+            left_crlf: Vec::new(),
+            right_crlf: Vec::new(),
+            left_no_final_nl: false,
+            right_no_final_nl: false,
+            syntax: crate::widgets::diff_syntax::DiffSyntax::with_runs(
+                crate::widgets::diff_syntax::runs_of(&left_langs),
+                crate::widgets::diff_syntax::runs_of(&right_langs),
+            ),
+        }
+    }
+
+    /// Every occurrence of `needle` across both columns, in reading order
+    /// (top to bottom, left column before right within a row). An Equal
+    /// row carries the same text on both sides, so a hit there is reported
+    /// twice — once per visible column — matching what the user sees.
+    pub fn find_matches(&self, needle: &str, opts: SearchOpts) -> Vec<DiffMatch> {
+        let mut out: Vec<DiffMatch> = Vec::new();
+        if needle.is_empty() {
+            return out;
+        }
+        for (row_idx, row) in self.rows.iter().enumerate() {
+            let left_idx = match row {
+                DiffRow::Equal { left, .. }
+                | DiffRow::Removed { left }
+                | DiffRow::Replaced { left, .. } => Some(*left),
+                DiffRow::Added { .. } => None,
+            };
+            if let Some(line) = left_idx.and_then(|i| self.left_lines.get(i)) {
+                for (col, len) in line_matches(line, opts, needle) {
+                    out.push(DiffMatch {
+                        row: row_idx,
+                        side: DiffSide::Left,
+                        col_chars: col,
+                        len_chars: len,
+                    });
+                }
+            }
+            let right_idx = match row {
+                DiffRow::Equal { right, .. }
+                | DiffRow::Added { right }
+                | DiffRow::Replaced { right, .. } => Some(*right),
+                DiffRow::Removed { .. } => None,
+            };
+            if let Some(line) = right_idx.and_then(|i| self.right_lines.get(i)) {
+                for (col, len) in line_matches(line, opts, needle) {
+                    out.push(DiffMatch {
+                        row: row_idx,
+                        side: DiffSide::Right,
+                        col_chars: col,
+                        len_chars: len,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Scroll the viewport so `m` is visible both vertically (its row lands
+    /// inside `viewport_rows`) and horizontally (its char span lands inside
+    /// `text_cols`). Mirrors the plain-editor `jump_editor_to_match` logic.
+    pub fn scroll_to_match(&mut self, m: DiffMatch, viewport_rows: usize, text_cols: usize) {
+        // A find jump relocates the viewport independently of hunk
+        // navigation, so the next ‹/› should re-anchor on the match, not
+        // on the stale hunk we last stepped to.
+        self.nav_anchor = None;
+        if viewport_rows > 0 {
+            if m.row < self.scroll {
+                self.scroll = m.row;
+            } else if m.row >= self.scroll + viewport_rows {
+                self.scroll = m.row + 1 - viewport_rows;
+            }
+        }
+        if text_cols > 0 {
+            let end = m.col_chars + m.len_chars;
+            if m.col_chars < self.scroll_x {
+                self.scroll_x = m.col_chars;
+            } else if end > self.scroll_x + text_cols {
+                self.scroll_x = end - text_cols;
+            }
+        }
+    }
+
+    pub fn start_selection(&mut self, side: DiffSide, row: usize, col: usize) {
+        let row = row.min(self.rows.len().saturating_sub(1));
+        // A click is also a hunk-action/jump anchor, like a landed jump; a
+        // later jump or scroll then supersedes it (see `action_row`).
+        self.nav_anchor = Some(row);
+        self.selection = Some(DiffSelection {
+            side,
+            anchor_row: row,
+            anchor_col: col,
+            head_row: row,
+            head_col: col,
+        });
+    }
+
+    pub fn extend_selection_to(&mut self, row: usize, col: usize) {
+        if let Some(sel) = self.selection.as_mut() {
+            sel.head_row = row.min(self.rows.len().saturating_sub(1));
+            sel.head_col = col;
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Double-click word selection. Snaps the selection to the word
+    /// boundaries containing `col` on the source line that backs
+    /// `row` on the chosen side. Same word-boundary semantics as the
+    /// regular text editor: a "word" is a maximal run of
+    /// alphanumeric-or-underscore characters. A click on whitespace
+    /// or punctuation clears the selection and returns without anchoring
+    /// anything, matching VS Code / standard text-editor behaviour.
+    pub fn select_word_at(&mut self, side: DiffSide, row: usize, col: usize) {
+        let Some(row_data) = self.rows.get(row).copied() else {
+            self.selection = None;
+            return;
+        };
+        let line_idx = match (side, row_data) {
+            (DiffSide::Left, DiffRow::Equal { left, .. })
+            | (DiffSide::Left, DiffRow::Removed { left })
+            | (DiffSide::Left, DiffRow::Replaced { left, .. }) => Some(left),
+            (DiffSide::Right, DiffRow::Equal { right, .. })
+            | (DiffSide::Right, DiffRow::Added { right })
+            | (DiffSide::Right, DiffRow::Replaced { right, .. }) => Some(right),
+            _ => None,
+        };
+        let Some(line_idx) = line_idx else {
+            self.selection = None;
+            return;
+        };
+        let lines = match side {
+            DiffSide::Left => &self.left_lines,
+            DiffSide::Right => &self.right_lines,
+        };
+        let Some(text) = lines.get(line_idx) else {
+            self.selection = None;
+            return;
+        };
+        let chars: Vec<char> = text.chars().collect();
+        if chars.is_empty() {
+            self.selection = None;
+            return;
+        }
+        let c = col.min(chars.len());
+        let pivot = if c < chars.len() && is_word_char(chars[c]) {
+            Some(c)
+        } else if c == chars.len() && c > 0 && is_word_char(chars[c - 1]) {
+            Some(c - 1)
+        } else {
+            None
+        };
+        let Some(p) = pivot else {
+            self.selection = None;
+            return;
+        };
+        let mut start = p;
+        while start > 0 && is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = p + 1;
+        while end < chars.len() && is_word_char(chars[end]) {
+            end += 1;
+        }
+        self.nav_anchor = Some(row);
+        self.selection = Some(DiffSelection {
+            side,
+            anchor_row: row,
+            anchor_col: start,
+            head_row: row,
+            head_col: end,
+        });
+    }
+
+    /// Linearise the active selection into a copyable string. Walks the
+    /// chosen side's source-line texts for the selected `diff.rows` range,
+    /// clipping the first and last lines to the selection's char bounds.
+    /// Rows that are blank on the selected side (Added rows when Left is
+    /// selected, or Removed rows when Right is selected) contribute an
+    /// empty line so the row geometry the user sees matches the copied
+    /// payload.
+    pub fn selection_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        if !sel.has_area() {
+            return None;
+        }
+        let (start, end) = sel.normalized();
+        let lines = match sel.side {
+            DiffSide::Left => &self.left_lines,
+            DiffSide::Right => &self.right_lines,
+        };
+        let mut out = String::new();
+        for (emitted, row_idx) in (start.0..=end.0).enumerate() {
+            let Some(row) = self.rows.get(row_idx).copied() else {
+                break;
+            };
+            let line_idx = match (sel.side, row) {
+                (DiffSide::Left, DiffRow::Equal { left, .. })
+                | (DiffSide::Left, DiffRow::Removed { left })
+                | (DiffSide::Left, DiffRow::Replaced { left, .. }) => Some(left),
+                (DiffSide::Right, DiffRow::Equal { right, .. })
+                | (DiffSide::Right, DiffRow::Added { right })
+                | (DiffSide::Right, DiffRow::Replaced { right, .. }) => Some(right),
+                _ => None,
+            };
+            let text = line_idx
+                .and_then(|i| lines.get(i).cloned())
+                .unwrap_or_default();
+            let chars: Vec<char> = text.chars().collect();
+            let (cs, ce) = if start.0 == end.0 {
+                (start.1.min(chars.len()), end.1.min(chars.len()))
+            } else if row_idx == start.0 {
+                (start.1.min(chars.len()), chars.len())
+            } else if row_idx == end.0 {
+                (0, end.1.min(chars.len()))
+            } else {
+                (0, chars.len())
+            };
+            if emitted > 0 {
+                out.push('\n');
+            }
+            out.extend(chars[cs..ce].iter());
+        }
+        if out.is_empty() { None } else { Some(out) }
+    }
+
+    /// The literal substring an active single-row selection covers, used to
+    /// drive the "highlight every other occurrence" box (VS Code's
+    /// `editor.selectionHighlight`). Returns `None` for a zero-area click,
+    /// a multi-row selection (VS Code only highlights occurrences for
+    /// single-line selections), a whitespace-only selection, or one past the
+    /// `editor.selectionHighlightMaxLength` ceiling — mirroring the plain
+    /// editor's `selection_occurrence_needle` exactly.
+    pub fn selection_occurrence_needle(&self) -> Option<String> {
+        let sel = self.selection?;
+        if !sel.has_area() {
+            return None;
+        }
+        let (start, end) = sel.normalized();
+        if start.0 != end.0 {
+            return None;
+        }
+        let line_idx = match (sel.side, *self.rows.get(start.0)?) {
+            (DiffSide::Left, DiffRow::Equal { left, .. })
+            | (DiffSide::Left, DiffRow::Removed { left })
+            | (DiffSide::Left, DiffRow::Replaced { left, .. }) => left,
+            (DiffSide::Right, DiffRow::Equal { right, .. })
+            | (DiffSide::Right, DiffRow::Added { right })
+            | (DiffSide::Right, DiffRow::Replaced { right, .. }) => right,
+            _ => return None,
+        };
+        let lines = match sel.side {
+            DiffSide::Left => &self.left_lines,
+            DiffSide::Right => &self.right_lines,
+        };
+        let chars: Vec<char> = lines.get(line_idx)?.chars().collect();
+        let cs = start.1.min(chars.len());
+        let ce = end.1.min(chars.len());
+        if ce <= cs {
+            return None;
+        }
+        let text: String = chars[cs..ce].iter().collect();
+        if text.trim().is_empty() || text.chars().count() > SELECTION_HIGHLIGHT_MAX_LEN {
+            return None;
+        }
+        Some(text)
+    }
+
+    /// Length (in chars) of the longest line across both files. Used to
+    /// clamp horizontal scrolling so the user can't pan into empty space
+    /// past the end of the longest content.
+    pub fn longest_line_chars(&self) -> usize {
+        self.left_lines
+            .iter()
+            .chain(self.right_lines.iter())
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn total_rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The caret cell, i.e. the head of the active selection. A single
+    /// click leaves a zero-area selection whose head is exactly where the
+    /// user clicked, so this doubles as a read-only text cursor the
+    /// renderer can blink.
+    pub fn caret(&self) -> Option<(DiffSide, usize, usize)> {
+        self.selection.map(|s| (s.side, s.head_row, s.head_col))
+    }
+
+    pub fn caret_row(&self) -> Option<usize> {
+        self.selection.map(|s| s.head_row)
+    }
+
+    fn row_left_text(&self, row_idx: usize) -> Option<&str> {
+        match self.rows.get(row_idx)? {
+            DiffRow::Equal { left, .. }
+            | DiffRow::Removed { left }
+            | DiffRow::Replaced { left, .. } => self.left_lines.get(*left).map(String::as_str),
+            DiffRow::Added { .. } => None,
+        }
+    }
+
+    /// Resolve a diff row to the file and one-based line it represents so
+    /// Enter can open the working-tree file there.
+    ///
+    /// A single-file diff (built from two real paths) stores real file
+    /// line numbers in each row, so the answer is `right_path` plus the
+    /// row's new-side index. A multi-file `git diff` view stores the
+    /// `diff --git` and `@@` headers as ordinary rows and indexes into a
+    /// synthetic line array, so the file comes from the nearest preceding
+    /// `diff --git` header and the line from the nearest `@@` hunk header
+    /// plus a count of the right-bearing rows down to `row_idx`.
+    fn nearest_right_line0(&self, row_idx: usize) -> Option<usize> {
+        let right_of = |r: &DiffRow| match r {
+            DiffRow::Equal { right, .. }
+            | DiffRow::Added { right }
+            | DiffRow::Replaced { right, .. } => Some(*right),
+            DiffRow::Removed { .. } => None,
+        };
+        (row_idx + 1..self.rows.len())
+            .find_map(|i| self.rows.get(i).and_then(right_of))
+            .or_else(|| {
+                (0..row_idx)
+                    .rev()
+                    .find_map(|i| self.rows.get(i).and_then(right_of))
+            })
+    }
+
+    pub fn jump_target(&self, row_idx: usize, root: &Path) -> Option<DiffJump> {
+        let row = *self.rows.get(row_idx)?;
+        if !self.right_path.as_os_str().is_empty() {
+            let (path, line0) = match row {
+                DiffRow::Equal { right, .. }
+                | DiffRow::Added { right }
+                | DiffRow::Replaced { right, .. } => (self.right_path.clone(), right),
+                // A removed line lives only on the left. When the left side
+                // is a real file (two-file compare) open it there; when it's
+                // a synthetic HEAD label the line is gone from the working
+                // tree, so open the real right file at the nearest surviving
+                // line instead of a label path that ENOENTs.
+                DiffRow::Removed { left } => {
+                    if self.left_is_real_file {
+                        (self.left_path.clone(), left)
+                    } else if self.right_path != Path::new("/dev/null") {
+                        (self.right_path.clone(), self.nearest_right_line0(row_idx)?)
+                    } else {
+                        return None;
+                    }
+                }
+            };
+            return Some(DiffJump {
+                path,
+                line: line0 + 1,
+            });
+        }
+        let mut file: Option<PathBuf> = None;
+        let mut hunk_row: Option<usize> = None;
+        let mut hunk_start: usize = 1;
+        for i in (0..=row_idx).rev() {
+            let Some(text) = self.row_left_text(i) else {
+                continue;
+            };
+            if hunk_row.is_none() && text.starts_with("@@") {
+                hunk_row = Some(i);
+                if let Some(n) = parse_hunk_new_start(text) {
+                    hunk_start = n;
+                }
+            }
+            if let Some(rel) = parse_diff_git_new_path(text) {
+                file = Some(root.join(rel));
+                break;
+            }
+        }
+        let path = file?;
+        let start = hunk_row.unwrap_or(row_idx);
+        let right_count = (start + 1..=row_idx)
+            .filter(|&i| self.rows.get(i).is_some_and(row_has_right))
+            .count();
+        let line = if right_count == 0 {
+            hunk_start
+        } else {
+            hunk_start + right_count - 1
+        };
+        Some(DiffJump { path, line })
+    }
+
+    pub fn scroll_up_by(&mut self, n: usize) {
+        self.scroll = self.scroll.saturating_sub(n);
+        self.nav_anchor = None;
+    }
+
+    pub fn scroll_down_by(&mut self, n: usize) {
+        let max = self.rows.len();
+        // Clamp loosely here; render_diff also re-clamps against the live
+        // viewport, so we don't need to know it at scroll time.
+        self.scroll = (self.scroll + n).min(max);
+        self.nav_anchor = None;
+    }
+
+    pub fn scroll_home(&mut self) {
+        self.scroll = 0;
+        self.nav_anchor = None;
+    }
+
+    pub fn scroll_end(&mut self) {
+        self.scroll = self.rows.len();
+        self.nav_anchor = None;
+    }
+
+    pub fn scroll_left_by(&mut self, n: usize) {
+        self.scroll_x = self.scroll_x.saturating_sub(n);
+    }
+
+    pub fn scroll_right_by(&mut self, n: usize) {
+        let max = self.longest_line_chars();
+        self.scroll_x = (self.scroll_x + n).min(max);
+    }
+
+    /// Indices into `rows` where each contiguous change hunk begins (an
+    /// Added / Removed / Replaced row preceded by either start-of-file or
+    /// an Equal row). Drives Next / Prev change navigation in the diff
+    /// view and the "jump to first change on open" behaviour the Source
+    /// Control panel relies on.
+    pub fn hunk_starts(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut in_hunk = false;
+        // Navigation follows the VIEW: with ignore-whitespace on, `›` should
+        // skip the hunks the user cannot see. Staging is unaffected — it reads
+        // `self.rows` directly.
+        for (i, r) in self.display_rows().iter().enumerate() {
+            let is_change = !matches!(r, DiffRow::Equal { .. });
+            if is_change && !in_hunk {
+                out.push(i);
+                in_hunk = true;
+            } else if !is_change {
+                in_hunk = false;
+            }
+        }
+        out
+    }
+
+    /// First-row index of the first change hunk, or `None` when the two
+    /// sides are identical.
+    pub fn first_change_row(&self) -> Option<usize> {
+        self.hunk_starts().into_iter().next()
+    }
+
+    /// First-row index of the next hunk strictly past `current`, or
+    /// `None` when `current` is already in/past the last hunk.
+    pub fn next_change_row(&self, current: usize) -> Option<usize> {
+        self.hunk_starts().into_iter().find(|&s| s > current)
+    }
+
+    /// First-row index of the hunk that starts strictly before `current`,
+    /// or `None` when `current` is already at/before the first hunk.
+    pub fn prev_change_row(&self, current: usize) -> Option<usize> {
+        self.hunk_starts().into_iter().rev().find(|&s| s < current)
+    }
+
+    /// Like `next_change_row`, but wraps around to the first hunk when
+    /// `current` is at/past the last one. Used by the diff-pane ›
+    /// arrow and F7 so a user reading bottom-to-top can keep clicking
+    /// the same arrow to cycle through every hunk. Returns `None` only
+    /// when the diff has no change rows at all.
+    pub fn next_change_row_wrap(&self, current: usize) -> Option<usize> {
+        let starts = self.hunk_starts();
+        if starts.is_empty() {
+            return None;
+        }
+        starts
+            .iter()
+            .find(|&&s| s > current)
+            .copied()
+            .or_else(|| starts.first().copied())
+    }
+
+    /// Mirror of `next_change_row_wrap` going the other way: when
+    /// `current` sits at/before the first hunk, the next call wraps to
+    /// the last hunk instead of stalling.
+    pub fn prev_change_row_wrap(&self, current: usize) -> Option<usize> {
+        let starts = self.hunk_starts();
+        if starts.is_empty() {
+            return None;
+        }
+        starts
+            .iter()
+            .rev()
+            .find(|&&s| s < current)
+            .copied()
+            .or_else(|| starts.last().copied())
+    }
+
+    /// Park `scroll` two rows above `target` so the change row lands with
+    /// a slice of context above it, the way users read diffs.
+    pub fn scroll_to_row(&mut self, target: usize) {
+        self.scroll = target.saturating_sub(2);
+    }
+
+    /// Row to anchor the next hunk-to-hunk jump on. Prefers `nav_anchor`
+    /// (the row the previous jump landed on), which is immune to the
+    /// `render_diff` scroll clamp. Falls back to the row currently sitting
+    /// two below the top of the viewport (the hunk `scroll_to_row` parks in
+    /// view) when no jump is in flight, e.g. right after the diff opens or
+    /// after a manual scroll cleared the anchor.
+    fn jump_anchor(&self) -> usize {
+        self.nav_anchor
+            .unwrap_or_else(|| self.scroll.saturating_add(2))
+    }
+
+    /// Scroll to the next change hunk, wrapping from the last hunk back to
+    /// the first. Tracks the landed row in `nav_anchor` so repeated forward
+    /// jumps keep advancing even after the renderer clamps `scroll`. The
+    /// shared backend for the diff-pane › arrow and the F7 keybinding.
+    pub fn jump_next_change(&mut self) {
+        if let Some(row) = self.next_change_row_wrap(self.jump_anchor()) {
+            self.scroll_to_row(row);
+            self.nav_anchor = Some(row);
+        }
+    }
+
+    /// Mirror of `jump_next_change`: previous hunk, wrapping from the first
+    /// back to the last. Backs the ‹ arrow and Shift+F7.
+    pub fn jump_prev_change(&mut self) {
+        if let Some(row) = self.prev_change_row_wrap(self.jump_anchor()) {
+            self.scroll_to_row(row);
+            self.nav_anchor = Some(row);
+        }
+    }
+
+    /// The row hunk actions (stage / unstage / revert) anchor on: the most
+    /// recent click or hunk jump (both set `nav_anchor`, so the newer one
+    /// wins), else the top of the viewport — `hunk_range_at`'s fall-forward
+    /// then lands on the first visible hunk. A manual scroll clears the
+    /// anchor, so the action always targets something the user has seen:
+    /// a stale off-screen caret must never pick the hunk `R` destroys.
+    pub fn action_row(&self) -> usize {
+        self.nav_anchor.unwrap_or(self.scroll)
+    }
+
+    /// The rows the VIEW should paint and navigate: the whitespace-normalised
+    /// classification when the toggle is on, the real diff otherwise. Row
+    /// indices line up with [`Self::rows`] one-to-one — normalisation only
+    /// changes each row's variant, never how many rows there are or which
+    /// line each one points at — so a row index means the same thing to both.
+    pub fn display_rows(&self) -> &[DiffRow] {
+        self.display_rows.as_deref().unwrap_or(&self.rows)
+    }
+
+    /// Colour each side's code by its language (#2020), starting the pass if
+    /// none has run for this text and theme and waiting up to `wait` (`None`:
+    /// however long it takes) for it. A side takes its own path's language.
+    /// A side whose path is only a label takes the other side's: the left of
+    /// a Source Control diff is `foo.rs (HEAD)`, and a deleted file's right
+    /// is `/dev/null`. A real file with no grammar stays plain, even beside
+    /// one that has one.
+    pub fn colour_syntax(&mut self, wait: Option<std::time::Duration>) {
+        let (left_path, right_path) = (&self.left_path, &self.right_path);
+        let left_is_label = !self.left_is_real_file;
+        let right_is_label =
+            right_path.as_os_str().is_empty() || right_path == Path::new("/dev/null");
+        let langs = || {
+            let left = crate::highlight::lang_for_path(left_path);
+            let right = crate::highlight::lang_for_path(right_path);
+            (
+                if left_is_label { left.or(right) } else { left },
+                if right_is_label {
+                    right.or(left)
+                } else {
+                    right
+                },
+            )
+        };
+        self.syntax
+            .ensure(&self.left_lines, &self.right_lines, langs, wait);
+    }
+
+    /// Take over the reader's view state from the version of this diff being
+    /// replaced (#471): the whitespace mode, the viewport (clamped to the new
+    /// row count), the horizontal pan, the hunk-navigation anchor (only while
+    /// the rows are unchanged) and the find needle. A rebuild must read as "the rows updated under
+    /// me", never as "the tab reopened at the first hunk".
+    pub fn carry_view_from(&mut self, old: &DiffData) {
+        self.set_whitespace_mode(old.ws_mode);
+        self.scroll = old.scroll.min(self.rows.len().saturating_sub(1));
+        self.scroll_x = old.scroll_x;
+        // The hunk-navigation anchor survives only while the rows are the
+        // same rows: it is the sole input to `action_row`, which `S`, `U`
+        // and `R` read, and a row index over REBUILT rows names whatever now
+        // sits there -- `hunk_range_at` would even walk forward from a row
+        // that became Equal to the next change, so `R` could destroy a hunk
+        // the reader never selected. Dropping it falls back to `scroll`,
+        // which is what a manual scroll already does.
+        self.nav_anchor = old
+            .nav_anchor
+            .filter(|&row| row < self.rows.len() && self.rows == old.rows);
+        // The needle and its options survive; the active match is recomputed
+        // against the new rows rather than carried, since it names a row and
+        // a span of the old ones. Done here, not only by the app, so a view
+        // rebuilt in a background tab or split keeps its band; the app's own
+        // `diff_find_apply` still runs for the active tab, which additionally
+        // owes the find bar a count, an index and a scroll.
+        let active = old
+            .find
+            .needle
+            .as_deref()
+            .and_then(|needle| self.find_matches(needle, old.find.opts).first().copied());
+        self.find = DiffFindState {
+            needle: old.find.needle.clone(),
+            opts: old.find.opts,
+            active,
+        };
+        self.left_is_git_head = old.left_is_git_head;
+        self.left_is_real_file = old.left_is_real_file;
+        // The lens survives, its MAP does not (#349): the map is keyed on
+        // line indices the rebuilt rows have renumbered, so carrying it
+        // would credit whatever now sits at those lines. The app reloads it
+        // against the new right side; until it does, the lens is on with
+        // nothing claimed, which reads as unrecorded rather than as wrong.
+        self.group_by_seat = old.group_by_seat;
+        // A side whose lines did not change keeps its colours while the
+        // pass for the other side runs, rather than flashing plain.
+        self.syntax.carry_from(
+            &old.syntax,
+            self.left_lines == old.left_lines,
+            self.right_lines == old.right_lines,
+        );
+        // `source` is not carried here: the rebuild set it before stamping
+        // the sides, since which sides are files depends on it.
+    }
+
+    /// `(mtime, len)` of a real file, or `None` when it cannot be stat'ed.
+    fn stamp_of(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    }
+
+    /// Record the on-disk stamps of whichever sides are files: the right
+    /// side for every source but a git command, the left side only when it
+    /// is a real file. Called by the openers and after every rebuild so the
+    /// next `sides_moved_on_disk` compares against what is on screen.
+    pub fn stamp_sides(&mut self) {
+        let right_is_file = !matches!(
+            self.source,
+            DiffSource::Static | DiffSource::GitCommand { .. }
+        );
+        self.right_stamp = right_is_file
+            .then(|| Self::stamp_of(&self.right_path))
+            .flatten();
+        self.left_stamp = self
+            .left_is_real_file
+            .then(|| Self::stamp_of(&self.left_path))
+            .flatten();
+    }
+
+    /// True when a file-backed side's stamp no longer matches the one taken
+    /// at the last build: something rewrote it. A side that was never
+    /// stamped but exists now counts as moved, so the first refresh after an
+    /// opener that forgot to stamp self-corrects. A side whose file is gone
+    /// does not count: there is nothing to rebuild from, and the reader
+    /// keeps the last good view.
+    pub fn sides_moved_on_disk(&self) -> bool {
+        let right_is_file = !matches!(
+            self.source,
+            DiffSource::Static | DiffSource::GitCommand { .. }
+        );
+        let moved = |stamp: Option<(std::time::SystemTime, u64)>, path: &std::path::Path| {
+            match Self::stamp_of(path) {
+                Some(now) => stamp != Some(now),
+                None => false,
+            }
+        };
+        (right_is_file && moved(self.right_stamp, &self.right_path))
+            || (self.left_is_real_file && moved(self.left_stamp, &self.left_path))
+    }
+
+    /// True when a rebuild produced exactly what the reader already has:
+    /// the same line texts, rows, and BYTE facts on both sides. The byte
+    /// facts matter because they feed things the lines do not show -- the
+    /// "bytes differ, lines equal" banner, and the `\r` / `\ No newline at
+    /// end of file` handling in the hunk patches stage and revert send to
+    /// git. A rewrite that only adds a final newline changes no line text,
+    /// and skipping it would leave a patch built from bytes no longer on
+    /// disk. Used to skip a redraw-and-reset when nothing at all changed.
+    pub fn same_content_as(&self, other: &DiffData) -> bool {
+        self.left_lines == other.left_lines
+            && self.right_lines == other.right_lines
+            && self.rows == other.rows
+            && self.unified == other.unified
+            && self.left_crlf == other.left_crlf
+            && self.right_crlf == other.right_crlf
+            && self.left_no_final_nl == other.left_no_final_nl
+            && self.right_no_final_nl == other.right_no_final_nl
+            && self.bytes_differ_but_lines_equal == other.bytes_differ_but_lines_equal
+    }
+
+    /// Switch whitespace mode, recomputing the display classification.
+    /// [`Self::rows`] is never touched, so staging is unaffected.
+    pub fn set_whitespace_mode(&mut self, mode: DiffWhitespace) {
+        self.ws_mode = mode;
+        self.display_rows =
+            Self::normalised_rows(&self.rows, &self.left_lines, &self.right_lines, mode);
+    }
+
+    /// Who typed each ADDED line of this diff, newest-seat-first counts
+    /// (#349): the summary the group-by-seat lens puts in the header, and
+    /// the answer to "which part of this change is the agent's". Only rows
+    /// the diff calls added or replaced count, since an unchanged line's
+    /// seat describes work this change did not do. Lines with no record
+    /// are counted under `None`.
+    pub fn added_lines_by_seat(&self) -> Vec<(Option<crate::provenance::Seat>, usize)> {
+        // The REAL rows, like staging: the whitespace lens reclassifies a
+        // changed line as Equal, and a line this change wrote should not
+        // drop out of the tally because of how the view is currently read.
+        let mut counts: std::collections::BTreeMap<Option<crate::provenance::Seat>, usize> =
+            std::collections::BTreeMap::new();
+        for row in &self.rows {
+            let right = match row {
+                DiffRow::Added { right } | DiffRow::Replaced { right, .. } => *right,
+                // An unchanged or removed line's seat describes work this
+                // change did not do; a removed line has no right side at all.
+                DiffRow::Equal { .. } | DiffRow::Removed { .. } => continue,
+            };
+            *counts.entry(self.seats.seat(right).cloned()).or_default() += 1;
+        }
+        // Named seats first, in the enum's own order, and the unrecorded
+        // bucket last: it is the one entry that is not a claim about anyone.
+        let mut out: Vec<_> = counts.into_iter().collect();
+        out.sort_by(|a, b| a.0.is_none().cmp(&b.0.is_none()).then(a.0.cmp(&b.0)));
+        out
+    }
+
+    /// The group-by-seat lens's header text (#349): who wrote the lines
+    /// this change adds, as `you 3 \u{2022} agent (pane 2) 1`, with anything
+    /// unattributed named `unrecorded` rather than left out.
+    pub fn seat_summary(&self) -> String {
+        let tally = self.added_lines_by_seat();
+        if tally.is_empty() {
+            // A change that only removes lines has no authorship to report.
+            // Named, like the unrecorded bucket, rather than left empty: the
+            // header and the status line both read "by seat: <this>".
+            return String::from("no added lines");
+        }
+        tally
+            .into_iter()
+            .map(|(seat, n)| match seat {
+                Some(s) => format!("{} {n}", s.label()),
+                // Named, not omitted: a change croft did not watch being
+                // written must read as unrecorded rather than as nothing.
+                None => format!("unrecorded {n}"),
+            })
+            .collect::<Vec<_>>()
+            .join(" \u{2022} ")
+    }
+
+    /// Reclassify each real row under `mode`. A `Replaced` row whose two
+    /// lines share a normalised key becomes `Equal`; everything else is
+    /// carried through untouched, so `Added`/`Removed` rows (a line with no
+    /// counterpart) always keep showing — an added blank line is a real
+    /// change, not a whitespace difference.
+    fn normalised_rows(
+        rows: &[DiffRow],
+        left: &[String],
+        right: &[String],
+        mode: DiffWhitespace,
+    ) -> Option<Vec<DiffRow>> {
+        if mode == DiffWhitespace::Off {
+            return None;
+        }
+        Some(
+            rows.iter()
+                .map(|row| match *row {
+                    DiffRow::Replaced { left: l, right: r } => {
+                        let same = match (left.get(l), right.get(r)) {
+                            (Some(a), Some(b)) => mode.key(a) == mode.key(b),
+                            _ => false,
+                        };
+                        if same {
+                            DiffRow::Equal { left: l, right: r }
+                        } else {
+                            *row
+                        }
+                    }
+                    other => other,
+                })
+                .collect(),
+        )
+    }
+
+    /// Inclusive row range of the contiguous change hunk containing
+    /// `row`. A `row` sitting on context falls forward to the next hunk,
+    /// the same forgiving anchor Next Change uses. `None` when no change
+    /// hunk exists at or after `row`.
+    pub fn hunk_range_at(&self, row: usize) -> Option<(usize, usize)> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        let is_change = |i: usize| !matches!(self.rows.get(i), Some(DiffRow::Equal { .. }) | None);
+        let anchor = row.min(self.rows.len() - 1);
+        let start = if is_change(anchor) {
+            anchor
+        } else {
+            (anchor..self.rows.len()).find(|&i| is_change(i))?
+        };
+        let mut s = start;
+        while s > 0 && is_change(s - 1) {
+            s -= 1;
+        }
+        let mut e = start;
+        while e + 1 < self.rows.len() && is_change(e + 1) {
+            e += 1;
+        }
+        Some((s, e))
+    }
+
+    /// A patch that stages ONLY the rows in `sel` (VS Code's "Stage
+    /// Selected Ranges"), with every other row of the surrounding hunk
+    /// represented as the index already has it: an unselected `+` is
+    /// dropped (it is not being staged) and an unselected `-` becomes a
+    /// context line (that line still exists in HEAD). Applied with `-R`
+    /// the same patch unstages exactly those lines.
+    ///
+    /// `None` when the range covers no changed row, so the caller can
+    /// fall back to the whole-hunk action.
+    pub fn selected_lines_patch(&self, rel_path: &str, sel: (usize, usize)) -> Option<String> {
+        const CTX: usize = 3;
+        let (sel_start, sel_end) = (sel.0.min(sel.1), sel.0.max(sel.1));
+        let is_change = |i: usize| !matches!(self.rows.get(i), Some(DiffRow::Equal { .. }) | None);
+        if !(sel_start..=sel_end.min(self.rows.len().saturating_sub(1))).any(is_change) {
+            return None;
+        }
+        // Widen to the enclosing change run so the patch carries the whole
+        // hunk (with the unselected rows neutralised), then add context.
+        let mut hs = sel_start;
+        while hs > 0 && is_change(hs - 1) {
+            hs -= 1;
+        }
+        let mut he = sel_end.min(self.rows.len().saturating_sub(1));
+        while he + 1 < self.rows.len() && is_change(he + 1) {
+            he += 1;
+        }
+        // A line whose only change is its final newline goes with any
+        // selection in its run: the lines added after it need that newline,
+        // and a deletion before it needs the line to lose it (#1232).
+        let newline_only = |i: usize| match self.rows.get(i) {
+            Some(DiffRow::Replaced { left, right }) => {
+                self.left_lines[*left] == self.right_lines[*right]
+                    && (*left + 1 == self.left_lines.len() || *right + 1 == self.right_lines.len())
+            }
+            _ => false,
+        };
+        let selected =
+            |i: usize| (i >= sel_start && i <= sel_end) || (i >= hs && i <= he && newline_only(i));
+        let s = hs.saturating_sub(CTX);
+        let e = (he + CTX).min(self.rows.len().saturating_sub(1));
+        const NO_NL: &str = "\\ No newline at end of file";
+        let left_line = |sig: char, i: usize| {
+            let cr = if self.left_crlf.get(i).copied().unwrap_or(false) {
+                "\r"
+            } else {
+                ""
+            };
+            format!("{sig}{}{cr}", self.left_lines[i])
+        };
+        let right_line = |sig: char, i: usize| {
+            let cr = if self.right_crlf.get(i).copied().unwrap_or(false) {
+                "\r"
+            } else {
+                ""
+            };
+            format!("{sig}{}{cr}", self.right_lines[i])
+        };
+        let left_last = |i: usize| i + 1 == self.left_lines.len() && self.left_no_final_nl;
+        let right_last = |i: usize| i + 1 == self.right_lines.len() && self.right_no_final_nl;
+        let mut old_start: Option<usize> = None;
+        let mut new_start: Option<usize> = None;
+        let mut old_count = 0usize;
+        let mut new_count = 0usize;
+        let mut body: Vec<String> = Vec::new();
+        let mut minus: Vec<String> = Vec::new();
+        let mut plus: Vec<String> = Vec::new();
+        // Emit a HEAD line as context: it exists on both sides of this
+        // patch, because the change touching it is not being staged.
+        // Emit a HEAD line as context: the change touching it is not being
+        // staged, so it exists unchanged on both sides of THIS patch.
+        // Only the old-side start is recorded here; the new side's start
+        // is derived below (an unselected change contributes no new-side
+        // line number of its own).
+        let push_context_left = |i: usize,
+                                 body: &mut Vec<String>,
+                                 old_start: &mut Option<usize>,
+                                 old_count: &mut usize,
+                                 new_count: &mut usize| {
+            old_start.get_or_insert(i + 1);
+            *old_count += 1;
+            *new_count += 1;
+            body.push(left_line(' ', i));
+            if left_last(i) {
+                body.push(NO_NL.into());
+            }
+        };
+        for i in s..=e {
+            match self.rows[i] {
+                DiffRow::Equal { left, right } => {
+                    body.append(&mut minus);
+                    body.append(&mut plus);
+                    old_start.get_or_insert(left + 1);
+                    new_start.get_or_insert(right + 1);
+                    old_count += 1;
+                    new_count += 1;
+                    body.push(left_line(' ', left));
+                    if left_last(left) && right_last(right) {
+                        body.push(NO_NL.into());
+                    }
+                }
+                DiffRow::Removed { left } => {
+                    if selected(i) {
+                        old_start.get_or_insert(left + 1);
+                        old_count += 1;
+                        minus.push(left_line('-', left));
+                        if left_last(left) {
+                            minus.push(NO_NL.into());
+                        }
+                    } else {
+                        body.append(&mut minus);
+                        body.append(&mut plus);
+                        push_context_left(
+                            left,
+                            &mut body,
+                            &mut old_start,
+                            &mut old_count,
+                            &mut new_count,
+                        );
+                    }
+                }
+                DiffRow::Added { right } => {
+                    if selected(i) {
+                        new_start.get_or_insert(right + 1);
+                        new_count += 1;
+                        plus.push(right_line('+', right));
+                        if right_last(right) {
+                            plus.push(NO_NL.into());
+                        }
+                    }
+                    // An unselected addition simply does not exist in the
+                    // index-to-be: nothing to emit.
+                }
+                DiffRow::Replaced { left, right } => {
+                    if selected(i) {
+                        old_start.get_or_insert(left + 1);
+                        new_start.get_or_insert(right + 1);
+                        old_count += 1;
+                        new_count += 1;
+                        minus.push(left_line('-', left));
+                        if left_last(left) {
+                            minus.push(NO_NL.into());
+                        }
+                        plus.push(right_line('+', right));
+                        if right_last(right) {
+                            plus.push(NO_NL.into());
+                        }
+                    } else {
+                        body.append(&mut minus);
+                        body.append(&mut plus);
+                        push_context_left(
+                            left,
+                            &mut body,
+                            &mut old_start,
+                            &mut old_count,
+                            &mut new_count,
+                        );
+                    }
+                }
+            }
+        }
+        body.append(&mut minus);
+        body.append(&mut plus);
+        let old_start = old_start.unwrap_or(1);
+        // No selected change contributed a new-side start, which happens
+        // when the patch opens on context (including a neutralised
+        // unselected change): the two sides are still in step there, so
+        // the old-side number is also the new-side one.
+        let new_start = new_start.unwrap_or(old_start);
+        Some(format!(
+            "--- a/{rel_path}\n+++ b/{rel_path}\n@@ -{old_start},{old_count} +{new_start},{new_count} @@\n{}\n",
+            body.join("\n")
+        ))
+    }
+
+    /// A minimal unified diff containing only the hunk at `range` plus up
+    /// to three lines of surrounding context, in the exact shape
+    /// `git apply` accepts on stdin (`--- a/rel`, `+++ b/rel`, one `@@`
+    /// header). Because `git apply` verifies a hunk against its context
+    /// (with offset search), the same patch stages (`--cached`), unstages
+    /// (`--cached -R`) or reverts (`-R`) that one hunk.
+    pub fn hunk_patch(&self, rel_path: &str, range: (usize, usize)) -> String {
+        const CTX: usize = 3;
+        let (hs, he) = range;
+        let s = hs.saturating_sub(CTX).max(
+            // Context must not swallow a neighbouring hunk: back up only
+            // across Equal rows.
+            (0..hs)
+                .rev()
+                .take(CTX)
+                .take_while(|&i| matches!(self.rows.get(i), Some(DiffRow::Equal { .. })))
+                .last()
+                .unwrap_or(hs),
+        );
+        let e = {
+            let mut e = he;
+            for i in he + 1..self.rows.len() {
+                if i > he + CTX || !matches!(self.rows.get(i), Some(DiffRow::Equal { .. })) {
+                    break;
+                }
+                e = i;
+            }
+            e
+        };
+        let mut old_start: Option<usize> = None;
+        let mut new_start: Option<usize> = None;
+        let mut old_count = 0usize;
+        let mut new_count = 0usize;
+        let mut body: Vec<String> = Vec::new();
+        // The display lines were `str::lines()`-cleaned; restore each line's
+        // `\r` so the patch byte-matches a CRLF file, and mark a missing
+        // final newline the way git spells it — otherwise `git apply`
+        // rejects every hunk that reaches the end of such a file.
+        const NO_NL: &str = "\\ No newline at end of file";
+        let left_line = |sig: char, i: usize| {
+            let cr = if self.left_crlf.get(i).copied().unwrap_or(false) {
+                "\r"
+            } else {
+                ""
+            };
+            format!("{sig}{}{cr}", self.left_lines[i])
+        };
+        let right_line = |sig: char, i: usize| {
+            let cr = if self.right_crlf.get(i).copied().unwrap_or(false) {
+                "\r"
+            } else {
+                ""
+            };
+            format!("{sig}{}{cr}", self.right_lines[i])
+        };
+        let left_last = |i: usize| i + 1 == self.left_lines.len() && self.left_no_final_nl;
+        let right_last = |i: usize| i + 1 == self.right_lines.len() && self.right_no_final_nl;
+        // Within a change run, emit every `-` line before the `+` lines so
+        // Replaced pairs read as a canonical delete-then-insert block.
+        let mut minus: Vec<String> = Vec::new();
+        let mut plus: Vec<String> = Vec::new();
+        for i in s..=e {
+            match self.rows[i] {
+                DiffRow::Equal { left, right } => {
+                    body.append(&mut minus);
+                    body.append(&mut plus);
+                    old_start.get_or_insert(left + 1);
+                    new_start.get_or_insert(right + 1);
+                    old_count += 1;
+                    new_count += 1;
+                    body.push(left_line(' ', left));
+                    // Both sides end unterminated here: the build turns a
+                    // line only one side leaves open into a change.
+                    if left_last(left) && right_last(right) {
+                        body.push(NO_NL.into());
+                    }
+                }
+                DiffRow::Removed { left } => {
+                    old_start.get_or_insert(left + 1);
+                    old_count += 1;
+                    minus.push(left_line('-', left));
+                    if left_last(left) {
+                        minus.push(NO_NL.into());
+                    }
+                }
+                DiffRow::Added { right } => {
+                    new_start.get_or_insert(right + 1);
+                    new_count += 1;
+                    plus.push(right_line('+', right));
+                    if right_last(right) {
+                        plus.push(NO_NL.into());
+                    }
+                }
+                DiffRow::Replaced { left, right } => {
+                    old_start.get_or_insert(left + 1);
+                    new_start.get_or_insert(right + 1);
+                    old_count += 1;
+                    new_count += 1;
+                    minus.push(left_line('-', left));
+                    if left_last(left) {
+                        minus.push(NO_NL.into());
+                    }
+                    plus.push(right_line('+', right));
+                    if right_last(right) {
+                        plus.push(NO_NL.into());
+                    }
+                }
+            }
+        }
+        body.append(&mut minus);
+        body.append(&mut plus);
+        // A side with zero lines names the line BEFORE the change in its
+        // `@@` field (`-N,0` / `+N,0`), per the unified-diff format. That
+        // only happens with no context at all (edits touching an empty
+        // side), so derive it from the other side's insertion point.
+        let old_start = old_start.unwrap_or_else(|| {
+            (e + 1..self.rows.len())
+                .find_map(|i| match self.rows.get(i) {
+                    Some(DiffRow::Equal { left, .. })
+                    | Some(DiffRow::Removed { left })
+                    | Some(DiffRow::Replaced { left, .. }) => Some(*left),
+                    _ => None,
+                })
+                .unwrap_or(self.left_lines.len())
+        });
+        let new_start = new_start.unwrap_or_else(|| {
+            (e + 1..self.rows.len())
+                .find_map(|i| match self.rows.get(i) {
+                    Some(DiffRow::Equal { right, .. })
+                    | Some(DiffRow::Added { right })
+                    | Some(DiffRow::Replaced { right, .. }) => Some(*right),
+                    _ => None,
+                })
+                .unwrap_or(self.right_lines.len())
+        });
+        format!(
+            "--- a/{rel_path}\n+++ b/{rel_path}\n@@ -{old_start},{old_count} +{new_start},{new_count} @@\n{}\n",
+            body.join("\n")
+        )
+    }
+}
+
+fn row_has_right(row: &DiffRow) -> bool {
+    matches!(
+        row,
+        DiffRow::Equal { .. } | DiffRow::Added { .. } | DiffRow::Replaced { .. }
+    )
+}
+
+/// New-file start line from a `@@ -a,b +c,d @@` header, i.e. the `c`.
+fn parse_hunk_new_start(text: &str) -> Option<usize> {
+    let plus = text.find('+')?;
+    let after = &text[plus + 1..];
+    let end = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
+    after[..end].parse().ok()
+}
+
+/// The new-side path from a `diff --git a/<old> b/<new>` header line.
+///
+/// git quotes a path holding non-ASCII or special bytes (`"b/\303\244.txt"`
+/// under the default `core.quotepath`), and an unquoted path may itself
+/// contain ` b/`, so the first ` b/` is only the answer when nothing better
+/// is known: the common unrenamed case, `a/P b/P`, is split at its middle.
+fn parse_diff_git_new_path(text: &str) -> Option<String> {
+    let rest = text.strip_prefix("diff --git ")?;
+    if rest.ends_with('"') {
+        // The new side is the last quoted token; its opening quote is the
+        // last `"` not escaped and not the final one.
+        let bytes = rest.as_bytes();
+        let open = (0..rest.len() - 1).rev().find(|&i| {
+            bytes[i] == b'"'
+                && bytes[..i].iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 0
+                && (i == 0 || bytes[i - 1] == b' ')
+        })?;
+        let path = crate::git::unquote_porcelain_path(&rest[open..]);
+        return path.strip_prefix("b/").map(str::to_string);
+    }
+    if let Some(p) = rest.strip_prefix("a/")
+        && p.len() >= 3
+        && (p.len() - 3) % 2 == 0
+    {
+        let n = (p.len() - 3) / 2;
+        // `get` rather than indexing: either end of the window can fall
+        // inside a multi-byte character of a renamed path (#1166).
+        if p.get(n..n + 3) == Some(" b/") && p[..n] == p[n + 3..] {
+            return Some(p[n + 3..].to_string());
+        }
+    }
+    let idx = rest.find(" b/")?;
+    Some(rest[idx + 3..].to_string())
+}
+
+/// How long a line diff may search for the smallest edit script (#1152).
+/// Myers' cost grows with file length times lines changed: a 200k-line
+/// lockfile with half its lines changed ran for minutes on the UI thread.
+/// Past the deadline the rest of the change is reported as plain removals
+/// and additions: coarser, but still exactly the two texts, so staging a
+/// hunk stays correct. VS Code caps its diff the same way.
+pub const DIFF_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Run a line-level diff over `left` vs `right` and emit one DiffRow per
+/// visual row. Adjacent Delete + Insert runs are paired (so a one-line
+/// "edit" becomes a single Replaced row, not a Removed row above an Added
+/// row), which is what makes the side-by-side alignment readable.
+pub fn build_diff_rows<L: AsRef<str>, R: AsRef<str>>(left: &[L], right: &[R]) -> Vec<DiffRow> {
+    build_diff_rows_within(left, right, DIFF_DEADLINE).0
+}
+
+/// [`build_diff_rows`] with its search bounded by `budget`; the flag is
+/// true when the budget ran out and the rows are the coarser diff.
+pub fn build_diff_rows_within<L: AsRef<str>, R: AsRef<str>>(
+    left: &[L],
+    right: &[R],
+    budget: std::time::Duration,
+) -> (Vec<DiffRow>, bool) {
+    use similar::{ChangeTag, TextDiff};
+    let l: Vec<&str> = left.iter().map(AsRef::as_ref).collect();
+    let r: Vec<&str> = right.iter().map(AsRef::as_ref).collect();
+    let started = std::time::Instant::now();
+    let diff = TextDiff::configure().timeout(budget).diff_slices(&l, &r);
+    let coarse = started.elapsed() >= budget;
+    let changes: Vec<_> = diff.iter_all_changes().collect();
+    let mut rows = Vec::new();
+    let mut li = 0usize;
+    let mut ri = 0usize;
+    let mut i = 0usize;
+    while i < changes.len() {
+        match changes[i].tag() {
+            ChangeTag::Equal => {
+                rows.push(DiffRow::Equal {
+                    left: li,
+                    right: ri,
+                });
+                li += 1;
+                ri += 1;
+                i += 1;
+            }
+            _ => {
+                let mut removed: Vec<usize> = Vec::new();
+                while i < changes.len() && changes[i].tag() == ChangeTag::Delete {
+                    removed.push(li);
+                    li += 1;
+                    i += 1;
+                }
+                let mut added: Vec<usize> = Vec::new();
+                while i < changes.len() && changes[i].tag() == ChangeTag::Insert {
+                    added.push(ri);
+                    ri += 1;
+                    i += 1;
+                }
+                let pair = removed.len().min(added.len());
+                for k in 0..pair {
+                    rows.push(DiffRow::Replaced {
+                        left: removed[k],
+                        right: added[k],
+                    });
+                }
+                for &left in removed.iter().skip(pair) {
+                    rows.push(DiffRow::Removed { left });
+                }
+                for &right in added.iter().skip(pair) {
+                    rows.push(DiffRow::Added { right });
+                }
+            }
+        }
+    }
+    (rows, coarse)
+}
+
+#[cfg(test)]
+mod seat_group_tests {
+    use super::*;
+    use crate::provenance::Seat;
+
+    /// The lens paints each added line in its seat's hue, and paints
+    /// nothing on a line with no record (#349): the module invariant is that
+    /// an unwatched line is never credited, and a bar IS a credit.
+    #[test]
+    fn the_lens_paints_a_seat_bar_on_added_lines_only() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget as _;
+        let mut e = crate::widgets::editor::Editor::new();
+        let mut d = head_diff(&["kept"], &["kept", "mine", "nobody's"]);
+        // Line 0 is unchanged AND has a seat: without it, dropping the
+        // added-rows-only guard would leave the count unchanged and this
+        // test would pass on a renderer that marks unchanged lines too.
+        d.seats.record(0..1, Seat::Navigator);
+        d.seats.record(1..2, Seat::Me);
+        e.diff = Some(d);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let bar = |b: &Buffer| {
+            (0..area.height)
+                .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+                .filter(|&(x, y)| b[(x, y)].symbol() == "\u{258e}")
+                .count()
+        };
+        assert_eq!(bar(&buf), 0, "off, the lens paints nothing");
+        e.diff.as_mut().unwrap().group_by_seat = true;
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        assert_eq!(
+            bar(&buf),
+            1,
+            "exactly the one added line with a seat wears a bar"
+        );
+    }
+
+    /// The bars and the header count the same lines (#349 review): the
+    /// whitespace lens reclassifies a re-indented line as Equal, and if the
+    /// renderer keyed on that the header would report a line with no bar
+    /// beside it.
+    #[test]
+    fn the_bars_and_the_tally_agree_under_the_whitespace_lens() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget as _;
+        let mut d = head_diff(&["  x"], &["    x"]);
+        d.seats.record(0..1, Seat::Me);
+        d.set_whitespace_mode(DiffWhitespace::All);
+        d.group_by_seat = true;
+        assert_eq!(
+            d.added_lines_by_seat(),
+            vec![(Some(Seat::Me), 1)],
+            "staging: the tally counts the re-indented line"
+        );
+        let mut e = crate::widgets::editor::Editor::new();
+        e.diff = Some(d);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let bars = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].symbol() == "\u{258e}")
+            .count();
+        assert_eq!(bars, 1, "and the renderer paints a bar for it");
+    }
+
+    /// A change that only removes lines reports that, rather than leaving
+    /// the header and status line trailing an empty label (#349 review).
+    #[test]
+    fn the_seat_summary_of_a_deletion_only_change_says_so() {
+        let d = head_diff(&["one", "two"], &["one"]);
+        assert_eq!(d.seat_summary(), "no added lines");
+    }
+
+    /// The header says which part of the change is whose (#349): a lens that
+    /// paints seats must name them, or a reader has colours and no key.
+    #[test]
+    fn the_seat_summary_reads_as_counts_per_seat() {
+        let mut d = head_diff(&["one"], &["one", "mine", "theirs", "nobody's"]);
+        d.seats.record(1..2, Seat::Me);
+        d.seats.record(2..3, Seat::Agent(String::from("pane 2")));
+        assert_eq!(
+            d.seat_summary(),
+            "you 1 \u{2022} agent (pane 2) 1 \u{2022} unrecorded 1"
+        );
+    }
+
+    /// A change nobody was watched making says so plainly rather than
+    /// naming a seat or reading as an empty summary.
+    #[test]
+    fn the_seat_summary_of_an_unrecorded_change_says_unrecorded() {
+        let d = head_diff(&["one"], &["one", "two"]);
+        assert_eq!(d.seat_summary(), "unrecorded 1");
+    }
+
+    fn head_diff(left: &[&str], right: &[&str]) -> DiffData {
+        let mut d = DiffData::build(
+            std::path::PathBuf::from("f.txt (HEAD)"),
+            std::path::PathBuf::from("f.txt"),
+            left.iter().map(|s| (*s).to_string()).collect(),
+            right.iter().map(|s| (*s).to_string()).collect(),
+        );
+        d.left_is_git_head = true;
+        d
+    }
+
+    /// The lens answers "which part of this change is whose" (#349, the
+    /// issue's slice four): only the lines this change ADDED count, tallied
+    /// per seat, with unrecorded lines their own bucket rather than folded
+    /// into anyone's total.
+    #[test]
+    fn added_lines_are_tallied_by_seat() {
+        let mut d = head_diff(&["one"], &["one", "mine", "theirs", "nobody's"]);
+        // Line 0 is unchanged: its seat describes work this change did not do.
+        d.seats.record(0..1, Seat::Navigator);
+        d.seats.record(1..2, Seat::Me);
+        d.seats.record(2..3, Seat::Agent(String::from("pane 2")));
+        let tally = d.added_lines_by_seat();
+        assert_eq!(
+            tally,
+            vec![
+                (Some(Seat::Me), 1),
+                (Some(Seat::Agent(String::from("pane 2"))), 1),
+                (None, 1),
+            ],
+            "each added line counts once, under its own seat: {tally:?}"
+        );
+    }
+
+    /// An added line nobody was watched typing is never credited (the
+    /// module invariant), and a diff with no map at all is all-unrecorded
+    /// rather than empty.
+    #[test]
+    fn added_lines_with_no_record_are_their_own_bucket() {
+        let d = head_diff(&["one"], &["one", "two", "three"]);
+        assert_eq!(
+            d.added_lines_by_seat(),
+            vec![(None, 2)],
+            "no map means every added line is unrecorded, not absent"
+        );
+    }
+
+    /// A replaced line is an added line for this purpose: the right side
+    /// carries new text, and that text has an author.
+    #[test]
+    fn a_replaced_line_counts_as_added_for_its_seat() {
+        let mut d = head_diff(&["one", "two"], &["one", "rewritten"]);
+        d.seats.record(1..2, Seat::Me);
+        assert_eq!(d.added_lines_by_seat(), vec![(Some(Seat::Me), 1)]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1351: the changed characters of a paired line, by common prefix
+    /// and suffix: `1.5` → `2.5` is just `1` and `2`.
+    #[test]
+    fn changed_chars_trim_the_common_prefix_and_suffix() {
+        assert_eq!(
+            changed_char_ranges("backoff=1.5", "backoff=2.5"),
+            Some(((8, 9), (8, 9)))
+        );
+        assert_eq!(
+            changed_char_ranges("abc", "abXc"),
+            Some(((2, 2), (2, 3))),
+            "an insertion marks only the new side"
+        );
+    }
+
+    /// #1351 negative: identical lines and lines sharing too little have no
+    /// ranges.
+    #[test]
+    fn changed_chars_are_none_for_equal_or_rewritten_lines() {
+        assert_eq!(changed_char_ranges("same", "same"), None);
+        assert_eq!(
+            changed_char_ranges("alpha beta gamma", "quite other words"),
+            None
+        );
+    }
+
+    // ---- A huge change is diffed within a deadline (#1152) ----
+
+    /// The issue's lockfile, `packages` entries long, before and after an
+    /// `npm install` that rewrote every version and integrity line.
+    fn lockfile_bump(packages: usize) -> (Vec<String>, Vec<String>) {
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        for i in 0..packages {
+            let hash = format!("{:040x}", i * 7919);
+            let rev: String = hash.chars().rev().collect();
+            for (side, version, hash) in [(&mut before, 0, &hash), (&mut after, 1, &rev)] {
+                side.push(format!("    \"node_modules/pkg-{i}\": {{"));
+                side.push(format!("      \"version\": \"1.{}.{version}\",", i % 7));
+                side.push(format!("      \"integrity\": \"sha512-{hash}\""));
+                side.push(String::from("    },"));
+            }
+        }
+        (before, after)
+    }
+
+    /// Both texts as the rows walk them: every line of each side exactly
+    /// once and in order, and an Equal row only pairs identical lines.
+    fn assert_rows_rebuild(rows: &[DiffRow], left: &[String], right: &[String]) {
+        let (mut l, mut r) = (0, 0);
+        for row in rows {
+            let (lo, ro) = match *row {
+                DiffRow::Equal { left: a, right: b } => {
+                    assert_eq!(left[a], right[b]);
+                    (Some(a), Some(b))
+                }
+                DiffRow::Replaced { left: a, right: b } => (Some(a), Some(b)),
+                DiffRow::Removed { left: a } => (Some(a), None),
+                DiffRow::Added { right: b } => (None, Some(b)),
+            };
+            if let Some(a) = lo {
+                assert_eq!(a, l, "left lines skipped or repeated");
+                l += 1;
+            }
+            if let Some(b) = ro {
+                assert_eq!(b, r, "right lines skipped or repeated");
+                r += 1;
+            }
+        }
+        assert_eq!((l, r), (left.len(), right.len()));
+    }
+
+    #[test]
+    fn a_lockfile_sized_change_is_diffed_within_the_deadline() {
+        let (before, after) = lockfile_bump(50_000);
+        let started = std::time::Instant::now();
+        let data = DiffData::build(
+            PathBuf::from("package-lock.json (HEAD)"),
+            PathBuf::from("package-lock.json"),
+            before.clone(),
+            after.clone(),
+        );
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "200k lines, 100k changed: the diff took {took:?}"
+        );
+        assert!(data.coarse, "the header must say the diff stopped early");
+        assert_rows_rebuild(&data.rows, &before, &after);
+    }
+
+    #[test]
+    fn a_small_change_still_gets_the_exact_diff() {
+        let (before, mut after) = lockfile_bump(500);
+        after.clone_from(&before);
+        after[1001] = String::from("      \"version\": \"9.9.9\",");
+        let data = DiffData::build(
+            PathBuf::from("a (HEAD)"),
+            PathBuf::from("a"),
+            before.clone(),
+            after.clone(),
+        );
+        assert!(!data.coarse);
+        let changed: Vec<_> = data
+            .rows
+            .iter()
+            .filter(|r| !matches!(r, DiffRow::Equal { .. }))
+            .collect();
+        assert_eq!(
+            changed,
+            vec![&DiffRow::Replaced {
+                left: 1001,
+                right: 1001
+            }]
+        );
+        assert_rows_rebuild(&data.rows, &before, &after);
+    }
+
+    #[test]
+    fn a_diff_out_of_budget_is_coarser_but_still_both_texts() {
+        let (before, after) = lockfile_bump(2_000);
+        let (rows, coarse) = build_diff_rows_within(&before, &after, std::time::Duration::ZERO);
+        assert!(coarse);
+        assert_rows_rebuild(&rows, &before, &after);
+        let (exact, coarse) =
+            build_diff_rows_within(&before, &after, std::time::Duration::from_secs(60));
+        assert!(!coarse);
+        assert_rows_rebuild(&exact, &before, &after);
+        let equal = |rows: &[DiffRow]| {
+            rows.iter()
+                .filter(|r| matches!(r, DiffRow::Equal { .. }))
+                .count()
+        };
+        assert!(equal(&exact) >= 4_000, "names and braces are unchanged");
+        assert!(equal(&rows) <= equal(&exact));
+    }
+
+    fn lines(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn identical_inputs_yield_only_equal_rows() {
+        let rows = build_diff_rows(
+            &lines(&["alpha", "beta", "gamma"]),
+            &lines(&["alpha", "beta", "gamma"]),
+        );
+        assert_eq!(rows.len(), 3);
+        for r in rows {
+            assert!(matches!(r, DiffRow::Equal { .. }));
+        }
+    }
+
+    #[test]
+    fn pure_addition_emits_added_rows() {
+        let rows = build_diff_rows(&lines(&[]), &lines(&["new1", "new2"]));
+        assert_eq!(
+            rows,
+            vec![DiffRow::Added { right: 0 }, DiffRow::Added { right: 1 },]
+        );
+    }
+
+    #[test]
+    fn pure_removal_emits_removed_rows() {
+        let rows = build_diff_rows(&lines(&["old1", "old2"]), &lines(&[]));
+        assert_eq!(
+            rows,
+            vec![DiffRow::Removed { left: 0 }, DiffRow::Removed { left: 1 },]
+        );
+    }
+
+    #[test]
+    fn one_line_edit_is_paired_into_a_single_replaced_row() {
+        let rows = build_diff_rows(
+            &lines(&["alpha", "beta", "gamma"]),
+            &lines(&["alpha", "BETA", "gamma"]),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                DiffRow::Equal { left: 0, right: 0 },
+                DiffRow::Replaced { left: 1, right: 1 },
+                DiffRow::Equal { left: 2, right: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn unequal_run_lengths_pair_what_they_can_then_overflow() {
+        // 3 removed + 1 added → 1 replaced + 2 removed (added-side runs out).
+        let rows = build_diff_rows(&lines(&["a", "b", "c", "d"]), &lines(&["A"]));
+        let kinds: Vec<&'static str> = rows
+            .iter()
+            .map(|r| match r {
+                DiffRow::Equal { .. } => "eq",
+                DiffRow::Replaced { .. } => "rep",
+                DiffRow::Removed { .. } => "rm",
+                DiffRow::Added { .. } => "add",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["rep", "rm", "rm", "rm"]);
+    }
+
+    #[test]
+    fn horizontal_scroll_helpers_clamp_at_longest_line() {
+        let mut d = DiffData::build(
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            lines(&["short", "medium length", "much-much-much-much-much-longer"]),
+            lines(&["short", "medium length", "much-much-much-much-much-longer"]),
+        );
+        assert_eq!(d.scroll_x, 0);
+        d.scroll_left_by(5);
+        assert_eq!(d.scroll_x, 0, "saturating sub at 0");
+        d.scroll_right_by(10);
+        assert_eq!(d.scroll_x, 10);
+        let longest = d.longest_line_chars();
+        d.scroll_right_by(99_999);
+        assert_eq!(d.scroll_x, longest, "right scroll clamps at longest line");
+        d.scroll_left_by(longest);
+        assert_eq!(d.scroll_x, 0);
+    }
+
+    #[test]
+    fn scroll_helpers_clamp_at_zero_and_total() {
+        let mut d = DiffData::build(
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            lines(&["1", "2", "3", "4", "5"]),
+            lines(&["1", "2", "X", "4", "5"]),
+        );
+        assert_eq!(d.scroll, 0);
+        d.scroll_up_by(3);
+        assert_eq!(d.scroll, 0, "saturating sub at 0");
+        d.scroll_down_by(2);
+        assert_eq!(d.scroll, 2);
+        d.scroll_down_by(99);
+        assert_eq!(d.scroll, d.rows.len(), "clamp at total rows");
+        d.scroll_home();
+        assert_eq!(d.scroll, 0);
+        d.scroll_end();
+        assert_eq!(d.scroll, d.rows.len());
+    }
+
+    #[test]
+    fn build_data_loads_paths_and_rows() {
+        let d = DiffData::build(
+            PathBuf::from("/tmp/a.txt"),
+            PathBuf::from("/tmp/b.txt"),
+            lines(&["x", "y"]),
+            lines(&["x", "Y"]),
+        );
+        assert_eq!(d.total_rows(), 2);
+        assert_eq!(d.left_lines, lines(&["x", "y"]));
+        assert_eq!(d.right_lines, lines(&["x", "Y"]));
+        assert_eq!(d.scroll, 0);
+    }
+
+    #[test]
+    fn caret_reports_the_selection_head_side_row_and_col() {
+        let mut d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["alpha", "bravo"]),
+            lines(&["alpha", "BRAVO"]),
+        );
+        assert_eq!(d.caret(), None, "no selection means no caret");
+        d.start_selection(DiffSide::Right, 1, 3);
+        assert_eq!(d.caret(), Some((DiffSide::Right, 1, 3)));
+        assert_eq!(d.caret_row(), Some(1));
+    }
+
+    #[test]
+    fn jump_target_single_file_maps_row_to_right_path_and_one_based_line() {
+        let d = DiffData::build(
+            PathBuf::from("/tmp/a.txt"),
+            PathBuf::from("/tmp/b.txt"),
+            lines(&["x", "y"]),
+            lines(&["x", "Y"]),
+        );
+        // Row 1 is the Replaced y -> Y row; its new-file line is index 1 + 1.
+        let j = d.jump_target(1, std::path::Path::new("/repo")).unwrap();
+        assert_eq!(j.path, PathBuf::from("/tmp/b.txt"));
+        assert_eq!(j.line, 2);
+    }
+
+    #[test]
+    fn jump_target_git_text_resolves_file_from_header_and_line_from_hunk() {
+        let raw = concat!(
+            "diff --git a/src/foo.rs b/src/foo.rs\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/src/foo.rs\n",
+            "+++ b/src/foo.rs\n",
+            "@@ -10,3 +10,4 @@ fn x() {\n",
+            " keep1\n",
+            "-old\n",
+            "+new1\n",
+            "+new2\n",
+            " keep2\n",
+        );
+        let d = DiffData::build_side_by_side_from_git_text(PathBuf::from("git diff"), raw);
+        // Rows: 0 diff-header, 1 @@-header, 2 keep1(10), 3 old->new1(11),
+        // 4 +new2(12), 5 keep2(13).
+        let root = std::path::Path::new("/repo");
+        let added = d.jump_target(4, root).unwrap();
+        assert_eq!(added.path, PathBuf::from("/repo/src/foo.rs"));
+        assert_eq!(added.line, 12, "the +new2 row is new-file line 12");
+        let keep = d.jump_target(2, root).unwrap();
+        assert_eq!(keep.line, 10, "the first kept row is new-file line 10");
+        let replaced = d.jump_target(3, root).unwrap();
+        assert_eq!(replaced.line, 11);
+    }
+
+    #[test]
+    fn jump_target_removed_row_with_real_left_opens_the_left_file() {
+        let mut d = DiffData::build(
+            PathBuf::from("/tmp/a.txt"),
+            PathBuf::from("/tmp/b.txt"),
+            lines(&["keep", "gone"]),
+            lines(&["keep"]),
+        );
+        d.left_is_real_file = true;
+        // Rows: 0 Equal keep, 1 Removed gone (left index 1).
+        let j = d.jump_target(1, std::path::Path::new("/repo")).unwrap();
+        assert_eq!(j.path, PathBuf::from("/tmp/a.txt"));
+        assert_eq!(j.line, 2, "the removed line is left-file line 2");
+    }
+
+    #[test]
+    fn jump_target_removed_row_with_synthetic_left_opens_the_working_right_file() {
+        // HEAD-vs-working diff: the left "path" is only a label, the right is
+        // the real file. A removed line is gone from the working tree, so
+        // Enter must land in the real right file, not the label that ENOENTs.
+        let d = DiffData::build(
+            PathBuf::from("foo.txt (HEAD)"),
+            PathBuf::from("/tmp/foo.txt"),
+            lines(&["keep", "gone"]),
+            lines(&["keep"]),
+        );
+        let j = d.jump_target(1, std::path::Path::new("/repo")).unwrap();
+        assert_eq!(
+            j.path,
+            PathBuf::from("/tmp/foo.txt"),
+            "left_is_real_file is false for a HEAD label, so the removed row resolves to the working file on the right"
+        );
+    }
+
+    #[test]
+    fn first_change_row_skips_leading_equal_rows() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d"]),
+            lines(&["a", "b", "X", "d"]),
+        );
+        assert_eq!(
+            d.first_change_row(),
+            Some(2),
+            "first change must skip the two leading Equal rows"
+        );
+    }
+
+    #[test]
+    fn first_change_row_is_none_for_identical_inputs() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b"]),
+            lines(&["a", "b"]),
+        );
+        assert_eq!(d.first_change_row(), None);
+    }
+
+    #[test]
+    fn hunk_starts_lists_one_index_per_contiguous_change_block() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d", "e", "f"]),
+            lines(&["a", "B", "c", "d", "E", "F"]),
+        );
+        // Hunk 1: row 1 (Replaced b→B), Hunk 2: rows 4-5 (Replaced e→E, f→F).
+        let starts = d.hunk_starts();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0], 1);
+        assert_eq!(starts[1], 4);
+    }
+
+    #[test]
+    fn hunk_range_at_expands_to_the_contiguous_change_block() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d", "e", "f"]),
+            lines(&["a", "B", "c", "d", "E", "F"]),
+        );
+        assert_eq!(d.hunk_range_at(1), Some((1, 1)));
+        assert_eq!(d.hunk_range_at(4), Some((4, 5)));
+        assert_eq!(d.hunk_range_at(5), Some((4, 5)));
+        // A context row falls forward to the next hunk, like Next Change.
+        assert_eq!(d.hunk_range_at(2), Some((4, 5)));
+        assert_eq!(d.hunk_range_at(0), Some((1, 1)));
+    }
+
+    #[test]
+    fn a_hunk_jump_after_a_click_moves_the_action_row() {
+        // Two hunks far apart; click on the first, then jump to the second.
+        // Stage/unstage/revert must act on the jump target, not the stale
+        // click, or `R` destroys a hunk the user is no longer looking at.
+        let left: Vec<String> = (1..=20).map(|i| format!("line{i}")).collect();
+        let mut right = left.clone();
+        right[1] = "LINE2".into();
+        right[17] = "LINE18".into();
+        let mut d = DiffData::build(PathBuf::new(), PathBuf::new(), left, right);
+        d.start_selection(DiffSide::Right, 1, 0);
+        assert_eq!(d.action_row(), 1, "a click targets the clicked row");
+        d.jump_next_change();
+        assert_eq!(
+            d.action_row(),
+            17,
+            "the jump target must win over the stale click"
+        );
+    }
+
+    /// Stage a croft-built hunk patch with real `git apply` — the only
+    /// oracle that matters for the patch shape.
+    fn git_apply_check(root: &std::path::Path, patch: &str) -> Result<(), String> {
+        use std::io::Write;
+        let mut child = crate::test_git::test_git_command()
+            .args(["-C", root.to_str().unwrap(), "apply", "--cached", "--check"])
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(patch.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).into_owned())
+        }
+    }
+
+    fn git_repo_with(root: &std::path::Path, content: &str) {
+        let run = |args: &[&str]| {
+            let ok = crate::test_git::test_git_command()
+                .args(["-C", root.to_str().unwrap()])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(root.join("f.txt"), content).unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+    }
+
+    fn head_diff(root: &std::path::Path, head: &str, work: &str) -> DiffData {
+        DiffData::build_with_byte_check(
+            PathBuf::new(),
+            root.join("f.txt"),
+            head.lines().map(str::to_string).collect(),
+            work.lines().map(str::to_string).collect(),
+            Some(head),
+            Some(work),
+        )
+    }
+
+    /// #258: the headline case. A block that only changed indentation shows
+    /// zero changed rows with the toggle on, while a real edit inside the
+    /// reindented block still shows.
+    #[test]
+    fn reindented_block_reads_as_unchanged_but_real_edits_still_show() {
+        let head: Vec<String> = (0..20)
+            .map(|i| {
+                if i == 7 {
+                    "let x = 1;".into()
+                } else {
+                    format!("line{i};")
+                }
+            })
+            .collect();
+        // Every line gains one indent level; line 7 also changes for real.
+        let work: Vec<String> = head
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                if i == 7 {
+                    "    let x = 2;".to_string()
+                } else {
+                    format!("    {l}")
+                }
+            })
+            .collect();
+        let mut d = DiffData::build(PathBuf::from("HEAD"), PathBuf::from("f.rs"), head, work);
+        let changed = |rows: &[DiffRow]| {
+            rows.iter()
+                .filter(|r| !matches!(r, DiffRow::Equal { .. }))
+                .count()
+        };
+        assert_eq!(changed(&d.rows), 20, "every line differs byte-wise");
+
+        d.set_whitespace_mode(DiffWhitespace::Leading);
+        assert_eq!(
+            changed(d.display_rows()),
+            1,
+            "only the real edit survives ignoring indentation"
+        );
+        assert_eq!(
+            changed(&d.rows),
+            20,
+            "the REAL rows are untouched, so staging still sees every line"
+        );
+    }
+
+    /// Trailing-whitespace-only differences vanish under `All` but not under
+    /// `Leading`, which is the distinction between the two modes.
+    #[test]
+    fn all_mode_ignores_trailing_and_internal_whitespace_leading_does_not() {
+        let head = vec!["let a = 1;".to_string(), "let b  =  2;".to_string()];
+        let work = vec!["let a = 1;   ".to_string(), "let b = 2;".to_string()];
+        let mut d = DiffData::build(PathBuf::from("HEAD"), PathBuf::from("f.rs"), head, work);
+        let changed = |rows: &[DiffRow]| {
+            rows.iter()
+                .filter(|r| !matches!(r, DiffRow::Equal { .. }))
+                .count()
+        };
+        d.set_whitespace_mode(DiffWhitespace::Leading);
+        assert_eq!(
+            changed(d.display_rows()),
+            2,
+            "leading-only normalisation keeps trailing and internal changes"
+        );
+        d.set_whitespace_mode(DiffWhitespace::All);
+        assert_eq!(changed(d.display_rows()), 0, "all whitespace collapses");
+        d.set_whitespace_mode(DiffWhitespace::Off);
+        assert_eq!(
+            changed(d.display_rows()),
+            2,
+            "turning it off restores the real diff"
+        );
+    }
+
+    /// The hard requirement from #258: what reaches the index must not depend
+    /// on the view. A hunk that is part whitespace-only and part real edit
+    /// must stage byte-identically with the toggle on or off, and git must
+    /// accept the patch.
+    #[test]
+    fn staging_is_byte_identical_with_ignore_whitespace_on_or_off() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let head = "fn main() {\nlet a = 1;\nlet b = 2;\nlet c = 3;\n}\n";
+        // Body reindented (whitespace-only) AND `b` genuinely changed.
+        let work = "fn main() {\n    let a = 1;\n    let b = 22;\n    let c = 3;\n}\n";
+        git_repo_with(&root, head);
+        std::fs::write(root.join("f.txt"), work).unwrap();
+
+        let mut d = head_diff(&root, head, work);
+        let range = d.hunk_range_at(0).expect("a change hunk exists");
+        let patch_off = d.hunk_patch("f.txt", range);
+
+        d.set_whitespace_mode(DiffWhitespace::All);
+        let range_on = d.hunk_range_at(0).expect("the REAL hunk is still there");
+        let patch_on = d.hunk_patch("f.txt", range_on);
+
+        assert_eq!(
+            patch_off, patch_on,
+            "the staged patch must not depend on the view's whitespace mode"
+        );
+        if let Err(e) = git_apply_check(&root, &patch_on) {
+            panic!("git apply rejected the patch:\n{patch_on}\n{e}");
+        }
+    }
+
+    #[test]
+    fn hunk_patches_apply_to_files_without_a_final_newline() {
+        // `str::lines()` erases the missing-newline fact, so the patch used
+        // to claim `b\n` against a file ending in `b` and git rejected it:
+        // every hunk within three context lines of EOF was dead.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (head, work) = ("a\nb", "a\nB");
+        git_repo_with(&root, head);
+        std::fs::write(root.join("f.txt"), work).unwrap();
+        let d = head_diff(&root, head, work);
+        let range = d.hunk_range_at(0).unwrap();
+        let patch = d.hunk_patch("f.txt", range);
+        if let Err(e) = git_apply_check(&root, &patch) {
+            panic!("git apply rejected the patch:\n{patch}\n{e}");
+        }
+    }
+
+    fn git_apply(root: &std::path::Path, patch: &str, args: &[&str]) -> Result<(), String> {
+        use std::io::Write;
+        let mut child = crate::test_git::test_git_command()
+            .args(["-C", root.to_str().unwrap(), "apply"])
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(patch.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).into_owned())
+        }
+    }
+
+    fn staged_text(root: &std::path::Path) -> String {
+        let out = crate::test_git::test_git_command()
+            .args(["-C", root.to_str().unwrap(), "show", ":f.txt"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// #1232: stage the one hunk, then revert it from the work tree; the
+    /// index must hold `work` and the file must go back to `head`, byte
+    /// for byte.
+    fn stage_and_revert_round_trip(head: &str, work: &str) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        git_repo_with(&root, head);
+        std::fs::write(root.join("f.txt"), work).unwrap();
+        let d = head_diff(&root, head, work);
+        let start = (0..d.rows.len())
+            .find(|&i| !matches!(d.rows[i], DiffRow::Equal { .. }))
+            .expect("a change row");
+        let range = d.hunk_range_at(start).unwrap();
+        let patch = d.hunk_patch("f.txt", range);
+        if let Err(e) = git_apply(&root, &patch, &["--cached"]) {
+            panic!("stage failed:\n{patch}\n{e}");
+        }
+        assert_eq!(staged_text(&root), work, "the index holds the work tree");
+        if let Err(e) = git_apply(&root, &patch, &["-R"]) {
+            panic!("revert failed:\n{patch}\n{e}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            head,
+            "revert restores HEAD's bytes"
+        );
+    }
+
+    #[test]
+    fn appending_to_a_file_without_a_final_newline_stages_and_reverts() {
+        stage_and_revert_round_trip("no newline end", "no newline end\nadded");
+    }
+
+    #[test]
+    fn appending_a_terminated_line_stages_and_reverts() {
+        stage_and_revert_round_trip("a", "a\nb\n");
+    }
+
+    #[test]
+    fn deleting_the_last_unterminated_line_stages_and_reverts() {
+        stage_and_revert_round_trip("a\nb\nc", "a\nb");
+    }
+
+    #[test]
+    fn adding_only_a_final_newline_stages_and_reverts() {
+        stage_and_revert_round_trip("a\nb", "a\nb\n");
+    }
+
+    #[test]
+    fn the_unterminated_line_shows_as_changed_when_one_side_ends_it() {
+        let d = DiffData::build_with_byte_check(
+            PathBuf::new(),
+            PathBuf::new(),
+            vec!["a".into()],
+            vec!["a".into(), "b".into()],
+            Some("a"),
+            Some("a\nb"),
+        );
+        assert!(
+            matches!(d.rows[0], DiffRow::Replaced { left: 0, right: 0 }),
+            "git counts `a` as changed: {:?}",
+            d.rows
+        );
+    }
+
+    #[test]
+    fn selecting_only_the_added_line_still_carries_the_newline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (head, work) = ("a", "a\nb");
+        git_repo_with(&root, head);
+        std::fs::write(root.join("f.txt"), work).unwrap();
+        let d = head_diff(&root, head, work);
+        let patch = d.selected_lines_patch("f.txt", (1, 1)).unwrap();
+        if let Err(e) = git_apply(&root, &patch, &["--cached"]) {
+            panic!("stage failed:\n{patch}\n{e}");
+        }
+        assert_eq!(staged_text(&root), work);
+    }
+
+    #[test]
+    fn a_line_both_sides_leave_unterminated_stays_context() {
+        // Negative: an edit above the last line keeps `b` as context on
+        // both sides, as git does.
+        let d = DiffData::build_with_byte_check(
+            PathBuf::new(),
+            PathBuf::new(),
+            vec!["a".into(), "b".into()],
+            vec!["A".into(), "b".into()],
+            Some("a\nb"),
+            Some("A\nb"),
+        );
+        assert!(matches!(d.rows[1], DiffRow::Equal { .. }));
+        let patch = d.hunk_patch("f.txt", d.hunk_range_at(0).unwrap());
+        assert!(
+            patch.ends_with(" b\n\\ No newline at end of file\n"),
+            "{patch}"
+        );
+        stage_and_revert_round_trip("a\nb", "A\nb");
+    }
+
+    #[test]
+    fn terminated_last_lines_stay_context() {
+        // Negative: with a final newline on both sides nothing changes.
+        let d = DiffData::build_with_byte_check(
+            PathBuf::new(),
+            PathBuf::new(),
+            vec!["a".into(), "b".into()],
+            vec!["a".into(), "b".into(), "c".into()],
+            Some("a\nb\n"),
+            Some("a\nb\nc\n"),
+        );
+        assert!(
+            d.rows[..2]
+                .iter()
+                .all(|r| matches!(r, DiffRow::Equal { .. }))
+        );
+        assert!(
+            !d.hunk_patch("f.txt", d.hunk_range_at(2).unwrap())
+                .contains("-b")
+        );
+        stage_and_revert_round_trip("a\nb\n", "a\nb\nc\n");
+    }
+
+    #[test]
+    fn hunk_patches_apply_to_crlf_files() {
+        // `str::lines()` also strips the `\r`, so a patch against a CRLF
+        // file never matched a single line of it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (head, work) = (
+            "l1\r\nl2\r\nl3\r\nl4\r\nl5\r\n",
+            "l1\r\nL2\r\nl3\r\nl4\r\nl5\r\n",
+        );
+        git_repo_with(&root, head);
+        std::fs::write(root.join("f.txt"), work).unwrap();
+        let d = head_diff(&root, head, work);
+        let range = d.hunk_range_at(1).unwrap();
+        let patch = d.hunk_patch("f.txt", range);
+        if let Err(e) = git_apply_check(&root, &patch) {
+            panic!("git apply rejected the patch:\n{patch}\n{e}");
+        }
+    }
+
+    /// The patch must not just LOOK right: git has to accept it and the
+    /// index must end up holding exactly the selected line. Runs a real
+    /// repo end to end (issue #214).
+    /// The risky shape: the patch opens on an UNSELECTED change (no
+    /// leading context to anchor the line numbers). git must still accept
+    /// it and stage only the selected line.
+    #[test]
+    fn git_accepts_a_patch_that_opens_on_an_unselected_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let head = "a\nb\nc\n";
+        let work = "X\nY\nc\n";
+        git_repo_with(root, head);
+        std::fs::write(root.join("f.txt"), work).unwrap();
+        let d = head_diff(root, head, work);
+        // Rows 0 and 1 are both changes; select only the SECOND.
+        let patch = d.selected_lines_patch("f.txt", (1, 1)).unwrap();
+        if let Err(e) = git_apply_check(root, &patch) {
+            panic!("git rejected the patch:\n{patch}\n{e}");
+        }
+        let applied = crate::test_git::test_git_command()
+            .args(["-C", root.to_str().unwrap(), "apply", "--cached"])
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin.take().unwrap().write_all(patch.as_bytes())?;
+                c.wait()
+            })
+            .map(|st| st.success())
+            .unwrap_or(false);
+        assert!(applied, "git apply --cached must succeed for:\n{patch}");
+        let staged = crate::test_git::test_git_command()
+            .args(["-C", root.to_str().unwrap(), "show", ":f.txt"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&staged.stdout),
+            "a\nY\nc\n",
+            "the unselected first change must stay out of the index"
+        );
+    }
+
+    #[test]
+    fn git_accepts_a_selected_lines_patch_and_stages_only_those_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let head = "a\nb\nc\nd\n";
+        let work = "a\nX\nY\nd\n";
+        git_repo_with(root, head);
+        std::fs::write(root.join("f.txt"), work).unwrap();
+        let d = head_diff(root, head, work);
+        // Row 1 is b -> X; row 2 is c -> Y. Stage only the first.
+        let patch = d.selected_lines_patch("f.txt", (1, 1)).unwrap();
+        if let Err(e) = git_apply_check(root, &patch) {
+            panic!("git rejected the selected-lines patch:\n{patch}\n{e}");
+        }
+        let ok = crate::test_git::test_git_command()
+            .args(["-C", root.to_str().unwrap(), "apply", "--cached"])
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin.take().unwrap().write_all(patch.as_bytes())?;
+                c.wait()
+            })
+            .map(|st| st.success())
+            .unwrap_or(false);
+        assert!(ok, "git apply --cached must succeed for:\n{patch}");
+        // The staged blob holds the FIRST change only: X applied, c intact.
+        let staged = crate::test_git::test_git_command()
+            .args(["-C", root.to_str().unwrap(), "show", ":f.txt"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&staged.stdout),
+            "a\nX\nc\nd\n",
+            "only the selected line may reach the index"
+        );
+    }
+
+    /// Issue #214: stage only the SELECTED lines. Rows outside the
+    /// selection must be represented as the index already has them: an
+    /// unselected `+` is dropped (it is not being staged), an unselected
+    /// `-` becomes context (that line still exists in HEAD).
+    #[test]
+    fn selected_lines_patch_keeps_unselected_changes_out_of_the_index() {
+        // HEAD: a b c d ; work: a X Y d  -> two independent changes.
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d"]),
+            lines(&["a", "X", "Y", "d"]),
+        );
+        // Select just the first changed row (b -> X).
+        let patch = d
+            .selected_lines_patch("f.txt", (1, 1))
+            .expect("the selection covers a change");
+        assert_eq!(
+            patch, "--- a/f.txt\n+++ b/f.txt\n@@ -1,4 +1,4 @@\n a\n-b\n+X\n c\n d\n",
+            "only the selected replacement is staged; the unselected c->Y \
+             leaves c as context and drops Y"
+        );
+    }
+
+    #[test]
+    fn selected_lines_patch_stages_one_added_line_of_several() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b"]),
+            lines(&["a", "x", "y", "b"]),
+        );
+        // Rows: 0 Equal(a), 1 Added(x), 2 Added(y), 3 Equal(b).
+        let patch = d
+            .selected_lines_patch("f.txt", (1, 1))
+            .expect("the selection covers the first addition");
+        assert_eq!(
+            patch, "--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,3 @@\n a\n+x\n b\n",
+            "the unselected second addition must not reach the index"
+        );
+    }
+
+    #[test]
+    fn selected_lines_patch_stages_one_deletion_of_several() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d"]),
+            lines(&["a", "d"]),
+        );
+        // Rows: 0 Equal(a), 1 Removed(b), 2 Removed(c), 3 Equal(d).
+        let patch = d
+            .selected_lines_patch("f.txt", (1, 1))
+            .expect("the selection covers the first deletion");
+        assert_eq!(
+            patch, "--- a/f.txt\n+++ b/f.txt\n@@ -1,4 +1,3 @@\n a\n-b\n c\n d\n",
+            "the unselected deletion stays in the index as context"
+        );
+    }
+
+    #[test]
+    fn selected_lines_patch_is_none_without_a_change_in_range() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c"]),
+            lines(&["a", "B", "c"]),
+        );
+        // Row 0 is context only.
+        assert!(d.selected_lines_patch("f.txt", (0, 0)).is_none());
+    }
+
+    #[test]
+    fn hunk_patch_contains_only_the_requested_hunk() {
+        // 15 untouched lines between the two edits so their context
+        // windows cannot overlap.
+        let left: Vec<String> = (1..=20).map(|i| format!("line{i}")).collect();
+        let mut right = left.clone();
+        right[1] = "LINE2".into();
+        right[17] = "LINE18".into();
+        let d = DiffData::build(PathBuf::new(), PathBuf::new(), left, right);
+        let range = d.hunk_range_at(1).unwrap();
+        assert_eq!(range, (1, 1));
+        let patch = d.hunk_patch("src/x.rs", range);
+        assert_eq!(
+            patch,
+            "--- a/src/x.rs\n+++ b/src/x.rs\n@@ -1,5 +1,5 @@\n line1\n-line2\n+LINE2\n line3\n line4\n line5\n",
+            "the patch must carry only the first hunk with three context lines"
+        );
+    }
+
+    #[test]
+    fn hunk_patch_handles_a_pure_addition() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b"]),
+            lines(&["a", "x", "b"]),
+        );
+        let range = d.hunk_range_at(0).unwrap();
+        let patch = d.hunk_patch("f.txt", range);
+        assert_eq!(
+            patch,
+            "--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,3 @@\n a\n+x\n b\n"
+        );
+    }
+
+    #[test]
+    fn hunk_patch_handles_a_deletion_at_end_of_file() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c"]),
+            lines(&["a", "b"]),
+        );
+        let range = d.hunk_range_at(0).unwrap();
+        let patch = d.hunk_patch("f.txt", range);
+        assert_eq!(
+            patch,
+            "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,2 @@\n a\n b\n-c\n"
+        );
+    }
+
+    #[test]
+    fn next_change_row_jumps_to_the_next_hunk_after_the_cursor() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d", "e"]),
+            lines(&["a", "B", "c", "d", "E"]),
+        );
+        assert_eq!(d.next_change_row(0), Some(1));
+        assert_eq!(
+            d.next_change_row(1),
+            Some(4),
+            "must skip past the current hunk"
+        );
+        assert_eq!(d.next_change_row(4), None);
+    }
+
+    #[test]
+    fn prev_change_row_jumps_to_the_previous_hunk_before_the_cursor() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d", "e"]),
+            lines(&["a", "B", "c", "d", "E"]),
+        );
+        assert_eq!(d.prev_change_row(4), Some(1));
+        assert_eq!(d.prev_change_row(1), None);
+        assert_eq!(d.prev_change_row(0), None);
+    }
+
+    #[test]
+    fn next_change_row_wrap_loops_from_last_hunk_back_to_first() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d", "e"]),
+            lines(&["a", "B", "c", "d", "E"]),
+        );
+        assert_eq!(d.next_change_row_wrap(0), Some(1));
+        assert_eq!(d.next_change_row_wrap(1), Some(4));
+        // Past the last hunk: wrap to the first instead of stalling.
+        assert_eq!(
+            d.next_change_row_wrap(4),
+            Some(1),
+            "at/past the last hunk the next ⟶ click must loop back to the first"
+        );
+        assert_eq!(d.next_change_row_wrap(999), Some(1));
+    }
+
+    #[test]
+    fn prev_change_row_wrap_loops_from_first_hunk_back_to_last() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d", "e"]),
+            lines(&["a", "B", "c", "d", "E"]),
+        );
+        assert_eq!(d.prev_change_row_wrap(4), Some(1));
+        assert_eq!(
+            d.prev_change_row_wrap(1),
+            Some(4),
+            "at/before the first hunk the previous ⟵ click must loop to the last"
+        );
+        assert_eq!(d.prev_change_row_wrap(0), Some(4));
+    }
+
+    #[test]
+    fn change_row_wrap_returns_none_when_diff_has_no_changes() {
+        let d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c"]),
+            lines(&["a", "b", "c"]),
+        );
+        assert_eq!(d.next_change_row_wrap(0), None);
+        assert_eq!(d.prev_change_row_wrap(0), None);
+    }
+
+    #[test]
+    fn scroll_to_row_parks_two_rows_of_context_above_the_target() {
+        let mut d = DiffData::build(
+            PathBuf::new(),
+            PathBuf::new(),
+            lines(&["a", "b", "c", "d", "e"]),
+            lines(&["a", "b", "C", "d", "e"]),
+        );
+        d.scroll_to_row(2);
+        assert_eq!(d.scroll, 0, "row 2 with 2-row context lands scroll at 0");
+        d.scroll_to_row(7);
+        assert_eq!(d.scroll, 5);
+    }
+
+    #[test]
+    fn build_with_byte_check_flags_a_crlf_only_difference() {
+        // Same lines on both sides but the working copy switched to CRLF.
+        // `.lines()` collapses the difference; the byte check catches it so
+        // the renderer can surface a banner.
+        let left_text = "alpha\nbeta\n";
+        let right_text = "alpha\r\nbeta\r\n";
+        let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
+        let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
+        let d = DiffData::build_with_byte_check(
+            PathBuf::from("/x"),
+            PathBuf::from("/x"),
+            left_lines,
+            right_lines,
+            Some(left_text),
+            Some(right_text),
+        );
+        assert!(
+            d.bytes_differ_but_lines_equal,
+            "a CRLF-only difference must set bytes_differ_but_lines_equal so the diff header explains why no red/green band paints"
+        );
+        assert!(
+            d.rows.iter().all(|r| matches!(r, DiffRow::Equal { .. })),
+            "the line-level diff is still entirely Equal rows — the flag is what tells the user the file is byte-different"
+        );
+    }
+
+    #[test]
+    fn a_lost_final_newline_is_a_changed_line_not_a_banner() {
+        // #1232: git shows `-beta` / `+beta` / `\ No newline`, so the view
+        // shows the row as changed and the hunk actions can reach it.
+        let d = DiffData::build_with_byte_check(
+            PathBuf::from("/x"),
+            PathBuf::from("/x"),
+            vec!["alpha".into(), "beta".into()],
+            vec!["alpha".into(), "beta".into()],
+            Some("alpha\nbeta\n"),
+            Some("alpha\nbeta"),
+        );
+        assert!(!d.bytes_differ_but_lines_equal);
+        assert!(matches!(d.rows[0], DiffRow::Equal { .. }));
+        assert!(matches!(d.rows[1], DiffRow::Replaced { left: 1, right: 1 }));
+        assert_eq!(d.hunk_range_at(1), Some((1, 1)));
+    }
+
+    #[test]
+    fn build_with_byte_check_leaves_flag_false_when_a_real_line_changes() {
+        let left_text = "alpha\nbeta\n";
+        let right_text = "alpha\nBETA\n";
+        let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
+        let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
+        let d = DiffData::build_with_byte_check(
+            PathBuf::from("/x"),
+            PathBuf::from("/x"),
+            left_lines,
+            right_lines,
+            Some(left_text),
+            Some(right_text),
+        );
+        assert!(
+            !d.bytes_differ_but_lines_equal,
+            "the flag must stay false when the diff has real Replaced rows — otherwise the header would lie that there's no line-level change"
+        );
+    }
+
+    #[test]
+    fn build_unified_deletion_emits_only_removed_rows_and_sets_unified_flag() {
+        let d = DiffData::build_unified_deletion(
+            PathBuf::from("doomed.rs"),
+            "fn main() {\n    println!(\"bye\");\n}\n",
+        );
+        assert!(
+            d.unified,
+            "unified flag must be set so the renderer picks the single-column path"
+        );
+        assert_eq!(
+            d.left_lines.len(),
+            3,
+            "three source lines must produce three rows"
+        );
+        assert!(d.right_lines.is_empty(), "deletion view has no right side");
+        assert_eq!(
+            d.rows,
+            vec![
+                DiffRow::Removed { left: 0 },
+                DiffRow::Removed { left: 1 },
+                DiffRow::Removed { left: 2 },
+            ],
+            "every row must be Removed so all lines paint red with a `-` sign"
+        );
+    }
+
+    #[test]
+    fn standard_diff_builders_leave_unified_flag_off() {
+        let d = DiffData::build(PathBuf::new(), PathBuf::new(), lines(&["a"]), lines(&["b"]));
+        assert!(!d.unified, "side-by-side diffs must stay non-unified");
+    }
+
+    #[test]
+    fn build_with_byte_check_leaves_flag_false_when_bytes_are_identical() {
+        let text = "alpha\nbeta\n";
+        let lines_vec: Vec<String> = text.lines().map(str::to_string).collect();
+        let d = DiffData::build_with_byte_check(
+            PathBuf::from("/x"),
+            PathBuf::from("/x"),
+            lines_vec.clone(),
+            lines_vec,
+            Some(text),
+            Some(text),
+        );
+        assert!(!d.bytes_differ_but_lines_equal);
+    }
+
+    #[test]
+    fn build_side_by_side_from_git_text_pairs_remove_add_into_replaced() {
+        // A one-line edit (- old / + new) must collapse into a single
+        // Replaced row so the two sides align visually instead of
+        // producing a zigzag of Removed-above-Added.
+        let raw = "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n keep\n-old\n+new\n";
+        let d = DiffData::build_side_by_side_from_git_text(PathBuf::from("staged"), raw);
+        assert!(
+            !d.unified,
+            "side-by-side builder must clear the unified flag so the two-column renderer takes over"
+        );
+        let tags: Vec<&'static str> = d
+            .rows
+            .iter()
+            .map(|r| match r {
+                DiffRow::Equal { .. } => "eq",
+                DiffRow::Added { .. } => "add",
+                DiffRow::Removed { .. } => "rm",
+                DiffRow::Replaced { .. } => "rep",
+            })
+            .collect();
+        // Expected after skipping index/---/+++ noise:
+        //   diff --git → Equal (file header)
+        //   @@ ...     → Equal (hunk header)
+        //    keep      → Equal (context)
+        //   -old / +new → paired into Replaced
+        //   trailing empty line → Equal
+        assert_eq!(
+            tags,
+            vec!["eq", "eq", "eq", "rep", "eq"],
+            "remove+add pair must collapse into one Replaced row; file/hunk headers stay as Equal markers"
+        );
+        assert!(
+            d.left_lines.iter().any(|s| s == "old"),
+            "removed body (without leading -) belongs in left_lines"
+        );
+        assert!(
+            d.right_lines.iter().any(|s| s == "new"),
+            "added body (without leading +) belongs in right_lines"
+        );
+    }
+
+    #[test]
+    fn build_side_by_side_from_git_text_overflow_runs_emit_extra_removed_or_added() {
+        // 3 removed + 1 added → 1 Replaced + 2 Removed (added side runs out).
+        let raw = "diff --git a/x b/x\n@@ -1,4 +1,2 @@\n keep\n-a\n-b\n-c\n+A\n other\n";
+        let d = DiffData::build_side_by_side_from_git_text(PathBuf::from("staged"), raw);
+        let change_tags: Vec<&'static str> = d
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                DiffRow::Replaced { .. } => Some("rep"),
+                DiffRow::Removed { .. } => Some("rm"),
+                DiffRow::Added { .. } => Some("add"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            change_tags,
+            vec!["rep", "rm", "rm"],
+            "unequal runs pair what they can then overflow with the longer side"
+        );
+    }
+
+    /// #2020: a `git diff` over several files colours each file's hunks
+    /// by that file's language, and leaves its header lines and a file with
+    /// no grammar in the plain diff colours.
+    #[test]
+    fn a_git_diff_colours_each_files_hunks_by_its_own_language() {
+        let raw = "diff --git a/src/a.rs b/src/a.rs\n\
+                   index 1..2 100644\n\
+                   --- a/src/a.rs\n\
+                   +++ b/src/a.rs\n\
+                   @@ -1,2 +1,2 @@\n\
+                   \x20fn main() {\n\
+                   -    let x = 1;\n\
+                   +    let x = 2;\n\
+                   diff --git a/notes.txt b/notes.txt\n\
+                   @@ -1 +1 @@\n\
+                   -fn not code\n\
+                   +fn still not code\n";
+        let mut d = DiffData::build_side_by_side_from_git_text(PathBuf::from("staged"), raw);
+        d.colour_syntax(None);
+        let at = |lines: &[String], text: &str| lines.iter().position(|l| l == text).unwrap();
+        let header = at(&d.left_lines, "diff --git a/src/a.rs b/src/a.rs");
+        assert!(
+            d.syntax.left(header).is_empty(),
+            "a file header is not code"
+        );
+        let hunk = at(&d.left_lines, "@@ -1,2 +1,2 @@");
+        assert!(d.syntax.left(hunk).is_empty(), "a hunk header is not code");
+        let context = at(&d.left_lines, "fn main() {");
+        assert!(
+            !d.syntax.left(context).is_empty(),
+            "Rust context is coloured"
+        );
+        let removed = at(&d.left_lines, "    let x = 1;");
+        assert!(
+            !d.syntax.left(removed).is_empty(),
+            "a removed Rust line too"
+        );
+        let added = at(&d.right_lines, "    let x = 2;");
+        assert!(!d.syntax.right(added).is_empty(), "and an added one");
+        let txt = at(&d.left_lines, "fn not code");
+        assert!(d.syntax.left(txt).is_empty(), "a .txt file stays plain");
+        let txt = at(&d.right_lines, "fn still not code");
+        assert!(d.syntax.right(txt).is_empty());
+    }
+
+    /// #2020: headers written under `diff.noprefix` or `diff.mnemonicPrefix`
+    /// still name the file's language.
+    #[test]
+    fn a_git_diff_without_the_usual_prefixes_is_still_coloured() {
+        for header in [
+            "diff --git a.rs a.rs",
+            "diff --git i/src/a.rs w/src/a.rs",
+            "diff --git c/a.rs i/a.rs",
+        ] {
+            let raw = format!("{header}\n@@ -1 +1 @@\n-fn a() {{}}\n+fn b() {{}}\n");
+            let mut d = DiffData::build_side_by_side_from_git_text(PathBuf::from("staged"), &raw);
+            d.colour_syntax(None);
+            let removed = d.left_lines.iter().position(|l| l == "fn a() {}").unwrap();
+            assert!(!d.syntax.left(removed).is_empty(), "{header}: coloured");
+        }
+    }
+
+    /// #2020: comparing two real files of different kinds colours each by
+    /// its own language: a text file beside a Rust one stays plain.
+    #[test]
+    fn a_real_file_with_no_grammar_stays_plain_beside_one_with_a_grammar() {
+        let mut d = DiffData::build(
+            PathBuf::from("old.rs"),
+            PathBuf::from("notes.txt"),
+            vec![String::from("fn a() {}")],
+            vec![String::from("fn a() {}")],
+        );
+        d.left_is_real_file = true;
+        d.colour_syntax(None);
+        assert!(!d.syntax.left(0).is_empty(), "the Rust file is coloured");
+        assert!(d.syntax.right(0).is_empty(), "the text file is not");
+    }
+
+    /// #2020: the left of a Source Control diff is a `foo.rs (HEAD)` label,
+    /// which names no language of its own, so it takes the working file's.
+    #[test]
+    fn the_head_side_takes_the_working_files_language() {
+        let mut d = DiffData::build(
+            PathBuf::from("src/a.rs (HEAD)"),
+            PathBuf::from("src/a.rs"),
+            vec![String::from("fn a() {}")],
+            vec![String::from("fn b() {}")],
+        );
+        d.colour_syntax(None);
+        assert!(!d.syntax.left(0).is_empty(), "HEAD reads as Rust");
+        assert!(!d.syntax.right(0).is_empty());
+    }
+
+    #[test]
+    fn build_side_by_side_from_git_text_skips_index_and_dashdash_headers() {
+        let raw =
+            "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n";
+        let d = DiffData::build_side_by_side_from_git_text(PathBuf::from("staged"), raw);
+        // No row may carry "index ", "--- a/x", or "+++ b/x" in either side.
+        assert!(
+            !d.left_lines.iter().any(|s| s.starts_with("index ")
+                || s.starts_with("--- a/")
+                || s.starts_with("+++ b/")),
+            "index / --- / +++ noise must be skipped from left_lines: {:?}",
+            d.left_lines
+        );
+        assert!(
+            !d.right_lines.iter().any(|s| s.starts_with("index ")
+                || s.starts_with("--- a/")
+                || s.starts_with("+++ b/")),
+            "index / --- / +++ noise must be skipped from right_lines: {:?}",
+            d.right_lines
+        );
+    }
+
+    #[test]
+    fn combined_diff_headers_after_the_first_file_are_still_skipped() {
+        let raw = "diff --cc a.rs\nindex 1,2..3\n--- a/a.rs\n+++ b/a.rs\n@@@ -1,1 -1,1 +1,1 @@@\n  x\ndiff --cc b.rs\nindex 4,5..6\n--- a/b.rs\n+++ b/b.rs\n@@@ -1,1 -1,1 +1,1 @@@\n  y\n";
+        let d = DiffData::build_side_by_side_from_git_text(PathBuf::from("m"), raw);
+        let all: Vec<&String> = d.left_lines.iter().chain(&d.right_lines).collect();
+        assert!(
+            !all.iter()
+                .any(|l| l.contains("a/b.rs") || l.contains("index 4")),
+            "{all:?}"
+        );
+    }
+
+    #[test]
+    fn a_removed_line_starting_with_dashes_inside_a_hunk_is_shown() {
+        let raw = "diff --git a/q.sql b/q.sql\n--- a/q.sql\n+++ b/q.sql\n@@ -1,2 +1,1 @@\n--- old comment\n select 1;\n";
+        let d = DiffData::build_side_by_side_from_git_text(PathBuf::from("staged"), raw);
+        assert!(
+            d.left_lines.iter().any(|s| s == "-- old comment"),
+            "{:?}",
+            d.left_lines
+        );
+    }
+
+    #[test]
+    fn the_new_path_is_read_from_quoted_and_space_b_slash_headers() {
+        assert_eq!(
+            parse_diff_git_new_path(r#"diff --git "a/\303\244.txt" "b/\303\244.txt""#).as_deref(),
+            Some("\u{e4}.txt")
+        );
+        assert_eq!(
+            parse_diff_git_new_path("diff --git a/my b/x b/my b/x").as_deref(),
+            Some("my b/x")
+        );
+        assert_eq!(
+            parse_diff_git_new_path("diff --git a/old.rs b/new.rs").as_deref(),
+            Some("new.rs")
+        );
+    }
+
+    #[test]
+    fn a_rename_whose_old_path_splits_a_character_at_the_midpoint_reads_the_new_path() {
+        // #1166: the midpoint window ends inside the emoji, so slicing it
+        // panicked and took the editor down.
+        assert_eq!(
+            parse_diff_git_new_path("diff --git a/aaaaa\u{1F600} b/x").as_deref(),
+            Some("x")
+        );
+        // Accented letters, two bytes each, straddling the window's end.
+        assert_eq!(
+            parse_diff_git_new_path("diff --git a/a\u{e9}\u{e9}\u{e9}\u{e9} b/x").as_deref(),
+            Some("x")
+        );
+    }
+
+    #[test]
+    fn a_header_with_no_b_side_still_yields_no_path() {
+        assert_eq!(
+            parse_diff_git_new_path("diff --git a/\u{1F600}\u{1F600}"),
+            None
+        );
+        assert_eq!(parse_diff_git_new_path("index 0000000..1111111"), None);
+    }
+
+    #[test]
+    fn build_side_by_side_from_git_text_empty_input_paints_placeholder_row() {
+        let d = DiffData::build_side_by_side_from_git_text(PathBuf::from("staged"), "");
+        assert_eq!(d.rows.len(), 1);
+        assert!(matches!(d.rows[0], DiffRow::Equal { .. }));
+        assert_eq!(d.left_lines, vec!["(no changes)".to_string()]);
+        assert!(!d.unified);
+    }
+
+    #[test]
+    fn selection_text_returns_substring_of_left_column_for_single_row_selection() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["alpha", "beta", "gamma"]),
+            lines(&["alpha", "BETA", "gamma"]),
+        );
+        // Row 1 is Replaced { left: 1, right: 1 }.
+        d.start_selection(DiffSide::Left, 1, 0);
+        d.extend_selection_to(1, 4);
+        assert_eq!(
+            d.selection_text().as_deref(),
+            Some("beta"),
+            "selecting cols 0..4 on the left column of a Replaced row must return the left line's first 4 chars"
+        );
+    }
+
+    #[test]
+    fn selection_text_returns_right_column_lines_across_multiple_rows() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["alpha", "beta", "gamma"]),
+            lines(&["alpha", "BETA", "GAMMA"]),
+        );
+        d.start_selection(DiffSide::Right, 0, 0);
+        d.extend_selection_to(2, 5);
+        assert_eq!(
+            d.selection_text().as_deref(),
+            Some("alpha\nBETA\nGAMMA"),
+            "multi-row right-column selection must concatenate the right_lines with newlines"
+        );
+    }
+
+    #[test]
+    fn selection_text_skips_added_row_content_when_left_side_is_selected() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["alpha", "gamma"]),
+            lines(&["alpha", "delta", "gamma"]),
+        );
+        let added_row_idx = d
+            .rows
+            .iter()
+            .position(|r| matches!(r, DiffRow::Added { .. }))
+            .expect("test fixture must contain an Added row");
+        d.start_selection(DiffSide::Left, added_row_idx, 0);
+        d.extend_selection_to(added_row_idx, 999);
+        assert!(
+            matches!(d.selection_text().as_deref(), None | Some("")),
+            "left-side selection over an Added row must yield no text — the left column is blank there"
+        );
+    }
+
+    #[test]
+    fn select_word_at_snaps_to_left_column_word_boundaries() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["alpha bravo charlie", "second"]),
+            lines(&["alpha BRAVO charlie", "second"]),
+        );
+        // Click inside "bravo" on the left side, row 0.
+        d.select_word_at(DiffSide::Left, 0, 8);
+        let sel = d.selection.expect("word click must produce a selection");
+        assert_eq!(sel.side, DiffSide::Left);
+        assert_eq!(sel.anchor_row, 0);
+        assert_eq!(sel.head_row, 0);
+        assert_eq!(sel.anchor_col, 6);
+        assert_eq!(sel.head_col, 11);
+        assert_eq!(
+            d.selection_text().as_deref(),
+            Some("bravo"),
+            "word selection must copy exactly the clicked word"
+        );
+    }
+
+    #[test]
+    fn select_word_at_on_punctuation_clears_selection() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["foo, bar"]),
+            lines(&["foo, bar"]),
+        );
+        d.select_word_at(DiffSide::Left, 0, 3);
+        assert!(
+            d.selection.is_none(),
+            "click on a non-word char (',') must NOT anchor a selection"
+        );
+    }
+
+    #[test]
+    fn select_word_at_on_added_row_left_side_clears() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["alpha", "gamma"]),
+            lines(&["alpha", "BETA", "gamma"]),
+        );
+        let added_row_idx = d
+            .rows
+            .iter()
+            .position(|r| matches!(r, DiffRow::Added { .. }))
+            .expect("fixture must contain an Added row");
+        d.select_word_at(DiffSide::Left, added_row_idx, 0);
+        assert!(
+            d.selection.is_none(),
+            "double-clicking on the (blank) left side of an Added row must NOT anchor a phantom selection"
+        );
+    }
+
+    #[test]
+    fn selection_occurrence_needle_returns_single_row_word() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["alpha beta", "alpha gamma"]),
+            lines(&["alpha beta", "alpha gamma"]),
+        );
+        d.select_word_at(DiffSide::Left, 0, 0);
+        assert_eq!(
+            d.selection_occurrence_needle().as_deref(),
+            Some("alpha"),
+            "a single-row word selection must expose its text as the occurrence needle"
+        );
+    }
+
+    #[test]
+    fn selection_occurrence_needle_is_none_for_zero_area_or_multi_row() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["alpha", "beta"]),
+            lines(&["alpha", "beta"]),
+        );
+        // Zero-area click: no occurrence highlight.
+        d.start_selection(DiffSide::Left, 0, 2);
+        assert_eq!(
+            d.selection_occurrence_needle(),
+            None,
+            "a click is not a word"
+        );
+        // Multi-row selection: VS Code only highlights single-line selections.
+        d.start_selection(DiffSide::Left, 0, 0);
+        d.extend_selection_to(1, 2);
+        assert_eq!(
+            d.selection_occurrence_needle(),
+            None,
+            "a multi-row selection must not drive occurrence highlighting"
+        );
+    }
+
+    #[test]
+    fn selection_occurrence_needle_skips_whitespace_only_selection() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["a   b"]),
+            lines(&["a   b"]),
+        );
+        // Select the run of spaces between the two words.
+        d.start_selection(DiffSide::Left, 0, 1);
+        d.extend_selection_to(0, 4);
+        assert_eq!(
+            d.selection_occurrence_needle(),
+            None,
+            "a whitespace-only selection must not highlight occurrences"
+        );
+    }
+
+    #[test]
+    fn zero_area_selection_yields_no_text() {
+        let mut d = DiffData::build(
+            PathBuf::from("x"),
+            PathBuf::from("y"),
+            lines(&["alpha"]),
+            lines(&["alpha"]),
+        );
+        d.start_selection(DiffSide::Left, 0, 2);
+        assert!(
+            d.selection_text().is_none(),
+            "a click without a drag must not produce copyable text"
+        );
+    }
+}

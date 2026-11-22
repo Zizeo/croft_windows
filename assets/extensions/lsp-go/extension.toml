@@ -1,0 +1,23 @@
+# Bundled croft extension: Go language support.
+# A gopls on PATH (or in ~/go/bin) wins. Without one, croft builds the pinned
+# gopls with the user's own `go install` into ~/.croft/servers/gopls/<version>,
+# so it matches their toolchain; with no `go` either, croft says once that Go
+# has no language server. Bump the version here and in `ServerConfig::gopls`.
+id = "lsp-go"
+name = "Go (gopls)"
+description = "Go language support via gopls (installed with go install if absent)."
+builtin = true
+api_version = 1
+
+[[languages]]
+id = "go"
+extensions = ["go"]
+root_markers = ["go.mod"]
+
+[[language_servers]]
+name = "gopls"
+command = "gopls"
+args = ["serve"]
+language = "go"
+priority = 0
+provision = { kind = "go", package = "golang.org/x/tools/gopls", version = "v0.23.0", bin = "gopls" }

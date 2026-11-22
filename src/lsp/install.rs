@@ -1,0 +1,2578 @@
+//! croft-managed language-server provisioning.
+//!
+//! When a language server isn't already on the user's PATH, croft installs and
+//! owns its own copy under `~/.croft/servers/` rather than touching the user's
+//! global package managers. This sidesteps `npm -g` permission failures, pins a
+//! known-good version where it matters, and means "open a file → get LSP" works
+//! on a fresh remote box with nothing pre-installed (the local/remote parity
+//! rule).
+//!
+//! Provisioning is keyed by ecosystem backend, not special-cased per server:
+//!   - [`Provision::Npm`] — TypeScript's `vtsls`, installed with `npm install
+//!     --prefix` and run via a discovered `node`.
+//!   - [`Provision::Uv`] — Python's `ty` / `ruff`, installed with `uv tool
+//!     install` into a croft-owned tool dir. uv resolves the platform, Python
+//!     interpreter and version itself, so there is no tarball to unpack.
+//!   - [`Provision::Go`] — Go's `gopls`, built with the user's own `go install`
+//!     so it matches their toolchain.
+//!
+//! Every install is lazy and best-effort: it fires the first time a file whose
+//! server is missing is opened, runs on a detached thread so launch is never
+//! blocked, and a failure just leaves that language's LSP unavailable (with a
+//! status-bar note pointing at the cause).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+
+use crate::lsp::config::{Language, ServerConfig};
+use crate::lsp::log_file;
+
+/// How croft obtains a server it manages itself. Each variant maps to one
+/// ecosystem installer. `version` pins an exact release for reproducibility;
+/// `None` tracks latest (what the fast-moving Astral servers want, since they
+/// are backward-compatible LSP daemons and a stale pin would just fail to
+/// install).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Provision {
+    /// An npm package installed under `~/.croft/servers/<name>` and invoked via
+    /// the discovered `node`. `bin` is the executable npm drops in
+    /// `node_modules/.bin`.
+    Npm {
+        package: &'static str,
+        version: Option<&'static str>,
+        bin: &'static str,
+    },
+    /// A PyPI tool installed with `uv tool install` into croft's own uv tool
+    /// dir (`~/.croft/servers/uv`). `bin` is the entry-point uv writes into
+    /// `UV_TOOL_BIN_DIR`.
+    Uv {
+        package: &'static str,
+        version: Option<&'static str>,
+        bin: &'static str,
+        /// The Termux package the install reroutes to on Android, where uv
+        /// cannot run. Termux packages ty and ruff under their PyPI names, so
+        /// a manifest that says nothing gets `package`; `None` is a tool
+        /// Termux does not package at all (rumdl, #851), which is left to a
+        /// copy on PATH rather than sent to a `pkg install` bound to fail.
+        termux_pkg: Option<&'static str>,
+    },
+    /// A prebuilt binary downloaded from a release URL and unpacked under
+    /// `~/.croft/servers/<name>/`. Host-agnostic: each `targets` entry is a full
+    /// literal URL (GitHub, Codeberg, GitLab, or any host), so neither the host
+    /// nor the project's asset-naming scheme is baked into croft. This is how
+    /// VS Code, Zed and Mason provision servers that ship as native binaries
+    /// (clangd, taplo) rather than npm/PyPI packages.
+    Binary {
+        /// Supported platforms mapped to their literal download URL. Keys are
+        /// `"<os>-<arch>"` (e.g. `linux-x86_64`) or a bare `"<os>"` (e.g.
+        /// `macos` for a universal build that serves every arch), using Rust's
+        /// `target_os`/`target_arch` tokens. Resolution tries the specific
+        /// `os-arch` key first, then the bare `os`. A platform absent from the
+        /// map is unsupported for managed install and falls back to PATH — this
+        /// is how an irregular matrix (clangd: universal mac, x86_64-only linux,
+        /// no linux-aarch64) is expressed exactly.
+        targets: &'static [(&'static str, &'static str)],
+        /// Executable name croft invokes after unpacking (also the PATH-probe
+        /// name for a user-installed copy).
+        bin: &'static str,
+        /// Archive format of the downloaded asset.
+        archive: ArchiveKind,
+        /// Literal path to the executable inside the unpacked archive, relative
+        /// to `~/.croft/servers/<name>/`. `None` for a single-file `.gz` whose
+        /// decompressed bytes ARE the binary, or a raw asset that is the binary
+        /// itself (either is placed at `<name>/<bin>`). Set for
+        /// `.zip` payloads that carry sibling files the binary needs at a fixed
+        /// relative path (e.g. clangd's `clangd_<ver>/bin/clangd` beside `lib/`).
+        bin_path: Option<&'static str>,
+        /// Termux/Android package name for `pkg install`. Set for a native
+        /// binary whose cross-distro release can't run on Android's bionic libc
+        /// (and whose `android` arch is therefore absent from `targets`): on
+        /// Termux the install reroutes to `pkg install <termux_pkg>`, which
+        /// lands the server in the always-on-PATH `$PREFIX/bin`. `None` leaves
+        /// an unsupported platform to fall back to PATH (clangd's linux-aarch64,
+        /// which has no Termux package either).
+        termux_pkg: Option<&'static str>,
+        /// Per-platform SHA-256 of the asset, keyed like `targets`. Three
+        /// outcomes: an empty map installs unverified (the pre-existing state
+        /// of every older binary provision); a platform with an entry has its
+        /// download verified before anything is unpacked or marked executable;
+        /// a non-empty map with no entry for this platform refuses to install,
+        /// since a partial map is a mistake in the manifest, not a licence to
+        /// skip the gate.
+        sha256: &'static [(&'static str, &'static str)],
+    },
+    /// A Go command built with the user's own `go install <package>@<version>`
+    /// into `~/.croft/servers/<name>/<version>/` (gopls, #930), so the server
+    /// is compiled by the toolchain it will analyse. The version is part of
+    /// the path, so a bumped pin installs afresh. Needs `go` on PATH; without
+    /// it no install is tried and the language reports that it has no server.
+    Go {
+        package: &'static str,
+        version: Option<&'static str>,
+        bin: &'static str,
+    },
+}
+
+/// Archive format of a [`Provision::Binary`] download.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ArchiveKind {
+    /// A single gzip-compressed executable; decompressed bytes are the binary.
+    Gz,
+    /// A zip holding the binary plus any sibling files it needs; extracted whole.
+    Zip,
+    /// A `.tar.xz` (cargo-dist's archive) holding the binary, usually inside a
+    /// per-target folder; extracted whole, then the named binary is placed at
+    /// `<name>/<bin>` wherever it sat in the tree.
+    TarXz,
+    /// No archive: the downloaded asset IS the executable (marksman publishes
+    /// bare per-platform binaries). Written as-is and marked executable.
+    Raw,
+}
+
+/// Latest one-line status of a managed install, polled by the app each tick and
+/// surfaced in the status bar so the background work isn't invisible. A single
+/// slot: when several servers install at once the most recent message wins,
+/// which is all the status bar can show anyway.
+static STATUS: Mutex<Option<String>> = Mutex::new(None);
+
+pub(crate) fn set_status(msg: impl Into<String>) {
+    if let Ok(mut g) = STATUS.lock() {
+        *g = Some(msg.into());
+    }
+}
+
+/// Take the pending install status message, if any. The app calls this once
+/// per tick; `Some` means "show this in the status bar and redraw".
+pub fn take_status() -> Option<String> {
+    STATUS.lock().ok().and_then(|mut g| g.take())
+}
+
+/// The user's own way to get a server, keyed by server name, for the servers
+/// croft downloads only because their toolchain copy cannot run (#927). A
+/// failed download then names it on the status line instead of leaving the
+/// user with the log alone.
+static FAILURE_HINTS: Mutex<BTreeMap<&'static str, String>> = Mutex::new(BTreeMap::new());
+
+/// The status line for a failed install of `name`: `msg`, then the hint
+/// [`FAILURE_HINTS`] holds for it, if any.
+pub(crate) fn failure_status(name: &str, msg: String) -> String {
+    match FAILURE_HINTS.lock().ok().and_then(|h| h.get(name).cloned()) {
+        Some(hint) => format!("{msg}; {hint}"),
+        None => msg,
+    }
+}
+
+/// Show "`name` install failed (`detail`)" on the status line, with its hint.
+fn set_failed(name: &str, detail: &str) {
+    set_status(failure_status(
+        name,
+        format!("{name} install failed ({detail})"),
+    ));
+}
+
+/// Languages whose managed server finished installing since the last call. The
+/// app re-opens that language's open documents so the manager re-probes and
+/// spawns the freshly-installed server — "installed" should mean "now working"
+/// without waiting for the user's next action.
+static JUST_INSTALLED: Mutex<Vec<Language>> = Mutex::new(Vec::new());
+
+fn mark_installed(language: Language) {
+    if let Ok(mut g) = JUST_INSTALLED.lock()
+        && !g.contains(&language)
+    {
+        g.push(language);
+    }
+}
+
+/// Drain the set of languages whose server just became available.
+pub fn take_just_installed() -> Vec<Language> {
+    JUST_INSTALLED
+        .lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or_default()
+}
+
+/// Ensures only one install thread is ever spawned per process per server, no
+/// matter how many times the manager re-probes a missing client.
+static INSTALL_STARTED: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
+
+/// Holds a name in [`INSTALL_STARTED`] for the life of one install attempt
+/// and removes it on drop, panic included, so a gate is never left held by
+/// an attempt that is over.
+struct InstallGate(&'static str);
+
+impl Drop for InstallGate {
+    fn drop(&mut self) {
+        if let Ok(mut started) = INSTALL_STARTED.lock() {
+            started.remove(self.0);
+        }
+    }
+}
+
+/// The names handed out by [`static_name`], so each distinct name is leaked
+/// once however often it is asked for.
+static STATIC_NAMES: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
+
+/// A `&'static str` for `name`, leaked at most once per distinct name: the
+/// install machinery keys its one-shot gates on `&'static str`, and a caller
+/// that ran on every click (a viewer whose tool is not installed yet) must
+/// not leak a fresh allocation each time.
+pub fn static_name(name: &str) -> &'static str {
+    let mut names = STATIC_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = names.get(name) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    names.insert(leaked);
+    leaked
+}
+
+// ---------------------------------------------------------------------------
+// Resolution: turn a `Provision` into a spawnable command, kicking off a lazy
+// background install when the server isn't there yet.
+// ---------------------------------------------------------------------------
+
+/// Resolve a managed server to a spawnable `(config, extra_PATH)` pair, or
+/// `None` (after starting a background install) when it isn't installed yet.
+/// The manager calls this for any `ServerConfig` carrying a `provision`.
+pub fn resolve_managed(
+    config: &ServerConfig,
+    provision: &Provision,
+    log_skip: bool,
+) -> Option<(ServerConfig, Vec<PathBuf>)> {
+    match provision {
+        Provision::Npm { bin, .. } => {
+            if let Some(command) = npm_command(config.name, bin) {
+                let mut resolved = config.clone();
+                resolved.command = command;
+                // vtsls is a Node script; its `env node` shebang needs node on
+                // the spawned process's PATH, which (for version managers) means
+                // the discovered node dir, not croft's inherited PATH.
+                let extra: Vec<PathBuf> = node_path_prepend().into_iter().collect();
+                return Some((resolved, extra));
+            }
+        }
+        Provision::Uv {
+            bin,
+            package,
+            version,
+            ..
+        } => {
+            if let Some(command) = uv_command(bin, package, *version) {
+                let mut resolved = config.clone();
+                resolved.command = command;
+                // uv writes a self-contained launcher (absolute shebang to the
+                // tool's own venv python), so no extra PATH entry is needed.
+                return Some((resolved, Vec::new()));
+            }
+        }
+        Provision::Binary { bin, bin_path, .. } => {
+            if let Some(command) = binary_command(config.name, bin, *bin_path) {
+                let mut resolved = config.clone();
+                resolved.command = command;
+                // A self-contained native binary launched by absolute path; the
+                // archive carries any sibling files it needs, so no extra PATH.
+                return Some((resolved, Vec::new()));
+            }
+        }
+        Provision::Go { bin, version, .. } => {
+            if let Some(command) = go_command(config.name, bin, *version) {
+                let mut resolved = config.clone();
+                resolved.command = command;
+                return Some((resolved, Vec::new()));
+            }
+        }
+    }
+    // Nothing to install with: the manager says so once for the language,
+    // rather than an install thread failing again on every re-probe.
+    if let Some(tool) = missing_installer(provision) {
+        if log_skip {
+            log_file::log(&format!(
+                "lsp[{}] skip: `{}` not on PATH and no `{tool}` to install it",
+                config.name, config.command
+            ));
+        }
+        return None;
+    }
+    // Not installed yet: start the one-shot managed install. This open skips the
+    // server; a later request re-probes once the install lands.
+    ensure_in_background(config, provision);
+    if log_skip {
+        // Name what was looked for, so the log says why a download started.
+        let tried = match provision {
+            Provision::Binary { bin, .. } => format!(" (no `{bin}` or `{bin}-NN` on PATH)"),
+            _ => String::new(),
+        };
+        log_file::log(&format!(
+            "lsp[{}] not installed{tried}; starting croft-managed install",
+            config.name
+        ));
+    }
+    None
+}
+
+/// [`resolve_managed`] for a binary server whose copy on PATH cannot run
+/// here, such as a rustup proxy whose toolchain lacks the component (#927):
+/// croft's own download, never the PATH copy, started in the background when
+/// it is missing. `why` says what is wrong with the PATH copy and `fix` how
+/// the user can mend it. The status line carries both while croft's copy
+/// serves, and `fix` if its download fails.
+pub fn resolve_managed_instead(
+    config: &ServerConfig,
+    provision: &Provision,
+    why: &str,
+    fix: &str,
+) -> Option<(ServerConfig, Vec<PathBuf>)> {
+    let Provision::Binary { bin, bin_path, .. } = provision else {
+        return resolve_managed(config, provision, false);
+    };
+    if let Some(p) = managed_binary_path(config.name, bin, *bin_path)
+        && p.is_file()
+    {
+        set_status(format!("{why}; using croft's copy (or run: {fix})"));
+        let mut resolved = config.clone();
+        resolved.command = p.to_string_lossy().into_owned();
+        return Some((resolved, Vec::new()));
+    }
+    if let Ok(mut hints) = FAILURE_HINTS.lock() {
+        hints.insert(config.name, format!("run: {fix}"));
+    }
+    ensure_in_background(config, provision);
+    None
+}
+
+/// Resolve the invocable command for a provisioned tool by `name` + `provision`,
+/// without the [`ServerConfig`] wrapper — the same managed-first / PATH-fallback
+/// resolution `resolve_managed` does, but usable by non-LSP callers (the MCP
+/// sidecar host). Returns the command plus any extra PATH dirs the launched
+/// process needs (the node dir for npm tools), or `None` when not yet installed.
+pub fn provisioned_command(name: &str, provision: &Provision) -> Option<(String, Vec<PathBuf>)> {
+    match provision {
+        Provision::Npm { bin, .. } => {
+            npm_command(name, bin).map(|c| (c, node_path_prepend().into_iter().collect()))
+        }
+        Provision::Uv {
+            bin,
+            package,
+            version,
+            ..
+        } => uv_command(bin, package, *version).map(|c| (c, Vec::new())),
+        Provision::Binary { bin, bin_path, .. } => {
+            binary_command(name, bin, *bin_path).map(|c| (c, Vec::new()))
+        }
+        Provision::Go { bin, version, .. } => {
+            go_command(name, bin, *version).map(|c| (c, Vec::new()))
+        }
+    }
+}
+
+/// The program croft needs before it can install `provision`, when the box
+/// lacks it. Only the Go backend builds with a toolchain croft never fetches:
+/// npm and uv report their own missing tools once an install is tried.
+pub(crate) fn missing_installer(provision: &Provision) -> Option<&'static str> {
+    match provision {
+        Provision::Go { .. } if !crate::lsp::manager::is_on_path("go") => Some("go"),
+        _ => None,
+    }
+}
+
+/// Resolve an invocable command for an npm-provisioned server: prefer croft's
+/// managed copy (absolute path, no PATH dependency), then fall back to a binary
+/// already on PATH so a user who installed one globally still works. `None`
+/// when neither exists. Managed-first because vtsls is an internal dependency
+/// croft pins, not a tool the user drives directly.
+fn npm_command(name: &str, bin: &str) -> Option<String> {
+    if let Some(p) = managed_npm_binary(name, bin)
+        && p.is_file()
+    {
+        return Some(p.to_string_lossy().into_owned());
+    }
+    if crate::lsp::manager::is_on_path(bin) {
+        return Some(bin.to_string());
+    }
+    None
+}
+
+/// Resolve an invocable command for a uv-provisioned server. Unlike vtsls,
+/// `ty`/`ruff` are user-facing tools the user may want to control the version
+/// of, so a copy already on PATH wins over croft's managed one; the managed
+/// copy is the fallback for a box that has neither. A managed copy installed
+/// under an older pin is not used, so the caller reinstalls it at the pin
+/// this build carries (#1297).
+fn uv_command(bin: &str, package: &str, version: Option<&str>) -> Option<String> {
+    if crate::lsp::manager::is_on_path(bin) {
+        return Some(bin.to_string());
+    }
+    if let Some(p) = managed_uv_binary(bin)
+        && p.is_file()
+        && uv_tool_dir().is_none_or(|dir| uv_receipt_matches_pin(&dir, package, version))
+    {
+        return Some(p.to_string_lossy().into_owned());
+    }
+    None
+}
+
+/// Resolve an invocable command for a Go-provisioned server: a copy on PATH
+/// (the user's own, built for their toolchain) wins, then croft's copy at the
+/// pinned version. `None` when neither exists yet.
+fn go_command(name: &str, bin: &str, version: Option<&str>) -> Option<String> {
+    if crate::lsp::manager::is_on_path(bin) {
+        return Some(bin.to_string());
+    }
+    let p = go_bin_dir(&servers_dir()?, name, version).join(bin);
+    p.is_file().then(|| p.to_string_lossy().into_owned())
+}
+
+// ---------------------------------------------------------------------------
+// Managed install locations.
+// ---------------------------------------------------------------------------
+
+/// croft's managed server store: `~/.croft/servers`. `None` when `$HOME` is
+/// unset (the same guard the rest of croft uses for `~/.croft`).
+fn servers_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".croft").join("servers"))
+}
+
+/// Directory `npm install --prefix` targets for a given server.
+fn npm_prefix(name: &str) -> Option<PathBuf> {
+    Some(servers_dir()?.join(name))
+}
+
+/// Path to an npm `bin` under a prefix. `npm install --prefix DIR PKG` drops
+/// executables in `DIR/node_modules/.bin`. Pure, so it's testable without
+/// touching `$HOME`.
+fn npm_bin_in(prefix: &Path, bin: &str) -> PathBuf {
+    prefix.join("node_modules").join(".bin").join(bin)
+}
+
+/// Absolute path to a managed npm-installed binary, whether or not it exists.
+fn managed_npm_binary(name: &str, bin: &str) -> Option<PathBuf> {
+    Some(npm_bin_in(&npm_prefix(name)?, bin))
+}
+
+/// The `GOBIN` a Go-provisioned server is installed into:
+/// `<servers>/<name>/<version>`, or `latest` when unpinned.
+fn go_bin_dir(servers: &Path, name: &str, version: Option<&str>) -> PathBuf {
+    servers.join(name).join(version.unwrap_or("latest"))
+}
+
+/// croft's uv tool dir (`uv` installs each tool's venv here).
+fn uv_tool_dir() -> Option<PathBuf> {
+    Some(servers_dir()?.join("uv").join("tools"))
+}
+
+/// croft's uv bin dir (`uv` writes entry-point launchers here).
+fn uv_bin_dir() -> Option<PathBuf> {
+    Some(servers_dir()?.join("uv").join("bin"))
+}
+
+/// Whether the uv tool `package` under `tool_dir` was installed at `version`,
+/// read from the `uv-receipt.toml` uv writes beside it. An unpinned
+/// provision, or a receipt that can't be read, counts as a match: only a
+/// receipt naming a different pin is stale.
+fn uv_receipt_matches_pin(tool_dir: &Path, package: &str, version: Option<&str>) -> bool {
+    let Some(version) = version else {
+        return true;
+    };
+    let Ok(text) = std::fs::read_to_string(tool_dir.join(package).join("uv-receipt.toml")) else {
+        return true;
+    };
+    let Ok(receipt) = toml::from_str::<toml::Value>(&text) else {
+        return true;
+    };
+    let Some(reqs) = receipt
+        .get("tool")
+        .and_then(|t| t.get("requirements"))
+        .and_then(toml::Value::as_array)
+    else {
+        return true;
+    };
+    let want = format!("=={version}");
+    reqs.iter()
+        .filter(|r| r.get("name").and_then(toml::Value::as_str) == Some(package))
+        .any(|r| r.get("specifier").and_then(toml::Value::as_str) == Some(want.as_str()))
+}
+
+/// Absolute path to a managed uv-installed binary, whether or not it exists.
+fn managed_uv_binary(bin: &str) -> Option<PathBuf> {
+    Some(uv_bin_dir()?.join(bin))
+}
+
+// ---------------------------------------------------------------------------
+// Binary backend: prebuilt release binaries (clangd, taplo). Host-agnostic —
+// the manifest carries a full URL template plus per-project OS/arch tokens, so
+// a server hosted on GitHub, Codeberg, GitLab or anywhere else is just data.
+// ---------------------------------------------------------------------------
+
+/// Generous ceiling on a release-binary download (clangd's zip is ~50 MB); a
+/// runaway or redirected body is refused past this.
+const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The key and value the platform resolves to in a per-target map, or `None`
+/// if unsupported. Tries the specific `"<os>-<arch>"` key first (e.g.
+/// `linux-x86_64`), then a bare `"<os>"` key (e.g. `macos` for a universal
+/// build). Returning the key lets a caller that needs two maps to agree (the
+/// URL and its digest) look both up under the one key the URL came from.
+fn target_entry<'a>(
+    targets: &'a [(&'a str, &'a str)],
+    os: &str,
+    arch: &str,
+) -> Option<(&'a str, &'a str)> {
+    let specific = format!("{os}-{arch}");
+    targets
+        .iter()
+        .find(|(k, _)| *k == specific)
+        .or_else(|| targets.iter().find(|(k, _)| *k == os))
+        .map(|(k, v)| (*k, *v))
+}
+
+/// The executable inside a managed binary install. `bin_path` locates a binary
+/// nested in an extracted archive; absent, the binary sits directly at
+/// `<name>/<bin>`.
+fn managed_binary_path(name: &str, bin: &str, bin_path: Option<&str>) -> Option<PathBuf> {
+    Some(managed_binary_path_in(&servers_dir()?, name, bin, bin_path))
+}
+
+/// [`managed_binary_path`] under an explicit servers dir, so a test can
+/// point it at a scratch tree. A `name` with a `/` (a viewer's
+/// `<extension>/<viewer>` key) nests, which is the point of the key.
+fn managed_binary_path_in(
+    servers: &Path,
+    name: &str,
+    bin: &str,
+    bin_path: Option<&str>,
+) -> PathBuf {
+    servers.join(name).join(bin_path.unwrap_or(bin))
+}
+
+/// The newest `bin-NN` executable on `path` (`clangd-18`, `clangd-20.1`),
+/// the name Debian/Ubuntu and apt.llvm.org install LLVM tools under, often
+/// with no unversioned symlink (#1211). The version is dot-separated
+/// numbers, compared numerically; at an equal version the earlier PATH entry
+/// wins. `None` when there is none.
+fn versioned_on_path(bin: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    let mut best: Option<(Vec<u64>, PathBuf)> = None;
+    for dir in std::env::split_paths(path) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(version) = name
+                .to_str()
+                .and_then(|n| n.strip_prefix(bin))
+                .and_then(|rest| rest.strip_prefix('-'))
+            else {
+                continue;
+            };
+            let Some(key) = version
+                .split('.')
+                .map(|part| part.parse::<u64>().ok())
+                .collect::<Option<Vec<u64>>>()
+            else {
+                continue;
+            };
+            // A relative PATH entry resolves against croft's cwd now; the
+            // server is spawned from the workspace root, so hand it an
+            // absolute path.
+            let Ok(full) = std::path::absolute(entry.path()) else {
+                continue;
+            };
+            if crate::lsp::manager::is_executable_file(&full)
+                && best.as_ref().is_none_or(|(k, _)| key > *k)
+            {
+                best = Some((key, full));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Resolve an invocable command for a binary-provisioned server. PATH-first
+/// (mirrors Zed: a user's own clangd/taplo, matching their toolchain, wins),
+/// then croft's managed copy. `None` when neither exists yet.
+fn binary_command(name: &str, bin: &str, bin_path: Option<&str>) -> Option<String> {
+    if crate::lsp::manager::is_on_path(bin) {
+        return Some(bin.to_string());
+    }
+    if let Some(p) = std::env::var_os("PATH").and_then(|path| versioned_on_path(bin, &path)) {
+        return Some(p.to_string_lossy().into_owned());
+    }
+    if let Some(p) = managed_binary_path(name, bin, bin_path)
+        && p.is_file()
+    {
+        return Some(p.to_string_lossy().into_owned());
+    }
+    None
+}
+
+/// Mark a downloaded file executable (no-op on non-unix; croft's targets are
+/// macOS/Linux/Android, all unix).
+#[cfg(unix)]
+fn set_executable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(perms.mode() | 0o755);
+    std::fs::set_permissions(path, perms)
+}
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Stream `url` into memory, refusing a body over `max` rather than keeping
+/// its first `max` bytes. Follows redirects (release URLs 302 to a CDN). On
+/// failure, the reason: the HTTP status, the transport error (DNS, refused,
+/// timeout, TLS) or the size limit, so the log and status bar can say it.
+fn download_capped(url: &str, max: u64) -> Result<Vec<u8>, String> {
+    let resp = crate::net::get(url)
+        .call()
+        .map_err(|e| crate::net::describe(&e))?;
+    crate::net::read_capped(resp.into_reader(), max).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::FileTooLarge {
+            e.to_string()
+        } else {
+            format!("reading the download: {e}")
+        }
+    })
+}
+
+/// Gunzip a single-file `.gz` payload (the decompressed bytes ARE the binary)
+/// to `target` and mark it executable.
+fn extract_gz(bytes: &[u8], target: &Path) -> std::io::Result<()> {
+    use std::io::Read;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut decoder = flate2::read::GzDecoder::new(bytes);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out)?;
+    std::fs::write(target, &out)?;
+    set_executable(target)
+}
+
+/// Write a raw (unarchived) payload — the downloaded bytes ARE the binary — to
+/// `target` and mark it executable.
+fn extract_raw(bytes: &[u8], target: &Path) -> std::io::Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(target, bytes)?;
+    set_executable(target)
+}
+
+/// Extract a `.zip` payload whole into `dir` (so the binary keeps its sibling
+/// files, e.g. clangd's `lib/`), then mark the resolved binary executable.
+fn extract_zip(bytes: &[u8], dir: &Path, target: &Path) -> std::io::Result<()> {
+    let reader = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(reader)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    archive.extract(dir).map_err(std::io::Error::other)?;
+    if target.is_file() {
+        set_executable(target)?;
+    }
+    Ok(())
+}
+
+/// Extract a `.tar.xz` payload whole into `dir` and place the binary at
+/// `target` (#465). cargo-dist nests the binary in a per-target folder
+/// (`csvlens-aarch64-apple-darwin/csvlens`), whose name differs per platform,
+/// so when `target` is not there after unpacking the tree is searched for a
+/// file with the binary's name and that file is moved into place.
+fn extract_tar_xz(bytes: &[u8], dir: &Path, target: &Path) -> std::io::Result<()> {
+    extract_tar_xz_capped(bytes, dir, target, MAX_BINARY_BYTES)
+}
+
+/// [`extract_tar_xz`] with the unpacked-size ceiling as a parameter; the
+/// decompressed stream and the sum of the entries it holds must both stay
+/// under `cap`, or nothing is written.
+fn extract_tar_xz_capped(bytes: &[u8], dir: &Path, target: &Path, cap: u64) -> std::io::Result<()> {
+    // The download cap covered compressed bytes; a high-ratio archive could
+    // still expand to fill memory and disk. The stream's own index says how
+    // much it decodes to, so an archive past the ceiling, or one whose index
+    // cannot be read, is refused before a byte is decoded: the pure-Rust
+    // decoder buffers a whole block before it writes, so a check on its
+    // output alone would bound the disk but not the decode. The sink below
+    // bounds only what can reach the disk, for an index that lies about a
+    // stream the decoder then checks against it.
+    let Some(declared) = xz_declared_size(bytes) else {
+        // No readable index means no way to bound the decode before it
+        // runs, and a corrupted footer is exactly what a hostile archive
+        // would carry: refuse rather than decode an unbounded stream.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the archive's xz index cannot be read, so its size cannot be checked before decoding",
+        ));
+    };
+    if declared > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("archive declares {declared} bytes, past the {cap}-byte ceiling"),
+        ));
+    }
+    let mut sink = Capped {
+        buf: Vec::new(),
+        cap,
+    };
+    lzma_rs::xz_decompress(&mut std::io::Cursor::new(bytes), &mut sink)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
+    let tar_bytes = sink.buf;
+    // A link entry named like the binary would be found by the walk below,
+    // renamed into place, chmodded through, and run: `tar` refuses links
+    // that escape `dir` but not links that point out of it. A release
+    // archive of a binary has no business carrying links, so any link
+    // refuses the whole archive before anything is unpacked.
+    for entry in tar::Archive::new(std::io::Cursor::new(&tar_bytes)).entries()? {
+        let entry = entry?;
+        let kind = entry.header().entry_type();
+        if kind.is_symlink() || kind.is_hard_link() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the archive carries a link entry ({:?}); refusing it",
+                    entry.path()?
+                ),
+            ));
+        }
+    }
+    tar::Archive::new(std::io::Cursor::new(tar_bytes)).unpack(dir)?;
+    if !target.is_file()
+        && let Some(name) = target.file_name()
+        && let Some(found) = find_file_named(dir, name)
+    {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if std::fs::rename(&found, target).is_err() {
+            std::fs::copy(&found, target)?;
+        }
+    }
+    if !target.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "the archive holds no {:?}",
+                target.file_name().unwrap_or_default()
+            ),
+        ));
+    }
+    set_executable(target)
+}
+
+/// The uncompressed size an xz stream declares in its index, read from the
+/// stream footer without decoding anything, or `None` when the footer or
+/// index cannot be read. Only a single-stream file is understood, which is
+/// what `xz` and cargo-dist produce; a concatenation of streams reads as
+/// unreadable and is refused by the caller, on the conservative side.
+pub(crate) fn xz_declared_size(bytes: &[u8]) -> Option<u64> {
+    // Stream footer, last 12 bytes: CRC32, backward size (index size / 4 - 1),
+    // stream flags, "YZ". The index precedes it: 0x00, a record count, then
+    // per record the unpadded and uncompressed sizes as 7-bit varints.
+    let n = bytes.len();
+    if n < 12 || &bytes[n - 2..] != b"YZ" {
+        return None;
+    }
+    let backward = u32::from_le_bytes(bytes[n - 8..n - 4].try_into().ok()?) as usize;
+    let index_size = backward.checked_add(1)?.checked_mul(4)?;
+    let index_start = n.checked_sub(12)?.checked_sub(index_size)?;
+    let index = &bytes[index_start..n - 12];
+    if index.first() != Some(&0) {
+        return None;
+    }
+    let mut pos = 1;
+    let records = xz_varint(index, &mut pos)?;
+    let mut total: u64 = 0;
+    for _ in 0..records {
+        let _unpadded = xz_varint(index, &mut pos)?;
+        total = total.checked_add(xz_varint(index, &mut pos)?)?;
+    }
+    Some(total)
+}
+
+/// One xz multibyte integer: little-endian 7-bit groups, high bit continues.
+fn xz_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for i in 0..9 {
+        let b = *buf.get(*pos)?;
+        *pos += 1;
+        value |= u64::from(b & 0x7f) << (7 * i);
+        if b & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// A `Write` sink that refuses to grow past `cap`: nothing past the ceiling
+/// is kept, so nothing past it can reach the disk. It bounds what is
+/// unpacked, not the decoder's own buffering; the declared-size check in
+/// [`extract_tar_xz_capped`] is what keeps an oversize stream from being
+/// decoded at all.
+pub(crate) struct Capped {
+    pub(crate) buf: Vec<u8>,
+    pub(crate) cap: u64,
+}
+
+impl std::io::Write for Capped {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if (self.buf.len() as u64).saturating_add(data.len() as u64) > self.cap {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("decompressed data exceeds the {}-byte ceiling", self.cap),
+            ));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The integrity verdict on a downloaded asset: `Ok` when the manifest pins
+/// nothing at all (unverified, the pre-existing state of every binary
+/// provision) or when the platform's pinned digest matches; an error naming
+/// the reason otherwise. A manifest that pins SOME platforms but not this
+/// one is refused rather than installed unverified: a partial map is a
+/// mistake in the manifest, not a licence to skip the gate here.
+fn digest_verdict(sha256: &[(&str, &str)], key: &str, bytes: &[u8]) -> Result<(), &'static str> {
+    if sha256.is_empty() {
+        return Ok(());
+    }
+    // Looked up under the exact key the URL resolved to, never by a second
+    // independent resolution: a manifest whose two maps are keyed at
+    // different granularities (a universal `macos` asset, per-arch digests)
+    // would otherwise pair a digest with bytes it was never the digest of.
+    // Such a manifest is a mistake and is refused, as a partial map is.
+    match sha256.iter().find(|(k, _)| *k == key) {
+        None => Err("the manifest's digest list does not cover this platform's download"),
+        Some((_, expected)) if sha256_matches(bytes, expected) => Ok(()),
+        Some(_) => Err("checksum mismatch"),
+    }
+}
+
+/// Whether `bytes` hash to `expected` (hex SHA-256, either case). An empty
+/// or malformed expectation never matches: a gate that passes on a typo is
+/// no gate.
+pub(crate) fn sha256_matches(bytes: &[u8], expected: &str) -> bool {
+    use sha2::Digest;
+    let expected = expected.trim().to_ascii_lowercase();
+    expected.len() == 64 && format!("{:x}", sha2::Sha256::digest(bytes)) == expected
+}
+
+/// First regular file named `name` under `dir`, depth-first. Links are
+/// never followed, in either direction: a link to a directory is not
+/// descended and a link named like the binary is not the binary.
+fn find_file_named(dir: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        // One unreadable directory is skipped, not the whole walk: the
+        // binary may sit in a sibling still on the stack.
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.file_type().is_dir() {
+                stack.push(p);
+            } else if meta.file_type().is_file() && p.file_name() == Some(name) {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// The pieces of a [`Provision::Binary`] a managed install needs, borrowed
+/// from the provision for the length of the install.
+struct BinarySpec<'a> {
+    targets: &'a [(&'a str, &'a str)],
+    bin: &'a str,
+    archive: ArchiveKind,
+    bin_path: Option<&'a str>,
+    termux_pkg: Option<&'a str>,
+    sha256: &'a [(&'a str, &'a str)],
+}
+
+/// Download + unpack a prebuilt release binary into `~/.croft/servers/<name>/`.
+/// Resolves the platform tokens, builds the URL, fetches, extracts per archive
+/// kind, and marks the language installed on success. A platform the project
+/// ships no asset for is logged + surfaced and left to PATH (e.g. clangd has no
+/// linux-aarch64 build).
+fn run_binary_install(name: &'static str, language: Language, spec: BinarySpec<'_>) {
+    let BinarySpec {
+        targets,
+        bin,
+        archive,
+        bin_path,
+        termux_pkg,
+        sha256,
+    } = spec;
+    // Termux/Android: the cross-distro release (linux-gnu) won't run on bionic
+    // libc and `android` is absent from `targets`, so reroute to the native
+    // package manager exactly as the uv backend does for ty/ruff. `pkg` lands
+    // the server in the always-on-PATH `$PREFIX/bin`, which the next resolve
+    // picks up with no further plumbing.
+    if crate::iterm2_inline::detect_termux()
+        && let Some(pkg) = termux_pkg
+    {
+        run_termux_pkg_install(name, language, pkg);
+        return;
+    }
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    let Some((key, url)) = target_entry(targets, os, arch) else {
+        log_file::log(&format!("lsp[{name}] no prebuilt binary for {os}-{arch}"));
+        set_status(format!(
+            "{name} unavailable: no prebuilt binary for this platform (install {bin} manually)"
+        ));
+        return;
+    };
+
+    let Some(dir) = servers_dir().map(|d| d.join(name)) else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log_file::log(&format!("lsp[{name}] could not create {dir:?}: {e}"));
+        set_failed(name, "could not create install dir");
+        return;
+    }
+
+    log_file::log(&format!("lsp[{name}] downloading {url}"));
+    crate::output::push(
+        crate::output::CHANNEL_PROVISION,
+        crate::output::OutputLevel::Info,
+        &format!("{name}: downloading {url}"),
+    );
+    set_status(format!("Installing {name}"));
+    let bytes = match download_capped(url, MAX_BINARY_BYTES) {
+        Ok(bytes) => bytes,
+        Err(why) => {
+            log_file::log(&format!("lsp[{name}] download failed: {url}: {why}"));
+            crate::output::push(
+                crate::output::CHANNEL_PROVISION,
+                crate::output::OutputLevel::Error,
+                &format!("{name}: download failed: {url}: {why}"),
+            );
+            set_failed(name, &format!("{why}, see ~/.croft/lsp.log"));
+            return;
+        }
+    };
+
+    // A manifest that pins digests has its download verified before a byte
+    // of it is unpacked or marked executable: an altered asset, a tampered
+    // delivery path, or a platform the manifest forgot to pin is refused,
+    // not installed. A manifest that pins nothing stays unverified.
+    if let Err(why) = digest_verdict(sha256, key, &bytes) {
+        log_file::log(&format!("lsp[{name}] {why} for {url}"));
+        crate::output::push(
+            crate::output::CHANNEL_PROVISION,
+            crate::output::OutputLevel::Error,
+            &format!("{name}: {why} for {url}; refusing to install"),
+        );
+        set_status(format!("{name} install refused ({why})"));
+        return;
+    }
+    let target = dir.join(bin_path.unwrap_or(bin));
+    let extracted = match archive {
+        ArchiveKind::Gz => extract_gz(&bytes, &target),
+        ArchiveKind::Zip => extract_zip(&bytes, &dir, &target),
+        ArchiveKind::TarXz => extract_tar_xz(&bytes, &dir, &target),
+        ArchiveKind::Raw => extract_raw(&bytes, &target),
+    };
+    if let Err(e) = extracted {
+        log_file::log(&format!("lsp[{name}] extract failed: {e}"));
+        crate::output::push(
+            crate::output::CHANNEL_PROVISION,
+            crate::output::OutputLevel::Error,
+            &format!("{name}: extract failed: {e}"),
+        );
+        set_failed(name, "extract error, see ~/.croft/lsp.log");
+        return;
+    }
+    if !target.is_file() {
+        log_file::log(&format!(
+            "lsp[{name}] expected binary missing after extract: {target:?}"
+        ));
+        set_failed(name, "unexpected archive layout");
+        return;
+    }
+    log_file::log(&format!("lsp[{name}] managed binary install complete"));
+    crate::output::push(
+        crate::output::CHANNEL_PROVISION,
+        crate::output::OutputLevel::Info,
+        &format!("{name}: install complete"),
+    );
+    mark_installed(language);
+    set_status(format!("{name} installed"));
+}
+
+/// Build the package spec npm installs, pinning the version when given.
+fn npm_spec(package: &str, version: Option<&str>) -> String {
+    match version {
+        Some(v) => format!("{package}@{v}"),
+        None => package.to_string(),
+    }
+}
+
+/// Build the package spec uv installs, pinning the version when given.
+fn uv_spec(package: &str, version: Option<&str>) -> String {
+    match version {
+        Some(v) => format!("{package}=={v}"),
+        None => package.to_string(),
+    }
+}
+
+/// Build the module path `go install` takes: `go install` outside a module
+/// needs a version, so an unpinned package installs `@latest`.
+fn go_spec(package: &str, version: Option<&str>) -> String {
+    format!("{package}@{}", version.unwrap_or("latest"))
+}
+
+// ---------------------------------------------------------------------------
+// Background installers.
+// ---------------------------------------------------------------------------
+
+/// Install `config`'s server into the managed store on a detached thread, if no
+/// thread for it is already running this process. Idempotent per server,
+/// best-effort, and non-blocking.
+pub fn ensure_in_background(config: &ServerConfig, provision: &Provision) {
+    {
+        let mut started = match INSTALL_STARTED.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if !started.insert(config.name) {
+            return; // an install thread for this server is already running
+        }
+    }
+    let name = config.name;
+    let language = config.language;
+    let provision = provision.clone();
+    std::thread::spawn(move || {
+        // Released when this attempt ends, however it ends: a download that
+        // failed or a digest that was refused must leave the next request
+        // free to try again rather than told "installing" for the rest of
+        // the session. An attempt that succeeded no longer needs the gate,
+        // since the binary is on disk for `provisioned_command` to find.
+        let _release = InstallGate(name);
+        match &provision {
+            Provision::Npm {
+                package, version, ..
+            } => run_npm_install(name, language, package, *version),
+            Provision::Uv {
+                package,
+                version,
+                bin,
+                termux_pkg,
+            } => run_uv_install(name, language, package, *version, bin, *termux_pkg),
+            Provision::Binary {
+                targets,
+                bin,
+                archive,
+                bin_path,
+                termux_pkg,
+                sha256,
+            } => run_binary_install(
+                name,
+                language,
+                BinarySpec {
+                    targets,
+                    bin,
+                    archive: *archive,
+                    bin_path: *bin_path,
+                    termux_pkg: *termux_pkg,
+                    sha256,
+                },
+            ),
+            Provision::Go {
+                package, version, ..
+            } => run_go_install(name, language, package, *version),
+        }
+    });
+}
+
+/// `GOBIN=~/.croft/servers/<name>/<version> go install <package>@<version>`,
+/// with the user's own `go`, which fetches a newer toolchain itself when the
+/// pinned release needs one (unless `GOTOOLCHAIN=local` forbids it, which
+/// fails here with go's own explanation in the log and OUTPUT).
+fn run_go_install(name: &'static str, language: Language, package: &str, version: Option<&str>) {
+    if !crate::lsp::manager::is_on_path("go") {
+        log_file::log(&format!("lsp[{name}] cannot auto-install: no `go` found"));
+        set_status(format!("{name} unavailable: install Go (go not found)"));
+        return;
+    }
+    let Some(gobin) = servers_dir().map(|d| go_bin_dir(&d, name, version)) else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(&gobin) {
+        log_file::log(&format!("lsp[{name}] could not create {gobin:?}: {e}"));
+        set_status(format!(
+            "{name} install failed (could not create install dir)"
+        ));
+        return;
+    }
+    let spec = go_spec(package, version);
+    log_file::log(&format!("lsp[{name}] go install {spec} into {gobin:?}"));
+    crate::output::push(
+        crate::output::CHANNEL_PROVISION,
+        crate::output::OutputLevel::Info,
+        &format!("{name}: go install {spec}"),
+    );
+    set_status(format!("Installing {name} (go install)"));
+    let output = Command::new("go")
+        .arg("install")
+        .arg(&spec)
+        .env("GOBIN", &gobin)
+        .output();
+    finish_install(name, language, output);
+}
+
+/// `npm install --prefix ~/.croft/servers/<name> <pkg>`. Requires `npm` on PATH
+/// (or a discovered version-manager dir); `node` must also be present for the
+/// installed server to actually run.
+fn run_npm_install(name: &'static str, language: Language, package: &str, version: Option<&str>) {
+    let Some(prefix) = npm_prefix(name) else {
+        return;
+    };
+    if !node_available() {
+        log_file::log(&format!(
+            "lsp[{name}] cannot auto-install: no `node`/`npm` found"
+        ));
+        set_status(format!(
+            "{name} unavailable: install Node.js (node/npm not found)"
+        ));
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(&prefix) {
+        log_file::log(&format!("lsp[{name}] could not create {prefix:?}: {e}"));
+        set_status(format!(
+            "{name} install failed (could not create install dir)"
+        ));
+        return;
+    }
+    let extra = node_path_prepend();
+    let npm: PathBuf = match &extra {
+        Some(dir) => dir.join("npm"),
+        None => PathBuf::from("npm"),
+    };
+    let spec = npm_spec(package, version);
+    log_file::log(&format!("lsp[{name}] installing {spec} into {prefix:?}"));
+    set_status(format!("Installing {name}"));
+    let output = Command::new(&npm)
+        .arg("install")
+        .arg("--prefix")
+        .arg(&prefix)
+        .arg(&spec)
+        .env("PATH", augmented_path(extra.as_deref()))
+        .output();
+    finish_install(name, language, output);
+}
+
+/// `pkg install` argument vector for a uv-provisioned server on Termux. The
+/// uv chain is structurally impossible there: stock Termux has no curl/wget
+/// to bootstrap uv, Astral ships no aarch64-linux-android uv build, and the
+/// ty/ruff PyPI wheels don't target Android. Termux's own repo packages both
+/// servers under their PyPI names, and `pkg` installs into the
+/// always-on-PATH `$PREFIX/bin`, which `uv_command`'s PATH-first probe then
+/// resolves with no further plumbing. The repo carries one rolling version,
+/// so any `Provision::Uv` pin is ignored on this path (ty/ruff track latest
+/// anyway).
+fn termux_pkg_args(package: &str) -> Vec<String> {
+    vec![
+        String::from("install"),
+        String::from("-y"),
+        String::from(package),
+    ]
+}
+
+/// apt/dpkg take a single process-global lock, so two `pkg install` calls can
+/// never run concurrently. Opening one Python file provisions both `ty` and
+/// `ruff` on separate install threads; without this gate they race for the
+/// lock and the loser dies with `Could not get lock …/apt/lists/lock`, leaving
+/// its server uninstalled (observed for `ty` in lsp.log 2026-06-11). Every
+/// Termux `pkg` invocation serializes through this mutex so croft never
+/// contends with itself.
+fn termux_pkg_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// How many extra times to retry a `pkg install` whose only problem was that
+/// the apt lock was held — by an *external* apt the mutex can't serialize.
+const PKG_LOCK_RETRIES: u32 = 5;
+
+/// True when `pkg`'s only failure was apt's lock being held elsewhere, i.e. the
+/// install should be retried rather than reported as a hard failure. A genuine
+/// error (missing package, network) is not contention and falls through.
+fn pkg_lock_contended(output: &std::io::Result<std::process::Output>) -> bool {
+    match output {
+        Ok(o) if !o.status.success() => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            stderr.contains("Could not get lock") || stderr.contains("Unable to lock")
+        }
+        _ => false,
+    }
+}
+
+/// Install a uv-provisioned server from the Termux repo. Same lifecycle as
+/// the other backends: logged, surfaced in the status bar, completion via
+/// `finish_install` so the language's open documents re-probe on success.
+/// Serialized against croft's other pkg installs and retried while the apt
+/// lock is held, so concurrent `ty`/`ruff` provisioning can't lose the race.
+fn run_termux_pkg_install(name: &'static str, language: Language, package: &str) {
+    log_file::log(&format!(
+        "lsp[{name}] installing {package} via pkg (Termux repo)"
+    ));
+    set_status(format!("Installing {name} (pkg)"));
+    // Recover the guard even if another install thread panicked mid-pkg: a
+    // poisoned lock still serializes correctly, the data is just `()`.
+    let _guard = termux_pkg_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut output = Command::new("pkg").args(termux_pkg_args(package)).output();
+    for attempt in 1..=PKG_LOCK_RETRIES {
+        if !pkg_lock_contended(&output) {
+            break;
+        }
+        log_file::log(&format!(
+            "lsp[{name}] apt lock held, retrying pkg install ({attempt}/{PKG_LOCK_RETRIES})"
+        ));
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        output = Command::new("pkg").args(termux_pkg_args(package)).output();
+    }
+    finish_install(name, language, output);
+}
+
+/// `uv tool install <pkg>` into croft's own uv tool dir. Requires `uv` on the
+/// system; uv pulls a suitable Python interpreter itself, so nothing else is
+/// needed on the box. On Termux the install reroutes to the native `pkg`
+/// backend instead of the unreachable uv chain, or, for a tool Termux does not
+/// package, says so and leaves it to a copy the user puts on PATH.
+fn run_uv_install(
+    name: &'static str,
+    language: Language,
+    package: &str,
+    version: Option<&str>,
+    bin: &str,
+    termux_pkg: Option<&str>,
+) {
+    if crate::iterm2_inline::detect_termux() {
+        match termux_pkg {
+            Some(pkg) => run_termux_pkg_install(name, language, pkg),
+            None => {
+                log_file::log(&format!(
+                    "lsp[{name}] cannot auto-install on Termux: no Termux package for {package}"
+                ));
+                set_status(format!(
+                    "{name} unavailable: Termux has no package for it (install `{bin}` on PATH yourself)"
+                ));
+            }
+        }
+        return;
+    }
+    let Some(uv) = ensure_uv() else {
+        log_file::log(&format!(
+            "lsp[{name}] cannot auto-install: `uv` unavailable and could not be bootstrapped"
+        ));
+        set_status(format!(
+            "{name} unavailable: could not install uv automatically (see ~/.croft/lsp.log)"
+        ));
+        return;
+    };
+    let (Some(tool_dir), Some(bin_dir)) = (uv_tool_dir(), uv_bin_dir()) else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(&bin_dir) {
+        log_file::log(&format!("lsp[{name}] could not create {bin_dir:?}: {e}"));
+        set_status(format!(
+            "{name} install failed (could not create install dir)"
+        ));
+        return;
+    }
+    let spec = uv_spec(package, version);
+    log_file::log(&format!(
+        "lsp[{name}] installing {spec} via uv into {tool_dir:?}"
+    ));
+    set_status(format!("Installing {name} (uv)"));
+    // `--force` so a half-finished previous attempt is overwritten cleanly.
+    let output = Command::new(&uv)
+        .arg("tool")
+        .arg("install")
+        .arg("--force")
+        .arg(&spec)
+        .env("UV_TOOL_DIR", &tool_dir)
+        .env("UV_TOOL_BIN_DIR", &bin_dir)
+        .output();
+    finish_install(name, language, output);
+}
+
+/// Shared completion handling for both backends: log + status + mark the
+/// language installed on success, log + status the failure otherwise.
+fn finish_install(
+    name: &'static str,
+    language: Language,
+    output: std::io::Result<std::process::Output>,
+) {
+    match output {
+        Ok(out) if out.status.success() => {
+            log_file::log(&format!("lsp[{name}] managed install complete"));
+            mark_installed(language);
+            set_status(format!("{name} installed"));
+        }
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            log_file::log(&format!("lsp[{name}] install failed: {}", err.trim()));
+            crate::output::push(
+                crate::output::CHANNEL_PROVISION,
+                crate::output::OutputLevel::Error,
+                &format!("{name}: install failed: {}", err.trim()),
+            );
+            set_status(format!("{name} install failed (see ~/.croft/lsp.log)"));
+        }
+        Err(e) => {
+            log_file::log(&format!("lsp[{name}] install error: {e}"));
+            set_status(format!("{name} install failed (see ~/.croft/lsp.log)"));
+        }
+    }
+}
+
+/// Where croft bootstraps its own `uv` when the box has none: the official
+/// installer is pointed here via `UV_INSTALL_DIR` so the binary is croft-owned
+/// and cleanly removable, rather than scattered in the user's `~/.local/bin`.
+fn uv_dist_dir() -> Option<PathBuf> {
+    Some(servers_dir()?.join("uv-dist"))
+}
+
+/// Locate the `uv` executable: PATH first, then croft's own bootstrapped copy,
+/// then the dirs uv's official installer drops it in (`~/.local/bin`,
+/// `~/.cargo/bin`) plus the common Homebrew/local prefixes — a non-login `exec`
+/// won't have those on PATH. `None` when uv isn't installed anywhere croft
+/// looks.
+fn uv_program() -> Option<PathBuf> {
+    if crate::lsp::manager::is_on_path("uv") {
+        return Some(PathBuf::from("uv"));
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(dist) = uv_dist_dir() {
+        candidates.push(dist.join("uv"));
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        candidates.push(home.join(".local").join("bin").join("uv"));
+        candidates.push(home.join(".cargo").join("bin").join("uv"));
+    }
+    candidates.push(PathBuf::from("/opt/homebrew/bin/uv"));
+    candidates.push(PathBuf::from("/usr/local/bin/uv"));
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// Return a usable `uv`, bootstrapping it via the official installer if the box
+/// has none. Serialized by a process-global lock so `ty` and `ruff` opening at
+/// once don't both kick off a uv install — the second waits, then finds the uv
+/// the first just laid down.
+fn ensure_uv() -> Option<PathBuf> {
+    if let Some(uv) = uv_program() {
+        return Some(uv);
+    }
+    static UV_BOOTSTRAP: Mutex<()> = Mutex::new(());
+    let _guard = UV_BOOTSTRAP.lock().ok()?;
+    // Re-probe under the lock: another server's install thread may have just
+    // bootstrapped uv while we waited.
+    if let Some(uv) = uv_program() {
+        return Some(uv);
+    }
+    bootstrap_uv()
+}
+
+/// Pick the fetcher for the uv install script: `curl` preferred, `wget` as a
+/// fallback (the official one-liner ships both forms). `None` when neither is
+/// available — uv can't be fetched without an HTTP client on the box.
+fn uv_fetch_command(has_curl: bool, has_wget: bool) -> Option<&'static str> {
+    if has_curl {
+        Some("curl -LsSf https://astral.sh/uv/install.sh")
+    } else if has_wget {
+        Some("wget -qO- https://astral.sh/uv/install.sh")
+    } else {
+        None
+    }
+}
+
+/// Install uv with Astral's official script, pointed at croft's own dir and
+/// told not to touch the user's shell rc files. Best-effort; returns the uv
+/// path on success.
+fn bootstrap_uv() -> Option<PathBuf> {
+    let dir = uv_dist_dir()?;
+    let Some(fetch) = uv_fetch_command(
+        crate::lsp::manager::is_on_path("curl"),
+        crate::lsp::manager::is_on_path("wget"),
+    ) else {
+        log_file::log("lsp[uv] cannot bootstrap: neither `curl` nor `wget` found");
+        set_status("Python LSP needs uv: install uv or curl/wget (see ~/.croft/lsp.log)");
+        return None;
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log_file::log(&format!("lsp[uv] could not create {dir:?}: {e}"));
+        set_status("uv install failed (could not create install dir)");
+        return None;
+    }
+    let script = format!("{fetch} | sh");
+    log_file::log(&format!(
+        "lsp[uv] bootstrapping uv via official installer into {dir:?}"
+    ));
+    set_status("Installing uv");
+    // `UV_INSTALL_DIR` puts uv in croft's dir; `INSTALLER_NO_MODIFY_PATH` keeps
+    // the script from editing the user's shell profiles. If the env vars are
+    // ignored by some installer version, uv lands in `~/.local/bin`, which
+    // `uv_program` also searches, so discovery still succeeds.
+    match Command::new("sh")
+        .arg("-c")
+        .arg(&script)
+        .env("UV_INSTALL_DIR", &dir)
+        .env("INSTALLER_NO_MODIFY_PATH", "1")
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            log_file::log("lsp[uv] bootstrap complete");
+            uv_program()
+        }
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            log_file::log(&format!("lsp[uv] bootstrap failed: {}", err.trim()));
+            set_status("uv install failed (see ~/.croft/lsp.log)");
+            None
+        }
+        Err(e) => {
+            log_file::log(&format!("lsp[uv] bootstrap error: {e}"));
+            set_status("uv install failed (see ~/.croft/lsp.log)");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// node discovery (needed by the npm backend and by spawning vtsls).
+// ---------------------------------------------------------------------------
+
+/// A directory to PREPEND to PATH so a non-shell `exec` can find `node`/`npm`,
+/// or `None` when `node` is already on croft's PATH (nothing to add) or none
+/// could be discovered. Cached: discovery runs at most once.
+///
+/// Version managers (nvm, fnm, asdf, volta) keep node off croft's inherited
+/// PATH (they add it only when a shell sources its init files). croft is exec'd
+/// without a shell, so [`discover_node_dir`] finds it — first by reading the
+/// well-known on-disk layouts, then by asking the user's shell in a detached
+/// session that can't touch croft's terminal.
+pub(crate) fn node_path_prepend() -> Option<PathBuf> {
+    static NODE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    NODE_DIR
+        .get_or_init(|| {
+            if crate::lsp::manager::is_on_path("node") && crate::lsp::manager::is_on_path("npm") {
+                return None;
+            }
+            discover_node_dir()
+        })
+        .clone()
+}
+
+/// True when croft can find a usable `node` + `npm`, either already on PATH or
+/// via the discovered version-manager directory.
+fn node_available() -> bool {
+    (crate::lsp::manager::is_on_path("node") && crate::lsp::manager::is_on_path("npm"))
+        || node_path_prepend().is_some()
+}
+
+/// Find a directory containing real `node` + `npm` binaries.
+///
+/// Fast path first: read the well-known on-disk layouts (nvm versions dir,
+/// Volta, Homebrew) with no process spawn. Universal fallback: ask the user's
+/// own login+interactive shell where `node` resolves — detached from croft's
+/// controlling terminal so it can never do tty job control. The fallback is
+/// what makes fnm / asdf / volta-shim / custom setups work, not just the ones
+/// with a guessable directory.
+fn discover_node_dir() -> Option<PathBuf> {
+    if let Some(dir) = nvm_node_dir() {
+        return Some(dir);
+    }
+    if let Some(dir) = well_known_node_dirs()
+        .into_iter()
+        .find(|dir| dir.join("node").is_file() && dir.join("npm").exists())
+    {
+        return Some(dir);
+    }
+    detached_shell_node_dir()
+}
+
+/// Marker the probe wraps `process.execPath` in, so the real path is
+/// recoverable even if the user's shell init prints noise to stdout first.
+const NODE_PROBE_MARKER: &str = "__CROFT_NODE__";
+
+/// Ask the user's login+interactive shell where `node` lives, detached from
+/// croft's controlling terminal. Runs `node -e` (so it works whether `node` is
+/// a real binary or a version-manager shell function) and reports the absolute
+/// `process.execPath`. Returns its directory.
+///
+/// SAFETY / why detached: an interactive shell does terminal job control
+/// (`tcsetpgrp`) on its controlling tty. Sharing croft's tty would background
+/// croft and corrupt the terminal. `setsid` in `pre_exec` puts the child in a
+/// brand-new session with NO controlling terminal, so it physically cannot
+/// touch croft's tty; stdin is `/dev/null` and stdout is captured. A timeout
+/// guards against a pathological init file that never returns.
+fn detached_shell_node_dir() -> Option<PathBuf> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run_detached_node_probe());
+    });
+    match rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(result) => result,
+        Err(_) => {
+            log_file::log("lsp[vtsls] node shell-probe timed out");
+            None
+        }
+    }
+}
+
+fn run_detached_node_probe() -> Option<PathBuf> {
+    let out = node_probe_command().output().ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let path = parse_node_probe(&stdout)?;
+    let node = Path::new(path);
+    if !node.is_file() {
+        return None;
+    }
+    node.parent().map(Path::to_path_buf)
+}
+
+/// The shell probe that asks where `node` lives: the user's login+interactive
+/// shell runs `node -e` and prints `process.execPath` after
+/// [`NODE_PROBE_MARKER`], detached from croft's terminal (see
+/// [`detached_shell_node_dir`] for why). Its stdout is read with
+/// [`parse_node_probe`]. Shared by the language-server install and the
+/// JavaScript debugger, so neither can run the shell attached (#2064).
+pub(crate) fn node_probe_command() -> Command {
+    let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
+    let script =
+        format!("node -e 'process.stdout.write(\"{NODE_PROBE_MARKER}\"+process.execPath)'");
+    detached_shell(&shell, &script)
+}
+
+/// `shell -l -i -c script` with stdin `/dev/null`, stdout piped and stderr
+/// discarded, started by `setsid` in a session of its own with no
+/// controlling terminal, so the interactive shell's job control can never
+/// reach croft's tty.
+fn detached_shell(shell: &std::ffi::OsStr, script: &str) -> Command {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    let mut cmd = Command::new(shell);
+    cmd.args(["-l", "-i", "-c", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd
+}
+
+/// Recover the node path from probe stdout: the absolute path written right
+/// after the last marker. Returns `None` if the marker is absent (the probe
+/// didn't run node) or the text after it isn't an absolute path. Tolerates
+/// arbitrary shell-init noise printed before the marker.
+pub(crate) fn parse_node_probe(stdout: &str) -> Option<&str> {
+    let after = &stdout[stdout.rfind(NODE_PROBE_MARKER)? + NODE_PROBE_MARKER.len()..];
+    let path = after.trim();
+    (path.starts_with('/') && !path.is_empty()).then_some(path)
+}
+
+/// Highest installed nvm node's `bin` dir: `$NVM_DIR/versions/node/vX.Y.Z/bin`
+/// (defaulting `NVM_DIR` to `~/.nvm`). Picks the greatest semver so we get a
+/// recent, working node; we only need *a* functional node to install/run vtsls,
+/// not the user's exact `default` alias.
+fn nvm_node_dir() -> Option<PathBuf> {
+    let nvm = std::env::var_os("NVM_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".nvm")))?;
+    nvm_node_dir_in(&nvm.join("versions").join("node"))
+}
+
+/// Pure core of [`nvm_node_dir`], split out so it's testable against a temp
+/// directory without reading `$NVM_DIR`.
+fn nvm_node_dir_in(versions: &Path) -> Option<PathBuf> {
+    let mut best: Option<((u64, u64, u64), PathBuf)> = None;
+    for entry in std::fs::read_dir(versions).ok()?.flatten() {
+        let bin = entry.path().join("bin");
+        if !bin.join("node").is_file() {
+            continue;
+        }
+        let version = parse_node_version(&entry.file_name().to_string_lossy());
+        if best.as_ref().is_none_or(|(b, _)| version > *b) {
+            best = Some((version, bin));
+        }
+    }
+    best.map(|(_, bin)| bin)
+}
+
+/// Parse an nvm version dir name like `v23.7.0` into a comparable tuple;
+/// unparseable components become 0.
+fn parse_node_version(name: &str) -> (u64, u64, u64) {
+    let mut parts = name
+        .trim_start_matches('v')
+        .split('.')
+        .map(|p| p.parse::<u64>().unwrap_or(0));
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
+}
+
+/// Static install locations for other managers, checked after nvm.
+fn well_known_node_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(&home).join(".volta").join("bin"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs
+}
+
+/// Build a PATH value with `extra` prepended (so it wins over any stale entry),
+/// or the current PATH unchanged when `extra` is `None`.
+fn augmented_path(extra: Option<&Path>) -> OsString {
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let Some(dir) = extra else {
+        return current;
+    };
+    let mut dirs = vec![dir.to_path_buf()];
+    dirs.extend(std::env::split_paths(&current));
+    std::env::join_paths(dirs).unwrap_or(current)
+}
+
+/// Build a PATH value with `dirs` prepended, for spawning a managed server
+/// (e.g. so vtsls finds `node`). Returns the current PATH when `dirs` is empty.
+pub(crate) fn prepend_paths(dirs: &[PathBuf]) -> OsString {
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    if dirs.is_empty() {
+        return current;
+    }
+    let mut all: Vec<PathBuf> = dirs.to_vec();
+    all.extend(std::env::split_paths(&current));
+    std::env::join_paths(all).unwrap_or(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn termux_pkg_args_install_the_package_noninteractively() {
+        assert_eq!(
+            termux_pkg_args("ty"),
+            ["install", "-y", "ty"],
+            "background installs can never answer an apt prompt, so -y is required"
+        );
+        assert_eq!(termux_pkg_args("ruff"), ["install", "-y", "ruff"]);
+    }
+
+    #[test]
+    fn apt_lock_contention_is_a_retryable_outcome_not_a_hard_failure() {
+        // Opening one Python file provisions ty AND ruff on separate threads;
+        // apt's single global lock means the loser sees this exact stderr.
+        // It must be treated as "retry", not "give up" — otherwise ty stays
+        // uninstalled forever (observed in lsp.log 2026-06-11).
+        let locked = fake_output(
+            false,
+            "E: Could not get lock /data/.../apt/lists/lock. It is held by process 10355 (apt)\n\
+             E: Unable to lock directory /data/.../apt/lists/\n",
+        );
+        assert!(
+            pkg_lock_contended(&Ok(locked)),
+            "apt lock-held stderr must be recognized as retryable contention"
+        );
+
+        // A clean success is not contention.
+        assert!(!pkg_lock_contended(&Ok(fake_output(true, ""))));
+        // A genuine failure (e.g. no such package) is not lock contention —
+        // retrying it would just waste time, so it must fall through to fail.
+        assert!(!pkg_lock_contended(&Ok(fake_output(
+            false,
+            "E: Unable to locate package nope\n"
+        ))));
+    }
+
+    fn fake_output(success: bool, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(if success { 0 } else { 256 }),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn uv_provisioned_python_servers_use_their_termux_repo_package_names() {
+        // The Termux pkg backend installs ty and ruff under their PyPI names,
+        // which works because Termux packages them under exactly those names
+        // (verified in termux-packages on 2026-06-10); this test pins the
+        // assumption on croft's side.
+        for (config, expected) in [
+            (crate::lsp::config::ServerConfig::ty(), "ty"),
+            (crate::lsp::config::ServerConfig::ruff(), "ruff"),
+        ] {
+            match config.provision {
+                Some(Provision::Uv {
+                    package,
+                    termux_pkg,
+                    ..
+                }) => {
+                    assert_eq!(package, expected);
+                    assert_eq!(termux_pkg, Some(expected));
+                }
+                other => panic!("expected Uv provision for {expected}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn npm_binary_lands_in_npm_bin_dir() {
+        let prefix = std::path::Path::new("/tmp/croft/servers/vtsls");
+        assert_eq!(
+            npm_bin_in(prefix, "vtsls"),
+            std::path::Path::new("/tmp/croft/servers/vtsls/node_modules/.bin/vtsls"),
+            "npm install --prefix drops executables under <prefix>/node_modules/.bin"
+        );
+    }
+
+    #[test]
+    fn target_entry_prefers_os_arch_then_falls_back_to_bare_os() {
+        // clangd's matrix: universal mac (a bare `macos` key serves any arch),
+        // x86_64-only linux, and no linux-aarch64 build at all.
+        let targets = [("macos", "MAC"), ("linux-x86_64", "LINUX64")];
+        let url = |os, arch| target_entry(&targets, os, arch).map(|(_, url)| url);
+        assert_eq!(url("macos", "aarch64"), Some("MAC"));
+        assert_eq!(url("macos", "x86_64"), Some("MAC"));
+        assert_eq!(url("linux", "x86_64"), Some("LINUX64"));
+        // Unsupported platform -> None, so the caller falls back to PATH.
+        assert_eq!(url("linux", "aarch64"), None);
+        assert_eq!(url("android", "aarch64"), None);
+    }
+
+    #[test]
+    fn target_entry_specific_os_arch_key_wins_over_bare_os() {
+        let targets = [("macos", "GENERIC"), ("macos-aarch64", "ARM")];
+        let url = |os, arch| target_entry(&targets, os, arch).map(|(_, url)| url);
+        assert_eq!(url("macos", "aarch64"), Some("ARM"));
+        assert_eq!(url("macos", "x86_64"), Some("GENERIC"));
+    }
+
+    /// A failed download says why (#872): the transport error reaches the
+    /// install's log line and status message instead of being dropped.
+    #[test]
+    fn a_failed_download_carries_the_transport_error() {
+        let url = crate::net::tests::https_server();
+        let why = download_capped(&url, MAX_BINARY_BYTES).unwrap_err();
+        assert!(why.contains("invalid peer certificate"), "{why}");
+    }
+
+    /// End-to-end exercise of the real download + gunzip path against taplo's
+    /// release. `#[ignore]`d because it hits the network and is platform-gated;
+    /// run explicitly with `cargo test --bin croft -- --ignored taplo_gz`.
+    /// Proves `download_capped` + `extract_gz` produce a runnable binary.
+    #[test]
+    #[ignore = "network: downloads a real taplo release"]
+    fn taplo_gz_binary_downloads_extracts_and_runs() {
+        let url = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", "aarch64") => {
+                "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-darwin-aarch64.gz"
+            }
+            ("macos", "x86_64") => {
+                "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-darwin-x86_64.gz"
+            }
+            ("linux", "x86_64") => {
+                "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-x86_64.gz"
+            }
+            other => panic!("no taplo asset wired for {other:?}"),
+        };
+        let bytes = download_capped(url, MAX_BINARY_BYTES).expect("download taplo");
+        let dir = std::env::temp_dir().join(format!("croft-taplo-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("taplo");
+        extract_gz(&bytes, &target).expect("gunzip taplo");
+        assert!(target.is_file(), "extracted taplo binary exists");
+        let out = Command::new(&target)
+            .arg("--version")
+            .output()
+            .expect("run taplo --version");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "taplo --version exits 0");
+        let v = String::from_utf8_lossy(&out.stdout);
+        assert!(v.contains("0.10.0"), "taplo reports its version: {v}");
+    }
+
+    /// End-to-end exercise of the real download + zip-extract path against
+    /// clangd (the riskier archive format: whole-archive extract, nested
+    /// `bin_path`, chmod). `#[ignore]`d: ~50 MB network download, platform-gated.
+    /// Run with `cargo test --bin croft -- --ignored clangd_zip`.
+    #[test]
+    #[ignore = "network: downloads a real ~50MB clangd release"]
+    fn clangd_zip_binary_downloads_extracts_and_runs() {
+        let url = match std::env::consts::OS {
+            "macos" => {
+                "https://github.com/clangd/clangd/releases/download/22.1.0/clangd-mac-22.1.0.zip"
+            }
+            "linux" => {
+                "https://github.com/clangd/clangd/releases/download/22.1.0/clangd-linux-22.1.0.zip"
+            }
+            other => panic!("no clangd asset wired for {other}"),
+        };
+        let bytes = download_capped(url, MAX_BINARY_BYTES).expect("download clangd");
+        let dir = std::env::temp_dir().join(format!("croft-clangd-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("clangd_22.1.0/bin/clangd");
+        extract_zip(&bytes, &dir, &target).expect("unzip clangd");
+        assert!(
+            target.is_file(),
+            "clangd binary exists at the nested bin_path"
+        );
+        let out = Command::new(&target)
+            .arg("--version")
+            .output()
+            .expect("run clangd --version");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "clangd --version exits 0");
+        let v = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            v.to_lowercase().contains("clangd"),
+            "clangd reports itself: {v}"
+        );
+    }
+
+    /// marksman publishes bare executables (#834): a `Raw` payload is written
+    /// byte for byte, its missing parent dirs are created, and it comes out
+    /// executable.
+    #[test]
+    fn a_raw_payload_is_the_binary_and_comes_out_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("marksman/marksman");
+        let script: &[u8] = b"#!/bin/sh\necho marksman-ok\n";
+        extract_raw(script, &target).expect("write the raw binary");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            script,
+            "the payload is written unaltered"
+        );
+        let out = Command::new(&target).output().expect("run the raw binary");
+        assert!(out.status.success(), "the raw binary is executable");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("marksman-ok"));
+    }
+
+    /// End-to-end exercise of the raw path against marksman's real release,
+    /// through the bundled manifest's own URL and pinned digest (#834): proves
+    /// the pin matches what the release serves for this platform and that the
+    /// written file runs. `#[ignore]`d: a 22-44 MB network download,
+    /// platform-gated. Run with `cargo test --bin croft -- --ignored marksman_raw`.
+    #[test]
+    #[ignore = "network: downloads a real marksman release"]
+    fn marksman_raw_binary_downloads_verifies_and_runs() {
+        let registry = crate::lsp::registry::ServerRegistry::with_defaults();
+        let marksman = &registry.for_language(Language::MARKDOWN)[0];
+        let Some(Provision::Binary {
+            targets,
+            sha256,
+            archive,
+            bin,
+            ..
+        }) = &marksman.provision
+        else {
+            panic!("marksman must carry a Binary provision");
+        };
+        assert_eq!(*archive, ArchiveKind::Raw);
+        let (key, url) = target_entry(targets, std::env::consts::OS, std::env::consts::ARCH)
+            .expect("the manifest has a marksman asset for this platform");
+        let bytes = download_capped(url, MAX_BINARY_BYTES).expect("download marksman");
+        digest_verdict(sha256, key, &bytes).expect("the pinned digest matches the release");
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(bin);
+        extract_raw(&bytes, &target).expect("write marksman");
+        let out = Command::new(&target)
+            .arg("--version")
+            .output()
+            .expect("run marksman --version");
+        assert!(out.status.success(), "marksman --version exits 0");
+        let v = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            v.contains("2026-02-08"),
+            "marksman reports its release: {v}"
+        );
+    }
+
+    /// #465: cargo-dist ships tar.xz archives with the binary inside a
+    /// per-target folder, so the extractor has to find it by name rather than
+    /// expect it at the root, and it must come out executable.
+    #[test]
+    fn a_tar_xz_archive_yields_the_named_binary_wherever_it_sits() {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let script: &[u8] = b"#!/bin/sh\necho csvlens-ok\n";
+            let mut h = tar::Header::new_gnu();
+            h.set_size(script.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, "csvlens-x86_64-unknown-linux-gnu/csvlens", script)
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+        let dir = std::env::temp_dir().join(format!("croft-tarxz-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("csvlens");
+        extract_tar_xz(&xz, &dir, &target).expect("unpack the tar.xz");
+        assert!(
+            target.is_file(),
+            "the binary lands at <dir>/<bin>: {target:?}"
+        );
+        let out = Command::new(&target)
+            .output()
+            .expect("run the extracted binary");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "the extracted binary is executable");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("csvlens-ok"));
+    }
+
+    /// A valid archive that expands past the ceiling must not land: the
+    /// download cap covers compressed bytes only, and a high-ratio archive
+    /// would otherwise fill memory and disk during provisioning.
+    #[test]
+    fn a_tar_xz_that_expands_past_the_cap_is_refused() {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let payload = vec![0u8; 4096];
+            let mut h = tar::Header::new_gnu();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, "big/csvlens", &payload[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+        let dir = std::env::temp_dir().join(format!("croft-tarxz-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("csvlens");
+        let outcome = extract_tar_xz_capped(&xz, &dir, &target, 1024);
+        let landed = target.is_file();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            outcome.is_err(),
+            "a 4 KiB payload under a 1 KiB cap is refused"
+        );
+        assert!(!landed, "and nothing is left at the target");
+    }
+
+    /// An archive that declares more than the ceiling is refused from its
+    /// index, before a byte is decoded: the pure-Rust decoder buffers a
+    /// whole block in memory before it writes, so a sink on its output
+    /// bounds the disk but not the decode itself.
+    #[test]
+    fn an_xz_stream_declares_its_size_and_is_refused_before_decoding() {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let payload = vec![0u8; 4096];
+            let mut h = tar::Header::new_gnu();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, "big/csvlens", &payload[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+        assert_eq!(
+            xz_declared_size(&xz),
+            Some(tar_bytes.len() as u64),
+            "the index names the tar's size"
+        );
+        assert_eq!(xz_declared_size(b"not an xz stream"), None);
+        let dir = std::env::temp_dir().join(format!("croft-tarxz-declared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = extract_tar_xz_capped(&xz, &dir, &dir.join("csvlens"), 1024)
+            .expect_err("a 4 KiB payload under a 1 KiB cap is refused");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            err.to_string().contains("declares"),
+            "the refusal comes from the index, before decoding: {err}"
+        );
+    }
+
+    /// A background install that ends without producing the binary releases
+    /// the one-shot gate (#485 review): the next request is a real retry,
+    /// not a "still installing" that never lands. The download here fails
+    /// at once (nothing listens on that port), which is the failure shape a
+    /// refused digest or a dead mirror also takes.
+    #[test]
+    fn a_failed_install_releases_the_gate_for_a_retry() {
+        let config = ServerConfig {
+            name: "gate-test-viewer",
+            command: String::new(),
+            args: vec![],
+            language: Language::GO,
+            initialization_options: None,
+            provision: None,
+        };
+        let targets: &'static [(&'static str, &'static str)] = Box::leak(
+            vec![(
+                static_name(std::env::consts::OS),
+                "http://127.0.0.1:1/never.tar.gz",
+            )]
+            .into_boxed_slice(),
+        );
+        let provision = Provision::Binary {
+            targets,
+            bin: "never",
+            archive: ArchiveKind::Gz,
+            bin_path: None,
+            termux_pkg: None,
+            sha256: &[],
+        };
+        ensure_in_background(&config, &provision);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let held = INSTALL_STARTED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains("gate-test-viewer");
+            if !held {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the gate is still held long after the download failed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // The attempt created its install dir under the real servers dir
+        // before the download; leave nothing behind on the host.
+        if let Some(dir) = servers_dir() {
+            let _ = std::fs::remove_dir_all(dir.join("gate-test-viewer"));
+        }
+    }
+
+    /// One unreadable directory is skipped, not the whole walk: the binary
+    /// in a sibling still on the stack is found.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_does_not_end_the_binary_walk() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let sealed = tmp.path().join("aaa-sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let open = tmp.path().join("zzz-open");
+        std::fs::create_dir(&open).unwrap();
+        let bin = open.join("csvlens");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        let found = find_file_named(tmp.path(), std::ffi::OsStr::new("csvlens"));
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            found,
+            Some(bin),
+            "the sibling's binary is found past the sealed dir"
+        );
+    }
+
+    /// A manifest that pins digests for some platforms but not this one
+    /// refuses to install here rather than silently skipping the gate; no
+    /// pins at all stays unverified, as every older binary provision is.
+    #[test]
+    fn a_partial_digest_map_refuses_an_unlisted_platform() {
+        let bytes = b"asset";
+        let real = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(bytes))
+        };
+        assert_eq!(
+            digest_verdict(&[], "linux-x86_64", bytes),
+            Ok(()),
+            "no pins: unverified"
+        );
+        assert_eq!(
+            digest_verdict(&[("macos-aarch64", real.as_str())], "macos-aarch64", bytes),
+            Ok(()),
+            "the platform's pin matches"
+        );
+        assert!(
+            digest_verdict(&[("macos-aarch64", "00")], "macos-aarch64", bytes).is_err(),
+            "a wrong pin refuses"
+        );
+        assert!(
+            digest_verdict(&[("macos-aarch64", real.as_str())], "linux-x86_64", bytes).is_err(),
+            "a map that pins other platforms but not this one refuses"
+        );
+    }
+
+    /// The digest is looked up under the key the URL resolved to, so the
+    /// two maps must agree on granularity: a universal `macos` asset pinned
+    /// under `macos` verifies on any Mac, and a per-arch digest map beside a
+    /// universal asset (or the reverse) is refused as the manifest mistake it
+    /// is, rather than checking bytes against a digest of other bytes.
+    #[test]
+    fn a_digest_is_pinned_to_the_key_the_url_resolved_to() {
+        use sha2::Digest;
+        let universal = b"one asset for every mac";
+        let digest = format!("{:x}", sha2::Sha256::digest(universal));
+        let targets = [("macos", "https://example.invalid/mac.tar.xz")];
+        let (key, _) = target_entry(&targets, "macos", "aarch64").unwrap();
+        assert_eq!(key, "macos");
+        assert_eq!(
+            digest_verdict(&[("macos", digest.as_str())], key, universal),
+            Ok(())
+        );
+        assert_eq!(
+            digest_verdict(&[("macos-aarch64", digest.as_str())], key, universal),
+            Err("the manifest's digest list does not cover this platform's download"),
+            "per-arch digests beside a universal asset are a manifest mistake"
+        );
+        let per_arch = [("macos-aarch64", "https://example.invalid/arm.tar.xz")];
+        let (key, _) = target_entry(&per_arch, "macos", "aarch64").unwrap();
+        assert_eq!(key, "macos-aarch64");
+        assert_eq!(
+            digest_verdict(&[("macos", digest.as_str())], key, universal),
+            Err("the manifest's digest list does not cover this platform's download"),
+            "a universal digest beside per-arch assets is refused, not checked against the wrong bytes"
+        );
+    }
+
+    /// A planted symlink named like the binary must not become the binary:
+    /// the walk must not follow it, the archive must be refused, and a file
+    /// it points at must keep its mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_the_archive_is_refused_and_touches_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let victim_dir =
+            std::env::temp_dir().join(format!("croft-tarxz-victim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&victim_dir);
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        let victim = victim_dir.join("victim");
+        std::fs::write(&victim, "keep me private").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            h.set_mode(0o777);
+            h.set_cksum();
+            b.append_link(&mut h, "csvlens-x86_64-unknown-linux-gnu/csvlens", &victim)
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+        let dir = std::env::temp_dir().join(format!("croft-tarxz-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("csvlens");
+        let outcome = extract_tar_xz(&xz, &dir, &target);
+        let target_is_link =
+            std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink());
+        let victim_mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&victim_dir);
+        assert!(outcome.is_err(), "an archive carrying a link is refused");
+        assert!(!target_is_link, "no link is left where the binary would go");
+        assert_eq!(victim_mode, 0o600, "the link's target keeps its mode");
+    }
+
+    /// The size ceiling must hold when the stream's index cannot be read:
+    /// a corrupted footer is exactly what a hostile archive would carry, so
+    /// an unreadable index refuses the archive rather than skipping the
+    /// check.
+    #[test]
+    fn a_tar_xz_with_an_unreadable_index_is_refused_before_decoding() {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let payload = vec![0u8; 4096];
+            let mut h = tar::Header::new_gnu();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, "big/csvlens", &payload[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+        // Corrupt the footer magic so the index cannot be located.
+        let n = xz.len();
+        xz[n - 2] = b'X';
+        assert_eq!(
+            xz_declared_size(&xz),
+            None,
+            "fixture: the index is unreadable"
+        );
+        let dir = std::env::temp_dir().join(format!("croft-tarxz-noindex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = extract_tar_xz_capped(&xz, &dir, &dir.join("csvlens"), 1 << 20)
+            .expect_err("an archive whose size cannot be read is refused");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            err.to_string().contains("index"),
+            "the refusal names the unreadable index, not a decode error: {err}"
+        );
+    }
+
+    /// The nested install name resolves to a nested directory and the
+    /// binary is found there afterwards.
+    #[test]
+    fn a_nested_install_name_places_and_finds_the_binary() {
+        let dir = std::env::temp_dir().join(format!("croft-nested-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let nested = dir.join("alpha").join("csvlens");
+        std::fs::create_dir_all(&nested).unwrap();
+        let bin = nested.join("csvlens");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        let found = managed_binary_path_in(&dir, "alpha/csvlens", "csvlens", None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            found, bin,
+            "`<servers>/alpha/csvlens/csvlens` is where the key points"
+        );
+    }
+
+    /// The checksum gate is the only thing between a download and an
+    /// executable; it must reject a mismatch and accept the true digest.
+    #[test]
+    fn sha256_matches_only_the_true_digest() {
+        let bytes = b"csvlens release bytes";
+        // A well-formed digest that is NOT this input's: the real one is
+        // computed below, and the two must differ for the test to mean
+        // anything.
+        let decoy = "8b0fa3ee6b2b3d3b0a0a4f3f6d2d7d5f1a4f0d6b3d5b1f0e3a4b7c2d9e8f1a0b";
+        assert!(!sha256_matches(
+            bytes,
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        ));
+        assert!(!sha256_matches(bytes, ""));
+        let real = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(bytes))
+        };
+        assert_ne!(real, decoy, "the decoy is not this input's digest");
+        assert!(sha256_matches(bytes, &real), "the true digest is accepted");
+        assert!(
+            sha256_matches(bytes, &real.to_uppercase()),
+            "case does not matter"
+        );
+    }
+
+    #[test]
+    fn npm_spec_pins_the_version_when_given() {
+        assert_eq!(
+            npm_spec("@vtsls/language-server", Some("0.3.0")),
+            "@vtsls/language-server@0.3.0"
+        );
+        assert_eq!(
+            npm_spec("@vtsls/language-server", None),
+            "@vtsls/language-server",
+            "no pin installs latest"
+        );
+    }
+
+    /// An executable at `dir/name`.
+    fn put_exe(dir: &Path, name: &str, exec: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, "#!/bin/sh\n").unwrap();
+        let mode = if exec { 0o755 } else { 0o644 };
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Ubuntu's `apt install clangd-18` leaves only `/usr/bin/clangd-18`; the
+    /// newest such executable on PATH is the toolchain copy croft uses
+    /// (#1211).
+    #[test]
+    fn a_versioned_binary_on_path_is_found_newest_first() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        put_exe(a.path(), "clangd-15", true);
+        put_exe(a.path(), "clangd-18", true);
+        put_exe(b.path(), "clangd-19", false);
+        put_exe(b.path(), "clangd-9", true);
+        let path = std::env::join_paths([a.path(), b.path()]).unwrap();
+        assert_eq!(
+            versioned_on_path("clangd", &path),
+            Some(a.path().join("clangd-18"))
+        );
+        put_exe(b.path(), "clangd-18.1", true);
+        assert_eq!(
+            versioned_on_path("clangd", &path),
+            Some(b.path().join("clangd-18.1"))
+        );
+    }
+
+    /// A relative PATH entry still yields an absolute path, so the server
+    /// launches from the workspace root, not croft's cwd.
+    #[test]
+    fn a_versioned_binary_on_a_relative_path_entry_is_returned_absolute() {
+        let a = tempfile::tempdir().unwrap();
+        put_exe(a.path(), "clangd-18", true);
+        let cwd = std::env::current_dir().unwrap();
+        let mut rel = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            rel.push("..");
+        }
+        rel.push(a.path().strip_prefix("/").unwrap());
+        assert!(rel.is_relative());
+        let found = versioned_on_path("clangd", rel.as_os_str()).unwrap();
+        assert!(found.is_absolute(), "{found:?}");
+        assert!(found.ends_with("clangd-18"), "{found:?}");
+    }
+
+    /// Negative: a different tool that shares the prefix (`clangd-tidy`,
+    /// `clangd-indexer`), a bare `clangd-`, a fused `clangd18` and a
+    /// non-executable `clangd-20` are never taken for clangd.
+    #[test]
+    fn only_a_numbered_executable_counts_as_a_versioned_binary() {
+        let a = tempfile::tempdir().unwrap();
+        for name in [
+            "clangd-tidy",
+            "clangd-indexer",
+            "clangd-",
+            "clangd18",
+            "clangd-18x",
+        ] {
+            put_exe(a.path(), name, true);
+        }
+        put_exe(a.path(), "clangd-20", false);
+        let path = std::env::join_paths([a.path()]).unwrap();
+        assert_eq!(versioned_on_path("clangd", &path), None);
+        assert_eq!(versioned_on_path("taplo", &path), None);
+    }
+
+    /// A managed uv tool installed under an older pin is stale, so croft
+    /// reinstalls it at the pin it now carries instead of running the old,
+    /// broken copy forever (#1297).
+    #[test]
+    fn a_uv_receipt_under_another_pin_is_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("mcp-server-time");
+        std::fs::create_dir_all(&tool).unwrap();
+        std::fs::write(
+            tool.join("uv-receipt.toml"),
+            "[tool]\nrequirements = [{ name = \"mcp-server-time\", specifier = \"==2026.6.4\" }]\n",
+        )
+        .unwrap();
+        let dir = tmp.path();
+        assert!(!uv_receipt_matches_pin(
+            dir,
+            "mcp-server-time",
+            Some("2026.8.18")
+        ));
+        assert!(uv_receipt_matches_pin(
+            dir,
+            "mcp-server-time",
+            Some("2026.6.4")
+        ));
+    }
+
+    /// Negative: an unpinned tool (ty, ruff), a missing receipt or an
+    /// unreadable one is never treated as stale, so nothing reinstalls in a
+    /// loop.
+    #[test]
+    fn an_unpinned_or_unreadable_uv_receipt_is_not_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert!(
+            uv_receipt_matches_pin(dir, "ty", Some("0.1.0")),
+            "no receipt"
+        );
+        std::fs::create_dir_all(dir.join("ty")).unwrap();
+        std::fs::write(
+            dir.join("ty/uv-receipt.toml"),
+            "[tool]\nrequirements = [{ name = \"ty\" }]\n",
+        )
+        .unwrap();
+        assert!(uv_receipt_matches_pin(dir, "ty", None));
+        std::fs::write(dir.join("ty/uv-receipt.toml"), "not toml [").unwrap();
+        assert!(uv_receipt_matches_pin(dir, "ty", Some("0.1.0")));
+    }
+
+    #[test]
+    fn uv_spec_uses_double_equals_for_pinning() {
+        // PyPI version pinning is `pkg==X`, not npm's `pkg@X`.
+        assert_eq!(uv_spec("ruff", Some("0.9.0")), "ruff==0.9.0");
+        assert_eq!(uv_spec("ty", None), "ty", "no pin tracks latest");
+    }
+
+    /// #930: `go install` outside a module needs `@version`, and each pin
+    /// gets its own GOBIN, so bumping the pin installs afresh instead of
+    /// running the copy the old pin left behind.
+    #[test]
+    fn go_installs_pin_the_version_in_the_spec_and_the_install_dir() {
+        assert_eq!(
+            go_spec("golang.org/x/tools/gopls", Some("v0.23.0")),
+            "golang.org/x/tools/gopls@v0.23.0"
+        );
+        assert_eq!(
+            go_spec("golang.org/x/tools/gopls", None),
+            "golang.org/x/tools/gopls@latest"
+        );
+        let servers = Path::new("/home/u/.croft/servers");
+        assert_eq!(
+            go_bin_dir(servers, "gopls", Some("v0.23.0")),
+            servers.join("gopls").join("v0.23.0")
+        );
+        assert_eq!(
+            go_bin_dir(servers, "gopls", None),
+            servers.join("gopls").join("latest")
+        );
+    }
+
+    #[test]
+    fn uv_fetch_command_prefers_curl_then_wget_then_gives_up() {
+        assert_eq!(
+            uv_fetch_command(true, true),
+            Some("curl -LsSf https://astral.sh/uv/install.sh"),
+            "curl wins when both are present"
+        );
+        assert_eq!(
+            uv_fetch_command(false, true),
+            Some("wget -qO- https://astral.sh/uv/install.sh"),
+            "wget is the fallback"
+        );
+        assert_eq!(
+            uv_fetch_command(false, false),
+            None,
+            "no fetcher → can't bootstrap uv"
+        );
+    }
+
+    #[test]
+    fn parse_node_version_orders_by_semver_not_lexically() {
+        assert_eq!(parse_node_version("v23.7.0"), (23, 7, 0));
+        assert_eq!(parse_node_version("v8.17.1"), (8, 17, 1));
+        // The bug a lexical sort would hit: v8 must NOT outrank v18.
+        assert!(parse_node_version("v18.0.0") > parse_node_version("v8.17.1"));
+        assert_eq!(parse_node_version("garbage"), (0, 0, 0));
+    }
+
+    #[test]
+    fn nvm_node_dir_picks_highest_version_with_a_node_binary() {
+        let tmp = TempDir::new().unwrap();
+        let versions = tmp.path();
+        // Two versions with node, one stray dir without — highest wins.
+        for v in ["v18.19.0", "v23.7.0"] {
+            let bin = versions.join(v).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("node"), b"#!/bin/sh\n").unwrap();
+        }
+        std::fs::create_dir_all(versions.join("v20.0.0")).unwrap(); // no bin/node
+        let dir = nvm_node_dir_in(versions).unwrap();
+        assert_eq!(dir, versions.join("v23.7.0").join("bin"));
+    }
+
+    #[test]
+    fn nvm_node_dir_is_none_when_no_versions_have_node() {
+        let tmp = TempDir::new().unwrap();
+        assert!(nvm_node_dir_in(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn parse_node_probe_extracts_path_after_marker_ignoring_init_noise() {
+        // Shell init may print noise before the marker; the path is what
+        // follows the last marker.
+        let stdout = "Welcome to your shell!\nnvm loaded\n__CROFT_NODE__/Users/x/.nvm/versions/node/v23.7.0/bin/node";
+        assert_eq!(
+            parse_node_probe(stdout),
+            Some("/Users/x/.nvm/versions/node/v23.7.0/bin/node")
+        );
+    }
+
+    #[test]
+    fn parse_node_probe_rejects_missing_marker_or_non_absolute() {
+        assert_eq!(parse_node_probe("no marker here"), None);
+        assert_eq!(parse_node_probe("__CROFT_NODE__"), None);
+        assert_eq!(parse_node_probe("__CROFT_NODE__relative/path"), None);
+    }
+
+    /// The node probe's shell leads a session of its own (#2064), so it has
+    /// no controlling terminal and its job control cannot reach croft's.
+    /// Read from the shell's own `/proc/<pid>/stat`: `pid (comm) state ppid
+    /// pgrp session ...`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_node_probe_shell_runs_in_a_session_of_its_own() {
+        let home = tempfile::tempdir().unwrap();
+        let out = detached_shell(
+            std::ffi::OsStr::new("/bin/sh"),
+            "printf __STAT__; cat /proc/$$/stat",
+        )
+        .env("HOME", home.path())
+        .env_remove("ENV")
+        .output()
+        .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stat = &stdout[stdout.rfind("__STAT__").expect("the probe ran") + "__STAT__".len()..];
+        let pid: i32 = stat.split_whitespace().next().unwrap().parse().unwrap();
+        let after_comm: Vec<&str> = stat[stat.rfind(')').unwrap() + 1..]
+            .split_whitespace()
+            .collect();
+        let session: i32 = after_comm[3].parse().unwrap();
+        assert_eq!(session, pid, "the shell leads its own session: {stat}");
+        let ours = unsafe { libc::getsid(0) };
+        assert_ne!(session, ours, "not croft's session");
+    }
+
+    #[test]
+    fn prepend_paths_puts_the_extra_dir_first() {
+        let dir = PathBuf::from("/opt/croft-test/node/bin");
+        let result = prepend_paths(std::slice::from_ref(&dir));
+        let first = std::env::split_paths(&result).next().unwrap();
+        assert_eq!(
+            first, dir,
+            "the discovered node dir must win over croft's inherited PATH"
+        );
+    }
+
+    #[test]
+    fn prepend_paths_empty_leaves_path_unchanged() {
+        assert_eq!(
+            prepend_paths(&[]),
+            std::env::var_os("PATH").unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn npm_binary_is_detected_only_once_the_bin_dir_is_populated() {
+        // Before install, the bin path doesn't exist; after a file appears
+        // there, `is_file()` (what `npm_command` keys off) flips to true.
+        let tmp = TempDir::new().unwrap();
+        let prefix = tmp.path().join("vtsls");
+        let bin = npm_bin_in(&prefix, "vtsls");
+        assert!(!bin.is_file());
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"#!/usr/bin/env node\n").unwrap();
+        assert!(bin.is_file());
+    }
+}

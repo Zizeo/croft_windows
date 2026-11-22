@@ -1,0 +1,574 @@
+//! Tree-sitter outline provider: the same data the OUTLINE panel shows, but
+//! derived locally from the buffer's own syntax tree instead of waiting on a
+//! language server's `textDocument/documentSymbol`. This is what paints the
+//! outline *instantly* on file open, before a cold rust-analyzer/ty has
+//! finished indexing; the LSP reply later supersedes it with richer kinds and
+//! detail. The design mirrors Zed (whose outline is a tree-sitter query by
+//! deliberate choice) and aerial.nvim (whose default backend order is
+//! `treesitter` first, `lsp` second).
+//!
+//! The grammar crates we depend on do not bundle a `tags` query, so the
+//! per-language outline queries below are hand-written. Each pattern captures
+//! the whole definition node as `@item` (its line span feeds follow-cursor)
+//! and the name node as `@name.<kind>` (its text is the label, its start the
+//! jump target, and the `<kind>` suffix selects the [`OutlineKind`]). Nesting
+//! is recovered from byte-range containment rather than from the query, so one
+//! flat pattern set yields the indented tree the panel renders.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use streaming_iterator::StreamingIterator;
+use tree_sitter::{Language, Parser, Point, Query, QueryCursor};
+
+use crate::highlight::LangKind;
+use crate::lsp::manager::{OutlineKind, OutlineSymbol};
+
+/// The outline of `lines` as the file at `path`, from its own syntax tree;
+/// empty for a language croft has no grammar for. Callable off the UI
+/// thread, which is where the history scrubber builds it (#371).
+pub fn symbols_for_lines(path: &std::path::Path, lines: &[String]) -> Vec<OutlineSymbol> {
+    // By full path, so `Gemfile` and `Rakefile` (no extension) reach Ruby.
+    let Some(kind) = crate::highlight::lang_for_path(path) else {
+        return Vec::new();
+    };
+    symbols_for(kind, lines.join("\n").as_bytes())
+}
+
+/// Extract the outline for `source` in `kind`'s grammar. Returns an empty vec
+/// for languages without an outline query (the panel then falls back to the
+/// LSP reply, exactly as before this provider existed) or when parsing fails.
+pub fn symbols_for(kind: LangKind, source: &[u8]) -> Vec<OutlineSymbol> {
+    let Some(compiled) = compiled_for(kind) else {
+        return Vec::new();
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&compiled.lang).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+
+    let names = compiled.query.capture_names();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&compiled.query, tree.root_node(), source);
+    let mut raw: Vec<Raw> = Vec::new();
+    while let Some(m) = matches.next() {
+        let mut name: Option<&str> = None;
+        let mut kind_sym: Option<OutlineKind> = None;
+        let mut sel: Option<(u32, u32)> = None;
+        let mut full: Option<(usize, usize, Point, Point)> = None;
+        for cap in m.captures {
+            let cap_name = names[cap.index as usize];
+            let node = cap.node;
+            if cap_name == "item" {
+                full = Some((
+                    node.start_byte(),
+                    node.end_byte(),
+                    node.start_position(),
+                    node.end_position(),
+                ));
+            } else if let Some(suffix) = cap_name.strip_prefix("name.") {
+                name = node.utf8_text(source).ok();
+                let start = node.start_position();
+                sel = Some((start.row as u32, start.column as u32));
+                kind_sym = Some(kind_from_suffix(suffix));
+            }
+        }
+        if let (Some(name), Some(kind), Some((line, character)), Some((sb, eb, start, end))) =
+            (name, kind_sym, sel, full)
+        {
+            raw.push(Raw {
+                name: name.to_string(),
+                kind,
+                line,
+                character,
+                start_byte: sb,
+                end_byte: eb,
+                range_start_line: start.row as u32,
+                range_end_line: end.row as u32,
+                range_start_character: start.column as u32,
+                range_end_character: end.column as u32,
+            });
+        }
+    }
+
+    // Document order, parents before children: ascending start, then the wider
+    // span first so an enclosing node precedes the symbols it contains.
+    raw.sort_by(|a, b| {
+        a.start_byte
+            .cmp(&b.start_byte)
+            .then(b.end_byte.cmp(&a.end_byte))
+    });
+
+    // Depth = number of still-open ancestors. A stack of ancestor byte ranges
+    // is popped until its top still encloses the current symbol's start. A
+    // symbol with the very same range is a sibling, not a child: `int x, y;`
+    // yields one symbol per declarator, all spanning the one declaration.
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    let mut out = Vec::with_capacity(raw.len());
+    for r in raw {
+        while stack.last().is_some_and(|&(start, end)| {
+            r.start_byte >= end || (start, end) == (r.start_byte, r.end_byte)
+        }) {
+            stack.pop();
+        }
+        let depth = stack.len() as u16;
+        stack.push((r.start_byte, r.end_byte));
+        out.push(OutlineSymbol {
+            name: r.name,
+            detail: None,
+            kind: r.kind,
+            depth,
+            line: r.line,
+            character: r.character,
+            range_start_line: r.range_start_line,
+            range_end_line: r.range_end_line,
+            range_start_character: r.range_start_character,
+            range_end_character: r.range_end_character,
+        });
+    }
+    out
+}
+
+/// A symbol before depth has been resolved; byte ranges drive the containment
+/// pass that assigns nesting.
+struct Raw {
+    name: String,
+    kind: OutlineKind,
+    line: u32,
+    character: u32,
+    start_byte: usize,
+    end_byte: usize,
+    range_start_line: u32,
+    range_end_line: u32,
+    range_start_character: u32,
+    range_end_character: u32,
+}
+
+struct Compiled {
+    lang: Language,
+    query: Query,
+}
+
+/// Compile (once) and cache the outline query for `kind`. `None` is cached too,
+/// so an unsupported language is not re-probed every keystroke-batch.
+fn compiled_for(kind: LangKind) -> Option<Arc<Compiled>> {
+    static CACHE: OnceLock<Mutex<HashMap<LangKind, Option<Arc<Compiled>>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap();
+    if let Some(entry) = guard.get(&kind) {
+        return entry.clone();
+    }
+    let (lang, src) = match lang_and_query(kind) {
+        Some(pair) => pair,
+        None => {
+            guard.insert(kind, None);
+            return None;
+        }
+    };
+    let built = match Query::new(&lang, src) {
+        Ok(query) => Some(Arc::new(Compiled { lang, query })),
+        Err(e) => {
+            crate::lsp::log_file::log(&format!(
+                "outline_syntax: outline query for {kind:?} failed to compile: {e}"
+            ));
+            None
+        }
+    };
+    guard.insert(kind, built.clone());
+    built
+}
+
+fn lang_and_query(kind: LangKind) -> Option<(Language, &'static str)> {
+    Some(match kind {
+        LangKind::Rust => (tree_sitter_rust::LANGUAGE.into(), RUST_QUERY),
+        LangKind::Python => (tree_sitter_python::LANGUAGE.into(), PYTHON_QUERY),
+        LangKind::JavaScript => (tree_sitter_javascript::LANGUAGE.into(), JS_QUERY),
+        LangKind::TypeScript => (tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), TS_QUERY),
+        LangKind::Tsx => (tree_sitter_typescript::LANGUAGE_TSX.into(), TS_QUERY),
+        LangKind::Go => (tree_sitter_go::LANGUAGE.into(), GO_QUERY),
+        LangKind::Lua => (tree_sitter_lua::LANGUAGE.into(), LUA_QUERY),
+        LangKind::Ql => (tree_sitter_ql::LANGUAGE.into(), QL_QUERY),
+        // Highlighted since #1226 but with no bundled language server, so
+        // this query is their only outline (#1651).
+        LangKind::Java => (tree_sitter_java::LANGUAGE.into(), JAVA_QUERY),
+        LangKind::Ruby => (tree_sitter_ruby::LANGUAGE.into(), RUBY_QUERY),
+        LangKind::CSharp => (tree_sitter_c_sharp::LANGUAGE.into(), CSHARP_QUERY),
+        // Other languages either lack a useful symbol structure (json/toml/
+        // yaml/css/html/bash) or are not yet covered; they fall through to the
+        // LSP outline. Add a query + arm here to light one up.
+        _ => return None,
+    })
+}
+
+fn kind_from_suffix(suffix: &str) -> OutlineKind {
+    match suffix {
+        "function" => OutlineKind::Function,
+        "method" => OutlineKind::Method,
+        "struct" => OutlineKind::Struct,
+        "enum" => OutlineKind::Enum,
+        "enum_member" => OutlineKind::EnumMember,
+        "interface" => OutlineKind::Interface,
+        "class" => OutlineKind::Class,
+        "constant" => OutlineKind::Constant,
+        "field" => OutlineKind::Field,
+        "module" => OutlineKind::Module,
+        "constructor" => OutlineKind::Constructor,
+        "property" => OutlineKind::Property,
+        "variable" => OutlineKind::Variable,
+        _ => OutlineKind::Field,
+    }
+}
+
+const RUST_QUERY: &str = r#"
+(function_item name: (identifier) @name.function) @item
+(struct_item name: (type_identifier) @name.struct) @item
+(union_item name: (type_identifier) @name.struct) @item
+(enum_item name: (type_identifier) @name.enum) @item
+(enum_variant name: (identifier) @name.enum_member) @item
+(trait_item name: (type_identifier) @name.interface) @item
+(type_item name: (type_identifier) @name.interface) @item
+(mod_item name: (identifier) @name.module) @item
+(const_item name: (identifier) @name.constant) @item
+(static_item name: (identifier) @name.constant) @item
+(macro_definition name: (identifier) @name.function) @item
+(impl_item type: (type_identifier) @name.class) @item
+(field_declaration name: (field_identifier) @name.field) @item
+"#;
+
+const PYTHON_QUERY: &str = r#"
+(function_definition name: (identifier) @name.function) @item
+(class_definition name: (identifier) @name.class) @item
+"#;
+
+const JS_QUERY: &str = r#"
+(function_declaration name: (identifier) @name.function) @item
+(generator_function_declaration name: (identifier) @name.function) @item
+(class_declaration name: (identifier) @name.class) @item
+(method_definition name: (property_identifier) @name.method) @item
+"#;
+
+const TS_QUERY: &str = r#"
+(function_declaration name: (identifier) @name.function) @item
+(class_declaration name: (type_identifier) @name.class) @item
+(abstract_class_declaration name: (type_identifier) @name.class) @item
+(method_definition name: (property_identifier) @name.method) @item
+(interface_declaration name: (type_identifier) @name.interface) @item
+(type_alias_declaration name: (type_identifier) @name.interface) @item
+(enum_declaration name: (identifier) @name.enum) @item
+"#;
+
+const GO_QUERY: &str = r#"
+(function_declaration name: (identifier) @name.function) @item
+(method_declaration name: (field_identifier) @name.method) @item
+(type_spec name: (type_identifier) @name.struct) @item
+(const_spec name: (identifier) @name.constant) @item
+"#;
+
+const LUA_QUERY: &str = r#"
+(function_declaration name: (identifier) @name.function) @item
+(function_declaration name: (dot_index_expression field: (identifier) @name.function)) @item
+(function_declaration name: (method_index_expression method: (identifier) @name.method)) @item
+(field
+  name: (identifier) @name.function
+  value: (function_definition)) @item
+(assignment_statement
+  (variable_list
+    .
+    name: [
+      (identifier) @name.function
+      (dot_index_expression field: (identifier) @name.function)
+    ])
+  (expression_list
+    .
+    value: (function_definition))) @item
+"#;
+
+// The definition patterns of tree-sitter-ql's own `tags.scm`, recaptured in
+// this file's `@item` / `@name.<kind>` shape. A `newtype` and its branches
+// read as an enum and its members; member predicates nest under their class
+// by byte containment.
+const QL_QUERY: &str = r#"
+(classlessPredicate name: (predicateName) @name.function) @item
+(memberPredicate name: (predicateName) @name.method) @item
+(module name: (moduleName) @name.module) @item
+(dataclass name: (className) @name.class) @item
+(datatype name: (className) @name.enum) @item
+(datatypeBranch name: (className) @name.enum_member) @item
+"#;
+
+// The definition patterns of each grammar's own `tags.scm`, widened to the
+// constructors, enums, records and fields an outline shows (#1651).
+const JAVA_QUERY: &str = r#"
+(class_declaration name: (identifier) @name.class) @item
+(record_declaration name: (identifier) @name.class) @item
+(interface_declaration name: (identifier) @name.interface) @item
+(annotation_type_declaration name: (identifier) @name.interface) @item
+(enum_declaration name: (identifier) @name.enum) @item
+(enum_constant name: (identifier) @name.enum_member) @item
+(constructor_declaration name: (identifier) @name.constructor) @item
+(compact_constructor_declaration name: (identifier) @name.constructor) @item
+(method_declaration name: (identifier) @name.method) @item
+(field_declaration declarator: (variable_declarator name: (identifier) @name.field)) @item
+"#;
+
+const RUBY_QUERY: &str = r#"
+(module name: [(constant) @name.module (scope_resolution name: (_) @name.module)]) @item
+(class name: [(constant) @name.class (scope_resolution name: (_) @name.class)]) @item
+(method name: (_) @name.method) @item
+(singleton_method name: (_) @name.method) @item
+"#;
+
+const CSHARP_QUERY: &str = r#"
+(namespace_declaration name: (_) @name.module) @item
+(file_scoped_namespace_declaration name: (_) @name.module) @item
+(class_declaration name: (identifier) @name.class) @item
+(record_declaration name: (identifier) @name.class) @item
+(struct_declaration name: (identifier) @name.struct) @item
+(interface_declaration name: (identifier) @name.interface) @item
+(enum_declaration name: (identifier) @name.enum) @item
+(enum_member_declaration name: (identifier) @name.enum_member) @item
+(constructor_declaration name: (identifier) @name.constructor) @item
+(method_declaration name: (identifier) @name.method) @item
+(property_declaration name: (identifier) @name.property) @item
+(field_declaration (variable_declaration (variable_declarator name: (identifier) @name.field))) @item
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names_kinds_depths(syms: &[OutlineSymbol]) -> Vec<(String, OutlineKind, u16)> {
+        syms.iter()
+            .map(|s| (s.name.clone(), s.kind, s.depth))
+            .collect()
+    }
+
+    #[test]
+    fn rust_methods_nest_under_their_impl() {
+        let src = b"struct Foo { x: i32 }\n\nimpl Foo {\n    fn new() -> Self { Foo { x: 0 } }\n    fn get(&self) -> i32 { self.x }\n}\n\nfn free() {}\n";
+        let syms = symbols_for(LangKind::Rust, src);
+        let got = names_kinds_depths(&syms);
+        // Document order: struct (and its field) first, then the impl with its
+        // two methods nested, then the free function.
+        assert_eq!(got[0], ("Foo".into(), OutlineKind::Struct, 0));
+        assert_eq!(got[1], ("x".into(), OutlineKind::Field, 1));
+        assert_eq!(got[2], ("Foo".into(), OutlineKind::Class, 0));
+        assert_eq!(got[3], ("new".into(), OutlineKind::Function, 1));
+        assert_eq!(got[4], ("get".into(), OutlineKind::Function, 1));
+        assert_eq!(got[5], ("free".into(), OutlineKind::Function, 0));
+    }
+
+    #[test]
+    fn rust_enum_variants_nest_under_enum() {
+        let src = b"enum Color {\n    Red,\n    Green,\n}\n";
+        let syms = symbols_for(LangKind::Rust, src);
+        let got = names_kinds_depths(&syms);
+        assert_eq!(got[0], ("Color".into(), OutlineKind::Enum, 0));
+        assert_eq!(got[1], ("Red".into(), OutlineKind::EnumMember, 1));
+        assert_eq!(got[2], ("Green".into(), OutlineKind::EnumMember, 1));
+    }
+
+    #[test]
+    fn python_methods_nest_under_class() {
+        let src = b"def top():\n    pass\n\nclass Greeter:\n    def __init__(self):\n        pass\n    def hi(self):\n        pass\n";
+        let syms = symbols_for(LangKind::Python, src);
+        let got = names_kinds_depths(&syms);
+        assert_eq!(got[0], ("top".into(), OutlineKind::Function, 0));
+        assert_eq!(got[1], ("Greeter".into(), OutlineKind::Class, 0));
+        assert_eq!(got[2], ("__init__".into(), OutlineKind::Function, 1));
+        assert_eq!(got[3], ("hi".into(), OutlineKind::Function, 1));
+    }
+
+    #[test]
+    fn typescript_surfaces_interfaces_and_classes() {
+        let src = b"interface Shape { area(): number }\n\nclass Circle {\n  radius(): number { return 1; }\n}\n";
+        let syms = symbols_for(LangKind::TypeScript, src);
+        let got = names_kinds_depths(&syms);
+        assert!(got.contains(&("Shape".into(), OutlineKind::Interface, 0)));
+        assert!(got.contains(&("Circle".into(), OutlineKind::Class, 0)));
+        assert!(got.contains(&("radius".into(), OutlineKind::Method, 1)));
+    }
+
+    #[test]
+    fn go_methods_and_types_are_extracted() {
+        let src = b"package main\n\ntype Point struct {\n\tX int\n}\n\nfunc (p Point) Norm() int {\n\treturn p.X\n}\n\nfunc Free() {}\n";
+        let syms = symbols_for(LangKind::Go, src);
+        let got = names_kinds_depths(&syms);
+        assert!(got.contains(&("Point".into(), OutlineKind::Struct, 0)));
+        assert!(got.contains(&("Norm".into(), OutlineKind::Method, 0)));
+        assert!(got.contains(&("Free".into(), OutlineKind::Function, 0)));
+    }
+
+    #[test]
+    fn lua_functions_and_methods_are_extracted() {
+        let src = b"function greet() end\nfunction Player.new() end\nfunction Player:move() end\nlocal Player = { jump = function() end }\nPlayer.attack = function() end\n";
+        let syms = symbols_for(LangKind::Lua, src);
+        let got = names_kinds_depths(&syms);
+        assert!(got.contains(&("greet".into(), OutlineKind::Function, 0)));
+        assert!(got.contains(&("new".into(), OutlineKind::Function, 0)));
+        assert!(got.contains(&("move".into(), OutlineKind::Method, 0)));
+        assert!(got.contains(&("jump".into(), OutlineKind::Function, 0)));
+        assert!(got.contains(&("attack".into(), OutlineKind::Function, 0)));
+    }
+
+    #[test]
+    fn codeql_predicates_classes_and_modules_are_extracted() {
+        let src = b"module Util {\n  predicate isSmall(int i) { i < 10 }\n}\n\nclass Small extends int {\n  Small() { this = 1 }\n  int twice() { result = this * 2 }\n}\n";
+        let syms = symbols_for(LangKind::Ql, src);
+        let got = names_kinds_depths(&syms);
+        assert!(got.contains(&("Util".into(), OutlineKind::Module, 0)));
+        assert!(got.contains(&("isSmall".into(), OutlineKind::Function, 1)));
+        assert!(got.contains(&("Small".into(), OutlineKind::Class, 0)));
+        assert!(got.contains(&("twice".into(), OutlineKind::Method, 1)));
+    }
+
+    /// #1651: the issue's `Cart.java`: the class, its field, constructor and
+    /// methods, in source order, nested under the class.
+    #[test]
+    fn java_classes_constructors_methods_and_fields_are_extracted() {
+        let src = b"public class Cart {\n    private int total;\n    public Cart(int total) { this.total = total; }\n    public int getTotal() { return total; }\n    public void addItem(int price) { this.total += price; }\n}\n\ninterface Priced { int price(); }\nenum Size { SMALL, LARGE }\n";
+        let got = names_kinds_depths(&symbols_for(LangKind::Java, src));
+        assert_eq!(
+            got,
+            vec![
+                ("Cart".into(), OutlineKind::Class, 0),
+                ("total".into(), OutlineKind::Field, 1),
+                ("Cart".into(), OutlineKind::Constructor, 1),
+                ("getTotal".into(), OutlineKind::Method, 1),
+                ("addItem".into(), OutlineKind::Method, 1),
+                ("Priced".into(), OutlineKind::Interface, 0),
+                ("price".into(), OutlineKind::Method, 1),
+                ("Size".into(), OutlineKind::Enum, 0),
+                ("SMALL".into(), OutlineKind::EnumMember, 1),
+                ("LARGE".into(), OutlineKind::EnumMember, 1),
+            ]
+        );
+    }
+
+    /// #1651: Ruby modules, classes (also `A::B`), instance and singleton
+    /// methods.
+    #[test]
+    fn ruby_modules_classes_and_methods_are_extracted() {
+        let src = b"module Shop\n  class Cart\n    def get_total\n      @total\n    end\n    def self.empty\n      new\n    end\n  end\nend\n\nclass Shop::Item\n  def price\n    1\n  end\nend\n";
+        let got = names_kinds_depths(&symbols_for(LangKind::Ruby, src));
+        assert_eq!(
+            got,
+            vec![
+                ("Shop".into(), OutlineKind::Module, 0),
+                ("Cart".into(), OutlineKind::Class, 1),
+                ("get_total".into(), OutlineKind::Method, 2),
+                ("empty".into(), OutlineKind::Method, 2),
+                ("Item".into(), OutlineKind::Class, 0),
+                ("price".into(), OutlineKind::Method, 1),
+            ]
+        );
+    }
+
+    /// #1651: a C# namespace with a class (field, property, constructor,
+    /// method), an interface, a struct and an enum.
+    #[test]
+    fn csharp_types_and_members_are_extracted() {
+        let src = b"namespace Shop {\n  public class Cart {\n    private int total;\n    public int Count { get; set; }\n    public Cart(int total) { this.total = total; }\n    public int GetTotal() { return total; }\n  }\n  interface IPriced { int Price(); }\n  struct Point { }\n  enum Size { Small, Large }\n}\n";
+        let got = names_kinds_depths(&symbols_for(LangKind::CSharp, src));
+        assert_eq!(
+            got,
+            vec![
+                ("Shop".into(), OutlineKind::Module, 0),
+                ("Cart".into(), OutlineKind::Class, 1),
+                ("total".into(), OutlineKind::Field, 2),
+                ("Count".into(), OutlineKind::Property, 2),
+                ("Cart".into(), OutlineKind::Constructor, 2),
+                ("GetTotal".into(), OutlineKind::Method, 2),
+                ("IPriced".into(), OutlineKind::Interface, 1),
+                ("Price".into(), OutlineKind::Method, 2),
+                ("Point".into(), OutlineKind::Struct, 1),
+                ("Size".into(), OutlineKind::Enum, 1),
+                ("Small".into(), OutlineKind::EnumMember, 2),
+                ("Large".into(), OutlineKind::EnumMember, 2),
+            ]
+        );
+    }
+
+    /// #1651 negative: a file of comments alone, or calls and expressions
+    /// with no definitions, has no symbols in any of the three.
+    #[test]
+    fn java_ruby_and_csharp_without_definitions_have_no_symbols() {
+        assert!(symbols_for(LangKind::Java, b"// just a note\n/* and another */\n").is_empty());
+        assert!(
+            symbols_for(LangKind::Ruby, b"# a note\nputs total\ncart.add_item(3)\n").is_empty()
+        );
+        assert!(symbols_for(LangKind::CSharp, b"// a note\nusing System;\n").is_empty());
+    }
+
+    /// `int x, y;` is one declaration with two declarators: two sibling
+    /// fields, neither nested under the other. Likewise in C#.
+    #[test]
+    fn multi_declarator_fields_are_siblings() {
+        let java = b"class P {\n    int x, y;\n    void m() {}\n}\n";
+        assert_eq!(
+            names_kinds_depths(&symbols_for(LangKind::Java, java)),
+            vec![
+                ("P".into(), OutlineKind::Class, 0),
+                ("x".into(), OutlineKind::Field, 1),
+                ("y".into(), OutlineKind::Field, 1),
+                ("m".into(), OutlineKind::Method, 1),
+            ]
+        );
+        let csharp = b"class P {\n    int x, y;\n    void M() {}\n}\n";
+        assert_eq!(
+            names_kinds_depths(&symbols_for(LangKind::CSharp, csharp)),
+            vec![
+                ("P".into(), OutlineKind::Class, 0),
+                ("x".into(), OutlineKind::Field, 1),
+                ("y".into(), OutlineKind::Field, 1),
+                ("M".into(), OutlineKind::Method, 1),
+            ]
+        );
+    }
+
+    /// A record's compact constructor (`Range { ... }`, no parameter list)
+    /// is a constructor of the record.
+    #[test]
+    fn java_record_compact_constructor_is_extracted() {
+        let src = b"record Range(int lo, int hi) {\n    Range {\n        if (lo > hi) throw new IllegalArgumentException();\n    }\n}\n";
+        assert_eq!(
+            names_kinds_depths(&symbols_for(LangKind::Java, src)),
+            vec![
+                ("Range".into(), OutlineKind::Class, 0),
+                ("Range".into(), OutlineKind::Constructor, 1),
+            ]
+        );
+    }
+
+    /// `Gemfile`, `Rakefile` and friends have no extension but are Ruby, so
+    /// the path-based entry point outlines them.
+    #[test]
+    fn extensionless_ruby_files_are_outlined_by_name() {
+        let lines = vec!["def build".to_string(), "end".to_string()];
+        for name in ["Gemfile", "Rakefile", "Guardfile", "Vagrantfile"] {
+            let got = names_kinds_depths(&symbols_for_lines(std::path::Path::new(name), &lines));
+            assert_eq!(
+                got,
+                vec![("build".into(), OutlineKind::Method, 0)],
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_language_returns_empty() {
+        assert!(symbols_for(LangKind::Json, b"{\"a\": 1}").is_empty());
+    }
+
+    #[test]
+    fn selection_point_targets_the_name_not_the_keyword() {
+        let src = b"fn alpha() {}\n";
+        let syms = symbols_for(LangKind::Rust, src);
+        assert_eq!(syms[0].name, "alpha");
+        // `fn ` is three columns; the name starts at column 3.
+        assert_eq!((syms[0].line, syms[0].character), (0, 3));
+    }
+}

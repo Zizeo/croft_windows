@@ -1,0 +1,297 @@
+"""The binstall contract check must FAIL on each drift it claims to catch.
+
+A gate that only ever passes is indistinguishable from no gate, and this one
+guards a failure that reaches users at install time rather than CI. So every
+case below breaks one half of the contract and asserts the checker rejects it,
+plus one control proving the unmodified pair passes.
+
+The checker reads Cargo.toml and .github/workflows/release.yml from the repo
+root, so each test copies both into a temp tree, mutates one, and runs the
+checker against that copy.
+"""
+
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent.parent
+CHECKER = ROOT / "scripts" / "check_binstall_contract.py"
+
+
+class BinstallContract(unittest.TestCase):
+    def build_tree(self, manifest_sub=None, workflow_sub=None, drop_workflow=False):
+        """A temp repo with both files, optionally mutated."""
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "scripts").mkdir()
+        (tmp / ".github" / "workflows").mkdir(parents=True)
+        shutil.copy(CHECKER, tmp / "scripts" / CHECKER.name)
+
+        manifest = (ROOT / "Cargo.toml").read_text()
+        if manifest_sub:
+            old, new = manifest_sub
+            self.assertIn(old, manifest, "manifest fixture anchor is stale")
+            manifest = manifest.replace(old, new, 1)
+        (tmp / "Cargo.toml").write_text(manifest)
+
+        if not drop_workflow:
+            workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+            if workflow_sub:
+                old, new = workflow_sub
+                self.assertIn(old, workflow, "workflow fixture anchor is stale")
+                workflow = workflow.replace(old, new, 1)
+            (tmp / ".github" / "workflows" / "release.yml").write_text(workflow)
+        return tmp
+
+    def run_checker(self, tree):
+        return subprocess.run(
+            [sys.executable, str(tree / "scripts" / CHECKER.name)],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_the_shipped_pair_agrees(self):
+        """The control: without this, every failure below could be vacuous."""
+        r = self.run_checker(self.build_tree())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("agree", r.stdout)
+
+    def test_renaming_the_archive_in_the_workflow_is_caught(self):
+        """The drift that 404s every install while CI stays green."""
+        tree = self.build_tree(
+            workflow_sub=('name="croft-${{ matrix.target }}"',
+                          'name="croftbin-${{ matrix.target }}"')
+        )
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("binstall would 404", r.stderr)
+
+    def test_a_bin_dir_pointing_at_the_wrong_folder_is_caught(self):
+        """binstall would unpack the archive and look in a folder that is not
+        in it, reporting a corrupt download rather than a config error."""
+        tree = self.build_tree(
+            manifest_sub=('bin-dir = "croft-{ target }/{ bin }{ binary-ext }"',
+                          'bin-dir = "bin/{ bin }{ binary-ext }"')
+        )
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("does not match the archive name", r.stderr)
+
+    def test_a_pkg_fmt_that_contradicts_the_extension_is_caught(self):
+        tree = self.build_tree(
+            manifest_sub=('pkg-fmt = "tgz"', 'pkg-fmt = "zip"')
+        )
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("pkg-fmt", r.stderr)
+
+    def test_dropping_a_target_from_the_workflow_is_caught(self):
+        """A release that carries three archives while the manifest promises
+        four resolves for some users and 404s for others."""
+        tree = self.build_tree(
+            workflow_sub=("          - target: aarch64-apple-darwin\n", "")
+        )
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("aarch64-apple-darwin", r.stderr)
+
+    def test_a_dropped_target_is_caught_even_when_its_name_survives(self):
+        """The trap this check fell into (#554).
+
+        The artifact-kind assertion names every triple in a `case` arm, so a
+        target dropped from the MATRIX still appears in the file. Substring
+        searching the whole workflow then reports agreement while no release
+        carries that platform - a check that cannot fail, in the checker
+        written to stop exactly that.
+        """
+        tree = self.build_tree(
+            workflow_sub=("          - target: aarch64-apple-darwin\n", "")
+        )
+        workflow = tree / ".github" / "workflows" / "release.yml"
+        text = workflow.read_text()
+        # The name survives elsewhere, exactly as the real workflow has it.
+        self.assertNotIn("- target: aarch64-apple-darwin", text)
+        workflow.write_text(
+            text.replace(
+                "      - name: Package",
+                "      - name: Assert\n"
+                "        run: |\n"
+                "          case \"$T\" in\n"
+                "            aarch64-apple-darwin) echo mach-o ;;\n"
+                "          esac\n"
+                "      - name: Package",
+                1,
+            )
+        )
+        self.assertIn("aarch64-apple-darwin", workflow.read_text())
+
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("aarch64-apple-darwin", r.stderr)
+
+    def test_excluded_targets_do_not_count_as_built(self):
+        """A sibling matrix key must not be read as more built targets.
+
+        The exclude entry repeats a target the include list no longer carries.
+        Reading `exclude` as a build would put that triple back and the run
+        would pass, so the assertion is the MISSING-target failure: this only
+        goes green when exclude is genuinely ignored. An exclude naming some
+        triple nobody expects would pass either way and prove nothing.
+        """
+        tree = self.build_tree(
+            workflow_sub=(
+                "          - target: x86_64-apple-darwin\n"
+                "            os: macos-latest\n"
+                "            cross: false\n",
+                "",
+            )
+        )
+        workflow = tree / ".github" / "workflows" / "release.yml"
+        text = workflow.read_text()
+        self.assertNotIn("x86_64-apple-darwin", text.split("steps:")[0])
+        workflow.write_text(
+            text.replace(
+                "    steps:\n",
+                "        exclude:\n"
+                "          - target: x86_64-apple-darwin\n"
+                "    steps:\n",
+                1,
+            )
+        )
+
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("x86_64-apple-darwin", r.stderr)
+
+    def test_target_after_another_include_key_still_counts(self):
+        """YAML mapping keys are unordered, so `os:` may come first.
+
+        Matching only `- target:` drops such an entry from the built set. That
+        is the checker's own false green: the triple IS built, the checker
+        cannot see it, and it reports a missing target - or, worse, stays
+        green when a different target really does go missing.
+        """
+        tree = self.build_tree(
+            workflow_sub=(
+                "          - target: x86_64-unknown-linux-musl\n"
+                "            os: ubuntu-latest\n"
+                "            cross: true\n",
+                "          - os: ubuntu-latest\n"
+                "            target: x86_64-unknown-linux-musl\n"
+                "            cross: true\n",
+            )
+        )
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_losing_the_tag_trigger_is_caught(self):
+        """pkg-url hard-codes the v-prefixed tag; without the trigger no
+        release is ever produced at that URL."""
+        tree = self.build_tree(workflow_sub=('      - "v*"\n', ""))
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("v* tags", r.stderr)
+
+    def test_a_missing_workflow_is_caught(self):
+        """Deleting release.yml while Cargo.toml still promises binstall."""
+        r = self.run_checker(self.build_tree(drop_workflow=True))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("missing", r.stderr)
+
+
+class TarLayoutDrift(unittest.TestCase):
+    """The drifts the review found the first version could not catch.
+
+    Both change what is INSIDE the tarball while leaving its name alone, so
+    every name-based check still agrees. The checker has to read the tar
+    invocation itself or these pass — which they did, until it did.
+    """
+
+    build_tree = BinstallContract.build_tree
+    run_checker = BinstallContract.run_checker
+
+    def test_flattening_the_archive_is_caught(self):
+        """`-C dist croft` puts the binary at the tar root while the archive
+        keeps its name, so bin-dir points at a directory that is not there.
+        Real binstall fails this with "bin file ... not found"."""
+        tree = self.build_tree(
+            workflow_sub=('tar -czf "dist/$name.tar.gz" -C dist "$name"',
+                          'tar -czf "dist/$name.tar.gz" -C dist croft')
+        )
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("look in a directory that is not in it", r.stderr)
+
+    def test_a_mismatched_output_extension_is_caught(self):
+        """`tar -czf dist/$name.zip` writes a file binstall never requests.
+
+        Every name-based check still agrees, because the archive NAME is built
+        from $name either way — only the extension moved. The checker has to
+        compare the tar OUTPUT path against pkg-url, which the first version
+        captured into a group and then discarded.
+        """
+        tree = self.build_tree(
+            workflow_sub=('tar -czf "dist/$name.tar.gz" -C dist "$name"',
+                          'tar -czf "dist/$name.zip" -C dist "$name"')
+        )
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("but pkg-url expects", r.stderr)
+
+    def test_switching_to_zip_is_caught(self):
+        """The guard used to arm itself on `tar -czf` being present, so the
+        drift that removed it also disabled the check."""
+        tree = self.build_tree(
+            workflow_sub=('tar -czf "dist/$name.tar.gz" -C dist "$name"',
+                          'zip -r "dist/$name.zip" "$name"')
+        )
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no longer produces a tar.gz", r.stderr)
+
+
+    def test_a_release_that_never_publishes_the_crate_is_caught(self):
+        """#1680: binstall picks its version from crates.io. With no publish
+        step crates.io stayed on 0.2.3, which has no release, so every
+        install failed while every archive the workflow built was there."""
+        tree = self.build_tree(
+            workflow_sub=("          cargo publish --locked --no-verify\n", "")
+        )
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("never runs `cargo publish`", r.stderr)
+
+    def test_publishing_before_the_release_exists_is_caught(self):
+        """A publish that does not wait for the release can name a version on
+        crates.io whose archives are not uploaded yet."""
+        tree = self.build_tree(
+            workflow_sub=("    # version points at already exist.\n    needs: publish\n",
+                          "    # version points at already exist.\n    needs: build\n")
+        )
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("does not wait for the publish job", r.stderr)
+
+    def test_the_publish_mints_its_token_and_skips_cleanly_without_one(self):
+        """The token is minted per run through trusted publishing, never a
+        stored secret. A mint that fails (no trusted publisher for
+        release.yml yet) warns and leaves the release green, the same
+        contract as the Homebrew job, and a version already on crates.io is
+        not published twice."""
+        workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+        crates = workflow.split("\n  crates:\n", 1)[1].split("\n  homebrew:\n", 1)[0]
+        self.assertNotIn("secrets.CARGO_REGISTRY_TOKEN", crates)
+        self.assertIn("id-token: write", crates)
+        self.assertIn("uses: rust-lang/crates-io-auth-action@", crates)
+        self.assertIn("continue-on-error: true", crates)
+        self.assertIn("CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}", crates)
+        self.assertIn('if [ -z "$CARGO_REGISTRY_TOKEN" ]; then', crates)
+        self.assertIn("::warning::no crates.io token could be minted", crates)
+        self.assertIn("is already on crates.io", crates)
+        self.assertIn("needs: publish", crates)
+
+if __name__ == "__main__":
+    unittest.main()

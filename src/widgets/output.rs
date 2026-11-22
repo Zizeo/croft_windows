@@ -1,0 +1,1063 @@
+//! The bottom panel's OUTPUT tab: a read-only, VS Code-style log viewer over
+//! the in-process [`crate::output`] bus. A toolbar row carries a channel
+//! dropdown (one channel per language server, plus Debug Adapter, Git, and
+//! Server Provisioning), a minimum-level filter, an RPC-trace toggle (Zed's
+//! RPC-messages equivalent), and a clear action; the rest of the area renders
+//! the selected channel's tail, level-coloured, auto-following new lines until
+//! the user scrolls up. The rows are a pure projection of the bus, refreshed
+//! whenever its generation counter advances.
+
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Clear, Paragraph, Widget},
+};
+
+use crate::output::{OutputLevel, OutputLine};
+use crate::theme::Theme;
+use crate::widgets::scrollbar;
+
+const COLOR_DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
+const COLOR_MSG: Color = Color::Rgb(0xCC, 0xCC, 0xCC);
+const COLOR_ERROR: Color = Color::Rgb(0xf1, 0x4c, 0x4c);
+const COLOR_WARNING: Color = Color::Rgb(0xcc, 0xa7, 0x00);
+const COLOR_INFO: Color = Color::Rgb(0x3b, 0x9e, 0xff);
+
+const CHEVRON_DOWN: char = '\u{eab4}'; // codicon chevron-down
+const CHEVRON_UP: char = '\u{eab7}'; // codicon chevron-up
+
+fn rect_has(r: Rect, x: u16, y: u16) -> bool {
+    r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+fn level_color(level: OutputLevel, theme: crate::theme::Theme) -> Color {
+    match level {
+        OutputLevel::Error => theme.ui(COLOR_ERROR),
+        OutputLevel::Warn => theme.ui(COLOR_WARNING),
+        OutputLevel::Info => theme.ui(COLOR_INFO),
+        OutputLevel::Debug | OutputLevel::Trace => theme.ui(COLOR_DIM),
+    }
+}
+
+pub struct OutputPanel {
+    /// Channel names, mirrored from the bus (sorted) on each generation change.
+    channels: Vec<String>,
+    /// Index into `channels` of the selected channel.
+    selected: usize,
+    /// Lines of the selected channel, snapshotted from the bus.
+    lines: Vec<OutputLine>,
+    /// Last bus generation we synced against, so an unchanged bus is a no-op.
+    last_gen: u64,
+    /// Minimum level shown; lines below it are filtered out (VS Code per-channel
+    /// log level / Neovim `set_log_level`). Trace shows everything.
+    min_level: OutputLevel,
+    scroll: usize,
+    /// Pin the viewport to the newest line until the user scrolls up.
+    follow_tail: bool,
+    dropdown_open: bool,
+    /// First channel row visible in the open dropdown (#45): with more
+    /// channels than the body is tall, the wheel (and PageUp/Down) moves
+    /// this window instead of the log, so every channel stays reachable.
+    /// Reset to the selection on every open; clamped at render.
+    dropdown_scroll: usize,
+    /// The open dropdown's scrollbar track, for click-to-jump. Empty when
+    /// the list fits.
+    dropdown_scrollbar: Rect,
+
+    pub focus_gradient: bool,
+    pub theme: Theme,
+    pub focused: bool,
+    pub hover_pointer: Option<(u16, u16)>,
+
+    pub last_area: Rect,
+    pub last_scrollbar: Rect,
+
+    // Toolbar hit rects, recomputed each render.
+    dropdown_rect: Rect,
+    level_rect: Rect,
+    rpc_rect: Rect,
+    clear_rect: Rect,
+    /// When the dropdown is open, the rect + channel index of each list row.
+    dropdown_items: Vec<(Rect, usize)>,
+
+    first_row_y: u16,
+    visible_rows: u16,
+    viewport_rows: u16,
+}
+
+impl OutputPanel {
+    pub fn new() -> Self {
+        Self {
+            channels: Vec::new(),
+            selected: 0,
+            lines: Vec::new(),
+            last_gen: 0,
+            min_level: OutputLevel::Trace,
+            scroll: 0,
+            follow_tail: true,
+            dropdown_open: false,
+            dropdown_scroll: 0,
+            dropdown_scrollbar: Rect::default(),
+            focus_gradient: false,
+            theme: Theme::default(),
+            focused: false,
+            hover_pointer: None,
+            last_area: Rect::default(),
+            last_scrollbar: Rect::default(),
+            dropdown_rect: Rect::default(),
+            level_rect: Rect::default(),
+            rpc_rect: Rect::default(),
+            clear_rect: Rect::default(),
+            dropdown_items: Vec::new(),
+            first_row_y: 0,
+            visible_rows: 0,
+            viewport_rows: 0,
+        }
+    }
+
+    /// Pull the latest channel set and selected channel's lines from the bus,
+    /// but only when its generation advanced (one relaxed atomic load otherwise).
+    /// Preserves the selected channel across list changes by name. Returns
+    /// whether anything changed, so the caller forces a redraw only on a real
+    /// update.
+    pub fn sync(&mut self) -> bool {
+        let cur_gen = crate::output::generation();
+        if cur_gen == self.last_gen && !self.channels.is_empty() {
+            return false;
+        }
+        self.last_gen = cur_gen;
+        let prev = self.selected_name();
+        let names = crate::output::channel_names();
+        if names == self.channels && prev.is_some() {
+            // Only the line contents of an existing channel changed.
+            self.refresh_lines();
+            return true;
+        }
+        self.channels = names;
+        self.selected = prev
+            .and_then(|name| self.channels.iter().position(|c| *c == name))
+            .unwrap_or(0);
+        if self.selected >= self.channels.len() {
+            self.selected = self.channels.len().saturating_sub(1);
+        }
+        self.refresh_lines();
+        true
+    }
+
+    fn refresh_lines(&mut self) {
+        self.lines = self
+            .selected_name()
+            .and_then(|c| crate::output::snapshot(&c))
+            .unwrap_or_default();
+    }
+
+    pub fn selected_name(&self) -> Option<String> {
+        self.channels.get(self.selected).cloned()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.channels.is_empty()
+    }
+
+    pub fn dropdown_open(&self) -> bool {
+        self.dropdown_open
+    }
+
+    pub fn min_level(&self) -> OutputLevel {
+        self.min_level
+    }
+
+    /// Select a channel by name, if present. Returns whether it was found.
+    pub fn select_by_name(&mut self, name: &str) -> bool {
+        if let Some(idx) = self.channels.iter().position(|c| c == name) {
+            self.select(idx);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Select a channel by index, closing the dropdown and re-following the tail.
+    pub fn select(&mut self, idx: usize) {
+        if idx < self.channels.len() {
+            self.selected = idx;
+            self.dropdown_open = false;
+            self.follow_tail = true;
+            self.scroll = 0;
+            self.refresh_lines();
+        }
+    }
+
+    /// Lines passing the current minimum-level filter, in arrival order.
+    fn filtered(&self) -> Vec<&OutputLine> {
+        self.lines
+            .iter()
+            .filter(|l| l.level >= self.min_level)
+            .collect()
+    }
+
+    fn cycle_level(&mut self) {
+        self.min_level = match self.min_level {
+            OutputLevel::Trace => OutputLevel::Debug,
+            OutputLevel::Debug => OutputLevel::Info,
+            OutputLevel::Info => OutputLevel::Warn,
+            OutputLevel::Warn => OutputLevel::Error,
+            OutputLevel::Error => OutputLevel::Trace,
+        };
+    }
+
+    pub fn scroll_up(&mut self, n: usize) {
+        // An open channel list owns the wheel: scrolling must move the
+        // list's window, never the log underneath it (#45).
+        if self.dropdown_open {
+            self.dropdown_scroll = self.dropdown_scroll.saturating_sub(n);
+            return;
+        }
+        self.scroll = self.scroll.saturating_sub(n);
+        self.follow_tail = false;
+    }
+
+    pub fn scroll_down(&mut self, n: usize) {
+        if self.dropdown_open {
+            // Loose clamp; the render clamps exactly against the body
+            // height it is given.
+            self.dropdown_scroll =
+                (self.dropdown_scroll + n).min(self.channels.len().saturating_sub(1));
+            return;
+        }
+        self.scroll = (self.scroll + n).min(self.max_scroll());
+        if self.scroll >= self.max_scroll() {
+            self.follow_tail = true;
+        }
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.filtered()
+            .len()
+            .saturating_sub(self.viewport_rows as usize)
+    }
+
+    pub fn scroll_to_bar_y(&mut self, y: u16) -> bool {
+        let Some(metrics) = scrollbar::vertical_metrics(
+            self.last_scrollbar,
+            self.filtered().len(),
+            self.viewport_rows as usize,
+            self.scroll,
+        ) else {
+            return false;
+        };
+        let target = scrollbar::scroll_for_y(metrics, y);
+        let moved = target != self.scroll;
+        self.scroll = target;
+        self.follow_tail = target >= self.max_scroll();
+        moved
+    }
+
+    /// Handle a click at `(x, y)`. Returns true if it landed on the toolbar or
+    /// the open dropdown (and was consumed); false if the caller should treat it
+    /// as a click in the log body (e.g. to focus the pane).
+    pub fn click(&mut self, x: u16, y: u16) -> bool {
+        if self.dropdown_open {
+            if let Some(&(_, idx)) = self.dropdown_items.iter().find(|(r, _)| rect_has(*r, x, y)) {
+                self.select(idx);
+                return true;
+            }
+            // A click on the list's scrollbar track jumps the window.
+            if rect_has(self.dropdown_scrollbar, x, y) {
+                if let Some(metrics) = scrollbar::vertical_metrics(
+                    self.dropdown_scrollbar,
+                    self.channels.len(),
+                    self.dropdown_scrollbar.height as usize,
+                    self.dropdown_scroll,
+                ) {
+                    self.dropdown_scroll = scrollbar::scroll_for_y(metrics, y);
+                }
+                return true;
+            }
+            // A click anywhere else closes the dropdown without selecting.
+            self.dropdown_open = false;
+            return true;
+        }
+        if rect_has(self.dropdown_rect, x, y) {
+            self.dropdown_open = !self.dropdown_open;
+            if self.dropdown_open {
+                // Open with the active channel in view however deep it
+                // sits; the render clamps to the last full window.
+                self.dropdown_scroll = self.selected;
+            }
+            return true;
+        }
+        if rect_has(self.clear_rect, x, y) {
+            if let Some(c) = self.selected_name() {
+                crate::output::clear(&c);
+            }
+            return true;
+        }
+        if rect_has(self.level_rect, x, y) {
+            self.cycle_level();
+            return true;
+        }
+        if rect_has(self.rpc_rect, x, y) {
+            crate::output::set_trace_enabled(!crate::output::trace_enabled());
+            return true;
+        }
+        false
+    }
+}
+
+impl Default for OutputPanel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Widget for &mut OutputPanel {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        self.last_area = area;
+        self.last_scrollbar = Rect::default();
+        self.dropdown_rect = Rect::default();
+        self.dropdown_scrollbar = Rect::default();
+        self.level_rect = Rect::default();
+        self.rpc_rect = Rect::default();
+        self.clear_rect = Rect::default();
+        self.dropdown_items.clear();
+        self.visible_rows = 0;
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let accent = if self.focus_gradient {
+            crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG)
+        } else {
+            self.theme.ui(Color::White)
+        };
+        buf.set_style(area, Style::default().bg(self.theme.editor_bg()));
+
+        // Toolbar row: dropdown on the left, actions on the right.
+        let toolbar = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        };
+        self.render_toolbar(toolbar, buf, accent);
+
+        let body = Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: area.width,
+            height: area.height.saturating_sub(1),
+        };
+        if body.height == 0 {
+            return;
+        }
+
+        if self.channels.is_empty() {
+            Paragraph::new(Line::from(Span::styled(
+                "No output yet. Channels appear as language servers and tasks log.",
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
+            )))
+            .render(body, buf);
+            return;
+        }
+
+        // Indices (owned, no borrow of `self`) of the lines passing the filter,
+        // so the field writes below don't conflict with a live borrow.
+        let filtered: Vec<usize> = self
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.level >= self.min_level)
+            .map(|(i, _)| i)
+            .collect();
+        self.first_row_y = body.y;
+        self.viewport_rows = body.height;
+        let total = filtered.len();
+        if self.follow_tail {
+            self.scroll = total.saturating_sub(body.height as usize);
+        }
+        self.scroll = self.scroll.min(total.saturating_sub(body.height as usize));
+
+        let bar = scrollbar::vertical_metrics(
+            Rect {
+                x: body.x + body.width.saturating_sub(1),
+                y: body.y,
+                width: 1,
+                height: body.height,
+            },
+            total,
+            body.height as usize,
+            self.scroll,
+        );
+        let content_w = body.width.saturating_sub(u16::from(bar.is_some()));
+
+        let visible = (body.height as usize).min(total.saturating_sub(self.scroll));
+        self.visible_rows = visible as u16;
+        for row in 0..visible {
+            let line = &self.lines[filtered[self.scroll + row]];
+            let y = body.y + row as u16;
+            let row_rect = Rect {
+                x: body.x,
+                y,
+                width: content_w,
+                height: 1,
+            };
+            let spans = vec![
+                Span::styled(
+                    format!("{} ", line.level.label()),
+                    Style::default().fg(level_color(line.level, self.theme)),
+                ),
+                Span::styled(
+                    row_text(&line.text),
+                    Style::default().fg(self.theme.ui(COLOR_MSG)),
+                ),
+            ];
+            Paragraph::new(Line::from(spans)).render(row_rect, buf);
+        }
+
+        if let Some(metrics) = bar {
+            self.last_scrollbar = metrics.area;
+            scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+        }
+
+        // The dropdown overlays the body, so paint it last.
+        if self.dropdown_open {
+            self.render_dropdown(body, buf, accent);
+        }
+    }
+}
+
+impl OutputPanel {
+    fn render_toolbar(&mut self, area: Rect, buf: &mut Buffer, accent: Color) {
+        let chevron = if self.dropdown_open {
+            CHEVRON_UP
+        } else {
+            CHEVRON_DOWN
+        };
+        let name = self.selected_name().unwrap_or_else(|| "Output".to_string());
+        let label = format!("{chevron} {name} ");
+        let w = label.chars().count() as u16;
+        self.dropdown_rect = Rect {
+            x: area.x + 1,
+            y: area.y,
+            width: w.min(area.width.saturating_sub(1)),
+            height: 1,
+        };
+        buf.set_stringn(
+            self.dropdown_rect.x,
+            area.y,
+            &label,
+            self.dropdown_rect.width as usize,
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        );
+
+        // Right-aligned action tokens: clear | rpc | level.
+        let rpc_on = crate::output::trace_enabled();
+        let clear_tok = " clear ".to_string();
+        let rpc_tok = if rpc_on { " ●rpc " } else { " rpc " }.to_string();
+        let level_tok = format!(" ≥{} ", self.min_level.label());
+        let mut x = area.x + area.width;
+        for (tok, slot) in [(clear_tok, 0u8), (rpc_tok, 1), (level_tok, 2)] {
+            let tw = tok.chars().count() as u16;
+            if x.saturating_sub(area.x) < tw + self.dropdown_rect.width + 1 {
+                break;
+            }
+            x -= tw;
+            let rect = Rect {
+                x,
+                y: area.y,
+                width: tw,
+                height: 1,
+            };
+            let hovered =
+                crate::widgets::hover::row_hover_bg(rect, self.hover_pointer, self.theme).is_some();
+            let on = slot == 1 && rpc_on;
+            let fg = if on || hovered {
+                accent
+            } else {
+                self.theme.ui(COLOR_DIM)
+            };
+            buf.set_stringn(rect.x, area.y, &tok, tw as usize, Style::default().fg(fg));
+            match slot {
+                0 => self.clear_rect = rect,
+                1 => self.rpc_rect = rect,
+                _ => self.level_rect = rect,
+            }
+        }
+    }
+
+    fn render_dropdown(&mut self, body: Rect, buf: &mut Buffer, accent: Color) {
+        let n = self.channels.len() as u16;
+        let longest = self
+            .channels
+            .iter()
+            .map(|c| c.chars().count() as u16 + 2)
+            .max()
+            .unwrap_or(8);
+        // The box's border takes a row above and below the list and a
+        // column either side, so the names sit inside it rather than on it
+        // (#846). `pad` is the border's width: 1, or 0 for the bare list.
+        let place = |pad: u16| {
+            let h = n.saturating_add(2 * pad).min(body.height);
+            let rows = h.saturating_sub(2 * pad);
+            // One extra column carries the scrollbar when the list
+            // overflows, so the longest channel name is never overpainted
+            // by the track.
+            let overflow = n > rows;
+            let w = longest
+                .saturating_add(2 * pad + overflow as u16)
+                .min(body.width.saturating_sub(1));
+            let area = Rect {
+                x: body.x + 1,
+                y: body.y,
+                width: w,
+                height: h,
+            };
+            let list = Rect {
+                x: area.x + pad,
+                y: area.y + pad,
+                width: w.saturating_sub(2 * pad),
+                height: rows,
+            };
+            (area, list, rows, overflow)
+        };
+        // A row holds a space, at least one character of its name and a
+        // space, beside the scrollbar when there is one.
+        let holds_a_name =
+            |list: Rect, overflow: bool| list.width.saturating_sub(overflow as u16) >= 3;
+        // A body too short for both border rows and a name, or too narrow
+        // for a name inside the border, gets the bare list instead. One too
+        // narrow even for that gets no dropdown, rather than a box with
+        // nothing in it.
+        let bordered = body.height >= 3 && {
+            let (_, list, _, overflow) = place(1);
+            holds_a_name(list, overflow)
+        };
+        let pad = u16::from(bordered);
+        let (area, list, rows, overflow) = place(pad);
+        if !holds_a_name(list, overflow) {
+            return;
+        }
+        // Clamp the window so the last page is always full; the wheel
+        // clamps loosely and this is the exact bound (#45).
+        self.dropdown_scroll = self
+            .dropdown_scroll
+            .min((n as usize).saturating_sub(rows as usize));
+        // Blank the cells first: a background style alone keeps each
+        // cell's symbol, and the log under the popup showed through it.
+        Clear.render(area, buf);
+        // Croft Loch lifts the dropdown onto its raised surface, like every
+        // other overlay card.
+        let fill = self
+            .theme
+            .surfaces()
+            .map_or(self.theme.editor_bg(), |s| s.raised());
+        buf.set_style(area, Style::default().bg(fill));
+        if pad == 1 {
+            crate::widgets::surface::paint_overlay_frame(buf, area, self.theme);
+        }
+        if overflow {
+            let track = Rect {
+                x: list.x + list.width - 1,
+                y: list.y,
+                width: 1,
+                height: list.height,
+            };
+            self.dropdown_scrollbar = track;
+            if let Some(metrics) =
+                scrollbar::vertical_metrics(track, n as usize, rows as usize, self.dropdown_scroll)
+            {
+                scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+            }
+        }
+        for (row, name) in self
+            .channels
+            .iter()
+            .enumerate()
+            .skip(self.dropdown_scroll)
+            .take(rows as usize)
+        {
+            let y = list.y + (row - self.dropdown_scroll) as u16;
+            let r = Rect {
+                x: list.x,
+                y,
+                // The scrollbar column is its own hit target, not the row's.
+                width: list.width - overflow as u16,
+                height: 1,
+            };
+            self.dropdown_items.push((r, row));
+            let selected = row == self.selected;
+            let hovered =
+                crate::widgets::hover::row_hover_bg(r, self.hover_pointer, self.theme).is_some();
+            if hovered || selected {
+                buf.set_style(
+                    r,
+                    Style::default().bg(crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)),
+                );
+            }
+            let fg = if selected {
+                accent
+            } else {
+                self.theme.ui(COLOR_MSG)
+            };
+            // A space either side of the name, inside the row.
+            buf.set_stringn(
+                r.x + 1,
+                y,
+                name,
+                r.width.saturating_sub(2) as usize,
+                Style::default().fg(fg),
+            );
+        }
+    }
+}
+
+/// Tab stops in an OUTPUT row, a terminal's: every 8 columns.
+const TAB_STOP: usize = 8;
+
+/// A bus line as one row: newlines become spaces and each tab advances to
+/// the next tab stop, counted in display columns, as a terminal shows it
+/// (#1114). ratatui draws a `\t` as nothing, so `FAIL\tpkg\t0.003s` read as
+/// `FAILpkg0.003s`.
+fn row_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(['\t', '\n']) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut out = String::with_capacity(text.len() + TAB_STOP);
+    let mut col = 0;
+    // Grapheme by grapheme, as ratatui draws them: `👩‍💻` is one two-column
+    // glyph, not three code points summing to four.
+    for g in text.graphemes(true) {
+        match g {
+            "\t" => {
+                let pad = TAB_STOP - col % TAB_STOP;
+                out.extend(std::iter::repeat_n(' ', pad));
+                col += pad;
+            }
+            "\n" | "\r\n" => {
+                out.push(' ');
+                col += 1;
+            }
+            g => {
+                out.push_str(g);
+                col += unicode_width::UnicodeWidthStr::width(g);
+            }
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(p: &mut OutputPanel, w: u16, h: u16) -> String {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        };
+        let mut buf = Buffer::empty(area);
+        p.render(area, &mut buf);
+        let mut out = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// #45: with more channels than the panel body is tall, the overflow
+    /// rows were neither drawn nor registered as hit targets — unreachable
+    /// by any gesture, with nothing indicating truncation. The wheel over
+    /// the open dropdown must scroll the LIST (not the log) and give every
+    /// channel a clickable rect.
+    #[test]
+    fn dropdown_overflow_channels_are_reachable_by_scrolling() {
+        let mut p = OutputPanel::new();
+        p.channels = (0..12).map(|i| format!("chan-{i:02}")).collect();
+        p.dropdown_open = true;
+        // 7 rows total: 1 toolbar + 6 body — inside the box's border, four
+        // of twelve channels fit.
+        let _ = render(&mut p, 40, 7);
+        let visible: Vec<usize> = p.dropdown_items.iter().map(|&(_, i)| i).collect();
+        assert!(
+            !visible.contains(&11),
+            "staging: the last channel starts off-screen; got {visible:?}"
+        );
+        p.scroll_down(8);
+        let _ = render(&mut p, 40, 7);
+        let visible: Vec<usize> = p.dropdown_items.iter().map(|&(_, i)| i).collect();
+        assert!(
+            visible.contains(&11),
+            "scrolling must bring the last channel into reach; got {visible:?}"
+        );
+        let &(r, _) = p.dropdown_items.iter().find(|&&(_, i)| i == 11).unwrap();
+        assert!(p.click(r.x, r.y), "the row consumes the click");
+        assert_eq!(
+            p.selected, 11,
+            "the click lands on the scrolled row's channel"
+        );
+        // Selecting closed the dropdown; the log wheel works again.
+        assert!(!p.dropdown_open);
+    }
+
+    /// Opening the dropdown starts the window AT the current selection, so
+    /// the active channel is immediately visible however deep it sits.
+    #[test]
+    fn dropdown_opens_with_the_selection_in_view() {
+        let mut p = OutputPanel::new();
+        p.channels = (0..12).map(|i| format!("chan-{i:02}")).collect();
+        p.selected = 10;
+        let _ = render(&mut p, 40, 7);
+        // Toggle open through the real gesture: a click on the picker.
+        let r = p.dropdown_rect;
+        assert!(p.click(r.x, r.y), "the picker consumes the click");
+        assert!(p.dropdown_open);
+        let _ = render(&mut p, 40, 7);
+        let visible: Vec<usize> = p.dropdown_items.iter().map(|&(_, i)| i).collect();
+        assert!(
+            visible.contains(&10),
+            "the selected channel must be in the opening window; got {visible:?}"
+        );
+    }
+
+    #[test]
+    fn croft_loch_lifts_the_channel_dropdown_onto_its_raised_surface() {
+        let loch = crate::theme::Theme::from_id("loch");
+        let mut p = OutputPanel::new();
+        p.theme = loch;
+        p.channels = vec!["Git".into(), "ruff".into()];
+        p.dropdown_open = true;
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        // The second name: the first is the selected channel's row.
+        let row = p.dropdown_items[1].0;
+        assert_eq!(buf[(row.x, row.y)].bg, loch.surfaces().unwrap().raised());
+    }
+
+    /// #846: the list was sized one row per channel and the box's border was
+    /// painted on its outer rows, so the first and last names replaced the
+    /// border; and the fill set only a background, keeping each cell's
+    /// symbol, so the log under the popup showed through its gaps
+    /// (`│i│ruffracebac│:`). The border now has rows of its own around the
+    /// names, the box is blanked first, and each name's click target is the
+    /// row it is drawn on.
+    #[test]
+    fn the_channel_dropdown_draws_its_names_inside_a_blank_bordered_box() {
+        let mut p = OutputPanel::new();
+        // The boxed dropdown, which Croft Loch draws as a card instead.
+        p.theme = Theme::BLACK;
+        p.channels = vec!["Git".into(), "ruff".into(), "Test Runner".into()];
+        p.selected = 2;
+        p.lines = (0..8)
+            .map(|_| OutputLine {
+                ts: 0.0,
+                level: OutputLevel::Info,
+                text: "Traceback (most recent call last): raise ValueError".repeat(2),
+            })
+            .collect();
+        p.dropdown_open = true;
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        // The box: the widest name plus a space either side, plus the
+        // border, from the column after the body's edge, under the toolbar.
+        let (left, right, top, bottom) = (1, 15, 1, 5);
+        assert_eq!(
+            cells(&buf, top, left..=right),
+            format!("╭{}╮", "─".repeat(13))
+        );
+        assert_eq!(
+            cells(&buf, bottom, left..=right),
+            format!("╰{}╯", "─".repeat(13))
+        );
+        for (i, name) in ["Git", "ruff", "Test Runner"].iter().enumerate() {
+            let y = top + 1 + i as u16;
+            assert_eq!(
+                cells(&buf, y, left..=right),
+                format!("│ {name:<12}│"),
+                "row {y}: the name inside the border, no log text around it"
+            );
+        }
+        let rows: Vec<(Rect, usize)> = p.dropdown_items.clone();
+        assert_eq!(
+            rows,
+            (0..3)
+                .map(|i| (Rect::new(2, 2 + i as u16, 13, 1), i))
+                .collect::<Vec<_>>(),
+            "each click target is the row its name is drawn on"
+        );
+
+        // A click on the border selects nothing; one on a name selects it.
+        assert!(p.click(5, top));
+        assert_eq!(p.selected, 2);
+        assert!(!p.dropdown_open);
+        p.dropdown_open = true;
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert!(p.click(5, top + 1));
+        assert_eq!(p.selected, 0, "the first name's row selects Git");
+    }
+
+    /// Renders `p` into a fresh `w`x`h` buffer and returns the buffer.
+    fn render_buf(p: &mut OutputPanel, w: u16, h: u16) -> Buffer {
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = Buffer::empty(area);
+        p.render(area, &mut buf);
+        buf
+    }
+
+    fn cells(buf: &Buffer, y: u16, xs: std::ops::RangeInclusive<u16>) -> String {
+        xs.map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    /// #846 negative: a body too short for both border rows and a name
+    /// (two rows under the toolbar) keeps the bare list: no border glyph is
+    /// drawn over a name, and each name is still the click target of its row.
+    #[test]
+    fn a_body_too_short_for_the_border_keeps_the_bare_list() {
+        let mut p = OutputPanel::new();
+        p.channels = vec!["Git".into(), "ruff".into(), "Test Runner".into()];
+        p.dropdown_open = true;
+        let buf = render_buf(&mut p, 40, 3);
+        for y in 1..3 {
+            let row = cells(&buf, y, 0..=39);
+            assert!(
+                !row.contains(['╭', '╮', '╰', '╯', '│', '─']),
+                "row {y} carries no border: {row:?}"
+            );
+        }
+        assert!(cells(&buf, 1, 1..=15).contains("Git"));
+        assert!(cells(&buf, 2, 1..=15).contains("ruff"));
+        let targets: Vec<(u16, usize)> = p.dropdown_items.iter().map(|&(r, i)| (r.y, i)).collect();
+        assert_eq!(targets, vec![(1, 0), (2, 1)], "two rows, two names");
+        assert!(p.click(3, 2));
+        assert_eq!(p.selected, 1, "the second row selects ruff");
+    }
+
+    /// #846 negative: with more channels than fit, the scrollbar sits inside
+    /// the border, on its own column: the border's corners and sides stay
+    /// whole and no name is overpainted by the track.
+    #[test]
+    fn an_overflowing_list_keeps_the_border_and_its_scrollbar_inside() {
+        let mut p = OutputPanel::new();
+        // The boxed dropdown, which Croft Loch draws as a card instead.
+        p.theme = Theme::BLACK;
+        p.channels = (0..12).map(|i| format!("chan-{i:02}")).collect();
+        p.dropdown_open = true;
+        // 1 toolbar + 6 body rows: the border takes two, four names fit.
+        let buf = render_buf(&mut p, 40, 7);
+        // "chan-00" + a space either side + the scrollbar column + border.
+        let (left, right) = (1u16, 12u16);
+        assert_eq!(
+            cells(&buf, 1, left..=right),
+            format!("╭{}╮", "─".repeat(10))
+        );
+        assert_eq!(
+            cells(&buf, 6, left..=right),
+            format!("╰{}╯", "─".repeat(10))
+        );
+        for y in 2..6 {
+            let name = format!("chan-{:02}", y - 2);
+            assert_eq!(cells(&buf, y, left..=left + 8), format!("│ {name}"));
+            assert_eq!(cells(&buf, y, right..=right), "│", "right side, row {y}");
+        }
+        assert_eq!(p.dropdown_items.len(), 4);
+        for &(r, _) in &p.dropdown_items {
+            assert!(
+                r.x > left && r.x + r.width < right,
+                "{r:?} inside the border"
+            );
+        }
+    }
+
+    /// #846 review: a body too narrow for a name inside the border (a space,
+    /// one character and a space between its sides) drops the border rather
+    /// than drawing a box with nothing in it: each row shows the start of
+    /// its name, and its click target is that row.
+    #[test]
+    fn a_dropdown_too_narrow_for_its_border_shows_its_names_without_it() {
+        for w in [4u16, 5] {
+            let mut p = OutputPanel::new();
+            p.channels = vec!["Git".into(), "ruff".into(), "Test Runner".into()];
+            p.dropdown_open = true;
+            let buf = render_buf(&mut p, w, 10);
+            for (i, name) in ["Git", "ruff", "Test Runner"].iter().enumerate() {
+                let y = 1 + i as u16;
+                let row = cells(&buf, y, 1..=w - 1);
+                assert!(
+                    !row.contains(['╭', '╮', '╰', '╯', '│', '─']),
+                    "width {w}, row {y} carries no border: {row:?}"
+                );
+                assert_eq!(
+                    row.trim(),
+                    &name[..usize::from(w) - 3],
+                    "width {w}, row {y}: the start of {name}"
+                );
+            }
+            let targets: Vec<(u16, usize)> =
+                p.dropdown_items.iter().map(|&(r, i)| (r.y, i)).collect();
+            assert_eq!(targets, vec![(1, 0), (2, 1), (3, 2)], "width {w}");
+            assert!(p.dropdown_items.iter().all(|&(r, _)| r.width >= 3));
+        }
+    }
+
+    /// #846 review guard: a body with no room for even one character of a
+    /// name draws no dropdown at all, and offers no click target.
+    #[test]
+    fn a_dropdown_with_no_room_for_a_name_is_not_drawn() {
+        for w in [1u16, 2, 3] {
+            let mut p = OutputPanel::new();
+            p.channels = vec!["Git".into(), "ruff".into()];
+            let closed = render_buf(&mut p, w, 10);
+            p.dropdown_open = true;
+            let open = render_buf(&mut p, w, 10);
+            // Below the toolbar, whose chevron says the dropdown is open.
+            for y in 1..10 {
+                assert_eq!(
+                    cells(&open, y, 0..=w - 1),
+                    cells(&closed, y, 0..=w - 1),
+                    "width {w}, row {y}: nothing drawn"
+                );
+            }
+            assert!(p.dropdown_items.is_empty(), "width {w}");
+        }
+    }
+
+    /// #846 negative: a channel name wider than the body is cut inside the
+    /// box, which never grows past the body; the right border stays drawn on
+    /// every row.
+    #[test]
+    fn a_long_channel_name_is_cut_inside_the_right_border() {
+        let mut p = OutputPanel::new();
+        // The boxed dropdown, which Croft Loch draws as a card instead.
+        p.theme = Theme::BLACK;
+        p.channels = vec!["Git".into(), "a-very-long-channel-name-for-the-box".into()];
+        p.dropdown_open = true;
+        let buf = render_buf(&mut p, 20, 8);
+        // The box spans the body's width less the column it starts after.
+        let right = 19u16;
+        assert_eq!(cells(&buf, 1, right..=right), "╮");
+        assert_eq!(cells(&buf, 2, right..=right), "│");
+        assert_eq!(cells(&buf, 3, right..=right), "│");
+        assert_eq!(cells(&buf, 4, right..=right), "╯");
+        let long_row = cells(&buf, 3, 1..=right);
+        assert!(long_row.starts_with("│ a-very-long"), "{long_row:?}");
+        assert!(
+            long_row.ends_with(" │"),
+            "a space before the border: {long_row:?}"
+        );
+    }
+
+    #[test]
+    fn empty_shows_a_hint() {
+        let mut p = OutputPanel::new();
+        let text = render(&mut p, 70, 4);
+        assert!(text.contains("No output yet"), "empty state: {text:?}");
+    }
+
+    #[test]
+    fn sync_picks_up_a_new_channel_and_renders_its_lines() {
+        let ch = "widget-test-render";
+        crate::output::push(ch, OutputLevel::Error, "kaboom here");
+        let mut p = OutputPanel::new();
+        assert!(p.sync(), "sync sees the new generation");
+        // Select our channel by name (other tests may have added channels).
+        let idx = p
+            .channels
+            .iter()
+            .position(|c| c == ch)
+            .expect("channel present");
+        p.select(idx);
+        let text = render(&mut p, 80, 6);
+        assert!(text.contains("kaboom here"), "renders the line: {text:?}");
+        assert!(text.contains("error"), "renders the level tag: {text:?}");
+    }
+
+    #[test]
+    fn tabs_advance_to_the_next_tab_stop() {
+        // #1114: `go test` ends a package with FAIL<TAB>pkg<TAB>time.
+        assert_eq!(row_text("FAIL\tpkg\t0.1s"), "FAIL    pkg     0.1s");
+        assert_eq!(row_text("\tindented"), "        indented");
+        assert_eq!(row_text("exactly8\tx"), "exactly8        x");
+        // Stops count display columns: a CJK char is two.
+        assert_eq!(row_text("表\tx"), "表      x");
+        // A cluster of several code points is the one glyph ratatui draws.
+        assert_eq!(row_text("👩‍💻\tx"), "👩‍💻      x");
+        assert_eq!(row_text("one\ntwo"), "one two");
+        assert!(matches!(
+            row_text("plain"),
+            std::borrow::Cow::Borrowed("plain")
+        ));
+
+        let ch = "widget-test-tabs";
+        crate::output::push(ch, OutputLevel::Error, "FAIL\texample.com/gt/parse\t0.003s");
+        let mut p = OutputPanel::new();
+        p.sync();
+        let idx = p.channels.iter().position(|c| c == ch).unwrap();
+        p.select(idx);
+        let text = render(&mut p, 80, 6);
+        assert!(
+            text.contains("FAIL    example.com/gt/parse    0.003s"),
+            "the columns stay apart: {text:?}"
+        );
+    }
+
+    #[test]
+    fn level_filter_hides_lower_levels() {
+        let ch = "widget-test-filter";
+        crate::output::push(ch, OutputLevel::Debug, "noisy-debug-line");
+        crate::output::push(ch, OutputLevel::Error, "the-error-line");
+        let mut p = OutputPanel::new();
+        p.sync();
+        let idx = p.channels.iter().position(|c| c == ch).unwrap();
+        p.select(idx);
+        // Default Trace shows both.
+        assert!(render(&mut p, 80, 6).contains("noisy-debug-line"));
+        // Cycle Trace -> Debug -> Info: now Debug is filtered out, Error stays.
+        p.cycle_level();
+        p.cycle_level();
+        let text = render(&mut p, 80, 6);
+        assert!(
+            !text.contains("noisy-debug-line"),
+            "debug filtered: {text:?}"
+        );
+        assert!(text.contains("the-error-line"), "error kept: {text:?}");
+    }
+
+    #[test]
+    fn clicking_the_dropdown_toggles_it() {
+        let ch = "widget-test-dropdown";
+        crate::output::push(ch, OutputLevel::Info, "x");
+        let mut p = OutputPanel::new();
+        p.sync();
+        render(&mut p, 80, 6);
+        assert!(!p.dropdown_open());
+        let r = p.dropdown_rect;
+        assert!(r.width > 0);
+        assert!(p.click(r.x, r.y), "dropdown click is consumed");
+        assert!(p.dropdown_open(), "dropdown opens");
+    }
+
+    #[test]
+    fn clicking_rpc_toggles_trace() {
+        let ch = "widget-test-rpc";
+        crate::output::push(ch, OutputLevel::Info, "x");
+        crate::output::set_trace_enabled(false);
+        let mut p = OutputPanel::new();
+        p.sync();
+        render(&mut p, 80, 6);
+        let r = p.rpc_rect;
+        assert!(r.width > 0, "rpc token rendered");
+        p.click(r.x, r.y);
+        assert!(crate::output::trace_enabled(), "rpc click enables trace");
+        crate::output::set_trace_enabled(false);
+    }
+}

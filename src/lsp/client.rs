@@ -1,0 +1,2573 @@
+use std::ops::ControlFlow;
+use std::path::Path;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result, anyhow};
+use async_lsp::concurrency::ConcurrencyLayer;
+use async_lsp::panic::CatchUnwindLayer;
+use async_lsp::router::Router;
+use async_lsp::tracing::TracingLayer;
+use async_lsp::{LanguageServer, MainLoop, ServerSocket};
+use lsp_types::DiagnosticSeverity as LspDiagnosticSeverity;
+use lsp_types::notification::{LogMessage, Progress, PublishDiagnostics, ShowMessage};
+use lsp_types::request::{SemanticTokensRefresh, WorkDoneProgressCreate};
+use lsp_types::{
+    ClientCapabilities, CodeAction, CodeActionContext, CodeActionParams, CodeActionResponse,
+    CompletionContext, CompletionParams, CompletionResponse, CompletionTriggerKind,
+    Diagnostic as LspDiagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentFormattingParams,
+    DocumentSymbolParams, DocumentSymbolResponse, ExecuteCommandParams, FormattingOptions,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InitializeParams,
+    InitializedParams, Location, PartialResultParams, Position, ProgressParamsValue, Range,
+    ReferenceContext, ReferenceParams, RenameParams, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, ServerCapabilities,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, TextEdit, Url, VersionedTextDocumentIdentifier, WorkDoneProgress,
+    WorkDoneProgressParams, WorkspaceEdit, WorkspaceFolder,
+};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tower::ServiceBuilder;
+
+use crate::lsp::config::ServerConfig;
+use crate::lsp::log_file;
+use crate::lsp::manager::{
+    CompletionTrigger, Diagnostic, DiagnosticSeverity, DiagnosticsUpdate, ServerEvent,
+    ServerUpdate, message_is_shown,
+};
+use crate::lsp::watched_files::WatchedFiles;
+use crate::output::{self, OutputLevel};
+
+/// Map an LSP `window/{show,log}Message` severity to an OUTPUT channel level so
+/// the panel colours a server's own messages the way it classified them.
+fn msg_level(typ: lsp_types::MessageType) -> OutputLevel {
+    use lsp_types::MessageType as MT;
+    if typ == MT::ERROR {
+        OutputLevel::Error
+    } else if typ == MT::WARNING {
+        OutputLevel::Warn
+    } else if typ == MT::INFO {
+        OutputLevel::Info
+    } else {
+        OutputLevel::Debug
+    }
+}
+
+/// Classify a language-server stderr line by its tracing level token, so
+/// rust-analyzer's WARN/ERROR lines (e.g. "overly long loop turn" during
+/// cache priming) reach the OUTPUT panel with their real severity instead of
+/// a blanket Info. The token sits near the start of a tracing-formatted line
+/// (after an optional timestamp / opening bracket), so only the first few
+/// words are inspected; anything unrecognised stays Info.
+fn stderr_level(line: &str) -> OutputLevel {
+    for word in line.split_whitespace().take(3) {
+        match word.trim_matches(|c: char| !c.is_ascii_alphabetic()) {
+            "ERROR" => return OutputLevel::Error,
+            "WARN" | "WARNING" => return OutputLevel::Warn,
+            "INFO" => return OutputLevel::Info,
+            "DEBUG" | "TRACE" => return OutputLevel::Debug,
+            _ => {}
+        }
+    }
+    OutputLevel::Info
+}
+
+struct ClientState {
+    name: String,
+    // Set when the server sends `workspace/semanticTokens/refresh`. The app
+    // polls and clears it, then re-pulls tokens for the visible editor(s).
+    // rust-analyzer relies on this: it answers the first request from partial
+    // syntax analysis, then sends refresh once the cargo/crate-graph analysis
+    // resolves the richer type-aware tokens. (ty/basedpyright never send it.)
+    semantic_refresh: Arc<AtomicBool>,
+    // Same contract for `workspace/inlayHint/refresh`: the app polls and
+    // clears it, then re-requests hints for the visible editor(s).
+    inlay_refresh: Arc<AtomicBool>,
+    // Same contract for `workspace/diagnostic/refresh` (#533): a server that
+    // answers PULL diagnostics sends it when a project-wide change makes what
+    // it last reported stale, and the app re-pulls the whole workspace.
+    diagnostic_refresh: Arc<AtomicBool>,
+    // Server-pushed `textDocument/publishDiagnostics` batches are normalised
+    // and forwarded here; the manager owns the receiver and the app drains it.
+    diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
+    // Server `$/progress` work-done updates (rust-analyzer indexing, etc.)
+    // forwarded here for the status bar, with the `window/*` messages,
+    // questions and documents the user should see (#1599).
+    progress_tx: std_mpsc::Sender<ServerUpdate>,
+    // Begin carries the progress title; Report/End don't, so the title is
+    // remembered per progress token to keep the status line meaningful.
+    progress_titles: std::collections::HashMap<String, String>,
+    // The folder list this client answers `workspace/workspaceFolders`
+    // with — the same list initialize carried. A server that saw the
+    // workspaceFolders capability may re-query it at any time (LSP 3.6).
+    workspace_folders: Vec<WorkspaceFolder>,
+    // The globs this server registered for `workspace/didChangeWatchedFiles`
+    // (#908), shared with the `LspClient` that forwards file events.
+    watched: Arc<Mutex<WatchedFiles>>,
+}
+
+/// Join a work-done progress title with its optional message and percentage
+/// into one compact status string (e.g. `Indexing 112/340 33%`).
+pub(crate) fn compose_progress(
+    title: &str,
+    message: Option<&str>,
+    percentage: Option<u32>,
+) -> String {
+    let mut out = title.to_string();
+    if let Some(m) = message.filter(|m| !m.is_empty()) {
+        out.push(' ');
+        out.push_str(m);
+    }
+    if let Some(p) = percentage {
+        out.push_str(&format!(" {p}%"));
+    }
+    out
+}
+
+fn progress_token_key(token: &lsp_types::ProgressToken) -> String {
+    match token {
+        lsp_types::NumberOrString::Number(n) => n.to_string(),
+        lsp_types::NumberOrString::String(s) => s.clone(),
+    }
+}
+
+impl ClientState {
+    #[allow(clippy::too_many_arguments)]
+    fn router(
+        name: String,
+        semantic_refresh: Arc<AtomicBool>,
+        inlay_refresh: Arc<AtomicBool>,
+        diagnostic_refresh: Arc<AtomicBool>,
+        diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
+        progress_tx: std_mpsc::Sender<ServerUpdate>,
+        workspace_folders: Vec<WorkspaceFolder>,
+        watched: Arc<Mutex<WatchedFiles>>,
+    ) -> Router<Self> {
+        let mut router = Router::new(ClientState {
+            name,
+            semantic_refresh,
+            inlay_refresh,
+            diagnostic_refresh,
+            diagnostics_tx,
+            progress_tx,
+            progress_titles: std::collections::HashMap::new(),
+            workspace_folders,
+            watched,
+        });
+        router
+            .request::<SemanticTokensRefresh, _>(|this, _params| {
+                this.semantic_refresh.store(true, Ordering::Relaxed);
+                log_file::log(&format!(
+                    "lsp[{}] semanticTokens/refresh -> re-pull queued",
+                    this.name
+                ));
+                std::future::ready(Ok(()))
+            })
+            // `workspace/inlayHint/refresh`: the server's hints changed for
+            // reasons other than an edit (config reload, cross-file analysis);
+            // acknowledge and queue a re-request, like the semantic flag above.
+            .request::<lsp_types::request::InlayHintRefreshRequest, _>(|this, _params| {
+                this.inlay_refresh.store(true, Ordering::Relaxed);
+                log_file::log(&format!(
+                    "lsp[{}] inlayHint/refresh -> re-request queued",
+                    this.name
+                ));
+                std::future::ready(Ok(()))
+            })
+            // `workspace/diagnostic/refresh` (#533): the server's PULLED
+            // diagnostics went stale for reasons other than an edit, so it
+            // asks the client to re-pull the workspace. Acknowledge and raise
+            // the flag; declining with METHOD_NOT_FOUND would leave the panel
+            // showing the last answer indefinitely.
+            .request::<lsp_types::request::WorkspaceDiagnosticRefresh, _>(|this, _params| {
+                this.diagnostic_refresh.store(true, Ordering::Relaxed);
+                log_file::log(&format!(
+                    "lsp[{}] diagnostic/refresh -> workspace re-pull queued",
+                    this.name
+                ));
+                std::future::ready(Ok(()))
+            })
+            // Servers (rust-analyzer) ask us to create a progress token before
+            // streaming `$/progress`. Acknowledge it so the progress flows;
+            // declining with METHOD_NOT_FOUND would suppress the indexing UI.
+            .request::<WorkDoneProgressCreate, _>(|_this, _params| std::future::ready(Ok(())))
+            // LSP 3.6 `workspace/workspaceFolders`: hand back the same
+            // folder list initialize carried. Declining this (the old
+            // unhandled_request fallback) told folder-aware servers the
+            // list was unavailable and legally degraded them to
+            // single-root behavior.
+            .request::<lsp_types::request::WorkspaceFoldersRequest, _>(|this, _params| {
+                std::future::ready(Ok(Some(this.workspace_folders.clone())))
+            })
+            // Dynamic registration is declared for watched files alone
+            // (#908): the server's globs are kept for the file events croft
+            // forwards. Any other registration is declined, as before.
+            .request::<lsp_types::request::RegisterCapability, _>(|this, params| {
+                let stored = this
+                    .watched
+                    .lock()
+                    .is_ok_and(|mut w| w.register(&params.registrations));
+                log_file::log(&format!(
+                    "lsp[{}] registerCapability watched_files={stored}",
+                    this.name
+                ));
+                std::future::ready(match stored {
+                    true => Ok(()),
+                    false => Err(async_lsp::ResponseError::new(
+                        async_lsp::ErrorCode::METHOD_NOT_FOUND,
+                        "only workspace/didChangeWatchedFiles can be registered",
+                    )),
+                })
+            })
+            .request::<lsp_types::request::UnregisterCapability, _>(|this, params| {
+                if let Ok(mut w) = this.watched.lock() {
+                    w.unregister(&params.unregisterations);
+                }
+                std::future::ready(Ok(()))
+            })
+            // `window/showMessageRequest` (#1599): the question goes to the
+            // app's picker and the pick comes back as the answer. Logged
+            // and kept in OUTPUT like a `showMessage`. Answering `null`
+            // (dismissed, or the app is gone) is what the spec gives a
+            // client that shows no actions.
+            .request::<lsp_types::request::ShowMessageRequest, _>(|this, params| {
+                log_file::log(&format!(
+                    "lsp[{}] asks {:?}: {}",
+                    this.name, params.typ, params.message
+                ));
+                output::push(&this.name, msg_level(params.typ), &params.message);
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                let _ = this.progress_tx.send(ServerUpdate {
+                    server: this.name.clone(),
+                    event: ServerEvent::Question {
+                        text: params.message,
+                        actions: params.actions.unwrap_or_default(),
+                        reply,
+                    },
+                });
+                async move { Ok(answer.await.ok().flatten()) }
+            })
+            // `window/showDocument` (#1599): a file to open at a range, or
+            // a link for the browser. Success is the app's word that it was
+            // shown; an app that is gone, or a file that would not open,
+            // answers false. Focus moves unless the server says
+            // `takeFocus: false`.
+            .request::<lsp_types::request::ShowDocument, _>(|this, params| {
+                log_file::log(&format!("lsp[{}] shows {}", this.name, params.uri));
+                let (reply, shown) = tokio::sync::oneshot::channel();
+                let _ = this.progress_tx.send(ServerUpdate {
+                    server: this.name.clone(),
+                    event: ServerEvent::ShowDocument {
+                        uri: params.uri,
+                        external: params.external.unwrap_or(false),
+                        take_focus: params.take_focus.unwrap_or(true),
+                        selection: params.selection,
+                        reply,
+                    },
+                });
+                async move {
+                    Ok(lsp_types::ShowDocumentResult {
+                        success: shown.await.unwrap_or(false),
+                    })
+                }
+            })
+            .notification::<Progress>(|this, params| {
+                let ProgressParamsValue::WorkDone(work) = params.value;
+                let key = progress_token_key(&params.token);
+                let message = match work {
+                    WorkDoneProgress::Begin(b) => {
+                        this.progress_titles.insert(key.clone(), b.title.clone());
+                        Some(compose_progress(
+                            &b.title,
+                            b.message.as_deref(),
+                            b.percentage,
+                        ))
+                    }
+                    WorkDoneProgress::Report(r) => {
+                        let title = this.progress_titles.get(&key).cloned().unwrap_or_default();
+                        Some(compose_progress(&title, r.message.as_deref(), r.percentage))
+                    }
+                    WorkDoneProgress::End(_) => {
+                        this.progress_titles.remove(&key);
+                        None
+                    }
+                };
+                let _ = this.progress_tx.send(ServerUpdate {
+                    server: this.name.clone(),
+                    event: ServerEvent::Progress(message),
+                });
+                ControlFlow::Continue(())
+            })
+            .notification::<PublishDiagnostics>(|this, params| {
+                log_file::log(&format!(
+                    "lsp[{}] diagnostics for {}: {} item(s)",
+                    this.name,
+                    params.uri,
+                    params.diagnostics.len()
+                ));
+                // Forward the normalised batch to the app. A non-file URI
+                // (e.g. an untitled buffer) has no editor to paint, so skip it.
+                if let Ok(path) = params.uri.to_file_path() {
+                    let diagnostics = params
+                        .diagnostics
+                        .iter()
+                        .map(|d| convert_diagnostic(&this.name, d))
+                        .collect();
+                    let _ = this.diagnostics_tx.send(DiagnosticsUpdate {
+                        path,
+                        server: this.name.clone(),
+                        diagnostics,
+                        pulled: false,
+                    });
+                }
+                ControlFlow::Continue(())
+            })
+            .notification::<ShowMessage>(|this, params| {
+                log_file::log(&format!(
+                    "lsp[{}] {:?}: {}",
+                    this.name, params.typ, params.message
+                ));
+                output::push(&this.name, msg_level(params.typ), &params.message);
+                if message_is_shown(params.typ, &params.message) {
+                    let _ = this.progress_tx.send(ServerUpdate {
+                        server: this.name.clone(),
+                        event: ServerEvent::Message {
+                            level: params.typ,
+                            text: params.message,
+                        },
+                    });
+                }
+                ControlFlow::Continue(())
+            })
+            .notification::<LogMessage>(|this, params| {
+                log_file::log(&format!(
+                    "lsp[{}] log {:?}: {}",
+                    this.name, params.typ, params.message
+                ));
+                output::push(&this.name, msg_level(params.typ), &params.message);
+                ControlFlow::Continue(())
+            });
+        router.unhandled_notification(|this, notif| {
+            log_file::log(&format!(
+                "lsp[{}] ignored notification {}",
+                this.name, notif.method
+            ));
+            ControlFlow::Continue(())
+        });
+        router.unhandled_request(|this, req| {
+            let method = req.method.clone();
+            let name = this.name.clone();
+            Box::pin(async move {
+                log_file::log(&format!(
+                    "lsp[{name}] declined unsupported request {method}"
+                ));
+                Err(async_lsp::ResponseError::new(
+                    async_lsp::ErrorCode::METHOD_NOT_FOUND,
+                    format!("No such method {method}"),
+                ))
+            })
+        });
+        router
+    }
+}
+
+/// Normalise one LSP wire diagnostic into croft's `Diagnostic`. Severity
+/// defaults to `Error` when the server omits it (the LSP spec says the client
+/// may pick, and an unclassified problem is most safely shown as an error).
+pub(crate) fn convert_diagnostic(server: &str, d: &lsp_types::Diagnostic) -> Diagnostic {
+    let severity = match d.severity {
+        Some(LspDiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
+        Some(LspDiagnosticSeverity::INFORMATION) => DiagnosticSeverity::Information,
+        Some(LspDiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
+        _ => DiagnosticSeverity::Error,
+    };
+    let tagged = |tag| d.tags.as_ref().is_some_and(|tags| tags.contains(&tag));
+    Diagnostic {
+        start_line: d.range.start.line,
+        start_char: d.range.start.character,
+        end_line: d.range.end.line,
+        end_char: d.range.end.character,
+        severity,
+        message: d.message.clone(),
+        tags: crate::lsp::manager::DiagnosticTags {
+            unnecessary: tagged(lsp_types::DiagnosticTag::UNNECESSARY),
+            deprecated: tagged(lsp_types::DiagnosticTag::DEPRECATED),
+        },
+        code: d
+            .code
+            .as_ref()
+            .map(|code| crate::lsp::manager::DiagnosticCode {
+                value: match code {
+                    lsp_types::NumberOrString::Number(n) => n.to_string(),
+                    lsp_types::NumberOrString::String(s) => s.clone(),
+                },
+                source: d.source.clone().filter(|s| !s.is_empty()),
+                href: d.code_description.as_ref().map(|c| c.href.to_string()),
+            }),
+        origin: Some(std::sync::Arc::new(crate::lsp::manager::DiagnosticOrigin {
+            server: server.to_string(),
+            wire: d.clone(),
+        })),
+    }
+}
+
+/// `initialize` sent as raw JSON, so croft can declare the workspace-level
+/// diagnostics capability under the name the SPEC gives it (#533).
+///
+/// `lsp-types` 0.95 names the field `diagnostic`, which serialises to
+/// `workspace.diagnostic`. LSP 3.17 names it `workspace.diagnostics` - the
+/// PLURAL is not a typo, it is the one capability the spec pluralises, and
+/// `vscode-languageserver-node` registers it as
+/// `CM.create('workspace.diagnostics.refreshSupport')`. A server that reads
+/// the spec name therefore never sees croft's `refreshSupport` and never
+/// sends `workspace/diagnostic/refresh`, which is a silent failure: the
+/// pulled set simply never refreshes.
+///
+/// async-lsp's typed `initialize` is a thin wrapper over
+/// `ServerSocket::request`, so sending the params as a `Value` costs nothing
+/// but the serialise step.
+enum RawInitialize {}
+
+impl lsp_types::request::Request for RawInitialize {
+    type Params = serde_json::Value;
+    // Raw, because `lsp-types` 0.95 has no `typeHierarchyProvider` field and
+    // would drop it (#613); the typed result is parsed from this value.
+    type Result = serde_json::Value;
+    const METHOD: &'static str = "initialize";
+}
+
+/// A request `lsp-types` has no type for, sent and answered as raw JSON.
+macro_rules! raw_request {
+    ($name:ident, $method:literal) => {
+        enum $name {}
+
+        impl lsp_types::request::Request for $name {
+            type Params = serde_json::Value;
+            type Result = serde_json::Value;
+            const METHOD: &'static str = $method;
+        }
+    };
+}
+
+raw_request!(RaExpandMacro, "rust-analyzer/expandMacro");
+raw_request!(RaParentModule, "experimental/parentModule");
+raw_request!(RaOpenCargoToml, "experimental/openCargoToml");
+raw_request!(RaRebuildProcMacros, "rust-analyzer/rebuildProcMacros");
+raw_request!(RaReloadWorkspace, "rust-analyzer/reloadWorkspace");
+
+/// Whether a raw `initialize` result advertises `typeHierarchyProvider`
+/// (#613): `true` or an options object, but not `false` or `null`.
+fn advertises_type_hierarchy(init: &serde_json::Value) -> bool {
+    match init.pointer("/capabilities/typeHierarchyProvider") {
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(false)) => false,
+        Some(_) => true,
+    }
+}
+
+/// Declare the workspace diagnostics capability under BOTH names (#533).
+///
+/// The plural is what the spec and every client generated from its metamodel
+/// read; the singular is what `lsp-types` emits and what the Rust servers
+/// built on the same crate read. An unknown capability key is ignored by
+/// definition, so carrying both costs one duplicated object and covers both
+/// populations. Everything else in the params is untouched.
+fn with_spec_workspace_diagnostics(mut params: serde_json::Value) -> serde_json::Value {
+    let Some(workspace) = params
+        .get_mut("capabilities")
+        .and_then(|c| c.get_mut("workspace"))
+        .and_then(|w| w.as_object_mut())
+    else {
+        return params;
+    };
+    if let Some(diagnostic) = workspace.get("diagnostic").cloned() {
+        workspace.insert("diagnostics".to_string(), diagnostic);
+    }
+    params
+}
+
+pub struct LspClient {
+    server: ServerSocket,
+    /// A clone of `server` for requests; see [`LspRequests`].
+    requests: LspRequests,
+    capabilities: ServerCapabilities,
+    /// See [`LspClient::supports_type_hierarchy`].
+    type_hierarchy: bool,
+    // Holds the process so kill_on_drop only fires when this client is
+    // dropped, not when spawn() returns. Without this the server is
+    // SIGKILLed mid-handshake and the mainloop reader sees EOF.
+    child: Child,
+    // The async-lsp MainLoop driving this client. Aborted on drop, before
+    // `server` (its ServerSocket sender) is dropped, so the loop never polls
+    // a closed event channel and panics with "Sender is alive" (lib.rs:553).
+    mainloop_task: tokio::task::JoinHandle<()>,
+    /// Set when the main loop ends: the server exited, crashed or was
+    /// killed (the OOM killer picks language servers first, #694). The
+    /// manager restarts the servers of a client that reports it.
+    exited: Arc<AtomicBool>,
+    /// The server's registered watchers (#908), filled by the router.
+    watched: Arc<Mutex<WatchedFiles>>,
+}
+
+impl LspClient {
+    /// True once the server process is gone (exited, crashed or killed),
+    /// so nothing sent to this client will be answered.
+    pub fn has_exited(&self) -> bool {
+        self.exited.load(Ordering::Acquire)
+    }
+
+    // Spawn wiring: each channel/flag is an independent router input;
+    // bundling them into a struct would add indirection without clarity.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn(
+        config: &ServerConfig,
+        workspace_root: &Path,
+        client_capabilities: ClientCapabilities,
+        extra_path: &[std::path::PathBuf],
+        semantic_refresh: Arc<AtomicBool>,
+        inlay_refresh: Arc<AtomicBool>,
+        diagnostic_refresh: Arc<AtomicBool>,
+        diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
+        progress_tx: std_mpsc::Sender<ServerUpdate>,
+    ) -> Result<Self> {
+        let workspace_uri = Url::from_file_path(workspace_root).map_err(|_| {
+            anyhow!(
+                "workspace root must be absolute: {}",
+                workspace_root.display()
+            )
+        })?;
+        let workspace_name = workspace_root
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "root".to_string());
+        // One folder list serves both initialize and the router's
+        // `workspace/workspaceFolders` responder, so the two can never
+        // disagree about what the client claimed.
+        let workspace_folders = vec![WorkspaceFolder {
+            uri: workspace_uri,
+            name: workspace_name,
+        }];
+        let router_folders = workspace_folders.clone();
+        let watched = Arc::new(Mutex::new(WatchedFiles::default()));
+        let router_watched = watched.clone();
+
+        let mut command = Command::new(&config.command);
+        command.args(&config.args).current_dir(workspace_root);
+        // Version-manager node dirs aren't on croft's inherited PATH; prepend
+        // them so a server like vtsls can find `node` for its shebang.
+        if !extra_path.is_empty() {
+            command.env("PATH", crate::lsp::install::prepend_paths(extra_path));
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("spawn lsp server `{}`", config.command))?;
+        // The kernel reclaims a language server before croft and the shells
+        // in its panes when memory runs out (#694): losing a server costs its
+        // editor features until relaunch, losing croft costs every shell.
+        if let Some(pid) = child.id() {
+            crate::oom::prefer_to_reclaim(pid, crate::oom::HELPER_SCORE);
+        }
+
+        let stdout = child
+            .stdout
+            .take()
+            .context("server stdout missing")?
+            .compat();
+        let stdin = child
+            .stdin
+            .take()
+            .context("server stdin missing")?
+            .compat_write();
+        let stderr = child.stderr.take().context("server stderr missing")?;
+
+        let name = config.name.to_string();
+        let router_name = name.clone();
+        let (mainloop, mut server) = MainLoop::new_client(move |_server_socket| {
+            ServiceBuilder::new()
+                .layer(TracingLayer::default())
+                .layer(CatchUnwindLayer::default())
+                .layer(ConcurrencyLayer::default())
+                .service(ClientState::router(
+                    router_name,
+                    semantic_refresh,
+                    inlay_refresh,
+                    diagnostic_refresh,
+                    diagnostics_tx,
+                    progress_tx,
+                    router_folders,
+                    router_watched,
+                ))
+        });
+
+        let stderr_name = name.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                log_file::log(&format!("lsp[{stderr_name}] stderr: {line}"));
+                output::push(&stderr_name, stderr_level(&line), &line);
+            }
+        });
+
+        // Tee both directions of the JSON-RPC stream into the server's
+        // "<name> (trace)" OUTPUT channel. The tee is inert (one atomic load per
+        // chunk) until the OUTPUT panel's RPC toggle turns tracing on.
+        let stdout = crate::lsp::trace::TraceRead::new(stdout, name.clone());
+        let stdin = crate::lsp::trace::TraceWrite::new(stdin, name.clone());
+
+        let mainloop_name = name;
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_for_loop = exited.clone();
+        let mainloop_task = tokio::spawn(async move {
+            if let Err(e) = mainloop.run_buffered(stdout, stdin).await {
+                log_file::log(&format!("lsp[{mainloop_name}] mainloop exited: {e}"));
+                output::push(
+                    &mainloop_name,
+                    OutputLevel::Error,
+                    &format!("language server exited: {e}"),
+                );
+            }
+            // Either way the server is gone: an EOF on its stdout ends the
+            // loop cleanly, a broken pipe ends it with an error.
+            exited_for_loop.store(true, Ordering::Release);
+        });
+
+        // `rootUri` and `rootPath` are deprecated for `workspaceFolders` but
+        // still sent, as VS Code and Neovim do: `rootUri` is a required
+        // field, null there means "no folder is open", and a server that
+        // reads it (lua-language-server) then never loads the workspace and
+        // answers nothing (#1517).
+        #[allow(deprecated)]
+        let params = serde_json::to_value(InitializeParams {
+            process_id: Some(std::process::id()),
+            root_path: Some(workspace_root.display().to_string()),
+            root_uri: Some(workspace_folders[0].uri.clone()),
+            capabilities: client_capabilities,
+            initialization_options: config.initialization_options.clone(),
+            workspace_folders: Some(workspace_folders),
+            ..InitializeParams::default()
+        })
+        .context("serialise initialize params")?;
+        let init = server
+            .request::<RawInitialize>(with_spec_workspace_diagnostics(params))
+            .await
+            .context("lsp initialize")?;
+        let type_hierarchy = advertises_type_hierarchy(&init);
+        let init: lsp_types::InitializeResult =
+            serde_json::from_value(init).context("parse initialize result")?;
+        server
+            .initialized(InitializedParams {})
+            .context("lsp initialized notification")?;
+
+        Ok(Self {
+            requests: LspRequests {
+                server: server.clone(),
+            },
+            server,
+            capabilities: init.capabilities,
+            type_hierarchy,
+            child,
+            mainloop_task,
+            exited,
+            watched,
+        })
+    }
+
+    pub fn capabilities(&self) -> &ServerCapabilities {
+        &self.capabilities
+    }
+
+    /// Whether the server advertised `typeHierarchyProvider` (#613), which
+    /// [`ServerCapabilities`] cannot carry in `lsp-types` 0.95.
+    pub fn supports_type_hierarchy(&self) -> bool {
+        self.type_hierarchy
+    }
+
+    /// A detached handle to the server, for a request whose answer must be
+    /// awaited WITHOUT holding this client's lock (#533 regression).
+    ///
+    /// `ServerSocket` is the sending half of the mainloop's channel, so a
+    /// clone talks to the same server and its responses are routed the same
+    /// way. A caller that awaits a slow request on the clone leaves the
+    /// `LspClient` itself free, which matters for any request the server may
+    /// never answer: holding the lock across such an await blocks every other
+    /// user of that client, including `open_doc` on the worker loop.
+    pub fn detached_server(&self) -> ServerSocket {
+        self.server.clone()
+    }
+
+    /// The request methods on their own, to await with the client unlocked.
+    pub fn requests(&self) -> LspRequests {
+        self.requests.clone()
+    }
+
+    pub fn did_open(
+        &mut self,
+        uri: Url,
+        language_id: &str,
+        version: i32,
+        text: String,
+    ) -> Result<()> {
+        self.server
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri,
+                    language_id: language_id.to_string(),
+                    version,
+                    text,
+                },
+            })
+            .context("did_open")
+    }
+
+    pub fn did_change_full(&mut self, uri: Url, version: i32, text: String) -> Result<()> {
+        self.server
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier { uri, version },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text,
+                }],
+            })
+            .context("did_change")
+    }
+
+    /// `textDocument/didSave`, carrying `text` only for a server whose
+    /// `save` options set `includeText` (#854); the caller decides from the
+    /// capability, and skips a server that never asked for saves at all.
+    pub fn did_save(&mut self, uri: Url, text: Option<String>) -> Result<()> {
+        self.server
+            .did_save(DidSaveTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri },
+                text,
+            })
+            .context("did_save")
+    }
+
+    /// `workspace/didChangeWatchedFiles` (#908) for the `changes` this
+    /// server's watchers cover. Nothing is sent when none does.
+    pub fn did_change_watched_files(
+        &mut self,
+        changes: &[(std::path::PathBuf, lsp_types::FileChangeType)],
+    ) -> Result<()> {
+        let events = match self.watched.lock() {
+            Ok(w) => w.events_for(changes),
+            Err(_) => return Ok(()),
+        };
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.server
+            .did_change_watched_files(lsp_types::DidChangeWatchedFilesParams { changes: events })
+            .context("did_change_watched_files")
+    }
+
+    pub fn did_close(&mut self, uri: Url) -> Result<()> {
+        self.server
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri },
+            })
+            .context("did_close")
+    }
+
+    /// `textDocument/codeLens` (#608), on a detached server handle so the
+    /// client's lock isn't held while the server answers.
+    pub async fn code_lens_on(
+        mut server: ServerSocket,
+        uri: Url,
+    ) -> Result<Option<Vec<lsp_types::CodeLens>>> {
+        server
+            .code_lens(lsp_types::CodeLensParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("codeLens")
+    }
+
+    /// `codeLens/resolve` (#608): fill in a lens's command, on a detached
+    /// server handle.
+    pub async fn code_lens_resolve_on(
+        mut server: ServerSocket,
+        lens: lsp_types::CodeLens,
+    ) -> Result<lsp_types::CodeLens> {
+        server
+            .code_lens_resolve(lens)
+            .await
+            .context("codeLens/resolve")
+    }
+
+    /// `workspace/didRenameFiles` (#610): tell the server the move happened.
+    pub fn did_rename_files(&mut self, files: Vec<lsp_types::FileRename>) -> Result<()> {
+        self.server
+            .did_rename_files(lsp_types::RenameFilesParams { files })
+            .context("didRenameFiles")
+    }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.server.shutdown(()).await.context("lsp shutdown")?;
+        self.server.exit(()).context("lsp exit")?;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.child.wait()).await;
+        Ok(())
+    }
+}
+
+/// The document and position a positional request is about.
+fn position_params(uri: Url, line: u32, character: u32) -> TextDocumentPositionParams {
+    TextDocumentPositionParams {
+        text_document: TextDocumentIdentifier { uri },
+        position: Position { line, character },
+    }
+}
+
+/// The params of every go-to request. lsp-types aliases the declaration,
+/// type-definition and implementation params and responses to the definition
+/// ones, so the same params serve all four; only the wire method differs.
+fn goto_params(uri: Url, line: u32, character: u32) -> GotoDefinitionParams {
+    GotoDefinitionParams {
+        text_document_position_params: position_params(uri, line, character),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    }
+}
+
+/// The request half of an [`LspClient`]: a clone of its server socket,
+/// cheap to take while the client's lock is held and awaited after it is
+/// released. A server may take long to answer, or never answer, and holding
+/// the client lock across that await stalled every other user of the client
+/// behind it, the document syncs of every language included.
+#[derive(Clone)]
+pub struct LspRequests {
+    server: ServerSocket,
+}
+
+impl LspRequests {
+    /// `trigger` says why it is asked: a typed trigger character goes with
+    /// the character (#929), so a server answers only where it means
+    /// something, and a re-ask for a list the server marked `isIncomplete`
+    /// (#1529) as `TriggerForIncompleteCompletions`.
+    pub async fn completion(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+        trigger: CompletionTrigger,
+    ) -> Result<Option<CompletionResponse>> {
+        use CompletionTriggerKind as Kind;
+        let (trigger_kind, trigger_character) = match trigger {
+            CompletionTrigger::Invoked => (Kind::INVOKED, None),
+            CompletionTrigger::Character(c) => (Kind::TRIGGER_CHARACTER, Some(c.to_string())),
+            CompletionTrigger::Incomplete => (Kind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS, None),
+        };
+        self.server
+            .completion(CompletionParams {
+                text_document_position: position_params(uri, line, character),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                context: Some(CompletionContext {
+                    trigger_kind,
+                    trigger_character,
+                }),
+            })
+            .await
+            .context("completion")
+    }
+
+    /// `completionItem/resolve`: the rest of an item the server listed
+    /// lazily (#928). vtsls sends an auto-import's `additionalTextEdits`
+    /// only here.
+    pub async fn completion_resolve(
+        &mut self,
+        item: lsp_types::CompletionItem,
+    ) -> Result<lsp_types::CompletionItem> {
+        self.server
+            .completion_item_resolve(item)
+            .await
+            .context("completion_resolve")
+    }
+
+    pub async fn signature_help(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<lsp_types::SignatureHelp>> {
+        self.server
+            .signature_help(lsp_types::SignatureHelpParams {
+                context: None,
+                text_document_position_params: position_params(uri, line, character),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("signature_help")
+    }
+
+    pub async fn hover(&mut self, uri: Url, line: u32, character: u32) -> Result<Option<Hover>> {
+        self.server
+            .hover(HoverParams {
+                text_document_position_params: position_params(uri, line, character),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("hover")
+    }
+
+    pub async fn definition(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        self.server
+            .definition(goto_params(uri, line, character))
+            .await
+            .context("definition")
+    }
+
+    /// Ask the server for the document's symbol tree (`textDocument/
+    /// documentSymbol`), the data behind the Outline view. Servers answer with
+    /// either the modern `Nested` hierarchy or the legacy `Flat` list; the
+    /// worker normalises both. No position: the request covers the whole file.
+    pub async fn document_symbol(&mut self, uri: Url) -> Result<Option<DocumentSymbolResponse>> {
+        self.server
+            .document_symbol(DocumentSymbolParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("document_symbol")
+    }
+
+    pub async fn declaration(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        self.server
+            .declaration(goto_params(uri, line, character))
+            .await
+            .context("declaration")
+    }
+
+    pub async fn type_definition(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        self.server
+            .type_definition(goto_params(uri, line, character))
+            .await
+            .context("type_definition")
+    }
+
+    pub async fn implementation(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        // This commonly returns an Array of locations (one abstraction, many
+        // implementors), which the manager keeps whole (`def_locations`).
+        self.server
+            .implementation(goto_params(uri, line, character))
+            .await
+            .context("implementation")
+    }
+
+    /// LSP 3.17 `workspace/diagnostic`: PULL the whole project's diagnostics
+    /// over the existing connection (#533).
+    ///
+    /// Issued on a socket the CALLER owns rather than on `&mut self`, so the
+    /// client lock can be released before the await. That is not a
+    /// convenience: a server may accept this request and never answer it
+    /// (`ty` 0.0.73 does), and holding the client across such an await blocks
+    /// every other user of it — including `open_doc` on the worker loop, which
+    /// wedged Go to Definition outright (#533 regression, 0.1.939).
+    ///
+    /// `identifier` is echoed back from the server's own
+    /// `diagnosticProvider.identifier` - a server that registered several
+    /// diagnostic sources uses it to tell which one the previous result ids
+    /// belong to, so dropping it would invalidate its incrementality.
+    /// `previous_result_ids` is what makes the answer incremental: files that
+    /// have not moved come back as `Unchanged` instead of a full re-report.
+    ///
+    /// Only call this on a server whose capability says
+    /// `workspaceDiagnostics: true` - one that pulls per document but not per
+    /// workspace answers `-32601 Unhandled method`.
+    pub async fn workspace_diagnostics_on(
+        mut server: ServerSocket,
+        identifier: Option<String>,
+        previous_result_ids: Vec<lsp_types::PreviousResultId>,
+    ) -> Result<lsp_types::WorkspaceDiagnosticReportResult> {
+        server
+            .workspace_diagnostic(lsp_types::WorkspaceDiagnosticParams {
+                identifier,
+                previous_result_ids,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("workspace/diagnostic")
+    }
+
+    /// `textDocument/diagnostic`, the LSP 3.17 PULL of one document's
+    /// diagnostics (#866), on a detached socket like
+    /// [`Self::workspace_diagnostics_on`] so the client is not held while the
+    /// server works. No previous result id is sent, so the answer is always a
+    /// full report: croft replaces a server's set for the file wholesale, and
+    /// has nothing to reuse an `Unchanged` against.
+    pub async fn document_diagnostics_on(
+        mut server: ServerSocket,
+        uri: Url,
+        identifier: Option<String>,
+    ) -> Result<lsp_types::DocumentDiagnosticReportResult> {
+        server
+            .document_diagnostic(lsp_types::DocumentDiagnosticParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri },
+                identifier,
+                previous_result_id: None,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("textDocument/diagnostic")
+    }
+
+    /// `workspace/symbol`: server-side fuzzy query over every symbol in the
+    /// project. Both response shapes (flat `SymbolInformation` and nested
+    /// `WorkspaceSymbol`) are normalised by the manager.
+    pub async fn workspace_symbols(
+        &mut self,
+        query: String,
+    ) -> Result<Option<lsp_types::WorkspaceSymbolResponse>> {
+        self.server
+            .symbol(lsp_types::WorkspaceSymbolParams {
+                query,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("workspace/symbol")
+    }
+
+    pub async fn references(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<Vec<Location>>> {
+        // `textDocument/references` is the odd one out of the navigation family:
+        // it takes `ReferenceParams` (not `GotoDefinitionParams`) and returns a
+        // flat `Vec<Location>` rather than a `GotoDefinitionResponse`, so it has
+        // its own params and its own `reference_locations` mapper in the manager.
+        // `include_declaration: true` matches VS Code's "Go to References", whose
+        // peek list includes the declaration site alongside every use.
+        self.server
+            .references(ReferenceParams {
+                text_document_position: position_params(uri, line, character),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                context: ReferenceContext {
+                    include_declaration: true,
+                },
+            })
+            .await
+            .context("references")
+    }
+
+    /// `textDocument/prepareCallHierarchy`: resolve the symbol at a position
+    /// into the item the `callHierarchy/*` expansion requests take.
+    pub async fn prepare_call_hierarchy(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<Vec<lsp_types::CallHierarchyItem>>> {
+        self.server
+            .prepare_call_hierarchy(lsp_types::CallHierarchyPrepareParams {
+                text_document_position_params: position_params(uri, line, character),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("prepareCallHierarchy")
+    }
+
+    /// `textDocument/prepareTypeHierarchy` (#613): resolve the type at a
+    /// position into the item the `typeHierarchy/*` requests take.
+    pub async fn prepare_type_hierarchy(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<Vec<lsp_types::TypeHierarchyItem>>> {
+        self.server
+            .prepare_type_hierarchy(lsp_types::TypeHierarchyPrepareParams {
+                text_document_position_params: position_params(uri, line, character),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("prepareTypeHierarchy")
+    }
+
+    /// `typeHierarchy/supertypes` or `typeHierarchy/subtypes` of `item`.
+    pub async fn type_hierarchy(
+        &mut self,
+        item: lsp_types::TypeHierarchyItem,
+        supertypes: bool,
+    ) -> Result<Option<Vec<lsp_types::TypeHierarchyItem>>> {
+        if supertypes {
+            self.server
+                .supertypes(lsp_types::TypeHierarchySupertypesParams {
+                    item,
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .await
+                .context("typeHierarchy/supertypes")
+        } else {
+            self.server
+                .subtypes(lsp_types::TypeHierarchySubtypesParams {
+                    item,
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .await
+                .context("typeHierarchy/subtypes")
+        }
+    }
+
+    /// `callHierarchy/incomingCalls`: everyone who calls `item`.
+    pub async fn incoming_calls(
+        &mut self,
+        item: lsp_types::CallHierarchyItem,
+    ) -> Result<Option<Vec<lsp_types::CallHierarchyIncomingCall>>> {
+        self.server
+            .incoming_calls(lsp_types::CallHierarchyIncomingCallsParams {
+                item,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("incomingCalls")
+    }
+
+    /// `callHierarchy/outgoingCalls`: everything `item` calls.
+    pub async fn outgoing_calls(
+        &mut self,
+        item: lsp_types::CallHierarchyItem,
+    ) -> Result<Option<Vec<lsp_types::CallHierarchyOutgoingCall>>> {
+        self.server
+            .outgoing_calls(lsp_types::CallHierarchyOutgoingCallsParams {
+                item,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("outgoingCalls")
+    }
+
+    /// `textDocument/documentHighlight`: the read/write occurrences of the
+    /// symbol at a position, within this document only. Backs the editor's
+    /// occurrences tint (VS Code's word highlight), not any navigation.
+    pub async fn document_highlight(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<Vec<lsp_types::DocumentHighlight>>> {
+        self.server
+            .document_highlight(lsp_types::DocumentHighlightParams {
+                text_document_position_params: position_params(uri, line, character),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("document_highlight")
+    }
+
+    /// `textDocument/linkedEditingRange`: the equal-content spans that
+    /// rename together with the one at the caret (paired HTML/JSX tags,
+    /// #254). Backs the editor's live tag mirroring.
+    pub async fn linked_editing_range(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<lsp_types::LinkedEditingRanges>> {
+        self.server
+            .linked_editing_range(lsp_types::LinkedEditingRangeParams {
+                text_document_position_params: position_params(uri, line, character),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("linked_editing_range")
+    }
+
+    /// `textDocument/inlineCompletion` (LSP 3.18, #607): ghost text for the
+    /// caret. croft asks after a pause in typing, so the trigger is
+    /// automatic, and never while the completion list is open.
+    pub async fn inline_completion(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<lsp_types::InlineCompletionResponse>> {
+        self.server
+            .request::<lsp_types::request::InlineCompletionRequest>(
+                lsp_types::InlineCompletionParams {
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    text_document_position: position_params(uri, line, character),
+                    context: lsp_types::InlineCompletionContext {
+                        trigger_kind: lsp_types::InlineCompletionTriggerKind::Automatic,
+                        selected_completion_info: None,
+                    },
+                },
+            )
+            .await
+            .context("inline_completion")
+    }
+
+    /// `textDocument/selectionRange`: per-position parent-linked chains of
+    /// semantically meaningful ranges — the whole Expand Selection ancestry
+    /// in one round trip, one chain per cursor (#254).
+    pub async fn selection_ranges(
+        &mut self,
+        uri: Url,
+        positions: Vec<Position>,
+    ) -> Result<Option<Vec<lsp_types::SelectionRange>>> {
+        self.server
+            .selection_range(lsp_types::SelectionRangeParams {
+                text_document: TextDocumentIdentifier { uri },
+                positions,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("selection_range")
+    }
+
+    /// `textDocument/inlayHint` over the whole document (`line_count` caps the
+    /// range end). VS Code requests per viewport and stitches; one whole-file
+    /// request per edit-batch is simpler and matches how croft already pulls
+    /// `semanticTokens/full`.
+    pub async fn inlay_hints(
+        &mut self,
+        uri: Url,
+        end: Position,
+    ) -> Result<Option<Vec<lsp_types::InlayHint>>> {
+        self.server
+            .inlay_hint(lsp_types::InlayHintParams {
+                text_document: TextDocumentIdentifier { uri },
+                range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("inlay_hint")
+    }
+
+    /// `textDocument/documentLink`: the ranges the server considers
+    /// clickable links (URLs, import specifiers), with their targets
+    /// (#254). Target-less links (which would need a resolve round trip)
+    /// are dropped by the caller.
+    pub async fn document_links(
+        &mut self,
+        uri: Url,
+    ) -> Result<Option<Vec<lsp_types::DocumentLink>>> {
+        self.server
+            .document_link(lsp_types::DocumentLinkParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("document_link")
+    }
+
+    /// `textDocument/foldingRange`: the server's fold spans for the whole
+    /// document, with optional kinds (comment / imports / region). Backs
+    /// the editor's LSP-first folding (#254); the indentation scan stays
+    /// the fallback when the server lacks the provider.
+    pub async fn folding_ranges(
+        &mut self,
+        uri: Url,
+    ) -> Result<Option<Vec<lsp_types::FoldingRange>>> {
+        self.server
+            .folding_range(lsp_types::FoldingRangeParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("folding_range")
+    }
+
+    /// `textDocument/documentColor`: every color value in the document
+    /// (#254) — the swatch decoration's data source.
+    pub async fn document_color(&mut self, uri: Url) -> Result<Vec<lsp_types::ColorInformation>> {
+        self.server
+            .document_color(lsp_types::DocumentColorParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("document_color")
+    }
+
+    /// `textDocument/colorPresentation`: the alternative spellings of one
+    /// color value (`#rrggbb`, `rgb()`, …), each carrying the edit that
+    /// rewrites the document to it (#254).
+    pub async fn color_presentations(
+        &mut self,
+        uri: Url,
+        color: lsp_types::Color,
+        start: (u32, u32),
+        end: (u32, u32),
+    ) -> Result<Vec<lsp_types::ColorPresentation>> {
+        self.server
+            .color_presentation(lsp_types::ColorPresentationParams {
+                text_document: TextDocumentIdentifier { uri },
+                color,
+                range: Range {
+                    start: Position {
+                        line: start.0,
+                        character: start.1,
+                    },
+                    end: Position {
+                        line: end.0,
+                        character: end.1,
+                    },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("color_presentation")
+    }
+
+    pub async fn rename(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+        new_name: String,
+    ) -> Result<Option<WorkspaceEdit>> {
+        self.server
+            .rename(RenameParams {
+                text_document_position: position_params(uri, line, character),
+                new_name,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("rename")
+    }
+
+    /// `workspace/willRenameFiles` (#610): the edit a server wants applied
+    /// before `files` move, typically the imports that name them.
+    pub async fn will_rename_files(
+        &mut self,
+        files: Vec<lsp_types::FileRename>,
+    ) -> Result<Option<WorkspaceEdit>> {
+        self.server
+            .will_rename_files(lsp_types::RenameFilesParams { files })
+            .await
+            .context("willRenameFiles")
+    }
+
+    /// `textDocument/prepareRename`: validate the position and get the
+    /// exact renameable range / placeholder before prompting (#254). An
+    /// `Err` carries the server's own refusal message — the fail-fast
+    /// half of the feature.
+    pub async fn prepare_rename(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<lsp_types::PrepareRenameResponse>> {
+        self.server
+            .prepare_rename(position_params(uri, line, character))
+            .await
+            .context("prepare_rename")
+    }
+
+    /// `textDocument/codeAction`: ask the server for the quick fixes and
+    /// refactors available over `range` (a point selection at the cursor, or a
+    /// real selection). `diagnostics` are the diagnostics overlapping the range,
+    /// passed as context so the server can offer fixes for them.
+    pub async fn code_action(
+        &mut self,
+        uri: Url,
+        range: Range,
+        diagnostics: Vec<LspDiagnostic>,
+    ) -> Result<Option<CodeActionResponse>> {
+        self.server
+            .code_action(CodeActionParams {
+                text_document: TextDocumentIdentifier { uri },
+                range,
+                context: CodeActionContext {
+                    diagnostics,
+                    only: None,
+                    trigger_kind: None,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("code_action")
+    }
+
+    /// `codeAction/resolve`: fill in the `edit` for an action the server
+    /// returned without one (it carried only `data`). vtsls and rust-analyzer
+    /// defer the expensive edit computation to this second round trip.
+    pub async fn code_action_resolve(&mut self, action: CodeAction) -> Result<CodeAction> {
+        self.server
+            .code_action_resolve(action)
+            .await
+            .context("code_action_resolve")
+    }
+
+    /// One of rust-analyzer's own requests (#1626), raw: `params` from
+    /// [`RaRequest::params`], the answer as the server sent it.
+    pub async fn rust_analyzer(
+        &mut self,
+        request: crate::lsp::rust_analyzer::RaRequest,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        use crate::lsp::rust_analyzer::RaRequest;
+        let s = &mut self.server;
+        match request {
+            RaRequest::ExpandMacro => s.request::<RaExpandMacro>(params).await,
+            RaRequest::ParentModule => s.request::<RaParentModule>(params).await,
+            RaRequest::OpenCargoToml => s.request::<RaOpenCargoToml>(params).await,
+            RaRequest::RebuildProcMacros => s.request::<RaRebuildProcMacros>(params).await,
+            RaRequest::ReloadWorkspace => s.request::<RaReloadWorkspace>(params).await,
+        }
+        .context(request.method())
+    }
+
+    /// `workspace/executeCommand`: run a command a code action asked for (some
+    /// actions perform their effect through a command rather than an edit).
+    pub async fn execute_command(
+        &mut self,
+        command: String,
+        arguments: Vec<serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>> {
+        self.server
+            .execute_command(ExecuteCommandParams {
+                command,
+                arguments,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("execute_command")
+    }
+
+    /// `textDocument/formatting`: ask the server to reformat the whole
+    /// document. Returns the edits to apply (servers usually answer with a
+    /// single full-document replacement, but the spec allows many disjoint
+    /// edits). `tab_size`/`insert_spaces` carry the editor's indentation
+    /// preference; most formatters (rustfmt, ruff, prettier) honour their own
+    /// project config and ignore these, but the LSP fields are required.
+    pub async fn formatting(
+        &mut self,
+        uri: Url,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        self.server
+            .formatting(DocumentFormattingParams {
+                text_document: TextDocumentIdentifier { uri },
+                options: FormattingOptions {
+                    tab_size,
+                    insert_spaces,
+                    ..FormattingOptions::default()
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("formatting")
+    }
+
+    /// `textDocument/rangeFormatting`: format only the given UTF-16 span
+    /// ("Format Selection", #254). Same options contract as whole-document
+    /// formatting.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn range_formatting(
+        &mut self,
+        uri: Url,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        self.server
+            .range_formatting(lsp_types::DocumentRangeFormattingParams {
+                text_document: TextDocumentIdentifier { uri },
+                range: Range {
+                    start: Position {
+                        line: start_line,
+                        character: start_character,
+                    },
+                    end: Position {
+                        line: end_line,
+                        character: end_character,
+                    },
+                },
+                options: FormattingOptions {
+                    tab_size,
+                    insert_spaces,
+                    ..FormattingOptions::default()
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("range_formatting")
+    }
+
+    /// `textDocument/onTypeFormatting`: the server's formatting reaction
+    /// to one just-typed trigger character (#254).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn on_type_formatting(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+        ch: String,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        self.server
+            .on_type_formatting(lsp_types::DocumentOnTypeFormattingParams {
+                text_document_position: position_params(uri, line, character),
+                ch,
+                options: FormattingOptions {
+                    tab_size,
+                    insert_spaces,
+                    ..FormattingOptions::default()
+                },
+            })
+            .await
+            .context("on_type_formatting")
+    }
+
+    pub async fn semantic_tokens_full(&mut self, uri: Url) -> Result<Option<SemanticTokensResult>> {
+        self.server
+            .semantic_tokens_full(SemanticTokensParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("semantic_tokens_full")
+    }
+
+    /// Semantic tokens for just the visible line range. ty answers a viewport
+    /// query in tens of milliseconds even on a cold workspace, so croft fires
+    /// this on open to paint on-screen code immediately while the whole-file
+    /// `semantic_tokens_full` request fills in the rest behind it (the VS Code
+    /// / Zed first-paint model). `start`/`end` are zero-based line numbers.
+    pub async fn semantic_tokens_range(
+        &mut self,
+        uri: Url,
+        start: u32,
+        end: Position,
+    ) -> Result<Option<SemanticTokensRangeResult>> {
+        self.server
+            .semantic_tokens_range(SemanticTokensRangeParams {
+                text_document: TextDocumentIdentifier { uri },
+                range: Range {
+                    start: Position {
+                        line: start,
+                        character: 0,
+                    },
+                    end,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("semantic_tokens_range")
+    }
+}
+
+impl std::ops::Deref for LspClient {
+    type Target = LspRequests;
+    fn deref(&self) -> &LspRequests {
+        &self.requests
+    }
+}
+
+impl std::ops::DerefMut for LspClient {
+    fn deref_mut(&mut self) -> &mut LspRequests {
+        &mut self.requests
+    }
+}
+
+impl Drop for LspClient {
+    fn drop(&mut self) {
+        // Abort the MainLoop before `server` (its ServerSocket) drops below.
+        // Otherwise the loop polls a closed event channel and panics with
+        // "Sender is alive" (async-lsp lib.rs:553). Graceful shutdown() leaves
+        // the task already finished, so this is a no-op in that case.
+        self.mainloop_task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lsp::runtime::LspRuntime;
+    use async_lsp::{AnyNotification, LspService};
+    use serde_json::json;
+
+    #[test]
+    fn stderr_level_reads_the_tracing_level_token() {
+        // Issue #37: rust-analyzer writes warnings to stderr in tracing
+        // format; croft showed them all as Info. The level token must map
+        // to the matching OUTPUT level.
+        assert_eq!(
+            stderr_level(
+                "2026-07-02T10:00:00Z WARN rust_analyzer::main_loop: overly long loop turn: 141ms"
+            ),
+            OutputLevel::Warn
+        );
+        assert_eq!(
+            stderr_level("[ERROR rust_analyzer::lsp] request failed"),
+            OutputLevel::Error
+        );
+        assert_eq!(
+            stderr_level("2026-07-02T10:00:00Z INFO ra: loaded workspace"),
+            OutputLevel::Info
+        );
+        assert_eq!(
+            stderr_level("2026-07-02T10:00:00Z DEBUG ra: vfs tick"),
+            OutputLevel::Debug
+        );
+        // A level word deep in the message body is not a level token.
+        assert_eq!(
+            stderr_level("loading config a b c d e ERROR handling disabled"),
+            OutputLevel::Info
+        );
+        // Unstructured stderr chatter stays Info.
+        assert_eq!(stderr_level("starting language server"), OutputLevel::Info);
+    }
+
+    #[test]
+    fn compose_progress_joins_title_message_and_percentage() {
+        // rust-analyzer's $/progress: Begin carries the title ("Indexing"),
+        // Report carries an optional message ("112/340") and percentage. We
+        // surface them as one compact status string.
+        assert_eq!(compose_progress("Indexing", None, None), "Indexing");
+        assert_eq!(
+            compose_progress("Indexing", Some("112/340"), None),
+            "Indexing 112/340"
+        );
+        assert_eq!(
+            compose_progress("Indexing", Some("112/340"), Some(33)),
+            "Indexing 112/340 33%"
+        );
+        assert_eq!(
+            compose_progress("Roots Scanned", None, Some(100)),
+            "Roots Scanned 100%"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_refresh_request_sets_the_repull_flag() {
+        use async_lsp::AnyRequest;
+        use tower::Service;
+        // rust-analyzer sends `workspace/semanticTokens/refresh` once its
+        // analysis upgrades the token set; the router must acknowledge it AND
+        // raise the shared flag so the app re-pulls (vs the old behaviour of
+        // declining it with METHOD_NOT_FOUND and never updating).
+        let flag = Arc::new(AtomicBool::new(false));
+        let inlay_flag = Arc::new(AtomicBool::new(false));
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut router = ClientState::router(
+            "rust-analyzer".into(),
+            flag.clone(),
+            inlay_flag,
+            Arc::new(AtomicBool::new(false)),
+            diag_tx,
+            prog_tx,
+            Vec::new(),
+            Default::default(),
+        );
+        let req: AnyRequest = serde_json::from_value(json!({
+            "id": 1,
+            "method": "workspace/semanticTokens/refresh",
+            "params": null
+        }))
+        .expect("AnyRequest deserialization");
+        let _ = futures::executor::block_on(router.call(req));
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "a workspace/semanticTokens/refresh request must set the re-pull flag"
+        );
+    }
+
+    #[test]
+    fn inlay_hint_refresh_request_sets_the_rerequest_flag() {
+        use async_lsp::AnyRequest;
+        use tower::Service;
+        // rust-analyzer sends `workspace/inlayHint/refresh` when its analysis
+        // (or a config reload) changes the hints without an edit; the router
+        // must acknowledge it AND queue a re-request.
+        let sem_flag = Arc::new(AtomicBool::new(false));
+        let flag = Arc::new(AtomicBool::new(false));
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut router = ClientState::router(
+            "rust-analyzer".into(),
+            sem_flag.clone(),
+            flag.clone(),
+            Arc::new(AtomicBool::new(false)),
+            diag_tx,
+            prog_tx,
+            Vec::new(),
+            Default::default(),
+        );
+        let req: AnyRequest = serde_json::from_value(json!({
+            "id": 1,
+            "method": "workspace/inlayHint/refresh",
+            "params": null
+        }))
+        .expect("AnyRequest deserialization");
+        let _ = futures::executor::block_on(router.call(req));
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "a workspace/inlayHint/refresh request must set the re-request flag"
+        );
+        assert!(
+            !sem_flag.load(Ordering::Relaxed),
+            "the semantic-token flag must stay untouched"
+        );
+    }
+
+    #[test]
+    fn type_hierarchy_is_read_from_the_raw_initialize_result() {
+        let caps = |v: serde_json::Value| serde_json::json!({ "capabilities": v });
+        assert!(advertises_type_hierarchy(&caps(
+            serde_json::json!({"typeHierarchyProvider": true})
+        )));
+        assert!(advertises_type_hierarchy(&caps(
+            serde_json::json!({"typeHierarchyProvider": {}})
+        )));
+        assert!(!advertises_type_hierarchy(&caps(
+            serde_json::json!({"typeHierarchyProvider": false})
+        )));
+        assert!(!advertises_type_hierarchy(&caps(serde_json::json!({}))));
+    }
+
+    #[test]
+    fn initialize_declares_workspace_diagnostics_under_both_names() {
+        // LSP 3.17 names this capability `workspace.diagnostics`, PLURAL -
+        // the one place the spec pluralises one. `lsp-types` 0.95 emits the
+        // singular, so a spec-conformant server never sees croft's
+        // `refreshSupport` and never sends `workspace/diagnostic/refresh`.
+        // Nothing errors when that happens; the pulled set just never
+        // refreshes, which reads as a slow server (#533).
+        let params = serde_json::json!({
+            "capabilities": {
+                "workspace": {
+                    "diagnostic": { "refreshSupport": true },
+                    "workspaceFolders": true
+                }
+            }
+        });
+        let sent = with_spec_workspace_diagnostics(params);
+        assert_eq!(
+            sent["capabilities"]["workspace"]["diagnostics"]["refreshSupport"],
+            serde_json::json!(true),
+            "the spec name is what a conforming server reads"
+        );
+        assert_eq!(
+            sent["capabilities"]["workspace"]["diagnostic"]["refreshSupport"],
+            serde_json::json!(true),
+            "the lsp-types name stays for the Rust servers built on the same crate"
+        );
+        assert_eq!(
+            sent["capabilities"]["workspace"]["workspaceFolders"],
+            serde_json::json!(true),
+            "nothing else in the capabilities may move"
+        );
+    }
+
+    #[test]
+    fn capabilities_without_the_diagnostic_key_are_passed_through_untouched() {
+        // A server config that ends up with no workspace diagnostics block
+        // must not gain an empty one, and params with no capabilities at all
+        // (the shape a future caller could hand in) must not panic.
+        let bare = serde_json::json!({"capabilities": {"workspace": {"applyEdit": true}}});
+        let sent = with_spec_workspace_diagnostics(bare.clone());
+        assert_eq!(sent, bare);
+        assert_eq!(
+            with_spec_workspace_diagnostics(serde_json::json!({})),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn workspace_diagnostic_refresh_sets_the_repull_flag() {
+        use async_lsp::AnyRequest;
+        use tower::Service;
+        // LSP 3.17: a server that answers PULL diagnostics sends
+        // `workspace/diagnostic/refresh` when a project-wide change (a config
+        // reload, a dependency resolving) invalidates what it last reported.
+        // Declining it leaves the pulled set frozen until something else
+        // forces a re-pull, which reads as a stale PROBLEMS panel rather than
+        // as a missing handler (#533).
+        let sem_flag = Arc::new(AtomicBool::new(false));
+        let inlay_flag = Arc::new(AtomicBool::new(false));
+        let flag = Arc::new(AtomicBool::new(false));
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut router = ClientState::router(
+            "taplo".into(),
+            sem_flag.clone(),
+            inlay_flag.clone(),
+            flag.clone(),
+            diag_tx,
+            prog_tx,
+            Vec::new(),
+            Default::default(),
+        );
+        let req: AnyRequest = serde_json::from_value(json!({
+            "id": 1,
+            "method": "workspace/diagnostic/refresh",
+            "params": null
+        }))
+        .expect("AnyRequest deserialization");
+        let _ = futures::executor::block_on(router.call(req));
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "a workspace/diagnostic/refresh request must set the re-pull flag"
+        );
+        assert!(
+            !sem_flag.load(Ordering::Relaxed) && !inlay_flag.load(Ordering::Relaxed),
+            "the token and hint flags must stay untouched"
+        );
+    }
+
+    /// #1030: the converted diagnostic keeps the server that sent it and
+    /// the diagnostic as sent, for a code-action request to hand back.
+    #[test]
+    fn a_converted_diagnostic_keeps_its_server_and_wire_form() {
+        let wire = lsp_types::Diagnostic {
+            message: "unused".into(),
+            data: Some(serde_json::json!({ "edits": [] })),
+            ..Default::default()
+        };
+        let origin = convert_diagnostic("ruff", &wire)
+            .origin
+            .expect("a published diagnostic has an origin");
+        assert_eq!(origin.server, "ruff");
+        assert_eq!(origin.wire, wire);
+    }
+
+    #[test]
+    fn convert_diagnostic_maps_severity_and_utf16_range() {
+        use lsp_types::{Position, Range};
+        let wire = lsp_types::Diagnostic {
+            range: Range {
+                start: Position {
+                    line: 6,
+                    character: 25,
+                },
+                end: Position {
+                    line: 6,
+                    character: 32,
+                },
+            },
+            severity: Some(LspDiagnosticSeverity::WARNING),
+            message: "Property 'capitol' does not exist".into(),
+            ..Default::default()
+        };
+        let d = convert_diagnostic("srv", &wire);
+        assert_eq!(d.start_line, 6);
+        assert_eq!(d.start_char, 25);
+        assert_eq!(d.end_line, 6);
+        assert_eq!(d.end_char, 32);
+        assert_eq!(d.severity, DiagnosticSeverity::Warning);
+        assert_eq!(d.message, "Property 'capitol' does not exist");
+    }
+
+    #[test]
+    fn convert_diagnostic_defaults_missing_severity_to_error() {
+        use lsp_types::{Position, Range};
+        let wire = lsp_types::Diagnostic {
+            range: Range {
+                start: Position::default(),
+                end: Position::default(),
+            },
+            severity: None,
+            message: "unclassified".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            convert_diagnostic("srv", &wire).severity,
+            DiagnosticSeverity::Error,
+            "an unclassified problem is shown as an error, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn convert_diagnostic_keeps_the_unnecessary_and_deprecated_tags() {
+        let wire = |tags: Option<Vec<lsp_types::DiagnosticTag>>| lsp_types::Diagnostic {
+            severity: Some(LspDiagnosticSeverity::HINT),
+            message: "`ctx` is unused".into(),
+            tags,
+            ..Default::default()
+        };
+        let unused = convert_diagnostic(
+            "srv",
+            &wire(Some(vec![lsp_types::DiagnosticTag::UNNECESSARY])),
+        );
+        assert_eq!(unused.severity, DiagnosticSeverity::Hint);
+        assert!(unused.tags.unnecessary && !unused.tags.deprecated);
+        let old = convert_diagnostic(
+            "srv",
+            &wire(Some(vec![lsp_types::DiagnosticTag::DEPRECATED])),
+        );
+        assert!(old.tags.deprecated && !old.tags.unnecessary);
+        let both = convert_diagnostic(
+            "srv",
+            &wire(Some(vec![
+                lsp_types::DiagnosticTag::DEPRECATED,
+                lsp_types::DiagnosticTag::UNNECESSARY,
+            ])),
+        );
+        assert!(both.tags.deprecated && both.tags.unnecessary);
+    }
+
+    #[test]
+    fn convert_diagnostic_without_tags_or_with_unknown_ones_is_untagged() {
+        let wire = |tags: Option<Vec<lsp_types::DiagnosticTag>>| lsp_types::Diagnostic {
+            severity: Some(LspDiagnosticSeverity::ERROR),
+            message: "type error".into(),
+            tags,
+            ..Default::default()
+        };
+        assert!(!convert_diagnostic("srv", &wire(None)).tags.any());
+        assert!(
+            !convert_diagnostic("srv", &wire(Some(Vec::new())))
+                .tags
+                .any()
+        );
+        let unknown: lsp_types::DiagnosticTag =
+            serde_json::from_value(serde_json::json!(7)).unwrap();
+        assert!(
+            !convert_diagnostic("srv", &wire(Some(vec![unknown])))
+                .tags
+                .any()
+        );
+    }
+
+    /// #1540: the rule code survives the conversion, a string (ruff, ty)
+    /// or a number (TypeScript), with the diagnostic's source and its link.
+    #[test]
+    fn convert_diagnostic_keeps_the_rule_code_source_and_link() {
+        let wire: lsp_types::Diagnostic = serde_json::from_value(json!({
+            "range": { "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 9 } },
+            "severity": 2,
+            "code": "F401",
+            "codeDescription": { "href": "https://docs.astral.sh/ruff/rules/unused-import" },
+            "source": "Ruff",
+            "message": "`os` imported but unused"
+        }))
+        .unwrap();
+        let code = convert_diagnostic("srv", &wire)
+            .code
+            .expect("the code is kept");
+        assert_eq!(code.value, "F401");
+        assert_eq!(code.source.as_deref(), Some("Ruff"));
+        assert_eq!(
+            code.href.as_deref(),
+            Some("https://docs.astral.sh/ruff/rules/unused-import")
+        );
+        assert_eq!(code.label("ruff"), "Ruff(F401)");
+
+        let ts: lsp_types::Diagnostic = serde_json::from_value(json!({
+            "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 1 } },
+            "code": 2322,
+            "message": "Type 'string' is not assignable to type 'number'."
+        }))
+        .unwrap();
+        let code = convert_diagnostic("srv", &ts).code.unwrap();
+        assert_eq!(
+            (code.value.as_str(), code.source, code.href),
+            ("2322", None, None)
+        );
+        assert_eq!(
+            convert_diagnostic("srv", &ts)
+                .code
+                .unwrap()
+                .label("typescript"),
+            "typescript(2322)"
+        );
+    }
+
+    /// #1540 negative: no code, no label; an empty source is no source.
+    #[test]
+    fn convert_diagnostic_without_a_code_has_none() {
+        let wire = lsp_types::Diagnostic {
+            message: "unclassified".into(),
+            source: Some(String::from("rustc")),
+            ..Default::default()
+        };
+        assert_eq!(convert_diagnostic("srv", &wire).code, None);
+        let blank: lsp_types::Diagnostic = serde_json::from_value(json!({
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
+            "code": "E1", "source": "", "message": "m"
+        }))
+        .unwrap();
+        assert_eq!(
+            convert_diagnostic("srv", &blank).code.unwrap().label(""),
+            "E1"
+        );
+    }
+
+    #[test]
+    fn router_continues_past_unhandled_vendor_notification_like_pyright_begin_progress() {
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut router = ClientState::router(
+            "basedpyright".into(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            diag_tx,
+            prog_tx,
+            Vec::new(),
+            Default::default(),
+        );
+        let notif: AnyNotification = serde_json::from_value(json!({
+            "method": "pyright/beginProgress",
+            "params": {}
+        }))
+        .expect("AnyNotification deserialization");
+        match router.notify(notif) {
+            ControlFlow::Continue(()) => {}
+            ControlFlow::Break(result) => {
+                panic!(
+                    "router must absorb vendor-specific notifications (basedpyright streams pyright/beginProgress / pyright/endProgress / pyright/reportProgress during workspace indexing) instead of breaking the mainloop; got Break({result:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn router_continues_past_arbitrary_unhandled_notification_methods() {
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut router = ClientState::router(
+            "any".into(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            diag_tx,
+            prog_tx,
+            Vec::new(),
+            Default::default(),
+        );
+        for method in ["foo/bar", "experimental/dap", "rust-analyzer/serverStatus"] {
+            let notif: AnyNotification = serde_json::from_value(json!({
+                "method": method,
+                "params": {}
+            }))
+            .expect("AnyNotification deserialization");
+            assert!(
+                matches!(router.notify(notif), ControlFlow::Continue(())),
+                "router must absorb the vendor notification {method} instead of killing the mainloop with an Unhandled-notification routing error"
+            );
+        }
+    }
+
+    /// A router for `name` and the receiving end of its update channel.
+    fn router_with_updates(name: &str) -> (Router<ClientState>, std_mpsc::Receiver<ServerUpdate>) {
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, prog_rx) = std_mpsc::channel();
+        let router = ClientState::router(
+            name.into(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            diag_tx,
+            prog_tx,
+            Vec::new(),
+            Default::default(),
+        );
+        (router, prog_rx)
+    }
+
+    fn notify(router: &mut Router<ClientState>, method: &str, params: serde_json::Value) {
+        let notif: AnyNotification =
+            serde_json::from_value(json!({ "method": method, "params": params }))
+                .expect("AnyNotification deserialization");
+        assert!(matches!(router.notify(notif), ControlFlow::Continue(())));
+    }
+
+    fn request(
+        router: &mut Router<ClientState>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> impl std::future::Future<Output = Result<serde_json::Value, async_lsp::ResponseError>>
+    {
+        use tower::Service;
+        let req: async_lsp::AnyRequest =
+            serde_json::from_value(json!({ "id": 7, "method": method, "params": params }))
+                .expect("AnyRequest deserialization");
+        router.call(req)
+    }
+
+    /// rust-analyzer reports a broken Cargo.toml as a `showMessage` Error,
+    /// three times; it must reach the app, not only OUTPUT (#1599).
+    #[test]
+    fn a_show_message_error_reaches_the_app() {
+        let (mut router, rx) = router_with_updates("rust-analyzer");
+        notify(
+            &mut router,
+            "window/showMessage",
+            json!({ "type": 1, "message": "Failed to load workspaces." }),
+        );
+        let update = rx.try_recv().expect("the error is forwarded");
+        assert_eq!(update.server, "rust-analyzer");
+        match update.event {
+            ServerEvent::Message { level, text } => {
+                assert_eq!(level, lsp_types::MessageType::ERROR);
+                assert_eq!(text, "Failed to load workspaces.");
+            }
+            other => panic!("expected a message, got {other:?}"),
+        }
+    }
+
+    /// Chatter stays in OUTPUT: an Info without a link, and every
+    /// `logMessage` whatever its level.
+    #[test]
+    fn plain_notes_and_log_messages_stay_in_output() {
+        let (mut router, rx) = router_with_updates("gopls");
+        notify(
+            &mut router,
+            "window/showMessage",
+            json!({ "type": 3, "message": "Loading packages..." }),
+        );
+        notify(
+            &mut router,
+            "window/logMessage",
+            json!({ "type": 1, "message": "go list failed" }),
+        );
+        assert!(rx.try_recv().is_err(), "nothing is forwarded");
+    }
+
+    /// `window/showMessageRequest` used to be declined with
+    /// MethodNotFound; now the question reaches the app and the pick is
+    /// the answer.
+    #[test]
+    fn a_question_is_answered_with_the_picked_action() {
+        let (mut router, rx) = router_with_updates("gopls");
+        let answer = request(
+            &mut router,
+            "window/showMessageRequest",
+            json!({
+                "type": 2,
+                "message": "go.mod needs updating",
+                "actions": [{ "title": "Update" }, { "title": "Ignore" }]
+            }),
+        );
+        let ServerEvent::Question {
+            text,
+            actions,
+            reply,
+            ..
+        } = rx.try_recv().expect("the question is forwarded").event
+        else {
+            panic!("expected a question");
+        };
+        assert_eq!(text, "go.mod needs updating");
+        let titles: Vec<&str> = actions.iter().map(|a| a.title.as_str()).collect();
+        assert_eq!(titles, ["Update", "Ignore"]);
+        reply.send(Some(actions[0].clone())).unwrap();
+        let answer = futures::executor::block_on(answer).expect("answered");
+        assert_eq!(answer, json!({ "title": "Update" }));
+    }
+
+    #[test]
+    fn a_dismissed_question_is_answered_with_null() {
+        let (mut router, rx) = router_with_updates("gopls");
+        let answer = request(
+            &mut router,
+            "window/showMessageRequest",
+            json!({ "type": 3, "message": "Pick one", "actions": [{ "title": "A" }] }),
+        );
+        drop(rx.try_recv().expect("the question is forwarded"));
+        let answer = futures::executor::block_on(answer).expect("answered");
+        assert_eq!(answer, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn show_document_hands_the_link_or_file_to_the_app() {
+        let (mut router, rx) = router_with_updates("gopls");
+        let reply = request(
+            &mut router,
+            "window/showDocument",
+            json!({ "uri": "https://go.dev/gopls", "external": true }),
+        );
+        match rx.try_recv().expect("forwarded").event {
+            ServerEvent::ShowDocument {
+                uri,
+                external,
+                take_focus,
+                selection,
+                reply: shown,
+            } => {
+                assert_eq!(uri.as_str(), "https://go.dev/gopls");
+                assert!(external);
+                assert!(take_focus, "takeFocus defaults to true");
+                assert!(selection.is_none());
+                shown.send(true).unwrap();
+            }
+            other => panic!("expected a document, got {other:?}"),
+        }
+        assert_eq!(
+            futures::executor::block_on(reply).expect("answered"),
+            json!({ "success": true })
+        );
+        let reply = request(
+            &mut router,
+            "window/showDocument",
+            json!({
+                "uri": "file:///tmp/a.go",
+                "takeFocus": false,
+                "selection": { "start": { "line": 4, "character": 2 }, "end": { "line": 4, "character": 6 } }
+            }),
+        );
+        match rx.try_recv().expect("forwarded").event {
+            ServerEvent::ShowDocument {
+                external,
+                take_focus,
+                selection,
+                ..
+            } => {
+                assert!(!external, "external defaults to false");
+                assert!(!take_focus, "takeFocus: false is carried");
+                assert_eq!(selection.map(|r| r.start.line), Some(4));
+            }
+            other => panic!("expected a document, got {other:?}"),
+        }
+        // The app dropped the reply without showing it: not a success.
+        assert_eq!(
+            futures::executor::block_on(reply).expect("answered"),
+            json!({ "success": false })
+        );
+    }
+
+    #[test]
+    fn workspace_folders_request_is_answered_not_declined() {
+        use async_lsp::AnyRequest;
+        use tower::Service;
+        // LSP 3.6 `workspace/workspaceFolders` is a SERVER->CLIENT request:
+        // a server that saw the workspaceFolders capability may re-query the
+        // folder list at any time. Declining it with MethodNotFound tells a
+        // folder-aware server the list is unavailable and legally degrades
+        // it to single-root behavior.
+        let sem_flag = Arc::new(AtomicBool::new(false));
+        let inlay_flag = Arc::new(AtomicBool::new(false));
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut router = ClientState::router(
+            "rust-analyzer".into(),
+            sem_flag,
+            inlay_flag,
+            Arc::new(AtomicBool::new(false)),
+            diag_tx,
+            prog_tx,
+            vec![WorkspaceFolder {
+                uri: Url::from_file_path("/tmp/ws").unwrap(),
+                name: "ws".into(),
+            }],
+            Default::default(),
+        );
+        let req: AnyRequest = serde_json::from_value(json!({
+            "id": 1,
+            "method": "workspace/workspaceFolders",
+            "params": null
+        }))
+        .expect("AnyRequest deserialization");
+        let out = futures::executor::block_on(router.call(req));
+        let value = out
+            .expect("the client must answer workspace/workspaceFolders with its folder list, not decline it");
+        assert_eq!(
+            value,
+            json!([{ "uri": "file:///tmp/ws", "name": "ws" }]),
+            "the reply is the same folder list initialize carried"
+        );
+    }
+
+    fn server_on_path(cmd: &str) -> bool {
+        let Some(path) = std::env::var_os("PATH") else {
+            return false;
+        };
+        for entry in std::env::split_paths(&path) {
+            let candidate = entry.join(cmd);
+            if !candidate.is_file() {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&candidate)
+                    && meta.permissions().mode() & 0o111 != 0
+                {
+                    return true;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn first_available_python_server() -> Option<ServerConfig> {
+        if server_on_path("basedpyright-langserver") {
+            Some(ServerConfig::basedpyright())
+        } else if server_on_path("pyright-langserver") {
+            Some(ServerConfig::pyright())
+        } else {
+            None
+        }
+    }
+
+    fn run_initialize_shutdown(config: ServerConfig) {
+        // The tempdir comes first because the probe has to run in the SAME
+        // working directory the real spawn will use; see `server_runs_here`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize tempdir");
+        if let Err(reason) = server_runs_here(&config, &root) {
+            eprintln!(
+                "SKIPPED: {} does not run on this machine: {reason}",
+                config.command
+            );
+            return;
+        }
+        let rt = LspRuntime::new().expect("runtime");
+        let display_name = config.name;
+
+        let result: Result<()> = rt.handle().block_on(async move {
+            let (diag_tx, _diag_rx) = std_mpsc::channel();
+            let (prog_tx, _prog_rx) = std_mpsc::channel();
+            let mut client = LspClient::spawn(
+                &config,
+                &root,
+                ClientCapabilities::default(),
+                &[],
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                diag_tx,
+                prog_tx,
+            )
+            .await?;
+            client.shutdown().await
+        });
+
+        if let Err(e) = result {
+            // The machine question was already answered above, so a failure
+            // here is croft's handshake, not this box (#545).
+            panic!("{display_name} runs on this machine, but the handshake failed: {e:#}");
+        }
+    }
+
+    /// Whether this machine can actually RUN the server, asked BEFORE the
+    /// handshake (#545). `Err` carries the reason, so the skip can say it.
+    ///
+    /// Classifying the handshake ERROR instead does not work, and the
+    /// re-break proved it: feeding rust-analyzer malformed `initialize`
+    /// params makes it EXIT rather than reply, which arrives as
+    /// `ServiceStopped` - the same thing a rustup shim whose toolchain lacks
+    /// the component produces. The two states are indistinguishable after the
+    /// fact, so the environment question has to be settled first, and then any
+    /// handshake failure is a failure.
+    ///
+    /// A server that exits without being spoken to cannot serve croft here: a
+    /// real one blocks reading stdin. That is what separates "installed" from
+    /// "runnable", which `server_on_path` (a file that exists and is +x)
+    /// cannot see.
+    ///
+    /// `workspace_root` is not decoration. `LspClient::spawn` runs the server
+    /// with `current_dir(workspace_root)`, and for a rustup shim the cwd is
+    /// what SELECTS the toolchain: probing from the repo (whose
+    /// `rust-toolchain.toml` pins a channel carrying the `rust-analyzer`
+    /// component) while the real spawn runs in a tempdir (where the default
+    /// channel may not carry it) answers a different question and turns a
+    /// machine fact into a panic blaming croft. Reproduced on a box where
+    /// `RUSTUP_TOOLCHAIN` was not exported.
+    fn server_runs_here(config: &ServerConfig, workspace_root: &Path) -> Result<(), String> {
+        let mut child = std::process::Command::new(&config.command)
+            .args(&config.args)
+            .current_dir(workspace_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // Kept rather than discarded: when the answer is "cannot run
+            // here", this is the only evidence of WHY, and the skip line is
+            // where it belongs.
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn failed: {e}"))?;
+        // Never a fresh constant: what decides whether a launch failure has
+        // printed and exited yet is suite contention, not this server
+        // (CONTRIBUTING, "Waiting on a spawned process in a test"). Node
+        // servers like basedpyright-langserver are exactly the case a fixed
+        // budget turns into a coin flip.
+        std::thread::sleep(crate::test_budget::spawn_budget(
+            std::time::Duration::from_millis(200),
+        ));
+        let probed = child.try_wait();
+        // Kill and reap on EVERY path, including the unexpected one: unwinding
+        // straight out of the match left the server running for the rest of
+        // the test binary.
+        let _ = child.kill();
+        let _ = child.wait();
+        let exited = match probed {
+            Ok(None) => None,
+            Ok(Some(status)) => Some(status),
+            // Not an answer to the question asked, so it must not spend the
+            // skip exit - that is the #545 shape all over again.
+            Err(e) => panic!("try_wait on {}: {e}", config.command),
+        };
+        let Some(status) = exited else {
+            return Ok(());
+        };
+        Err(match child.stderr.take() {
+            // Read on a thread with a deadline. A pipe reaches EOF only when
+            // EVERY write end closes, not when the direct child exits, so a
+            // launcher that forks and exits leaves its grandchild holding this
+            // one - and a plain `read_to_string` there hangs forever inside a
+            // test the CI workflow puts no `timeout-minutes` on. No configured
+            // server forks today; the helper is generic over `ServerConfig`.
+            Some(mut err) => {
+                let (tx, rx) = std_mpsc::channel();
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut said = String::new();
+                    let _ = err.read_to_string(&mut said);
+                    let _ = tx.send(said);
+                });
+                match rx.recv_timeout(crate::test_budget::spawn_budget(
+                    std::time::Duration::from_millis(200),
+                )) {
+                    Ok(said) if !said.trim().is_empty() => {
+                        format!("exited {status} before the handshake: {}", said.trim())
+                    }
+                    _ => format!("exited {status} before the handshake"),
+                }
+            }
+            None => format!("exited {status} before the handshake"),
+        })
+    }
+
+    #[test]
+    fn the_probe_separates_a_process_that_stays_alive_from_one_that_exits() {
+        // The probe rests on the child's stdin staying an OPEN PIPE: a
+        // refactor that dropped or closed it would make every server see EOF
+        // and exit, every test would skip, and #545 would be back with
+        // nothing to see. Degenerate fixtures pin it without a server.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut blocks = ServerConfig::ruff();
+        blocks.command = "cat".into();
+        blocks.args = Vec::new();
+        assert!(
+            server_runs_here(&blocks, tmp.path()).is_ok(),
+            "a process that sits reading stdin is what a real server looks like"
+        );
+
+        let mut exits = blocks.clone();
+        exits.command = "true".into();
+        let reason = server_runs_here(&exits, tmp.path())
+            .expect_err("a process that exits at once cannot serve croft here");
+        assert!(
+            reason.contains("before the handshake"),
+            "the skip must be able to say why, got {reason:?}"
+        );
+
+        let mut missing = blocks.clone();
+        missing.command = "croft-no-such-language-server".into();
+        assert!(
+            server_runs_here(&missing, tmp.path())
+                .expect_err("a command that cannot be launched")
+                .contains("spawn failed"),
+            "a missing binary is the ordinary skip, not a panic"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "handshake failed")]
+    fn a_server_that_runs_but_never_answers_initialize_fails_the_test() {
+        // The whole point of #545: a process that passes the probe and then
+        // does not speak LSP must FAIL, not skip. On main this passes
+        // silently, which is the bug.
+        let mut stub = ServerConfig::ruff();
+        stub.name = "stub";
+        stub.command = "sh".into();
+        // Derived, not a constant: the stub has to outlive the PROBE to reach
+        // the handshake at all. Hard-coding seconds couples this test to
+        // `spawn_budget`'s scaling factors, and raising either one silently
+        // turns the failure into "did not panic" - a message about the wrong
+        // thing entirely.
+        let outlives_the_probe =
+            crate::test_budget::spawn_budget(std::time::Duration::from_millis(200)) * 3;
+        stub.args = vec![
+            "-c".into(),
+            format!("sleep {}", outlives_the_probe.as_secs_f32().ceil()),
+        ];
+        run_initialize_shutdown(stub);
+    }
+
+    #[test]
+    fn initialize_and_shutdown_python_server() {
+        let Some(config) = first_available_python_server() else {
+            eprintln!("SKIPPED: no basedpyright/pyright on PATH");
+            return;
+        };
+        run_initialize_shutdown(config);
+    }
+
+    #[test]
+    fn initialize_and_shutdown_rust_analyzer() {
+        if !server_on_path("rust-analyzer") {
+            eprintln!("SKIPPED: rust-analyzer not on PATH");
+            return;
+        }
+        run_initialize_shutdown(ServerConfig::rust_analyzer());
+    }
+
+    #[test]
+    fn initialize_and_shutdown_ruff_server() {
+        if !server_on_path("ruff") {
+            eprintln!("SKIPPED: ruff not on PATH");
+            return;
+        }
+        run_initialize_shutdown(ServerConfig::ruff());
+    }
+}

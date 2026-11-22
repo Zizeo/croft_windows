@@ -1,0 +1,908 @@
+//! Agent lanes (#344): which terminal panes are running a coding agent,
+//! which one, and whether it is working, waiting for the user, or idle.
+//!
+//! Claude Code, Codex CLI, aider, gemini-cli and Crush all run in a pane, so
+//! croft is already where the agents live; everything in the agent-cockpit
+//! series starts from knowing that. The foreground process of every pane is
+//! already sampled for the name pill, so an agent is recognised from that
+//! name against a small table — built in, extended by `agents.json` in the
+//! config directory without a rebuild.
+//!
+//! Its status is the agent's own word when it gives one: Claude Code and
+//! Crush report idle, working, blocked or done over OSC 7501
+//! ([`crate::program_status`]), read by [`reported`]. An agent that has not
+//! reported is judged by [`judge`] from two things the pane already has: how
+//! long since it last produced output, and what its last screen rows say. An
+//! agent that stays in the foreground never emits OSC 133 marks, which is
+//! why "waiting" cannot come from the shell integration.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use regex::Regex;
+
+/// Whether a foreground process is a script runtime (#1380), whose name
+/// says nothing about what it runs: Codex CLI and Gemini CLI installed with
+/// npm run as `node`. Only these pay the argv read [`script_name`] needs.
+/// Newer Node names its main thread `MainThread`, and on Linux the main
+/// thread's name is the process name, so that is Node too.
+pub fn is_script_runtime(process_name: &str) -> bool {
+    let base = process_name.rsplit('/').next().unwrap_or(process_name);
+    let base = base.trim().to_lowercase();
+    matches!(
+        base.as_str(),
+        "node" | "nodejs" | "mainthread" | "bun" | "deno"
+    ) || base
+        .strip_prefix("python")
+        .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
+}
+
+/// The script a runtime's `argv` runs, by basename less a script extension:
+/// `node ~/.npm-global/bin/gemini` is `gemini`, `node …/codex/bin/codex.js`
+/// is `codex`, `bun run ./gemini.ts` is `gemini`, and `python -m aider` is
+/// `aider`. Runtime flags are skipped, with the value of those that take one
+/// (`--require x`, Python's `-X dev`); `None` for code passed with `-e`/`-c`
+/// or a bare REPL.
+pub fn script_name(argv: &[String]) -> Option<String> {
+    // bun and deno run a file through their `run` subcommand.
+    let runtime = argv.first().map(|a| a.rsplit('/').next().unwrap_or(a));
+    let mut run_subcommand = runtime.is_some_and(|r| r == "bun" || r == "deno");
+    let mut args = argv.iter().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-e" | "--eval" | "-p" | "--print" | "-c" => return None,
+            "-m" => return args.next().map(|m| m.trim().to_lowercase()),
+            "-r"
+            | "--require"
+            | "--import"
+            | "--loader"
+            | "--experimental-loader"
+            | "-C"
+            | "--conditions"
+            | "-X"
+            | "-W"
+            | "--cwd" => {
+                args.next();
+            }
+            a if a.starts_with('-') => {}
+            "run" if run_subcommand => run_subcommand = false,
+            script => {
+                let base = Path::new(script).file_name()?.to_string_lossy();
+                let stem = [".js", ".mjs", ".cjs", ".ts", ".mts", ".py"]
+                    .iter()
+                    .find_map(|ext| base.strip_suffix(ext))
+                    .unwrap_or(&base);
+                let stem = stem.trim().to_lowercase();
+                return (!stem.is_empty()).then_some(stem);
+            }
+        }
+    }
+    None
+}
+
+/// An agent's prompt regexes. The built-in agents' are compiled the first
+/// time a screen is read for them, or by [`prewarm_builtin`] at launch,
+/// whichever comes first, and every copy of the table shares that one
+/// compile: building them was a sixth of what a launch did before its first
+/// frame, for a check that runs only once an agent is in a pane. Rows from
+/// `agents.json` compile when they load, so a broken pattern is counted.
+#[derive(Debug, Clone)]
+pub struct Prompts(std::sync::Arc<PromptsInner>);
+
+#[derive(Debug)]
+struct PromptsInner {
+    patterns: Vec<String>,
+    compiled: std::sync::OnceLock<Vec<Regex>>,
+}
+
+impl Prompts {
+    /// Patterns compiled when first read; one that does not compile is left
+    /// out.
+    fn lazy(patterns: &[&str]) -> Self {
+        Self(std::sync::Arc::new(PromptsInner {
+            patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
+            compiled: std::sync::OnceLock::new(),
+        }))
+    }
+
+    fn compiled(regexes: Vec<Regex>) -> Self {
+        Self(std::sync::Arc::new(PromptsInner {
+            patterns: Vec::new(),
+            compiled: std::sync::OnceLock::from(regexes),
+        }))
+    }
+
+    pub fn regexes(&self) -> &[Regex] {
+        self.0.compiled.get_or_init(|| {
+            self.0
+                .patterns
+                .iter()
+                .filter_map(|p| Regex::new(p).ok())
+                .collect()
+        })
+    }
+}
+
+/// One recognised agent: the badge it wears, the process names that mean
+/// it, and the prompt shapes that mean it is waiting on the user.
+#[derive(Debug, Clone)]
+pub struct AgentKind {
+    /// The badge text (`claude`).
+    pub name: String,
+    /// Foreground process names, matched case-insensitively against the
+    /// sampled name's basename.
+    pub process: Vec<String>,
+    /// Regexes a recent screen row matches when the agent is waiting for
+    /// input: a permission question, a `>` prompt, a Y/n.
+    pub prompt: Prompts,
+    /// The command line a new worktree lane starts this agent with (#348):
+    /// typed into the lane's fresh shell. The built-ins launch as their own
+    /// name; a row may set its own (`claude --model opus`). A NEW row
+    /// without one opens a plain shell, while a row that replaces a
+    /// built-in and OMITS it keeps the built-in's command (such rows
+    /// usually exist to fix a prompt pattern, not to unteach the launch);
+    /// a blank `launch` on such a row is the explicit way to unteach it.
+    pub launch: Option<String>,
+}
+
+/// What an agent in a pane is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentStatus {
+    /// Output is still flowing.
+    Working,
+    /// Quiet, and the last rows look like a prompt for the user.
+    Waiting,
+    /// Quiet, and nothing on screen asks for anything.
+    Idle,
+}
+
+impl AgentStatus {
+    /// The glyph the pane pill and the status chip show beside the name.
+    pub fn glyph(self) -> char {
+        match self {
+            AgentStatus::Working => '\u{25cf}', // ● output flowing
+            AgentStatus::Waiting => '\u{25d0}', // ◐ waiting on you
+            AgentStatus::Idle => '\u{25cb}',    // ○ quiet
+        }
+    }
+}
+
+/// An agent seated in a pane, as the pane carries it between samples.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLane {
+    pub name: String,
+    pub status: AgentStatus,
+}
+
+/// The transitions the rest of the cockpit consumes (#345, #358, #347).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentEvent {
+    /// An agent appeared in the pane.
+    Seated { pane: String, agent: String },
+    /// It went from quiet to producing output.
+    Working { pane: String, agent: String },
+    /// It stopped and its screen asks for the user: once per prompt.
+    Waiting { pane: String, agent: String },
+    /// It is no longer the pane's foreground process.
+    Gone { pane: String, agent: String },
+}
+
+/// No output for this long is "quiet"; a sample inside it is Working.
+pub const QUIET_AFTER: Duration = Duration::from_secs(3);
+
+/// The user-editable table beside the other config files.
+pub fn agents_path() -> PathBuf {
+    crate::paths::config_dir().join("agents.json")
+}
+
+/// Starter `agents.json`, seeded on first open. Rows here EXTEND the
+/// built-in table; a row whose `name` matches a built-in replaces it.
+pub const TEMPLATE: &str = r##"// croft agent lanes: which foreground processes are coding agents, and what
+// their screen looks like when they are waiting for you (#344).
+//
+// Built in: claude, codex, aider, gemini, crush. Add a row to teach croft another
+// agent without a rebuild; a row named like a built-in replaces it.
+//   name:    the badge shown on the pane pill
+//   process: foreground process names that mean this agent
+//   prompt:  regexes a recent screen row matches when it is waiting on you
+//   launch:  the command a new worktree lane (Cmd+K Shift+L) starts the agent
+//            with, when `lane_agent` in settings.json names this row (#348);
+//            the built-ins launch as their own name; a NEW row without one
+//            opens a plain shell, while a row replacing a built-in keeps the
+//            built-in's command unless it sets its own or a blank one
+[
+  // { "name": "goose", "process": ["goose"], "prompt": ["^\\s*>\\s*$", "\\(y/n\\)"], "launch": "goose" }
+]
+"##;
+
+/// One raw `agents.json` row.
+#[derive(serde::Deserialize)]
+struct AgentRow {
+    name: String,
+    #[serde(default)]
+    process: Vec<String>,
+    #[serde(default)]
+    prompt: Vec<String>,
+    #[serde(default)]
+    launch: Option<String>,
+}
+
+/// The table of agents croft recognises.
+#[derive(Debug, Clone, Default)]
+pub struct AgentTable {
+    kinds: Vec<AgentKind>,
+    /// `agents.json` prompt patterns that did not compile and were dropped,
+    /// so the reload status can say so instead of an agent that silently
+    /// never reads as waiting.
+    dropped_patterns: usize,
+}
+
+static BUILTIN: std::sync::LazyLock<AgentTable> = std::sync::LazyLock::new(AgentTable::new_builtin);
+
+/// Compile the built-in agents' prompt regexes now, so the first agent a
+/// pane runs finds them ready. Startup calls this on a thread of its own.
+pub fn prewarm_builtin() {
+    for kind in &BUILTIN.kinds {
+        kind.prompt.regexes();
+    }
+}
+
+fn kind(name: &str, process: &[&str], prompt: &[&str]) -> AgentKind {
+    AgentKind {
+        name: name.to_string(),
+        process: process.iter().map(|p| p.to_string()).collect(),
+        prompt: Prompts::lazy(prompt),
+        // Each built-in is started by the command that is also its name.
+        launch: Some(name.to_string()),
+    }
+}
+
+impl AgentTable {
+    /// The agents croft knows without any configuration; every copy shares
+    /// one compile of their prompt regexes (see [`Prompts`]).
+    pub fn builtin() -> Self {
+        BUILTIN.clone()
+    }
+
+    fn new_builtin() -> Self {
+        // The prompt shapes are what each agent prints when it stops for the
+        // user, anchored to the affordance rather than to a word: a bare
+        // `Allow` or a trailing `?` matched ordinary output ("Allowed
+        // origins: …", a rhetorical question in prose) and read as waiting.
+        let yes_no = ["\\(y/n\\)", "\\[Y/n\\]", "\\[y/N\\]"];
+        let claude = [
+            "Do you want to.*\\?",
+            "Esc to cancel",
+            "^\\s*\u{276f}\\s*\\d+\\.\\s",
+            "^\\s*[>\u{276f}]\\s*$",
+        ];
+        let codex = [
+            "^\\s*Allow command",
+            "^\\s*[\u{276f}\u{203a}]\\s*\\d+\\.\\s",
+            "^\\s*[>\u{276f}\u{203a}]\\s*$",
+        ];
+        let aider = ["^\\s*[>\u{276f}]\\s*$", "\\(Y\\)es"];
+        let gemini = [
+            "^\\s*[>\u{276f}\u{203a}]\\s*$",
+            "^\\s*(Allow|Approve).*\\?\\s*$",
+        ];
+        fn with<'a>(own: &[&'a str], yes_no: &[&'a str]) -> Vec<&'a str> {
+            own.iter().chain(yes_no.iter()).copied().collect()
+        }
+        Self {
+            kinds: vec![
+                kind("claude", &["claude"], &with(&claude, &yes_no)),
+                kind("codex", &["codex"], &with(&codex, &yes_no)),
+                kind("aider", &["aider"], &with(&aider, &yes_no)),
+                kind("gemini", &["gemini"], &with(&gemini, &yes_no)),
+                // Crush reports its status over OSC 7501 (0.98 and later),
+                // so it has no screen shapes to fall back on.
+                kind("crush", &["crush"], &[]),
+            ],
+            dropped_patterns: 0,
+        }
+    }
+
+    /// The built-in table plus whatever `path` adds; a missing or broken file
+    /// is the built-in table alone, never a failed start.
+    pub fn load(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(json) => Self::from_json(&json),
+            Err(_) => Self::builtin(),
+        }
+    }
+
+    /// The built-in table extended by rows from `agents.json` text. A row
+    /// named like a built-in replaces it; a row with no usable regex still
+    /// badges the pane (it just never reads as waiting).
+    pub fn from_json(json: &str) -> Self {
+        // Row by row, so one malformed row (or a trailing comma) no longer
+        // drops every agent the user added.
+        let rows: Vec<AgentRow> =
+            serde_json::from_str::<Vec<serde_json::Value>>(&crate::jsonc::strip_jsonc(json))
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|r| serde_json::from_value(r).ok())
+                .collect();
+        let mut table = Self::builtin();
+        for row in rows {
+            let name = row.name.trim().to_lowercase();
+            if name.is_empty() {
+                continue;
+            }
+            let process: Vec<String> = if row.process.is_empty() {
+                vec![name.clone()]
+            } else {
+                row.process
+                    .iter()
+                    .map(|p| p.trim().to_lowercase())
+                    .collect()
+            };
+            let mut prompt: Vec<Regex> = Vec::with_capacity(row.prompt.len());
+            for pat in &row.prompt {
+                match Regex::new(pat) {
+                    Ok(re) => prompt.push(re),
+                    Err(_) => table.dropped_patterns += 1,
+                }
+            }
+            // Omitted and blank are different answers: a row that says
+            // nothing about launching has no opinion, a row that says
+            // `"launch": ""` is asking for no command.
+            let launch_omitted = row.launch.is_none();
+            let launch = row
+                .launch
+                .as_deref()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string);
+            match table.kinds.iter_mut().find(|k| k.name == name) {
+                Some(existing) => {
+                    // A row that replaces a built-in but says nothing about
+                    // launching keeps the built-in's command: the row is
+                    // usually there to fix a prompt pattern, not to unteach
+                    // croft how to start the agent. A blank one is the
+                    // explicit way to unteach it.
+                    let launch = if launch_omitted {
+                        existing.launch.clone()
+                    } else {
+                        launch
+                    };
+                    *existing = AgentKind {
+                        name: name.clone(),
+                        process,
+                        prompt: Prompts::compiled(prompt),
+                        launch,
+                    };
+                }
+                None => table.kinds.push(AgentKind {
+                    name: name.clone(),
+                    process,
+                    prompt: Prompts::compiled(prompt),
+                    launch,
+                }),
+            }
+        }
+        table
+    }
+
+    /// The agent a foreground process name means, if any. The name may be a
+    /// path (`/opt/homebrew/bin/claude`) and any case.
+    pub fn classify(&self, process_name: &str) -> Option<&AgentKind> {
+        let base = process_name
+            .rsplit('/')
+            .next()
+            .unwrap_or(process_name)
+            .trim()
+            .to_lowercase();
+        if base.is_empty() {
+            return None;
+        }
+        self.kinds
+            .iter()
+            .find(|k| k.process.iter().any(|p| p.eq_ignore_ascii_case(&base)))
+    }
+
+    /// The name a pane's foreground process is classified by (#1380): the
+    /// script a runtime runs ([`script_name`]) when that names an agent, so
+    /// `node …/bin/gemini` is gemini; else the process's own name, so a row
+    /// that names the runtime itself still matches.
+    pub fn sample_name<'a>(&self, process_name: &'a str, script: Option<&'a str>) -> &'a str {
+        script
+            .filter(|s| self.classify(s).is_some())
+            .unwrap_or(process_name)
+    }
+
+    pub fn names(&self) -> Vec<&str> {
+        self.kinds.iter().map(|k| k.name.as_str()).collect()
+    }
+
+    /// The command a worktree lane starts `agent` with (#348), by row name
+    /// in any case; `None` for an unknown agent or a row with no launch line.
+    pub fn launch_line(&self, agent: &str) -> Option<&str> {
+        let want = agent.trim();
+        self.kinds
+            .iter()
+            .find(|k| k.name.eq_ignore_ascii_case(want))
+            .and_then(|k| k.launch.as_deref())
+    }
+
+    /// How many `agents.json` prompt patterns failed to compile.
+    pub fn dropped_patterns(&self) -> usize {
+        self.dropped_patterns
+    }
+}
+
+/// What an agent is doing, by its own OSC 7501 report. Blocked, done and
+/// error all hand the turn back to the user, as a prompt on screen does.
+pub fn reported(state: crate::program_status::State) -> AgentStatus {
+    use crate::program_status::State;
+    match state {
+        State::Working => AgentStatus::Working,
+        State::Blocked | State::Done | State::Error => AgentStatus::Waiting,
+        State::Idle => AgentStatus::Idle,
+    }
+}
+
+/// What an agent that has not reported is doing, from how long its pane has
+/// been quiet and what its last screen rows say. `quiet_after` is the threshold ([`QUIET_AFTER`]
+/// in the app; tests pass 0 to judge the screen alone).
+pub fn judge(
+    kind: &AgentKind,
+    quiet_for: Duration,
+    last_rows: &[String],
+    quiet_after: Duration,
+) -> AgentStatus {
+    if quiet_for < quiet_after {
+        return AgentStatus::Working;
+    }
+    let asks = last_rows
+        .iter()
+        .rev()
+        .filter(|r| !r.trim().is_empty())
+        .take(6)
+        .any(|row| kind.prompt.regexes().iter().any(|re| re.is_match(row)));
+    if asks {
+        AgentStatus::Waiting
+    } else {
+        AgentStatus::Idle
+    }
+}
+
+/// The events one sample produces for a pane, given what it carried before
+/// and what it carries now. `Waiting` fires only on the way INTO waiting, so
+/// a prompt that sits on screen across many samples notifies once.
+pub fn transition(
+    pane: &str,
+    prev: Option<&AgentLane>,
+    next: Option<&AgentLane>,
+) -> Vec<AgentEvent> {
+    let pane = pane.to_string();
+    match (prev, next) {
+        (None, None) => Vec::new(),
+        (None, Some(n)) => {
+            let mut ev = vec![AgentEvent::Seated {
+                pane: pane.clone(),
+                agent: n.name.clone(),
+            }];
+            if n.status == AgentStatus::Waiting {
+                ev.push(AgentEvent::Waiting {
+                    pane,
+                    agent: n.name.clone(),
+                });
+            }
+            ev
+        }
+        (Some(p), None) => vec![AgentEvent::Gone {
+            pane,
+            agent: p.name.clone(),
+        }],
+        (Some(p), Some(n)) if p.name != n.name => {
+            let mut ev = vec![
+                AgentEvent::Gone {
+                    pane: pane.clone(),
+                    agent: p.name.clone(),
+                },
+                AgentEvent::Seated {
+                    pane: pane.clone(),
+                    agent: n.name.clone(),
+                },
+            ];
+            if n.status == AgentStatus::Waiting {
+                ev.push(AgentEvent::Waiting {
+                    pane,
+                    agent: n.name.clone(),
+                });
+            }
+            ev
+        }
+        (Some(p), Some(n)) => match (p.status, n.status) {
+            (a, b) if a == b => Vec::new(),
+            (_, AgentStatus::Waiting) => vec![AgentEvent::Waiting {
+                pane,
+                agent: n.name.clone(),
+            }],
+            (_, AgentStatus::Working) => vec![AgentEvent::Working {
+                pane,
+                agent: n.name.clone(),
+            }],
+            (_, AgentStatus::Idle) => Vec::new(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rows(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_builtin_table_recognises_the_five_agents_by_name_or_path() {
+        let t = AgentTable::builtin();
+        assert_eq!(t.names(), ["claude", "codex", "aider", "gemini", "crush"]);
+        for (proc_name, want) in [
+            ("claude", "claude"),
+            ("/opt/homebrew/bin/claude", "claude"),
+            ("Codex", "codex"),
+            ("aider", "aider"),
+            ("gemini", "gemini"),
+            ("/usr/local/bin/crush", "crush"),
+        ] {
+            assert_eq!(
+                t.classify(proc_name).map(|k| k.name.as_str()),
+                Some(want),
+                "{proc_name}"
+            );
+        }
+        for not in ["zsh", "node", "cargo", "", "claudette", "/usr/bin/vim"] {
+            assert!(t.classify(not).is_none(), "{not:?} is not an agent");
+        }
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// #1380: Codex CLI and Gemini CLI installed with npm run as `node`. The
+    /// script node runs names them; other node programs stay unbadged, and
+    /// a native binary is classified by its own name without an argv read.
+    #[test]
+    fn an_agent_run_by_a_script_runtime_is_recognised_by_its_script() {
+        let t = AgentTable::builtin();
+        let who = |name: &str, args: &[&str]| {
+            let script = is_script_runtime(name)
+                .then(|| script_name(&argv(args)))
+                .flatten();
+            t.classify(t.sample_name(name, script.as_deref()))
+                .map(|k| k.name.clone())
+        };
+        assert_eq!(
+            who("node", &["node", "/home/u/.npm-global/bin/gemini"]).as_deref(),
+            Some("gemini")
+        );
+        assert_eq!(
+            who(
+                "node",
+                &[
+                    "/usr/bin/node",
+                    "/usr/lib/node_modules/@openai/codex/bin/codex.js"
+                ]
+            )
+            .as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            who(
+                "node",
+                &[
+                    "node",
+                    "--no-warnings",
+                    "--require",
+                    "./hook.js",
+                    "/u/bin/gemini"
+                ]
+            )
+            .as_deref(),
+            Some("gemini"),
+            "flags, and a flag's value, are not the script"
+        );
+        assert_eq!(
+            who("python3", &["python3", "-m", "aider"]).as_deref(),
+            Some("aider")
+        );
+        // The forms review found: a runtime's `run` subcommand, and Python
+        // options whose value is a separate word.
+        for (name, args, want) in [
+            ("bun", &["bun", "run", "./gemini.ts"][..], "gemini"),
+            (
+                "bun",
+                &["bun", "--cwd", "/w", "run", "/u/bin/codex"],
+                "codex",
+            ),
+            ("deno", &["deno", "run", "-A", "/u/gemini.ts"], "gemini"),
+            ("python3", &["python3", "-X", "dev", "-m", "aider"], "aider"),
+            (
+                "python3",
+                &["python3", "-W", "default", "/u/bin/aider"],
+                "aider",
+            ),
+        ] {
+            assert_eq!(who(name, args).as_deref(), Some(want), "{args:?}");
+        }
+        assert_eq!(who("bun", &["bun", "run", "dev"]), None, "a package script");
+        for (name, args) in [
+            ("node", &["node", "vite.js"][..]),
+            ("node", &["node", "server.js"]),
+            ("node", &["node", "-e", "require('gemini')"]),
+            ("node", &["node"]),
+            ("python3.12", &["python3.12", "manage.py", "runserver"]),
+        ] {
+            assert_eq!(who(name, args), None, "{args:?} is not an agent");
+        }
+        // Newer Node renames its main thread, and with it the process.
+        assert_eq!(
+            who("MainThread", &["node", "/u/.npm-global/bin/gemini"]).as_deref(),
+            Some("gemini")
+        );
+        assert_eq!(
+            who(
+                "MainThread",
+                &["/usr/bin/node", "/u/lib/codex/bin/codex.js"]
+            )
+            .as_deref(),
+            Some("codex")
+        );
+        // A native binary never asks for argv.
+        assert!(!is_script_runtime("claude") && !is_script_runtime("codex"));
+        assert!(is_script_runtime("/usr/bin/node") && is_script_runtime("python3.12"));
+        assert!(!is_script_runtime("pythonista"));
+        assert_eq!(who("claude", &[]).as_deref(), Some("claude"));
+    }
+
+    /// #1380: a row that names the runtime itself, the old workaround,
+    /// still badges its panes when the script names no agent.
+    #[test]
+    fn a_row_naming_the_runtime_still_matches_a_script_that_is_no_agent() {
+        let t = AgentTable::from_json(r#"[{ "name": "mybot", "process": ["node"] }]"#);
+        assert_eq!(t.sample_name("node", Some("vite")), "node");
+        assert_eq!(
+            t.classify(t.sample_name("node", Some("vite")))
+                .map(|k| k.name.as_str()),
+            Some("mybot")
+        );
+        assert_eq!(t.sample_name("node", Some("gemini")), "gemini");
+    }
+
+    #[test]
+    fn agents_json_extends_the_table_without_a_rebuild_and_can_replace_a_builtin() {
+        let t = AgentTable::from_json(
+            r#"// a comment
+            [
+              { "name": "goose", "process": ["goose", "goose-cli"], "prompt": ["^\\s*>\\s*$"] },
+              { "name": "claude", "process": ["claude", "claude-code"], "prompt": ["Proceed\\?"] }
+            ]"#,
+        );
+        assert_eq!(
+            t.classify("goose-cli").map(|k| k.name.as_str()),
+            Some("goose")
+        );
+        let claude = t
+            .classify("claude-code")
+            .expect("the replaced row matches its new process");
+        assert_eq!(claude.name, "claude");
+        assert_eq!(
+            claude.prompt.regexes().len(),
+            1,
+            "the row replaced the built-in prompts"
+        );
+        assert_eq!(t.names().len(), 6);
+        assert_eq!(t.dropped_patterns(), 0);
+        let bad = AgentTable::from_json(r#"[{ "name": "x", "prompt": ["(unclosed", "ok"] }]"#);
+        assert_eq!(
+            bad.dropped_patterns(),
+            1,
+            "a pattern that does not compile is counted"
+        );
+        assert_eq!(bad.classify("x").unwrap().prompt.regexes().len(), 1);
+        // A broken file is the built-in table, not a failed start.
+        assert_eq!(AgentTable::from_json("{ not json").names().len(), 5);
+        assert_eq!(
+            AgentTable::load(Path::new("/definitely/missing.json"))
+                .names()
+                .len(),
+            5
+        );
+        // TEMPLATE parses (comments stripped) to zero rows.
+        assert_eq!(AgentTable::from_json(TEMPLATE).names().len(), 5);
+    }
+
+    #[test]
+    fn a_row_can_name_the_command_a_lane_starts_the_agent_with() {
+        // The built-ins launch as their own name; a row sets its own, a row
+        // replacing a built-in without one keeps the built-in's, a blank one
+        // is none, and lookup is by row name in any case.
+        let t = AgentTable::builtin();
+        assert_eq!(t.launch_line("claude"), Some("claude"));
+        assert_eq!(t.launch_line("Codex"), Some("codex"), "any case");
+        assert_eq!(t.launch_line("goose"), None, "unknown agent");
+        let t = AgentTable::from_json(
+            r#"[
+              { "name": "goose", "launch": "  goose session --resume " },
+              { "name": "claude", "prompt": ["Proceed\\?"] },
+              { "name": "quiet", "launch": "   " }
+            ]"#,
+        );
+        assert_eq!(
+            t.launch_line("goose"),
+            Some("goose session --resume"),
+            "trimmed"
+        );
+        assert_eq!(
+            t.launch_line("claude"),
+            Some("claude"),
+            "a replacing row without a launch keeps the built-in's"
+        );
+        assert_eq!(t.launch_line("quiet"), None, "a blank launch is none");
+        let t = AgentTable::from_json(r#"[{ "name": "claude", "launch": "claude --model opus" }]"#);
+        assert_eq!(t.launch_line("claude"), Some("claude --model opus"));
+        // Omitted inherits; blank is an explicit "no command", even on a
+        // row that replaces a built-in.
+        let t = AgentTable::from_json(r#"[{ "name": "claude", "launch": "  " }]"#);
+        assert_eq!(
+            t.launch_line("claude"),
+            None,
+            "a blank launch on a replacing row unteaches the built-in's"
+        );
+    }
+
+    #[test]
+    fn status_is_working_while_output_flows_then_waiting_or_idle_by_the_screen() {
+        let t = AgentTable::builtin();
+        let claude = t.classify("claude").unwrap();
+        let prompt = rows(&["Edited src/main.rs", "", "Do you want to proceed? (y/n)"]);
+        let quiet = rows(&["Edited src/main.rs", "Done."]);
+        let after = Duration::from_secs(3);
+        assert_eq!(
+            judge(claude, Duration::from_millis(500), &prompt, after),
+            AgentStatus::Working
+        );
+        assert_eq!(
+            judge(claude, Duration::from_secs(10), &prompt, after),
+            AgentStatus::Waiting
+        );
+        assert_eq!(
+            judge(claude, Duration::from_secs(10), &quiet, after),
+            AgentStatus::Idle
+        );
+        // A bare prompt line counts, and so does Claude Code's numbered
+        // permission menu; a question ten rows up does not.
+        assert_eq!(
+            judge(claude, after, &rows(&["> "]), after),
+            AgentStatus::Waiting
+        );
+        assert_eq!(
+            judge(
+                claude,
+                after,
+                &rows(&["Do you want to make this edit?", "\u{276f} 1. Yes"]),
+                after
+            ),
+            AgentStatus::Waiting
+        );
+        // Ordinary output that merely contains a question mark or the word
+        // "Allow" is not a prompt.
+        let gemini = t.classify("gemini").unwrap();
+        for (kind, row) in [
+            (claude, "Allowed origins: https://example.com"),
+            (claude, "  Do you want to know more"),
+            (gemini, "Does that make sense?"),
+            (claude, "if (x == 1) { return y; } // ?"),
+        ] {
+            assert_eq!(
+                judge(kind, after, &rows(&[row]), after),
+                AgentStatus::Idle,
+                "{row:?}"
+            );
+        }
+        assert_eq!(
+            judge(gemini, after, &rows(&["Allow this tool call?"]), after),
+            AgentStatus::Waiting
+        );
+        let mut buried = vec!["Allow this? (y/n)".to_string()];
+        buried.extend((0..8).map(|i| format!("log line {i}")));
+        assert_eq!(judge(claude, after, &buried, after), AgentStatus::Idle);
+    }
+
+    #[test]
+    fn a_reported_state_maps_to_the_lane_status() {
+        use crate::program_status::State;
+        for (state, want) in [
+            (State::Working, AgentStatus::Working),
+            (State::Blocked, AgentStatus::Waiting),
+            (State::Done, AgentStatus::Waiting),
+            (State::Error, AgentStatus::Waiting),
+            (State::Idle, AgentStatus::Idle),
+        ] {
+            assert_eq!(reported(state), want, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn waiting_fires_once_per_prompt_and_seated_gone_bracket_the_lane() {
+        let lane = |s| AgentLane {
+            name: "claude".into(),
+            status: s,
+        };
+        let pane = "Terminal 2";
+        assert_eq!(
+            transition(pane, None, Some(&lane(AgentStatus::Working))),
+            vec![AgentEvent::Seated {
+                pane: pane.into(),
+                agent: "claude".into()
+            }]
+        );
+        let waiting = vec![AgentEvent::Waiting {
+            pane: pane.into(),
+            agent: "claude".into(),
+        }];
+        assert_eq!(
+            transition(
+                pane,
+                Some(&lane(AgentStatus::Working)),
+                Some(&lane(AgentStatus::Waiting))
+            ),
+            waiting
+        );
+        assert_eq!(
+            transition(
+                pane,
+                Some(&lane(AgentStatus::Waiting)),
+                Some(&lane(AgentStatus::Waiting))
+            ),
+            Vec::<AgentEvent>::new(),
+            "a prompt that stays on screen fires once"
+        );
+        assert_eq!(
+            transition(
+                pane,
+                Some(&lane(AgentStatus::Waiting)),
+                Some(&lane(AgentStatus::Working))
+            ),
+            vec![AgentEvent::Working {
+                pane: pane.into(),
+                agent: "claude".into()
+            }]
+        );
+        assert_eq!(
+            transition(
+                pane,
+                Some(&lane(AgentStatus::Working)),
+                Some(&lane(AgentStatus::Idle))
+            ),
+            Vec::<AgentEvent>::new()
+        );
+        assert_eq!(
+            transition(pane, Some(&lane(AgentStatus::Idle)), None),
+            vec![AgentEvent::Gone {
+                pane: pane.into(),
+                agent: "claude".into()
+            }]
+        );
+        // Seated straight into a prompt is one Seated and one Waiting.
+        assert_eq!(
+            transition(pane, None, Some(&lane(AgentStatus::Waiting))).len(),
+            2
+        );
+        // A different agent taking the pane is Gone then Seated.
+        let other = AgentLane {
+            name: "aider".into(),
+            status: AgentStatus::Working,
+        };
+        let ev = transition(pane, Some(&lane(AgentStatus::Idle)), Some(&other));
+        assert!(
+            matches!(ev[0], AgentEvent::Gone { .. }) && matches!(ev[1], AgentEvent::Seated { .. })
+        );
+    }
+}

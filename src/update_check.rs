@@ -1,0 +1,1452 @@
+//! Release-availability check and staged upgrade for a locally installed
+//! croft (#333).
+//!
+//! The model is VS Code's and Zed's, not a package manager's: croft learns
+//! in the background that a newer release exists, tells the user once in a
+//! corner popup, and does nothing else until they ask. Choosing Update
+//! builds the new version into a STAGING root under `~/.cache/croft` -
+//! the binary on PATH is untouched, so a fresh `croft` launch tomorrow is
+//! still the version the user has today. Only Relaunch copies the staged
+//! binary over the installed one and re-execs into it. Later remembers the
+//! version so the same release is not offered again. On Linux, a croft that
+//! is a release (from crates.io or a release archive) stages the release's
+//! own verified binary instead of building it, so a box with no Rust
+//! toolchain updates too (#261); building stays the fallback.
+//!
+//! (Neovim has no updater at all and leaves it to the package manager; VS
+//! Code downloads in the background and shows "Restart to Update"; Zed
+//! does the same with a title-bar pill. The download-then-ask shape is the
+//! one that never surprises, so it is the one here.)
+
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, channel};
+use std::time::Duration;
+
+use crate::update_watch::UpdateEvent;
+
+/// GitHub's "latest release" endpoint for this repository. Releases are
+/// tags with notes, not binaries, so the version is all that is read.
+pub const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/vitali87/croft/releases/latest";
+/// The crate `cargo install` builds when staging an update.
+pub const CRATE_NAME: &str = "croft-software";
+/// How long a cached answer stands before the network is asked again.
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Network budget for the one request; a slow or absent network must never
+/// be felt in the editor.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const CACHE_FILE: &str = "update-check.json";
+const STAGE_DIR: &str = "staged";
+
+/// Where the running binary came from, as far as upgrading it is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallSource {
+    /// Inside a Homebrew Cellar: Homebrew owns the file, and `brew upgrade`
+    /// is the only upgrade that keeps its records true.
+    Homebrew,
+    /// Anything else (cargo, binstall, a release archive, a source build):
+    /// croft may stage and swap the binary itself.
+    SelfManaged,
+}
+
+/// What a Homebrew user runs instead of croft's own updater.
+pub const BREW_UPGRADE: &str = "brew upgrade croft";
+
+/// The GitHub page of `version`'s release, whose notes cover every version
+/// since the release before it.
+pub fn release_notes_url(version: &str) -> String {
+    format!("https://github.com/vitali87/croft/releases/tag/v{version}")
+}
+
+/// Classify `exe`, the canonical path of the running binary (symlinks such
+/// as `/opt/homebrew/bin/croft` already resolved into the Cellar).
+pub fn install_source(exe: &Path) -> InstallSource {
+    // Homebrew keeps every formula at `<prefix>/Cellar/<formula>/<version>/`,
+    // on every prefix it supports (/opt/homebrew, /usr/local, linuxbrew), so
+    // a `Cellar/croft` pair of components is the signature, not the prefix.
+    let parts: Vec<_> = exe.components().map(|c| c.as_os_str()).collect();
+    // The whole `Cellar/croft/<version>/bin/croft` tail: a source checkout
+    // that happens to sit under a `Cellar/croft` directory is not brew's.
+    let owned = parts.len() >= 5
+        && parts[parts.len() - 5] == "Cellar"
+        && parts[parts.len() - 4] == "croft"
+        && parts[parts.len() - 2] == "bin"
+        && parts[parts.len() - 1] == "croft";
+    if owned {
+        InstallSource::Homebrew
+    } else {
+        InstallSource::SelfManaged
+    }
+}
+
+/// The running binary's install source, resolving symlinks first so the
+/// `bin/croft` link Homebrew puts on PATH is traced into the Cellar.
+pub fn current_install_source() -> InstallSource {
+    std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .map(|p| install_source(&p))
+        .unwrap_or(InstallSource::SelfManaged)
+}
+
+/// A release croft can offer, with what the update popup says about it
+/// besides its version: the day it was published and how much this machine
+/// downloads to stage it. Either is `None` when the release does not say.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Release {
+    pub version: String,
+    /// `YYYY-MM-DD`, the date part of GitHub's `published_at`.
+    pub published: Option<String>,
+    /// Bytes of this machine's release archive, when staging fetches one
+    /// rather than building from crates.io.
+    pub size: Option<u64>,
+}
+
+impl From<&str> for Release {
+    fn from(version: &str) -> Self {
+        Release {
+            version: version.to_string(),
+            ..Release::default()
+        }
+    }
+}
+
+/// The on-disk memory of the check, one small JSON file in the cache dir.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CheckCache {
+    /// Unix seconds of the last successful query.
+    #[serde(default)]
+    pub checked_at: u64,
+    /// The newest release tag seen (without the leading `v`).
+    #[serde(default)]
+    pub latest: Option<String>,
+    /// [`Release::published`] for `latest`.
+    #[serde(default)]
+    pub published: Option<String>,
+    /// [`Release::size`] for `latest`.
+    #[serde(default)]
+    pub size: Option<u64>,
+    /// A version the user chose Skip on: never offered again.
+    #[serde(default)]
+    pub dismissed: Option<String>,
+}
+
+impl CheckCache {
+    /// Remember `release` as the newest, its details with it: an answer
+    /// replaces all three, so details never outlive their version.
+    pub fn set_latest(&mut self, release: Option<Release>) {
+        let (latest, published, size) = match release {
+            Some(r) => (Some(r.version), r.published, r.size),
+            None => (None, None, None),
+        };
+        self.latest = latest;
+        self.published = published;
+        self.size = size;
+    }
+
+    /// `latest` with the details remembered about it.
+    pub fn latest_release(&self) -> Option<Release> {
+        Some(Release {
+            version: self.latest.clone()?,
+            published: self.published.clone(),
+            size: self.size,
+        })
+    }
+
+    pub fn load(cache_dir: &Path) -> Self {
+        std::fs::read_to_string(cache_dir.join(CACHE_FILE))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, cache_dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(cache_dir)?;
+        let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        std::fs::write(cache_dir.join(CACHE_FILE), text)
+    }
+}
+
+/// `1.2.3` or `v1.2.3` as a comparable triple; anything else is not a
+/// release croft knows how to rank.
+pub fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+    let s = s.trim().trim_start_matches('v');
+    let mut it = s.split('.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    let patch = it.next()?.parse().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Whether `candidate` is a strictly newer release than `current`. Unparseable
+/// on either side is "no": a development build must not be nagged.
+pub fn is_newer(candidate: &str, current: &str) -> bool {
+    match (parse_version(candidate), parse_version(current)) {
+        (Some(c), Some(cur)) => c > cur,
+        _ => false,
+    }
+}
+
+/// The release version out of GitHub's release JSON (`tag_name`), the
+/// leading `v` stripped.
+pub fn latest_from_release_json(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let tag = v.get("tag_name")?.as_str()?.trim();
+    let version = tag.trim_start_matches('v');
+    parse_version(version).map(|_| version.to_string())
+}
+
+/// Whether the cache is stale enough to ask the network again. Keyed on
+/// the last attempt, not the last answer: a failed request counts, so a
+/// blocked endpoint is retried daily rather than on every launch.
+pub fn should_query(cache: &CheckCache, now_secs: u64) -> bool {
+    // A stamp from the future (clock skew, a restored backup) is stale,
+    // not a reason to stay silent until the clock catches up.
+    now_secs < cache.checked_at || now_secs - cache.checked_at >= CHECK_INTERVAL.as_secs()
+}
+
+/// The release to offer, if the cache knows one newer than `current` that
+/// the user has not already declined.
+pub fn offer_from(cache: &CheckCache, current: &str) -> Option<Release> {
+    let latest = cache.latest.as_deref()?;
+    if !is_newer(latest, current) {
+        return None;
+    }
+    if cache.dismissed.as_deref() == Some(latest) {
+        return None;
+    }
+    cache.latest_release()
+}
+
+/// What the popup says about the release in `json` besides `version`: the
+/// day it was published and, when staging fetches this machine's archive
+/// (`triple`, see [`release_has_archive`]), that archive's size.
+pub fn release_details(json: &str, version: String, triple: Option<&str>) -> Release {
+    let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    let published = v
+        .get("published_at")
+        .and_then(|p| p.as_str())
+        .and_then(|p| p.get(..10))
+        .filter(|d| date_label(d).is_some())
+        .map(str::to_string);
+    let size = triple
+        .filter(|t| release_has_archive(json, t))
+        .and_then(|t| {
+            let archive = format!("croft-{t}.tar.gz");
+            v.get("assets")?
+                .as_array()?
+                .iter()
+                .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(archive.as_str()))?
+                .get("size")?
+                .as_u64()
+        });
+    Release {
+        version,
+        published,
+        size,
+    }
+}
+
+/// `2026-03-03` as the popup writes it, `Mar 3, 2026`; `None` for anything
+/// that is not a calendar date.
+pub fn date_label(date: &str) -> Option<String> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut it = date.split('-');
+    let (y, m, d) = (it.next()?, it.next()?, it.next()?);
+    if it.next().is_some() || y.len() != 4 || m.len() != 2 || d.len() != 2 {
+        return None;
+    }
+    let year: u32 = y.parse().ok()?;
+    let month: usize = m.parse().ok()?;
+    let day: u32 = d.parse().ok()?;
+    let name = MONTHS.get(month.checked_sub(1)?)?;
+    (1..=31)
+        .contains(&day)
+        .then(|| format!("{name} {day}, {year}"))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// crates.io's record of one version of the crate `cargo install` builds.
+const CRATES_IO_VERSION_URL: &str = "https://crates.io/api/v1/crates/croft-software";
+
+/// Whether the latest release carries the archive, checksums and signature
+/// [`stage_update`] fetches for `triple` (`croft-<triple>.tar.gz`,
+/// `SHA256SUMS` and `SHA256SUMS.sigstore.json`, without which the archive
+/// is refused), read from GitHub's release JSON `assets`.
+pub fn release_has_archive(json: &str, triple: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+    let names: Vec<&str> = v
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|a| a.get("name")?.as_str())
+        .collect();
+    let archive = format!("croft-{triple}.tar.gz");
+    names.contains(&archive.as_str())
+        && names.contains(&"SHA256SUMS")
+        && names.contains(&"SHA256SUMS.sigstore.json")
+}
+
+/// Whether crates.io's JSON for one version says it is published and not
+/// yanked, so `cargo install --version` can build it.
+pub fn crate_version_listed(json: &str, version: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+    let Some(entry) = v.get("version") else {
+        return false;
+    };
+    entry.get("num").and_then(|n| n.as_str()) == Some(version)
+        && entry.get("yanked").and_then(|y| y.as_bool()) != Some(true)
+}
+
+/// The latest release's version when this install can actually stage it
+/// (#1579): the release has an archive for `triple`, this machine's
+/// release target, or crates.io has the version for `cargo install` to
+/// build. A release that is tagged but neither is never offered, since
+/// choosing Update could only fail.
+///
+/// `on_crates_io` answers `None` when crates.io could not be asked; that
+/// failure is passed on as `None` (rather than "not installable") so the
+/// caller keeps what it had cached, as it does when GitHub fails.
+pub fn installable_release(
+    json: &str,
+    triple: Option<&str>,
+    on_crates_io: &dyn Fn(&str) -> Option<bool>,
+) -> Option<Option<String>> {
+    let Some(version) = latest_from_release_json(json) else {
+        return Some(None);
+    };
+    if triple.is_some_and(|t| release_has_archive(json, t)) {
+        return Some(Some(version));
+    }
+    Some(on_crates_io(&version)?.then_some(version))
+}
+
+fn http_agent(url: &str) -> ureq::Agent {
+    crate::net::builder(url).timeout(REQUEST_TIMEOUT).build()
+}
+
+/// `None` when crates.io could not be asked (a timeout, a 5xx, an
+/// unreadable body); `Some(false)` when it says the version is absent.
+fn crate_version_published(version: &str) -> Option<bool> {
+    let url = format!("{CRATES_IO_VERSION_URL}/{version}");
+    let resp = http_agent(&url)
+        .get(&url)
+        .set("User-Agent", concat!("croft/", env!("CARGO_PKG_VERSION")))
+        .call();
+    match resp {
+        Ok(resp) => Some(crate_version_listed(&resp.into_string().ok()?, version)),
+        Err(ureq::Error::Status(404, _)) => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// `None` when GitHub (or, when it is consulted, crates.io) could not be
+/// asked; `Some(None)` when it answered
+/// but the latest release is not one this install can stage.
+fn fetch_latest() -> Option<Option<Release>> {
+    fetch_latest_checked().ok()
+}
+
+/// [`fetch_latest`] saying why it could not ask (#1844): the newest release
+/// this install can stage, `None` when there is none, or the reason.
+pub fn fetch_latest_checked() -> Result<Option<Release>, String> {
+    let resp = http_agent(RELEASES_LATEST_URL)
+        .get(RELEASES_LATEST_URL)
+        .set("Accept", "application/vnd.github+json")
+        .set("User-Agent", concat!("croft/", env!("CARGO_PKG_VERSION")))
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::Transport(_) => String::from(OFFLINE_REASON),
+            ureq::Error::Status(code, _) => format!("GitHub answered {code}"),
+        })?;
+    let unreadable = || String::from("GitHub's answer could not be read");
+    let body = resp.into_string().map_err(|_| unreadable())?;
+    latest_from_release_json(&body).ok_or_else(unreadable)?;
+    let triple =
+        prebuilt_triple().filter(|_| crate::remote_prebuilt::eligible(env!("CARGO_MANIFEST_DIR")));
+    let version = installable_release(&body, triple, &crate_version_published)
+        .ok_or_else(|| String::from("crates.io could not be reached"))?;
+    Ok(version.map(|v| release_details(&body, v, triple)))
+}
+
+/// A check the user asked for (#1844): unlike the daily one it always asks
+/// the network, offers a version they said Later to, and says what it
+/// found, failures included.
+pub struct ManualCheck {
+    rx: Receiver<Result<Option<Release>, String>>,
+}
+
+impl ManualCheck {
+    /// Ask with `fetch` off-thread, recording its answer for the daily
+    /// check. The verdict is the newer release to offer, `None` when croft
+    /// is up to date, or why the network could not be asked.
+    pub fn start_with(
+        cache_dir: PathBuf,
+        current_version: String,
+        fetch: fn() -> Result<Option<Release>, String>,
+    ) -> Self {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            // A download the first frame never shows.
+            crate::startup_gate::wait();
+            let verdict = fetch().map(|latest| {
+                let mut cache = CheckCache::load(&cache_dir);
+                cache.set_latest(latest.clone());
+                cache.checked_at = now_secs();
+                let _ = cache.save(&cache_dir);
+                latest.filter(|r| is_newer(&r.version, &current_version))
+            });
+            let _ = tx.send(verdict);
+        });
+        Self { rx }
+    }
+
+    /// The verdict once it lands; `None` while still checking.
+    pub fn take(&self) -> Option<Result<Option<Release>, String>> {
+        self.rx.try_recv().ok()
+    }
+}
+
+/// One background answer: `Some(release)` when a newer release is available
+/// and not dismissed, `None` otherwise (including every failure - the
+/// editor never learns why, it just does not nag).
+pub struct UpdateCheck {
+    rx: Receiver<Option<Release>>,
+}
+
+impl UpdateCheck {
+    /// Consult the cache first; hit the network at most once per
+    /// [`CHECK_INTERVAL`]. Everything runs off-thread.
+    pub fn start(cache_dir: PathBuf, current_version: String) -> Self {
+        Self::start_with(cache_dir, current_version, fetch_latest)
+    }
+
+    /// [`Self::start`] with the network call injected, so the throttle can
+    /// be exercised without a network. `fetch` answers `None` when the
+    /// request failed and `Some(None)` when no installable release exists.
+    pub fn start_with(
+        cache_dir: PathBuf,
+        current_version: String,
+        fetch: impl FnOnce() -> Option<Option<Release>> + Send + 'static,
+    ) -> Self {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let mut cache = CheckCache::load(&cache_dir);
+            if should_query(&cache, now_secs()) {
+                // An answer replaces what was cached, an empty one too: a
+                // version remembered before this check knew to ask whether
+                // it can be installed is not offered again (#1579).
+                if let Some(latest) = fetch() {
+                    cache.set_latest(latest);
+                }
+                // Stamped on failure too: a blocked or rate-limited endpoint
+                // must not be asked again on every launch, and every launch
+                // would otherwise pay the request's timeout.
+                cache.checked_at = now_secs();
+                let _ = cache.save(&cache_dir);
+            }
+            let _ = tx.send(offer_from(&cache, &current_version));
+        });
+        Self { rx }
+    }
+
+    /// Block for the verdict (tests only; the app polls with [`Self::take`]).
+    #[cfg(test)]
+    pub fn wait(&self) -> Option<Release> {
+        self.rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the check answers")
+    }
+
+    /// The verdict once it lands; `None` while still checking.
+    pub fn take(&self) -> Option<Option<Release>> {
+        self.rx.try_recv().ok()
+    }
+
+    #[cfg(test)]
+    pub fn preloaded(offer: Option<Release>) -> Self {
+        let (tx, rx) = channel();
+        let _ = tx.send(offer);
+        Self { rx }
+    }
+}
+
+/// Remember that `version` was declined so it is not offered again.
+pub fn dismiss(cache_dir: &Path, version: &str) -> std::io::Result<()> {
+    let mut cache = CheckCache::load(cache_dir);
+    cache.dismissed = Some(version.to_string());
+    cache.save(cache_dir)
+}
+
+/// Where a staged build lands: cargo's `--root` layout puts the binary
+/// under `bin/`.
+pub fn staged_binary_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join(STAGE_DIR).join("bin").join("croft")
+}
+
+/// `cargo install croft-software --version X --locked --root <stage>`: a
+/// full build of the published crate into the staging root. Nothing on
+/// PATH changes until [`apply_staged`] runs.
+pub fn stage_command(cargo: PathBuf, version: &str, stage_root: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(cargo);
+    cmd.args([
+        "install",
+        CRATE_NAME,
+        "--version",
+        version,
+        "--locked",
+        "--root",
+    ])
+    .arg(stage_root);
+    cmd
+}
+
+/// The release binary target this machine runs, when releases carry one:
+/// the static musl builds for Linux on x86_64 and aarch64 (#261), and the
+/// Apple silicon and Intel builds for macOS (#1579).
+pub fn prebuilt_triple() -> Option<&'static str> {
+    prebuilt_triple_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// [`prebuilt_triple`] for an explicit OS and architecture.
+pub fn prebuilt_triple_for(os: &str, arch: &str) -> Option<&'static str> {
+    match os {
+        "linux" => crate::remote::arch_to_musl_triple(arch),
+        "macos" => match arch {
+            "aarch64" => Some("aarch64-apple-darwin"),
+            "x86_64" => Some("x86_64-apple-darwin"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Fetches `version`'s verified release binary for a target:
+/// [`crate::remote_prebuilt::prepare`] with its cache and verifier bound.
+pub type PrepareRelease<'a> =
+    dyn Fn(&str, &str) -> anyhow::Result<(PathBuf, crate::remote_prebuilt::Signature)> + 'a;
+
+/// Stage `version` at `binary`, saying how in the returned log. With a
+/// release target (`prebuilt`), the release's own binary is fetched,
+/// checked against its signed `SHA256SUMS` and copied in: no compile, so a
+/// box with no toolchain can update itself (#261). Without one, or when
+/// that release has no binary or it fails its checks, `build` compiles the
+/// published crate as before.
+pub fn stage_update(
+    version: &str,
+    binary: &Path,
+    prebuilt: Option<(&str, &PrepareRelease<'_>)>,
+    build: &dyn Fn() -> std::io::Result<std::process::Output>,
+) -> (UpdateEvent, String) {
+    let mut log = String::new();
+    if let Some((triple, prepare)) = prebuilt {
+        match prepare(version, triple) {
+            Ok((path, signature)) => {
+                let copied = binary
+                    .parent()
+                    .map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|()| std::fs::copy(&path, binary).map(|_| ()));
+                match copied {
+                    Ok(()) => {
+                        log.push_str(&format!(
+                            "Staged the v{version} release binary for {triple} (signature {})\n",
+                            match signature {
+                                crate::remote_prebuilt::Signature::Verified => "verified",
+                                crate::remote_prebuilt::Signature::Unchecked =>
+                                    "NOT checked: cosign is not installed",
+                            }
+                        ));
+                        return (UpdateEvent::Ready, log);
+                    }
+                    Err(e) => log.push_str(&format!(
+                        "Could not stage the release binary ({e}); building instead\n"
+                    )),
+                }
+            }
+            // GitHub out of reach is not crates.io out of reach (a proxy
+            // cargo honours and this client does not, a blocked host), so
+            // the build still runs; the log says why, for the popup (#1844).
+            Err(e) if crate::remote_prebuilt::is_unreachable(&e) => log.push_str(&format!(
+                "{OFFLINE_LOG}: the v{version} release binary ({e:#}); building instead\n"
+            )),
+            Err(e) if crate::remote_prebuilt::is_not_published(&e) => log.push_str(&format!(
+                "v{version} has no release binary for {triple}; building instead\n"
+            )),
+            Err(e) => log.push_str(&format!(
+                "The v{version} release binary was refused ({e:#}); building instead\n"
+            )),
+        }
+    }
+    match build() {
+        Ok(out) => {
+            log.push_str(&String::from_utf8_lossy(&out.stdout));
+            log.push_str(&String::from_utf8_lossy(&out.stderr));
+            let event = if out.status.success() {
+                UpdateEvent::Ready
+            } else {
+                UpdateEvent::Failed
+            };
+            (event, log)
+        }
+        Err(err) => {
+            log.push_str(&format!("failed to run cargo: {err}"));
+            (UpdateEvent::Failed, log)
+        }
+    }
+}
+
+/// What a staging log opens a line with when the release server could not
+/// be reached (#1844).
+const OFFLINE_LOG: &str = "Could not reach the network to fetch";
+
+/// Why an update could not be staged or checked when the network is the
+/// reason, in the words the popup and status line use (#1844).
+pub const OFFLINE_REASON: &str = "no internet connection";
+
+/// What cargo prints when it cannot reach crates.io.
+const CARGO_OFFLINE_MARKERS: [&str; 5] = [
+    "Couldn't resolve host",
+    "Could not resolve host",
+    "spurious network error",
+    "failed to download from",
+    "network failure",
+];
+
+/// Why a staging that failed did, from its log, said briefly enough for
+/// the update popup (#1844): the network (cargo could not reach crates.io,
+/// or the release binary was out of reach and there is no cargo to build
+/// with), a missing cargo, or the build.
+pub fn failure_reason(log: &str) -> &'static str {
+    let no_cargo = log.contains("failed to run cargo");
+    if CARGO_OFFLINE_MARKERS.iter().any(|m| log.contains(m))
+        || (no_cargo && log.contains(OFFLINE_LOG))
+    {
+        OFFLINE_REASON
+    } else if no_cargo {
+        "cargo was not found, and this install has no release binary to fetch"
+    } else {
+        "the build failed"
+    }
+}
+
+/// A background staged build, reported through the same [`UpdateEvent`]
+/// lifecycle the remote watcher and the drift reinstall use so the app's
+/// spinner and "ready" pill need no third state machine.
+pub struct StagedInstall {
+    rx: Receiver<UpdateEvent>,
+    binary: PathBuf,
+    pub version: String,
+    /// Why it failed, set before `Failed` is sent (#1844).
+    failure: std::sync::Arc<std::sync::Mutex<Option<&'static str>>>,
+}
+
+impl StagedInstall {
+    /// Build output lands in `log_path` so a failure is diagnosable.
+    // Tests never download or build croft: the app stages a preloaded
+    // install instead.
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn start(cache_dir: PathBuf, version: String, log_path: PathBuf) -> Self {
+        let (tx, rx) = channel();
+        let binary = staged_binary_path(&cache_dir);
+        let stage_root = cache_dir.join(STAGE_DIR);
+        let ver = version.clone();
+        let failure = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let failure_tx = failure.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(UpdateEvent::InProgress);
+            if let Some(dir) = log_path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let build = || {
+                stage_command(
+                    crate::widgets::dependencies::cargo_binary(),
+                    &ver,
+                    &stage_root,
+                )
+                .output()
+            };
+            let cache = crate::session_state::dirs_cache_croft().join("prebuilt");
+            let prepare = |version: &str, triple: &str| {
+                crate::remote_prebuilt::prepare(
+                    version,
+                    triple,
+                    &cache,
+                    &crate::remote_prebuilt::http_get,
+                    &crate::remote_prebuilt::cosign_verify,
+                )
+            };
+            // A release binary only stands in for a release: a croft from
+            // crates.io or a release archive, never a source build.
+            let prebuilt = prebuilt_triple()
+                .filter(|_| crate::remote_prebuilt::eligible(env!("CARGO_MANIFEST_DIR")))
+                .map(|t| (t, &prepare as &PrepareRelease<'_>));
+            let staged = staged_binary_path(&cache_dir);
+            let (event, log) = stage_update(&ver, &staged, prebuilt, &build);
+            if event == UpdateEvent::Failed
+                && let Ok(mut reason) = failure_tx.lock()
+            {
+                *reason = Some(failure_reason(&log));
+            }
+            let _ = std::fs::write(&log_path, log);
+            let _ = tx.send(event);
+        });
+        Self {
+            rx,
+            binary,
+            version,
+            failure,
+        }
+    }
+
+    /// Why the staging failed, once `Failed` has been sent.
+    pub fn failure_reason(&self) -> Option<&'static str> {
+        self.failure.lock().ok().and_then(|r| *r)
+    }
+
+    /// The staged binary's path (present once `Ready` was sent).
+    pub fn binary(&self) -> &Path {
+        &self.binary
+    }
+
+    pub fn drain(&self) -> Vec<UpdateEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = self.rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[cfg(test)]
+    pub fn preloaded(events: &[UpdateEvent], binary: PathBuf, version: &str) -> Self {
+        let (tx, rx) = channel();
+        for ev in events {
+            let _ = tx.send(*ev);
+        }
+        Self {
+            rx,
+            binary,
+            version: version.to_string(),
+            failure: Default::default(),
+        }
+    }
+
+    /// A preloaded install that failed for `reason`.
+    #[cfg(test)]
+    pub fn failing_with(self, reason: &'static str) -> Self {
+        *self.failure.lock().unwrap() = Some(reason);
+        self
+    }
+}
+
+/// Put the staged binary in place of `target`: copy beside it, then rename
+/// over, so a crash mid-copy never leaves a half-written croft on PATH and
+/// the running process keeps its own (unlinked) image until it execs. The
+/// temp file is created exclusively (`create_new`), so a pre-planted
+/// symlink at the predictable name is refused rather than followed.
+pub fn apply_staged(staged: &Path, target: &Path) -> std::io::Result<()> {
+    let Some(dir) = target.parent() else {
+        return Err(std::io::Error::other(
+            "install target has no parent directory",
+        ));
+    };
+    std::fs::create_dir_all(dir)?;
+    let tmp = temp_name(dir);
+    apply_staged_at(staged, target, &tmp)
+}
+
+/// The temp file beside the target. PIDs recycle: a croft killed between
+/// open and rename would leave a file that every later process drawing
+/// the same PID trips over, so the name carries a clock reading too.
+/// `create_new` in [`apply_staged_at`] still refuses anything planted at
+/// the name.
+fn temp_name(dir: &Path) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    dir.join(format!(".croft-update-{}-{nonce}", std::process::id()))
+}
+
+fn apply_staged_at(staged: &Path, target: &Path, tmp: &Path) -> std::io::Result<()> {
+    let result = (|| {
+        let mut src = std::fs::File::open(staged)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o755);
+        }
+        let mut dst = opts.open(tmp)?;
+        std::io::copy(&mut src, &mut dst)?;
+        dst.sync_all()?;
+        drop(dst);
+        std::fs::rename(tmp, target)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_binary_in_a_homebrew_cellar_is_homebrew_owned() {
+        for p in [
+            "/opt/homebrew/Cellar/croft/0.1.961/bin/croft",
+            "/usr/local/Cellar/croft/0.1.961/bin/croft",
+            "/home/linuxbrew/.linuxbrew/Cellar/croft/0.1.961/bin/croft",
+        ] {
+            assert_eq!(install_source(Path::new(p)), InstallSource::Homebrew, "{p}");
+        }
+    }
+
+    #[test]
+    fn other_installs_are_self_managed() {
+        for p in [
+            "/Users/me/.cargo/bin/croft",
+            "/usr/local/bin/croft",
+            // Another formula's Cellar is not ours, and a folder merely named
+            // Cellar outside a Homebrew layout is not Homebrew.
+            "/opt/homebrew/Cellar/other/1.0/bin/croft",
+            "/Users/me/Cellar/notes/croft",
+            "/Users/me/Cellar/croft/target/release/croft",
+            "/Users/me/code/croft/target/release/croft",
+        ] {
+            assert_eq!(
+                install_source(Path::new(p)),
+                InstallSource::SelfManaged,
+                "{p}"
+            );
+        }
+    }
+
+    #[test]
+    fn versions_parse_with_or_without_the_v_and_compare_numerically() {
+        assert_eq!(parse_version("v0.1.800"), Some((0, 1, 800)));
+        assert_eq!(parse_version("0.1.9"), Some((0, 1, 9)));
+        assert_eq!(parse_version("0.1"), None);
+        assert_eq!(parse_version("0.1.9-dirty"), None);
+        assert!(is_newer("0.1.800", "0.1.799"));
+        assert!(is_newer("0.2.0", "0.1.999"), "numeric, not lexical");
+        assert!(!is_newer("0.1.799", "0.1.799"));
+        assert!(!is_newer("garbage", "0.1.799"), "unparseable never nags");
+    }
+
+    #[test]
+    fn the_release_tag_is_read_from_github_json() {
+        let json = r#"{"tag_name":"v0.1.900","name":"croft v0.1.900","assets":[]}"#;
+        assert_eq!(latest_from_release_json(json).as_deref(), Some("0.1.900"));
+        assert_eq!(latest_from_release_json(r#"{"message":"Not Found"}"#), None);
+        assert_eq!(latest_from_release_json("not json"), None);
+    }
+
+    #[test]
+    fn the_network_is_asked_once_a_day() {
+        let fresh = CheckCache {
+            checked_at: 1_000_000,
+            latest: Some("0.1.5".into()),
+            dismissed: None,
+            ..CheckCache::default()
+        };
+        assert!(!should_query(&fresh, 1_000_000 + 3600));
+        assert!(should_query(&fresh, 1_000_000 + CHECK_INTERVAL.as_secs()));
+        assert!(
+            should_query(&CheckCache::default(), 1_700_000_000),
+            "a never-stamped cache asks"
+        );
+        assert!(
+            should_query(&fresh, 1_000_000 - 60),
+            "a stamp from the future is stale, not a gag"
+        );
+    }
+
+    #[test]
+    fn an_offer_needs_a_newer_undismissed_release() {
+        let mut cache = CheckCache {
+            checked_at: 1,
+            latest: Some("0.1.5".into()),
+            dismissed: None,
+            ..CheckCache::default()
+        };
+        let offered = |cache: &CheckCache| offer_from(cache, "0.1.4").map(|r| r.version);
+        assert_eq!(offered(&cache).as_deref(), Some("0.1.5"));
+        assert_eq!(offer_from(&cache, "0.1.5"), None, "already current");
+        assert_eq!(offer_from(&cache, "0.1.6"), None, "ahead of the release");
+        cache.dismissed = Some("0.1.5".into());
+        assert_eq!(offered(&cache), None, "Skip means not again");
+        cache.latest = Some("0.1.6".into());
+        assert_eq!(
+            offered(&cache).as_deref(),
+            Some("0.1.6"),
+            "a newer release than the dismissed one is offered"
+        );
+    }
+
+    #[test]
+    fn dismiss_persists_through_the_cache_file() {
+        let dir = tempfile::tempdir().unwrap();
+        CheckCache {
+            checked_at: 7,
+            latest: Some("0.1.5".into()),
+            dismissed: None,
+            ..CheckCache::default()
+        }
+        .save(dir.path())
+        .unwrap();
+        dismiss(dir.path(), "0.1.5").unwrap();
+        let cache = CheckCache::load(dir.path());
+        assert_eq!(cache.dismissed.as_deref(), Some("0.1.5"));
+        assert_eq!(
+            cache.latest.as_deref(),
+            Some("0.1.5"),
+            "dismiss keeps the rest"
+        );
+        assert_eq!(cache.checked_at, 7);
+        assert_eq!(
+            CheckCache::load(&dir.path().join("nowhere")),
+            CheckCache::default(),
+            "a missing file is an empty cache"
+        );
+    }
+
+    /// A failed or blocked request is throttled like a successful one:
+    /// the stamp advances so the next launch does not pay the timeout
+    /// again, and the empty answer never offers anything.
+    #[test]
+    fn a_failed_check_is_stamped_and_not_retried_until_the_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let check = UpdateCheck::start_with(dir.path().to_path_buf(), "0.1.0".into(), || None);
+        assert_eq!(check.wait(), None);
+        let cache = CheckCache::load(dir.path());
+        assert!(cache.checked_at > 0, "the failed attempt is stamped");
+        assert_eq!(cache.latest, None);
+        assert!(
+            !should_query(&cache, cache.checked_at + 60),
+            "not asked again for a day"
+        );
+        // A later successful fetch after the interval offers normally.
+        let check = UpdateCheck::start_with(dir.path().to_path_buf(), "0.1.0".into(), || {
+            Some(Some("0.2.0".into()))
+        });
+        assert_eq!(
+            check.wait(),
+            None,
+            "inside the interval the cache answers, and it is empty"
+        );
+    }
+
+    #[test]
+    fn apply_refuses_a_planted_symlink_at_the_temp_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staged");
+        std::fs::write(&staged, b"new").unwrap();
+        let target = dir.path().join("bin").join("croft");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"old").unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        // The temp name carries a clock nonce, so plant the symlink at the
+        // exact name the next call will use by exercising the helper.
+        let tmp = temp_name(target.parent().unwrap());
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        assert!(
+            apply_staged_at(&staged, &target, &tmp).is_err(),
+            "an existing entry is refused"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"precious",
+            "the symlink target is untouched"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+    }
+
+    #[test]
+    fn staging_builds_the_published_crate_into_the_cache_root() {
+        let cmd = stage_command(PathBuf::from("/x/cargo"), "0.1.900", Path::new("/c/staged"));
+        assert_eq!(cmd.get_program(), "/x/cargo");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "install",
+                "croft-software",
+                "--version",
+                "0.1.900",
+                "--locked",
+                "--root",
+                "/c/staged"
+            ]
+        );
+        assert_eq!(
+            staged_binary_path(Path::new("/c")),
+            PathBuf::from("/c/staged/bin/croft")
+        );
+    }
+
+    #[test]
+    fn apply_copies_the_staged_binary_over_the_target_executably() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staged").join("bin").join("croft");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"#!/bin/sh\necho new\n").unwrap();
+        let target = dir.path().join("bin").join("croft");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"old").unwrap();
+        apply_staged(&staged, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"#!/bin/sh\necho new\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "executable by everyone: {mode:o}");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".croft-update-")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp file survives a successful swap"
+        );
+        assert!(
+            apply_staged(&dir.path().join("missing"), &target).is_err(),
+            "a missing staged binary is an error, not a silent no-op"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"#!/bin/sh\necho new\n",
+            "the failed apply left the target alone"
+        );
+    }
+    #[test]
+    fn a_release_binary_is_staged_without_building() {
+        use crate::remote_prebuilt::{NotPublished, Signature};
+        let tmp = tempfile::tempdir().unwrap();
+        let release = tmp.path().join("release-croft");
+        std::fs::write(&release, b"release bytes").unwrap();
+        let staged = tmp.path().join("staged/bin/croft");
+        let built = std::cell::Cell::new(0);
+        let build = || {
+            built.set(built.get() + 1);
+            std::process::Command::new("sh")
+                .args(["-c", "echo compiled; exit 0"])
+                .output()
+        };
+        let asked = std::cell::RefCell::new(Vec::new());
+        let found = |v: &str, t: &str| {
+            asked.borrow_mut().push(format!("{v} {t}"));
+            Ok((release.clone(), Signature::Verified))
+        };
+        let (event, log) = stage_update(
+            "0.2.0",
+            &staged,
+            Some(("x86_64-unknown-linux-musl", &found)),
+            &build,
+        );
+        assert_eq!(event, UpdateEvent::Ready);
+        assert_eq!(std::fs::read(&staged).unwrap(), b"release bytes");
+        assert_eq!(built.get(), 0, "no compile");
+        assert_eq!(*asked.borrow(), ["0.2.0 x86_64-unknown-linux-musl"]);
+        assert!(log.contains("signature verified"), "{log}");
+
+        // No binary for that release: build as before.
+        let missing = |_: &str, _: &str| -> anyhow::Result<(PathBuf, Signature)> {
+            Err(anyhow::Error::new(NotPublished(String::from("x"))))
+        };
+        let (event, log) = stage_update("0.2.1", &staged, Some(("t", &missing)), &build);
+        assert_eq!((event, built.get()), (UpdateEvent::Ready, 1));
+        assert!(
+            log.contains("v0.2.1 has no release binary for t; building instead"),
+            "{log}"
+        );
+        assert!(log.contains("compiled"), "{log}");
+
+        // A release that fails its checks is refused, and built instead.
+        let forged = |_: &str, _: &str| -> anyhow::Result<(PathBuf, Signature)> {
+            anyhow::bail!("does not match SHA256SUMS")
+        };
+        let (_, log) = stage_update("0.2.2", &staged, Some(("t", &forged)), &build);
+        assert!(log.contains("refused (does not match SHA256SUMS)"), "{log}");
+        assert_eq!(built.get(), 2);
+
+        // No release target (macOS, a source build): only the build.
+        let failing = || {
+            std::process::Command::new("sh")
+                .args(["-c", "echo broken >&2; exit 1"])
+                .output()
+        };
+        let (event, log) = stage_update("0.2.3", &staged, None, &failing);
+        assert_eq!(event, UpdateEvent::Failed);
+        assert!(log.contains("broken"), "{log}");
+    }
+
+    /// #1844: a release server out of reach is not crates.io out of reach
+    /// (cargo honours a proxy this client does not), so the build still
+    /// runs. When it cannot run either, the network is named as the reason.
+    #[test]
+    fn an_unreachable_release_server_still_builds_and_names_the_network_if_that_fails() {
+        use crate::remote_prebuilt::{Signature, Unreachable};
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("staged/bin/croft");
+        let offline = |_: &str, _: &str| -> anyhow::Result<(PathBuf, Signature)> {
+            Err(Unreachable {
+                url: String::from(
+                    "https://github.com/vitali87/croft/releases/download/v9/SHA256SUMS",
+                ),
+                detail: String::from("Dns Failed: resolve dns name 'github.com:443'"),
+            }
+            .into())
+        };
+        let built = std::cell::Cell::new(0);
+        let build = || {
+            built.set(built.get() + 1);
+            std::process::Command::new("true").output()
+        };
+        let (event, _) = stage_update("9.0.0", &staged, Some(("t", &offline)), &build);
+        assert_eq!(event, UpdateEvent::Ready, "crates.io was reachable");
+        assert_eq!(built.get(), 1);
+
+        let no_cargo = || -> std::io::Result<std::process::Output> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        };
+        let (event, log) = stage_update("9.0.0", &staged, Some(("t", &offline)), &no_cargo);
+        assert_eq!(event, UpdateEvent::Failed);
+        assert_eq!(failure_reason(&log), OFFLINE_REASON, "{log}");
+    }
+
+    /// #1844: the popup says why a staging failed in a few words.
+    #[test]
+    fn a_failure_reason_names_the_network_cargo_or_the_build() {
+        let cargo_offline = "    Updating crates.io index\nwarning: spurious network error \
+                             (3 tries remaining): [6] Couldn't resolve host name";
+        assert_eq!(failure_reason(cargo_offline), OFFLINE_REASON);
+        assert!(
+            failure_reason("failed to run cargo: No such file or directory")
+                .starts_with("cargo was not found")
+        );
+        assert_eq!(
+            failure_reason("error[E0425]: cannot find value"),
+            "the build failed"
+        );
+    }
+
+    /// #1844: a check the user asks for always asks, says when it could
+    /// not, offers a version they said Later to, and records what it found.
+    #[test]
+    fn a_manual_check_says_what_it_found() {
+        fn offline() -> Result<Option<Release>, String> {
+            Err(String::from(OFFLINE_REASON))
+        }
+        fn newer() -> Result<Option<Release>, String> {
+            Ok(Some(Release {
+                version: String::from("9.0.0"),
+                published: Some(String::from("2026-03-03")),
+                size: Some(33_700_000),
+            }))
+        }
+        fn same() -> Result<Option<Release>, String> {
+            Ok(Some(Release::from("1.0.0")))
+        }
+        let wait = |check: ManualCheck| loop {
+            if let Some(v) = check.take() {
+                return v;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        // Checked a minute ago, and 9.0.0 declined: the daily check would
+        // stay silent on both counts.
+        CheckCache {
+            checked_at: now_secs(),
+            latest: None,
+            dismissed: Some(String::from("9.0.0")),
+            ..CheckCache::default()
+        }
+        .save(&dir)
+        .unwrap();
+        let start = |fetch| ManualCheck::start_with(dir.clone(), String::from("1.0.0"), fetch);
+        assert_eq!(wait(start(offline)), Err(String::from(OFFLINE_REASON)));
+        assert_eq!(wait(start(same)), Ok(None));
+        assert_eq!(wait(start(newer)), Ok(newer().unwrap()));
+        assert_eq!(
+            CheckCache::load(&dir).latest_release(),
+            newer().unwrap(),
+            "the details are remembered with the version"
+        );
+    }
+
+    /// #1579: GitHub's v0.2.28 release with its macOS and Linux archives.
+    const RELEASE_0_2_28: &str = r#"{"tag_name":"v0.2.28","assets":[
+        {"name":"croft-aarch64-apple-darwin.tar.gz"},
+        {"name":"croft-x86_64-apple-darwin.tar.gz"},
+        {"name":"croft-x86_64-unknown-linux-musl.tar.gz"},
+        {"name":"croft-aarch64-unknown-linux-musl.tar.gz"},
+        {"name":"SHA256SUMS"},
+        {"name":"SHA256SUMS.sigstore.json"}]}"#;
+
+    /// #1579: the issue's case. v0.2.28 is tagged but crates.io stops at
+    /// 0.2.3, so a machine with no release target could only run a
+    /// `cargo install --version 0.2.28` that fails: nothing is offered.
+    #[test]
+    fn a_release_with_no_crate_and_no_archive_for_this_machine_is_not_offered() {
+        let not_on_crates_io = |_: &str| Some(false);
+        assert_eq!(
+            installable_release(RELEASE_0_2_28, None, &not_on_crates_io),
+            Some(None)
+        );
+        assert_eq!(
+            installable_release(
+                RELEASE_0_2_28,
+                Some("riscv64gc-unknown-linux-gnu"),
+                &not_on_crates_io
+            ),
+            Some(None),
+            "an archive for some other machine does not count"
+        );
+    }
+
+    /// #1579: either route makes the release installable: its archive for
+    /// this machine, or the version on crates.io.
+    #[test]
+    fn a_release_is_offered_when_its_archive_or_its_crate_exists() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let on_crates_io = |v: &str| {
+            asked.borrow_mut().push(v.to_string());
+            Some(v == "0.2.28")
+        };
+        assert_eq!(
+            installable_release(RELEASE_0_2_28, None, &on_crates_io),
+            Some(Some("0.2.28".to_string()))
+        );
+        assert_eq!(
+            *asked.borrow(),
+            ["0.2.28"],
+            "crates.io is asked for the tag"
+        );
+        for triple in [
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "x86_64-unknown-linux-musl",
+        ] {
+            assert_eq!(
+                installable_release(RELEASE_0_2_28, Some(triple), &|_| Some(false)),
+                Some(Some("0.2.28".to_string())),
+                "{triple}"
+            );
+        }
+        // An archive without the checksums `stage_update` verifies is not one.
+        let unsummed =
+            r#"{"tag_name":"v0.2.29","assets":[{"name":"croft-x86_64-apple-darwin.tar.gz"}]}"#;
+        assert_eq!(
+            installable_release(unsummed, Some("x86_64-apple-darwin"), &|_| Some(false)),
+            Some(None)
+        );
+        // Nor without the signature bundle `remote_prebuilt` refuses to go
+        // without: only the crate route is left, and here it is missing.
+        let unsigned = r#"{"tag_name":"v0.2.29","assets":[
+            {"name":"croft-x86_64-apple-darwin.tar.gz"},{"name":"SHA256SUMS"}]}"#;
+        assert_eq!(
+            installable_release(unsigned, Some("x86_64-apple-darwin"), &|_| Some(false)),
+            Some(None)
+        );
+        assert_eq!(
+            installable_release("not json", None, &|_| Some(true)),
+            Some(None)
+        );
+    }
+
+    /// A crates.io request that fails is a failed check, not a "no": the
+    /// caller keeps its cached offer instead of clearing it for a day.
+    #[test]
+    fn a_crates_io_failure_is_not_an_uninstallable_answer() {
+        assert_eq!(installable_release(RELEASE_0_2_28, None, &|_| None), None);
+        // An archive for this machine needs no crates.io answer at all.
+        assert_eq!(
+            installable_release(RELEASE_0_2_28, Some("x86_64-apple-darwin"), &|_| None),
+            Some(Some("0.2.28".to_string()))
+        );
+    }
+
+    /// The popup's Released and Size rows come from the release JSON the
+    /// check already fetched: the size only when staging downloads this
+    /// machine's archive, since a crates.io build downloads something else.
+    #[test]
+    fn release_details_read_the_date_and_this_machines_archive_size() {
+        let json = r#"{"tag_name":"v0.2.90","published_at":"2026-03-03T17:04:11Z","assets":[
+            {"name":"croft-x86_64-apple-darwin.tar.gz","size":33700000},
+            {"name":"croft-x86_64-unknown-linux-musl.tar.gz","size":21329278},
+            {"name":"SHA256SUMS","size":828},
+            {"name":"SHA256SUMS.sigstore.json","size":10119}]}"#;
+        let details = release_details(json, "0.2.90".into(), Some("x86_64-apple-darwin"));
+        assert_eq!(
+            details,
+            Release {
+                version: "0.2.90".into(),
+                published: Some("2026-03-03".into()),
+                size: Some(33_700_000),
+            }
+        );
+        let built = release_details(json, "0.2.90".into(), None);
+        assert_eq!(
+            (built.published.as_deref(), built.size),
+            (Some("2026-03-03"), None)
+        );
+        let elsewhere = release_details(json, "0.2.90".into(), Some("riscv64gc-unknown-linux-gnu"));
+        assert_eq!(elsewhere.size, None, "no archive for this machine");
+        let bare = release_details(r#"{"published_at":"soon"}"#, "1.0.0".into(), None);
+        assert_eq!(
+            bare,
+            Release::from("1.0.0"),
+            "an unreadable date is left out"
+        );
+    }
+
+    #[test]
+    fn dates_read_the_way_the_popup_writes_them() {
+        assert_eq!(date_label("2026-03-03").as_deref(), Some("Mar 3, 2026"));
+        assert_eq!(date_label("2026-12-31").as_deref(), Some("Dec 31, 2026"));
+        for bad in [
+            "2026-13-01",
+            "2026-00-10",
+            "2026-01-32",
+            "26-01-01",
+            "2026-1-1",
+            "soon",
+        ] {
+            assert_eq!(date_label(bad), None, "{bad}");
+        }
+    }
+
+    /// A new answer replaces the details with the version, so a size read
+    /// for one release is never shown beside another.
+    #[test]
+    fn the_cache_keeps_details_with_their_version() {
+        let mut cache = CheckCache::default();
+        cache.set_latest(Some(Release {
+            version: "0.2.90".into(),
+            published: Some("2026-03-03".into()),
+            size: Some(1),
+        }));
+        cache.set_latest(Some(Release::from("0.2.91")));
+        assert_eq!(cache.latest_release(), Some(Release::from("0.2.91")));
+        cache.set_latest(None);
+        assert_eq!(cache, CheckCache::default());
+        // A cache written before the details existed still loads.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CACHE_FILE),
+            r#"{"checked_at":5,"latest":"0.2.90","dismissed":null}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            CheckCache::load(dir.path()).latest_release(),
+            Some(Release::from("0.2.90"))
+        );
+    }
+
+    #[test]
+    fn crates_io_says_which_versions_cargo_can_install() {
+        let listed = r#"{"version":{"num":"0.2.28","yanked":false}}"#;
+        assert!(crate_version_listed(listed, "0.2.28"));
+        assert!(!crate_version_listed(listed, "0.2.29"), "another version");
+        assert!(!crate_version_listed(
+            r#"{"version":{"num":"0.2.28","yanked":true}}"#,
+            "0.2.28"
+        ));
+        assert!(!crate_version_listed(
+            r#"{"errors":[{"detail":"crate `croft-software` does not have a version `0.2.28`"}]}"#,
+            "0.2.28"
+        ));
+        assert!(!crate_version_listed("<html>", "0.2.28"));
+    }
+
+    /// #1579: macOS stages the release's own archive, as Linux does, so it
+    /// no longer depends on crates.io keeping up with every tag.
+    #[test]
+    fn macos_and_linux_have_release_targets() {
+        assert_eq!(
+            prebuilt_triple_for("macos", "aarch64"),
+            Some("aarch64-apple-darwin")
+        );
+        assert_eq!(
+            prebuilt_triple_for("macos", "x86_64"),
+            Some("x86_64-apple-darwin")
+        );
+        assert_eq!(
+            prebuilt_triple_for("linux", "x86_64"),
+            Some("x86_64-unknown-linux-musl")
+        );
+        assert_eq!(
+            prebuilt_triple_for("linux", "aarch64"),
+            Some("aarch64-unknown-linux-musl")
+        );
+        assert_eq!(prebuilt_triple_for("macos", "powerpc"), None);
+        assert_eq!(prebuilt_triple_for("windows", "x86_64"), None);
+        assert_eq!(prebuilt_triple_for("freebsd", "x86_64"), None);
+    }
+
+    /// #1579: a version cached before croft asked whether it can be
+    /// installed is dropped once the check says it cannot, rather than
+    /// being offered from the cache every day.
+    #[test]
+    fn an_uninstallable_answer_clears_a_cached_offer() {
+        let dir = tempfile::tempdir().unwrap();
+        CheckCache {
+            checked_at: 1,
+            latest: Some("0.2.28".into()),
+            dismissed: None,
+            ..CheckCache::default()
+        }
+        .save(dir.path())
+        .unwrap();
+        let check =
+            UpdateCheck::start_with(dir.path().to_path_buf(), "0.2.3".into(), || Some(None));
+        assert_eq!(check.wait(), None);
+        assert_eq!(CheckCache::load(dir.path()).latest, None);
+    }
+
+    /// #1579 negative: a request that fails keeps what the cache knew, as
+    /// before; only an answer replaces it.
+    #[test]
+    fn a_failed_request_keeps_the_cached_offer() {
+        let dir = tempfile::tempdir().unwrap();
+        CheckCache {
+            checked_at: 1,
+            latest: Some("0.2.28".into()),
+            dismissed: None,
+            ..CheckCache::default()
+        }
+        .save(dir.path())
+        .unwrap();
+        let check = UpdateCheck::start_with(dir.path().to_path_buf(), "0.2.3".into(), || None);
+        assert_eq!(check.wait().map(|r| r.version).as_deref(), Some("0.2.28"));
+    }
+}

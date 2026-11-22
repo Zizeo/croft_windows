@@ -1,0 +1,307 @@
+# Contributing to croft
+
+Thanks for helping. This page covers what you need to land a change. For
+building and running croft see [docs/INSTALL.md](docs/INSTALL.md) and
+[docs/CLI.md](docs/CLI.md); for how the code is laid out see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). AI agents follow this page too.
+
+Every change is weighed against the [tenets](README.md#tenets): croft starts in
+milliseconds with no exceptions, speed and low latency come first, the same
+behaviour locally and over SSH, a shortcut for every action, and bugs fixed at
+the root rather than worked around. A change that adds blocking work before the
+first frame does not land: run it after the first frame, off the UI thread.
+
+## Set up
+
+```bash
+git clone https://github.com/vitali87/croft.git && cd croft
+cargo run -- .        # rustup installs the pinned toolchain (rust-toolchain.toml)
+```
+
+The full test suite also needs `zsh` at `/bin/zsh` and `pdftoppm` (poppler-utils)
+on `PATH`, plus `python3` for the scripts in `scripts/`. On macOS, set up a
+`.noindex` build directory first, or Spotlight will index it and spin your fans:
+see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
+
+## Pick something to work on
+
+1. Start from an issue. Issues labelled `ready`, or opened by the maintainer, are
+   vetted and fair game. For anything new, open an issue first.
+2. Check that no open PR already references it. There is no claim label: an open
+   PR is the claim.
+
+## Make the change
+
+* **Keep PRs small.** Aim for under about 400 changed lines. Split bigger work
+  into stacked PRs.
+* **Tests** go beside the code in a `#[cfg(test)]` module. Whole-app behaviour is
+  tested in `src/app/tests/`, one file per area (`terminal.rs`, `scm.rs`,
+  `lsp.rs`, ...), and the CLI in `tests/`. Put a whole-app test in the file for
+  the area it covers, beside the tests closest to it rather than at the end of
+  the file; a helper more than one file needs goes in `src/app/tests/mod.rs`.
+* **Commits** are one imperative sentence saying what changed for the user, for
+  example `Keep folds collapsed when lines are added or deleted`. No prefixes.
+* **Keep your branch current by merging `main` into it.** Don't rebase or
+  force-push a branch someone else is working on.
+* **Insert new items after a complete item, never just above a `///` block.**
+  Rust attaches a doc comment to whatever follows it, so inserting there gives
+  the old item's docs to the new one, and nothing fails. The
+  `doc comments stay with their function` CI job catches it. If you are removing
+  a doc on purpose, add `doc-removal: src/path/to/file.rs::name` to a commit
+  message. The CI error tells you the exact key to use.
+* **Moving code between files?** Add the line `pure-move: true` to a commit
+  message and CI proves every Rust item you touched moved byte for byte
+  (visibility may widen, and rustfmt may lay out anew an item the wider
+  visibility made too long). `python3 scripts/check_pure_move.py list <file>`
+  lists a file's items with their line ranges, to plan the move.
+  `scripts/move_items.py` moves the items a manifest assigns to a file and
+  writes the move's glue, release note and docs row; it split
+  `src/app/mod.rs` into feature files (#2062) from
+  `scripts/split_manifest.tsv`, with `--target editor` split
+  `src/widgets/editor.rs` from `scripts/split_editor_manifest.tsv`, with
+  `--target lsp` split `src/lsp/manager.rs` from
+  `scripts/split_lsp_manifest.tsv`, with `--target terminal` split
+  `src/widgets/terminal.rs` from `scripts/split_terminal_manifest.tsv`, with
+  `--target git` split `src/git.rs` from `scripts/split_git_manifest.tsv`,
+  with `--target remote` split `src/remote.rs` from
+  `scripts/split_remote_manifest.tsv`, with `--target search` split
+  `src/widgets/search.rs` from `scripts/split_search_manifest.tsv`, with
+  `--target session_host` split `src/session_host.rs` from
+  `scripts/split_session_host_manifest.tsv`, with `--target pair` split
+  `src/pair.rs` from `scripts/split_pair_manifest.tsv`, with
+  `--target source_control` split `src/widgets/source_control.rs` from
+  `scripts/split_source_control_manifest.tsv`, with `--target cli` split
+  `src/cli.rs` from `scripts/split_cli_manifest.tsv`, with
+  `--target codeql` split `src/app/codeql.rs` from
+  `scripts/split_codeql_manifest.tsv`, with `--target debugger` split
+  `src/app/debugger.rs` from `scripts/split_debugger_manifest.tsv`, with
+  `--target language_servers` split `src/app/language_servers.rs` from
+  `scripts/split_language_servers_manifest.tsv`, with
+  `--target dap_session` split `src/dap/session.rs` from
+  `scripts/split_dap_session_manifest.tsv`, with `--target file_tree`
+  split `src/widgets/file_tree.rs` from `scripts/split_file_tree_manifest.tsv`,
+  with `--target dap_configs` split `src/dap/configs.rs` from
+  `scripts/split_dap_configs_manifest.tsv`, and with `--target test_worker`
+  split `src/testing/worker.rs` from `scripts/split_test_worker_manifest.tsv`
+  (`--tests-out` first moved a file's inline tests, and any other inline
+  module, to their own file).
+* **Adding to the app, the editor, the language-server manager, the
+  terminal pane, git, remote sessions, the search panel, the session host,
+  the pair pilot, the Source Control panel, the command line, the CodeQL
+  side bar, Run and Debug, a language feature such as go-to, rename or the
+  outline, a debug session's talk with its adapter, the Explorer's file
+  tree, launch.json or the test runner?** Put a feature's code in its file
+  under `src/app/`,
+  `src/widgets/editor/`, `src/lsp/manager/`, `src/widgets/terminal/`,
+  `src/git/`, `src/remote/`, `src/widgets/search/`, `src/session_host/`,
+  `src/pair/`, `src/widgets/source_control/`, `src/cli/`, `src/app/codeql/`,
+  `src/app/debugger/`, `src/app/language_servers/`, `src/dap/session/`,
+  `src/widgets/file_tree/`, `src/dap/configs/` or `src/testing/worker/`
+  (see the lists in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)),
+  not in `src/app/mod.rs`, which keeps only the `App` struct, its state,
+  start-up and the main loop, nor in `src/widgets/editor.rs`, which keeps only
+  the `Editor` type, its constructor and the data types its parts share, nor
+  in `src/lsp/manager.rs`, which keeps only the `LspManager` type, the command
+  enum, the worker's and each server's state and the helpers several features
+  share, nor in `src/widgets/terminal.rs`, which keeps only the `PtyTerminal`
+  type and the structs its parts share, nor in `src/git.rs`, which keeps only
+  the git runner and the mutation wrappers every part shares, nor in
+  `src/remote.rs`, which keeps only the structs and helpers its parts share,
+  nor in `src/widgets/search.rs`, which keeps only the `SearchPanel` type, its
+  constructor and the types its parts share, nor in `src/session_host.rs`,
+  which keeps only the structs whose private fields its parts share, nor in
+  `src/pair.rs`, which keeps only the pilot's shared state, nor in
+  `src/widgets/source_control.rs`, which keeps only the `SourceControlPanel`
+  type, its constructor and the row action areas, nor in `src/cli.rs`, which
+  keeps only the clap root, `Cli`, nor in `src/app/codeql.rs`,
+  `src/app/debugger.rs` or `src/app/language_servers.rs`, which keep only the
+  types and constants their parts share, nor in `src/dap/session.rs`, which
+  keeps only `DapSession`, the types its fields hold and the `DapEvent`s it
+  returns, nor in `src/widgets/file_tree.rs`, which keeps only `FileTree`,
+  its constructor and `Node`, the row its fields hold, nor in
+  `src/dap/configs.rs`, which keeps only `DebugConfig`, its `RequestKind`
+  and its `preLaunchTask`, nor in `src/testing/worker.rs`, which keeps only
+  `Runner`, `TestRequest`, `TestResponse`, its `CoverageError`,
+  `TestWorker`, `RunControl` and `EpochTx`. A new subcommand's flags go in
+  `src/cli/commands.rs` and its line in `Cli::run` (`src/cli/run.rs`); its
+  own code goes in a file under `src/cli/`, or in the module of the feature
+  it drives (as `croft remote` calls into `src/remote/`). A new feature that
+  fits no file gets a file of its own.
+* **New or changed module?** Update its entry in
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). CI fails if you shorten a
+  module's description without moving its reasoning into a `### <module>`
+  section.
+
+## Every shipped change carries release notes
+
+If your PR changes `src/`, `assets/`, `build.rs`, `Cargo.toml` or `Cargo.lock`,
+add one file named `src/release_notes/unreleased/<issue>-<slug>.md`, for example
+`862-hot-exit.md`. Put one user-facing highlight on each line:
+
+```text
+feature: Unsaved edits survive a kill and come back on the next launch.
+fix: Ctrl+Q asks before throwing away unsaved edits.
+```
+
+If your change ships but nothing changes for the people using croft, use the
+third kind, `refactor:`:
+
+```text
+refactor: Moved the file tree's code into its own file (#2062). Nothing changes in use.
+```
+
+That covers code moved between files, renames, and restructuring that keeps
+the same behaviour. Reviewers check the claim: if anything a user can see or
+do is different, it's a `feature:` or a `fix:`. A merge whose notes are all
+`refactor:` makes no version of its own and never counts toward the 50 below.
+Its notes wait and go out with the next version that has a feature, a fix or a
+dependency update. The welcome card leaves refactor lines out, and a GitHub
+release sums them up in one line.
+
+**Never** change `version` in `Cargo.toml`, and never edit
+`src/release_notes/<version>.md`. After your PR merges, CI assigns the version,
+folds in the notes, and publishes the release. You don't need a fragment for
+docs, CI or test-only changes. A diff confined to `#[cfg(test)]`,
+`src/app/tests/` or `tests/` counts as test-only. Nor do you need one for a
+change that only moves dependency versions in `Cargo.lock` (and their
+requirements in `Cargo.toml`), like a Dependabot PR: the release adds a line
+naming the crates that moved.
+
+Releases to crates.io and GitHub go out every 50 versions. If users shouldn't
+wait that long for a merge, a maintainer labels its PR `release now`. The
+first version that includes the merge is then released as soon as it's cut.
+The label counts only if whoever applied it last is a repository admin or
+maintainer. From anyone else, a bot included, it's ignored, and the
+`publish crate` run's summary says so. Add the label before merging. Added
+later, it takes effect at the next push to `main`.
+
+## Show it
+
+If a user can see the change (a view, modal, command, status message,
+keybinding, layout or colour), the PR description needs a recording of it. Use a
+**GIF** for interaction and a **screenshot** for a still. Record the real binary
+built from your branch. Show the feature working and the edge case a reviewer
+will ask about, such as an error or an empty state. Aim for 30 seconds or less
+and under 1 MB. If nothing visible changed, replace the template's Demo section
+with one line saying why.
+
+To show a before and after, stack the two images, each under its own label.
+Never put them side by side in a table: each image shrinks to half the width
+and the terminal text becomes too small to read.
+
+```markdown
+**Before**
+
+![before](https://raw.githubusercontent.com/vitali87/croft/<sha>/<pr>/before.gif)
+
+**After**
+
+![after](https://raw.githubusercontent.com/vitali87/croft/<sha>/<pr>/after.gif)
+```
+
+To record, use vhs, asciinema with agg, or any screen recorder, then drag the
+file into the PR description.
+
+<details>
+<summary>Recording without a browser (agents, headless machines)</summary>
+
+`scripts/demo/tui_demo.py` drives the real binary and writes a GIF. On macOS
+with Ghostty 1.4+ it runs croft in a new window of your Ghostty and screenshots
+it (allow Screen Recording and Automation once; leave the window alone while
+it records). Elsewhere, or with `CROFT_DEMO_TERMINAL=xterm`, it uses tmux and
+replays the frames in headless Chromium, which needs tmux, node and Chromium.
+Both need Pillow. Copy the scenario in `scripts/demo/examples/`:
+
+```bash
+cargo build
+python3 scripts/demo/examples/settings_editor.py target/debug/croft out.gif
+```
+
+`scripts/demo/docs_gifs.py target/debug/croft [scene ...]` re-records the GIFs
+in `docs/images/`. Record from a clean checkout, so the status bar shows no
+rebuild hint.
+
+If you have push access, commit the GIF to the never-merged `pr-media` branch at
+`<pr>/<name>.gif`. Then embed it with a URL pinned to that commit's SHA, so the
+image stays the same after later pushes:
+
+```bash
+git fetch origin pr-media && git worktree add ../pr-media origin/pr-media
+mkdir -p ../pr-media/<pr> && cp out.gif ../pr-media/<pr>/<name>.gif
+git -C ../pr-media add -A && git -C ../pr-media commit -m "pr-media: <what> (#<pr>)"
+git -C ../pr-media push origin HEAD:pr-media && git -C ../pr-media rev-parse HEAD
+```
+
+```markdown
+![what it shows](https://raw.githubusercontent.com/vitali87/croft/<sha>/<pr>/<name>.gif)
+```
+
+</details>
+
+## Check before you push
+
+CI runs all of these. Running them locally first saves a round trip:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+RUST_TEST_THREADS=4 cargo test --locked
+python3 -m unittest discover -s scripts/tests
+
+base=$(git merge-base origin/main HEAD)
+python3 scripts/release.py check "$base" HEAD           # release notes
+python3 scripts/check_doc_ownership.py "$base" HEAD     # doc comments
+```
+
+CI also cross-builds the static musl binaries that `croft remote` ships, and an
+Android build. If you bump `rust-toolchain.toml`, add the cross targets
+(`rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl`) and
+make sure those jobs stay green. Pull requests labelled `refactor`, and every
+push to `main`, also run clippy on macOS, since the Linux jobs never compile
+`#[cfg(target_os = "macos")]` code. CI fails if the published package nears
+crates.io's 10 MiB limit.
+
+### Flaky tests
+
+The suite spawns real PTYs and shells, so terminal, clipboard and pairing tests
+can fail on a busy machine. Cap the thread count at about half your cores, as
+above. To set it permanently, use the gitignored `/.cargo/config.toml` (build
+jobs) and `/.config/nextest.toml` (nextest threads). Before you blame your
+change, run the same tests on an untouched `main` under the same load. If they
+fail there too, your diff is not the cause.
+
+One wall-clock test is `#[ignore]`d and runs on its own:
+`cargo test --bin croft fs_sync_reflects -- --ignored --test-threads=1`.
+
+### Waiting on a spawned process in a test
+
+A fixed timeout will eventually flake on a loaded machine. Use the shared helper,
+which scales a quiet-machine baseline by the current load:
+
+```rust
+crate::test_budget::await_spawned(
+    Duration::from_millis(500),           // cost on a quiet machine
+    "the shell to paint the linked cell", // what you are waiting for
+    || linked_cell(&app).is_some(),
+);
+```
+
+To get a `Duration` you can pass on, such as to `recv_timeout`, use
+`test_budget::spawn_budget(base)`.
+
+## Review and merge
+
+Bots (CodeRabbit, Greptile and Copilot) review every PR. They are tuned to flag
+only bugs, security issues and data loss. Fix each thread or reply saying why you didn't, then **resolve** it. Merge
+is blocked until every thread is resolved. PRs are merged with a merge commit.
+
+## Keep `target/` from filling your disk
+
+Cargo never cleans a project's `target/`, so it can grow to hundreds of GB.
+[`cargo-sweep`](https://github.com/holmgr/cargo-sweep) deletes only artifacts
+you haven't used recently. Run it weekly from cron or launchd:
+
+```bash
+cargo install cargo-sweep
+cargo sweep -r --time 15 ~/path/to/projects   # drop artifacts unused for 15+ days
+```

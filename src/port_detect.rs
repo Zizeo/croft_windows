@@ -1,0 +1,1104 @@
+//! Port detection for the PORTS panel and the auto-forward toast.
+//!
+//! Two independent sources feed the same [`PortHit`] stream:
+//!
+//! * **Output scrape** — [`PortSniffer::sniff`] runs on every PTY chunk in the
+//!   terminal reader thread (right beside `sniff_bracketed_paste_mode`),
+//!   matching the `http://localhost:PORT` banners and `listening on :PORT`
+//!   lines that dev servers print. Cheap: two precompiled regexes over a small
+//!   carry buffer of the printed text, escape codes stripped (#1449).
+//!   Emission is position-based — only a match in the freshly read bytes
+//!   fires, so the carried tail is never re-emitted, yet a banner reprinted
+//!   by a restarted server is. Deduping live ports is the app's job.
+//! * **Socket poll** — [`poll_listeners`] shells out to `lsof`/`ss` on a low
+//!   cadence to catch servers that bind a port without announcing it. Scoped to
+//!   the shell's own process subtree so system daemons don't leak in. On a
+//!   remote session this runs on the remote (remote croft polls its own
+//!   sockets), which is exactly the host whose ports we want to forward.
+//!
+//! The detector never decides what to do with a port: it reports, the app
+//! deduplicates against its live registry and offers the forward.
+
+use std::collections::HashSet;
+use std::process::Command;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use regex::Regex;
+
+/// A loopback listener we noticed, from either source. The app turns this into
+/// a registry entry and (on a remote session) an offer to forward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortHit {
+    pub port: u16,
+    /// The full URL when scraped from one (`http://localhost:3000/`), so the
+    /// app can preserve scheme and path when opening. `None` for socket-poll
+    /// hits and bare `listening on :PORT` lines, where the app assumes http.
+    pub url: Option<String>,
+    /// Owning process name when known (socket poll), else `None`.
+    pub process: Option<String>,
+}
+
+impl PortHit {
+    fn bare(port: u16) -> Self {
+        Self {
+            port,
+            url: None,
+            process: None,
+        }
+    }
+}
+
+/// `http://localhost:3000/path` — captures the port and keeps the whole match
+/// so the app can open the exact URL. Hosts are restricted to the loopback
+/// spellings a local dev server uses; a public host isn't ours to forward.
+static URL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bhttps?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::(\d{1,5}))?(?:/[^\s'\x22)\]]*)?")
+        .expect("port URL regex")
+});
+
+/// `Listening on port 8080`, `serving at :8080`, `bound to 0.0.0.0:8080` — the
+/// announce lines that carry no scheme. The number must be introduced by the
+/// word `port` or by a colon: an announce verb followed by a bare number is
+/// ordinary output (`running 289 tests`, `Started 15 workers`), and inventing
+/// a port from it offers to forward one nothing is listening on. The colon
+/// branch still needs [`is_clock_time`] to reject `Started backup at 03:15`.
+static BARE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(?:listening|serving|started|running|bound)\b[^\n]{0,40}?(?:\bport\b\s*:?\s*|:\s*)(\d{2,5})\b",
+    )
+    .expect("bare port regex")
+});
+
+/// Whether the digits captured at `start` in `text` are the minutes of a clock
+/// time (`03:15`, `running since 10:22`) rather than a port. An address keeps
+/// its host in front of the colon (`0.0.0.0:8080`, `[::1]:80`), so only a bare
+/// one or two digit number introducing the colon reads as an hour.
+fn is_clock_time(text: &str, start: usize, digits: &str) -> bool {
+    if digits.len() != 2 {
+        return false;
+    }
+    let before = text[..start].trim_end();
+    let Some(head) = before.strip_suffix(':') else {
+        return false;
+    };
+    let hour: String = head
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if hour.is_empty() || hour.len() > 2 {
+        return false;
+    }
+    // Only a STANDALONE number reads as an hour: `0.0.0.0:80` and
+    // `127.0.0.1:8080` end in a digit too but the dot marks an address, and
+    // in `api1:80` or `web-1:80` the digits are a hostname's tail.
+    !head[..head.len() - hour.len()]
+        .ends_with(|c: char| c == '.' || c == '-' || c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// A general http(s) URL token, for Cmd/Ctrl+click in the terminal (any host,
+/// not just loopback). Stops at whitespace and the brackets/quotes that
+/// commonly surround a URL in log output. Parentheses are taken, since paths
+/// use them (`/wiki/Rust_(programming_language)`, #1355); [`url_at`] drops
+/// a closing one the URL did not open.
+static CLICK_URL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)\bhttps?://[^\s'"<>\[\]]+"#).expect("click url regex"));
+
+/// The http(s) URL covering character index `col` in `text`, if any — used to
+/// resolve which printed link a Cmd/Ctrl+click landed on. Trailing sentence
+/// punctuation is trimmed so a link at the end of a line doesn't grab the dot,
+/// and so is a closing parenthesis the URL has no opening one for, so
+/// `(see https://x.dev/a)` keeps its link and loses the prose's bracket.
+pub fn url_at(text: &str, col: usize) -> Option<String> {
+    for m in CLICK_URL_RE.find_iter(text) {
+        let start = text[..m.start()].chars().count();
+        let end = start + m.as_str().chars().count();
+        if col >= start && col < end {
+            let mut url = m.as_str();
+            loop {
+                url = url.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+                let unbalanced =
+                    url.ends_with(')') && url.matches(')').count() > url.matches('(').count();
+                if !unbalanced {
+                    break;
+                }
+                url = &url[..url.len() - 1];
+            }
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
+/// The loopback port of `url` when the whole string is a loopback dev-server
+/// URL (`http://localhost:3000/...`), else `None`. Lets a click decide whether
+/// a URL is a remote port to forward or an ordinary link to open. Defaults to
+/// the scheme's port when none is spelled out.
+pub fn loopback_url_port(url: &str) -> Option<u16> {
+    let cap = URL_RE.captures(url)?;
+    if cap.get(0)?.start() != 0 {
+        return None;
+    }
+    cap.get(1).and_then(|m| parse_port(m.as_str())).or(Some(
+        if url.to_ascii_lowercase().starts_with("https") {
+            443
+        } else {
+            80
+        },
+    ))
+}
+
+fn parse_port(s: &str) -> Option<u16> {
+    s.parse::<u32>()
+        .ok()
+        .filter(|p| *p >= 1 && *p <= 65535)
+        .map(|p| p as u16)
+}
+
+/// Stateful scraper owned by a terminal's reader thread. Carries a short tail of
+/// already-scanned text so a banner split across two `read()`s still matches.
+/// Emission is position-based: only a match reaching into the *new* chunk fires,
+/// so the carried tail is never re-emitted, yet a banner printed afresh (a
+/// restarted server) is. Dedup against the live set is the app's job, not the
+/// sniffer's — which is what lets a restart re-toast.
+pub struct PortSniffer {
+    carry: String,
+    /// Where in `carry` the text not yet reported on starts: its end, or
+    /// the start of a URL that ended a read and may still be growing.
+    fresh: usize,
+    /// The escape sequence a read ended inside, if any.
+    esc: Esc,
+    /// URL hits held back because they ended a read and may still grow;
+    /// [`PortSniffer::flush`] sends them when no further read comes.
+    pending: Vec<PortHit>,
+}
+
+/// Where a read left the escape-sequence stripper (#1449), so a sequence
+/// split across two reads is still dropped whole.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Esc {
+    #[default]
+    Text,
+    /// After ESC.
+    Start,
+    /// After ESC and a charset designator (`ESC ( B`): one more byte.
+    Charset,
+    /// Inside `ESC [ …`, up to its final byte.
+    Csi,
+    /// Inside `ESC ] …`, up to BEL or ST.
+    Osc,
+    /// ESC inside an OSC: `\` ends it (ST).
+    OscSt,
+}
+
+/// `text` with its CSI, OSC and two-byte escape sequences removed, picking
+/// up in `state` from the previous read and leaving it for the next. Only
+/// the printed text is scanned: Vite colours its URL and bolds the port,
+/// so the raw bytes read `\e[36mhttp://localhost:\e[1m5173\e[22m/`. A
+/// newline always ends a sequence, so a malformed one cannot swallow the
+/// rest of the output.
+fn strip_escapes(state: &mut Esc, text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        *state = match (*state, c) {
+            (_, '\n') => {
+                out.push(c);
+                Esc::Text
+            }
+            (Esc::Text, '\x1b') => Esc::Start,
+            (Esc::Text, c) => {
+                out.push(c);
+                Esc::Text
+            }
+            (Esc::Start, '[') => Esc::Csi,
+            (Esc::Start, ']') => Esc::Osc,
+            (Esc::Start, '(' | ')' | '*' | '+') => Esc::Charset,
+            (Esc::Start | Esc::Charset, _) => Esc::Text,
+            (Esc::Csi, '\x20'..='\x3f') => Esc::Csi,
+            (Esc::Csi, _) => Esc::Text,
+            (Esc::Osc, '\x07') => Esc::Text,
+            (Esc::Osc | Esc::OscSt, '\x1b') => Esc::OscSt,
+            (Esc::OscSt, '\\') => Esc::Text,
+            (Esc::Osc | Esc::OscSt, _) => Esc::Osc,
+        };
+    }
+    out
+}
+
+/// How many trailing chars of the combined text to keep for the next scan,
+/// covering a URL straddling a read boundary without rescanning whole chunks.
+const CARRY_BYTES: usize = 256;
+
+impl PortSniffer {
+    pub fn new() -> Self {
+        Self {
+            carry: String::new(),
+            fresh: 0,
+            esc: Esc::Text,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Scan one PTY chunk, pushing a [`PortHit`] for each port whose match
+    /// extends past the carried prefix (i.e. lives in the new bytes). The send
+    /// is best-effort: a dropped hit just means the app learns of the port from
+    /// the next line or the socket poll.
+    pub fn sniff(&mut self, chunk: &[u8], tx: &std::sync::mpsc::Sender<PortHit>) {
+        // The printed text, not the bytes: escape codes sit around and even
+        // inside a URL (#1449).
+        let printed = strip_escapes(&mut self.esc, &String::from_utf8_lossy(chunk));
+        // Held-back hits are rescanned from the carry with this read added.
+        self.pending.clear();
+        let fresh = self.fresh;
+        let text = format!("{}{printed}", self.carry);
+        // A URL that ends the text may still be growing (`localhost:` with
+        // its port in the next read): it waits for that read instead of
+        // going out as port 80, or as `:51` of `:5173`.
+        let mut growing_from: Option<usize> = None;
+        for (start, end, hit) in scan_with_pos(&text) {
+            // A match ending within the carried prefix was already scanned last
+            // call; only emit one that reaches into the freshly read bytes.
+            if end <= fresh {
+                continue;
+            }
+            // Bounded, so a URL that never stops growing cannot grow the
+            // carry without limit.
+            if hit.url.is_some()
+                && matches!(&text[end..], "" | ":")
+                && text.len() - start <= CARRY_BYTES
+            {
+                growing_from = Some(growing_from.map_or(start, |g| g.min(start)));
+                self.pending.push(hit);
+                continue;
+            }
+            let _ = tx.send(hit);
+        }
+        // Keep the tail (on a char boundary) for the next call's split coverage.
+        let mut keep_from = text.len().saturating_sub(CARRY_BYTES);
+        if let Some(g) = growing_from {
+            keep_from = keep_from.min(g);
+        }
+        while keep_from < text.len() && !text.is_char_boundary(keep_from) {
+            keep_from += 1;
+        }
+        self.carry = text[keep_from..].to_string();
+        // Any match ending past a growing URL's start is reported next time,
+        // even when the next read adds nothing to the URL itself.
+        self.fresh = growing_from.map_or(self.carry.len(), |g| g - keep_from);
+    }
+
+    /// Whether a URL is held back waiting for the next read.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// The output went quiet (or ended) after a URL that ended a read: it
+    /// has stopped growing, so send it as it stands. Everything carried
+    /// counts as reported, so the next read does not send it again.
+    pub fn flush(&mut self, tx: &std::sync::mpsc::Sender<PortHit>) {
+        for hit in self.pending.drain(..) {
+            let _ = tx.send(hit);
+        }
+        self.fresh = self.carry.len();
+    }
+}
+
+impl Default for PortSniffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Position-free view of [`scan_with_pos`] for the tests. URL hits win over bare
+/// hits for the same port (the URL carries scheme and path).
+#[cfg(test)]
+fn scan(text: &str) -> Vec<PortHit> {
+    scan_with_pos(text).into_iter().map(|(_, _, h)| h).collect()
+}
+
+/// Like [`scan`] but pairs each hit with the byte offsets where its match
+/// starts and ends, so [`PortSniffer::sniff`] can tell a hit in the freshly
+/// read bytes from one that only lives in the carried-over prefix.
+fn scan_with_pos(text: &str) -> Vec<(usize, usize, PortHit)> {
+    let mut out: Vec<(usize, usize, PortHit)> = Vec::new();
+    for cap in URL_RE.captures_iter(text) {
+        let m = cap.get(0).expect("group 0 always present");
+        let whole = m.as_str().to_string();
+        // Explicit port, or the scheme's default (http=80, https=443).
+        let port = cap.get(1).and_then(|g| parse_port(g.as_str())).unwrap_or(
+            if whole.to_ascii_lowercase().starts_with("https") {
+                443
+            } else {
+                80
+            },
+        );
+        out.push((
+            m.start(),
+            m.end(),
+            PortHit {
+                port,
+                url: Some(whole),
+                process: None,
+            },
+        ));
+    }
+    for cap in BARE_RE.captures_iter(text) {
+        if let Some(g) = cap.get(1)
+            && !is_clock_time(text, g.start(), g.as_str())
+            && let Some(port) = parse_port(g.as_str())
+            && !out.iter().any(|(_, _, h)| h.port == port)
+        {
+            out.push((g.start(), g.end(), PortHit::bare(port)));
+        }
+    }
+    out
+}
+
+/// `lsof` arguments shared by both socket scans. `-b` keeps lsof off
+/// `stat`/`lstat`/`readlink`, which it otherwise calls on every mounted file
+/// system at startup and which stall on an unreachable NFS server; a TCP
+/// listener row needs none of them. `-w` drops the warnings `-b` then prints.
+const LSOF_LISTEN_ARGS: &[&str] = &["-b", "-w", "-nP", "-iTCP", "-sTCP:LISTEN"];
+
+/// The soft descriptor limit a poll helper runs under. lsof before 4.95
+/// (Ubuntu 20.04 and 22.04 ship 4.93) closes every descriptor up to the
+/// soft limit at startup, so under a raised limit, 1,048,576 on some
+/// desktops, each run spent ~0.15 s of CPU on a million `close` calls.
+/// None of the helpers holds more than a handful open (#1903).
+const PROBE_FD_LIMIT: libc::rlim_t = 1024;
+
+/// A socket-poll helper command, detached into its own session. The poll runs
+/// every few seconds, and the kernel prints a hung-NFS notice ("nfs server
+/// X: not responding") on the controlling tty of the process waiting on the
+/// mount: with croft's tty inherited, that text lands on top of the UI. With
+/// no controlling tty the notice goes to the system log only.
+///
+/// The helper also runs under [`PROBE_FD_LIMIT`] descriptors; croft's own
+/// limit is left alone.
+///
+/// The null stdin only states intent (`.output()` already gives one); the
+/// session is the fix. A pre-exec hook takes std off `posix_spawn` and onto a
+/// full `fork`, a cost paid per probe on the poll thread, never the UI thread.
+fn probe(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.stdin(std::process::Stdio::null());
+    let fd_limit = probe_fd_limit();
+    // SAFETY: `setsid` and `setrlimit` are single system calls that neither
+    // allocate nor lock, and the limit was read before the fork. The forked
+    // child is never a process-group leader, so `setsid` cannot fail today;
+    // if it ever does, the spawn fails rather than silently keeping the tty.
+    // Lowering a soft limit cannot fail, and the helper works either way.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut cmd, move || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if let Some(lim) = fd_limit {
+                libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+            }
+            Ok(())
+        });
+    }
+    cmd
+}
+
+/// croft's descriptor limit with its soft value lowered to
+/// [`PROBE_FD_LIMIT`], or `None` when it is already that low or unreadable.
+fn probe_fd_limit() -> Option<libc::rlimit> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit only writes the struct it is handed.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0
+        || lim.rlim_cur <= PROBE_FD_LIMIT
+    {
+        return None;
+    }
+    lim.rlim_cur = PROBE_FD_LIMIT;
+    Some(lim)
+}
+
+/// PIDs in `root`'s process subtree (inclusive), from one `ps` snapshot. Used
+/// to scope the socket poll to the shell's own children so we don't surface
+/// every system daemon listening on loopback. Empty on `ps` failure (the poll
+/// then reports nothing, falling back to the output scrape).
+fn descendant_pids(root: i32) -> HashSet<i32> {
+    let mut subtree: HashSet<i32> = HashSet::new();
+    subtree.insert(root);
+    let Ok(out) = probe("ps").args(["-axo", "pid=,ppid="]).output() else {
+        return subtree;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let pairs: Vec<(i32, i32)> = text
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let pid = it.next()?.parse().ok()?;
+            let ppid = it.next()?.parse().ok()?;
+            Some((pid, ppid))
+        })
+        .collect();
+    // Iterate to a fixed point: a child whose parent joined the set joins too.
+    loop {
+        let before = subtree.len();
+        for (pid, ppid) in &pairs {
+            if subtree.contains(ppid) {
+                subtree.insert(*pid);
+            }
+        }
+        if subtree.len() == before {
+            break;
+        }
+    }
+    subtree
+}
+
+/// Listening loopback TCP ports owned by `shell_pid`'s subtree, via `lsof`
+/// (macOS + Linux) with an `ss` fallback (Linux without lsof). Best-effort:
+/// any failure yields an empty list and the output scrape carries the load.
+pub fn poll_listeners(shell_pid: i32) -> Vec<PortHit> {
+    let pids = descendant_pids(shell_pid);
+    if let Some(hits) = poll_via_lsof(&pids) {
+        return hits;
+    }
+    poll_via_ss(&pids).unwrap_or_default()
+}
+
+/// Every loopback TCP port listening on this machine, whoever owns it. The
+/// scoped [`poll_listeners`] decides what to SURFACE (a system daemon is not
+/// the user's dev server); this decides what is still UP, which is a different
+/// question and one the subtree scope cannot answer — a container's published
+/// port, or a server started before croft, is nobody's descendant. `None` when
+/// neither tool ran, so the caller can tell "nothing is listening" from "no
+/// evidence" and leave the registry alone rather than retiring live rows.
+///
+/// `ss` answers first where it is installed: it reads the kernel's socket
+/// table, so it lists a listener whoever owns it. An unprivileged `lsof` sees
+/// only the caller's own processes and misses, say, a root-owned
+/// `docker-proxy` publishing a container's port, so it answers only where
+/// `ss` is missing, as on macOS.
+pub fn poll_all_listening() -> Option<HashSet<u16>> {
+    listening_snapshot(run_ss(&["-tlnH"]), || {
+        probe("lsof").args(LSOF_LISTEN_ARGS).output().ok()
+    })
+}
+
+/// The [`poll_all_listening`] decision over its scans: a successful `ss`
+/// table wins, and `lsof` is only run without one.
+fn listening_snapshot(
+    ss: Option<std::process::Output>,
+    lsof: impl FnOnce() -> Option<std::process::Output>,
+) -> Option<HashSet<u16>> {
+    if let Some(out) = ss.filter(|o| o.status.success()) {
+        return Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.split_whitespace().nth(3).and_then(loopback_port))
+                .collect(),
+        );
+    }
+    let rows = lsof_rows(&lsof()?)?;
+    Some(parse_lsof(&rows).into_iter().map(|h| h.port).collect())
+}
+
+/// Set once `ss` turns out not to be installed, so a box without it doesn't
+/// pay a failed spawn on every poll.
+static SS_MISSING: AtomicBool = AtomicBool::new(false);
+
+/// `ss` run with `args`, or `None` when it isn't installed or didn't start.
+fn run_ss(args: &[&str]) -> Option<std::process::Output> {
+    if SS_MISSING.load(Ordering::Relaxed) {
+        return None;
+    }
+    match probe("ss").args(args).output() {
+        Ok(out) => Some(out),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                SS_MISSING.store(true, Ordering::Relaxed);
+            }
+            None
+        }
+    }
+}
+
+fn poll_via_lsof(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
+    if pids.is_empty() {
+        return Some(Vec::new());
+    }
+    let pid_arg = pids
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let out = probe("lsof")
+        .args(LSOF_LISTEN_ARGS)
+        .args(["-a", "-p", &pid_arg])
+        .output()
+        .ok()?;
+    Some(parse_lsof(&lsof_rows(&out)?))
+}
+
+/// What a finished `lsof` scan printed, or `None` when lsof failed. lsof
+/// exits 1 with nothing on either stream when no socket matches, which is
+/// the usual answer while no dev server runs: that is an empty scan, and
+/// reading it as a failure sent every poll on to `ss` as well (#1903). A
+/// real failure, a bad option or a denied read, says why on stderr, which
+/// `-w` keeps free of warnings.
+fn lsof_rows(out: &std::process::Output) -> Option<String> {
+    let no_match = out.status.code() == Some(1) && out.stderr.is_empty();
+    (out.status.success() || !out.stdout.is_empty() || no_match)
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Parse `lsof` rows from a [`LSOF_LISTEN_ARGS`] scan. Field 0 is the
+/// command; the NAME column (`*:3000`, `127.0.0.1:3000`) is followed by a
+/// `(LISTEN)` token, so we scan the row for the first field that parses as a
+/// loopback/wildcard address.
+fn parse_lsof(text: &str) -> Vec<PortHit> {
+    let mut out: Vec<PortHit> = Vec::new();
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(cmd) = fields.first() else { continue };
+        if let Some(port) = fields.iter().find_map(|f| loopback_port(f))
+            && !out.iter().any(|h| h.port == port)
+        {
+            out.push(PortHit {
+                port,
+                url: None,
+                process: Some((*cmd).to_string()),
+            });
+        }
+    }
+    out
+}
+
+fn poll_via_ss(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
+    let out = run_ss(&["-tlnpH"])?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(parse_ss(&String::from_utf8_lossy(&out.stdout), pids))
+}
+
+/// Parse `ss -tlnpH` rows. The local-address column is field 3 and the process
+/// column embeds `pid=NNN`; we keep only rows whose pid is in the subtree.
+fn parse_ss(text: &str, pids: &HashSet<i32>) -> Vec<PortHit> {
+    let mut out: Vec<PortHit> = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(local) = fields.get(3) else { continue };
+        let Some(port) = loopback_port(local) else {
+            continue;
+        };
+        let proc = fields
+            .last()
+            .and_then(|f| ss_pid(f).map(|pid| (pid, ss_proc_name(f))));
+        match proc {
+            Some((pid, name))
+                if (pids.is_empty() || pids.contains(&pid))
+                    && !out.iter().any(|h| h.port == port) =>
+            {
+                out.push(PortHit {
+                    port,
+                    url: None,
+                    process: name,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn ss_pid(field: &str) -> Option<i32> {
+    let start = field.find("pid=")? + 4;
+    let rest = &field[start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+fn ss_proc_name(field: &str) -> Option<String> {
+    let start = field.find("((\"")? + 3;
+    let rest = &field[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// The port from a `host:port` address, but only for loopback / wildcard hosts
+/// (`*`, `0.0.0.0`, `127.0.0.1`, `[::]`, `[::1]`, `localhost`). A bound public
+/// interface isn't a dev server we should be offering to tunnel home.
+fn loopback_port(addr: &str) -> Option<u16> {
+    let (host, port) = addr.rsplit_once(':')?;
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    let loopback = matches!(
+        host,
+        "" | "*" | "0.0.0.0" | "127.0.0.1" | "::" | "::1" | "localhost"
+    );
+    if !loopback {
+        return None;
+    }
+    parse_port(port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A kernel notice about a hung NFS mount is printed on the controlling
+    /// tty of the process waiting on it. A socket probe runs every few
+    /// seconds, so it must own no tty: it leads its own session.
+    #[test]
+    fn a_socket_probe_runs_in_its_own_session() {
+        // Asked of the kernel, not of `ps`: macOS `ps` exposes no session id.
+        let mut child = probe("sleep").arg("5").spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        // SAFETY: getsid only reads the session id of a live pid.
+        let (sid, ours) = unsafe { (libc::getsid(pid), libc::getsid(0)) };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(sid, pid, "the probe is not its own session leader");
+        assert_ne!(sid, ours, "the probe shares croft's session");
+    }
+
+    /// The scoped `-b -w` scan still finds a listener: bind one and look
+    /// for it through the real call site. Skipped where lsof is not
+    /// installed.
+    #[test]
+    fn the_lsof_scan_still_finds_a_loopback_listener() {
+        if probe("lsof").arg("-v").output().is_err() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = poll_via_lsof(&HashSet::from([std::process::id() as i32])).expect("lsof ran");
+        assert!(
+            hits.iter().any(|h| h.port == port),
+            "port {port} missing from {hits:?}"
+        );
+    }
+
+    /// A helper runs under at most [`PROBE_FD_LIMIT`] descriptors, so an
+    /// lsof that closes every one up to the limit stays cheap (#1903).
+    #[test]
+    fn a_socket_probe_runs_under_a_low_descriptor_limit() {
+        let out = probe("sh").args(["-c", "ulimit -n"]).output().unwrap();
+        let limit: libc::rlim_t = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        assert!(limit <= PROBE_FD_LIMIT, "the helper ran under {limit}");
+        let lowered = probe_fd_limit();
+        assert!(lowered.is_none_or(|l| l.rlim_cur == PROBE_FD_LIMIT));
+    }
+
+    /// lsof's "nothing matched" is exit 1 with both streams empty: an
+    /// answer of no listeners, so `ss` is not run after it (#1903).
+    #[test]
+    fn an_lsof_that_matched_nothing_is_an_empty_scan_not_a_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stdout: &str, stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        assert_eq!(lsof_rows(&out(1, "", "")).as_deref(), Some(""));
+        assert_eq!(lsof_rows(&out(0, "", "")).as_deref(), Some(""));
+        let row = "COMMAND PID\nnode 7 u IPv4 TCP 127.0.0.1:3000 (LISTEN)\n";
+        assert_eq!(lsof_rows(&out(1, row, "")).as_deref(), Some(row));
+        assert_eq!(lsof_rows(&out(1, "", "lsof: illegal option")), None);
+        assert_eq!(lsof_rows(&out(2, "", "")), None);
+    }
+
+    /// The still-up snapshot trusts `ss` over `lsof`. An unprivileged lsof
+    /// can't see another user's sockets, such as a root-owned `docker-proxy`
+    /// publishing a container's port, and with none of the user's own
+    /// listening it answers with an empty scan. ss reads the kernel's table
+    /// and lists the port, so lsof is only asked when ss didn't run.
+    #[test]
+    fn the_still_up_snapshot_asks_ss_before_lsof() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stdout: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.into(),
+            stderr: Vec::new(),
+        };
+        let ss = "LISTEN 0 4096 0.0.0.0:8080 0.0.0.0:*\n";
+        let lsof = "COMMAND PID\nnode 7 u IPv4 TCP 127.0.0.1:3000 (LISTEN)\n";
+        let unasked =
+            || -> Option<std::process::Output> { panic!("lsof ran although ss answered") };
+        assert_eq!(
+            listening_snapshot(Some(out(0, ss)), unasked),
+            Some(HashSet::from([8080]))
+        );
+        assert_eq!(
+            listening_snapshot(None, || Some(out(0, lsof))),
+            Some(HashSet::from([3000]))
+        );
+        assert_eq!(
+            listening_snapshot(Some(out(1, "")), || Some(out(0, lsof))),
+            Some(HashSet::from([3000]))
+        );
+        assert_eq!(
+            listening_snapshot(None, || Some(out(1, ""))),
+            Some(HashSet::new())
+        );
+        assert_eq!(listening_snapshot(None, || None), None);
+    }
+
+    /// The real lsof on a process with no listener: an empty scan rather
+    /// than `None`, which is what sent the poll on to `ss`. Skipped where
+    /// lsof is not installed.
+    #[test]
+    fn the_lsof_scan_of_a_process_without_listeners_is_empty() {
+        if probe("lsof").arg("-v").output().is_err() {
+            return;
+        }
+        let mut child = probe("sleep").arg("5").spawn().unwrap();
+        let hits = poll_via_lsof(&HashSet::from([child.id() as i32]));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(hits, Some(Vec::new()));
+    }
+
+    /// Every poll helper is spawned through `probe`, so none can bring the
+    /// inherited tty back.
+    #[test]
+    fn every_poll_helper_spawns_through_probe() {
+        let src = include_str!("port_detect.rs");
+        let body = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        assert_eq!(
+            body.matches("Command::new(").count(),
+            1,
+            "only inside probe"
+        );
+    }
+
+    #[test]
+    fn scans_a_vite_banner_url_with_port_and_path() {
+        let hits = scan("  VITE v5.2  ready  ->  Local: http://localhost:3000/app");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].port, 3000);
+        assert_eq!(hits[0].url.as_deref(), Some("http://localhost:3000/app"));
+    }
+
+    #[test]
+    fn scans_a_bare_listening_line() {
+        let hits = scan("INFO server listening on port 8080");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].port, 8080);
+        assert!(hits[0].url.is_none());
+    }
+
+    /// The reconciliation snapshot must cover every loopback listener, not just
+    /// a croft pane's process subtree. A container's published port is nobody's
+    /// descendant; judging it by the scoped scan retired the row and cancelled
+    /// its tunnel seconds after the output scrape found it. This test's own
+    /// listener is owned by the test binary, which is exactly such an outsider.
+    #[test]
+    fn the_reconciliation_snapshot_covers_listeners_outside_any_subtree() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+        let port = listener.local_addr().unwrap().port();
+        let Some(all) = poll_all_listening() else {
+            // No lsof and no ss: the app skips reconciliation entirely, which
+            // is the safe direction, and there is nothing to assert here.
+            return;
+        };
+        assert!(
+            all.contains(&port),
+            "port {port} is listening but missing from the snapshot"
+        );
+    }
+
+    /// A test harness counting its cases is not a dev server. Matching a bare
+    /// number after an announce verb fabricates a port, which on a remote
+    /// session offers to `ssh -O forward` a port nothing is listening on.
+    #[test]
+    fn a_plain_count_after_an_announce_verb_is_not_a_port() {
+        for line in [
+            "running 289 tests",
+            "Started 15 workers",
+            "started 42 jobs, running 1200 checks",
+        ] {
+            assert!(scan(line).is_empty(), "{line:?} must not report a port");
+        }
+    }
+
+    /// A clock time is not a port either. The colon branch has to let
+    /// `0.0.0.0:80` through, so the digits before it are what separate an
+    /// address from an hour.
+    #[test]
+    fn a_clock_time_after_an_announce_verb_is_not_a_port() {
+        for line in [
+            "Started backup at 03:15",
+            "server started, running since 10:22",
+            "running 289 tests across 12:30 minutes",
+        ] {
+            assert!(scan(line).is_empty(), "{line:?} must not report a port");
+        }
+    }
+
+    /// The announce forms the scrape exists for still match: a spelled-out
+    /// `port N`, `port: N` (Express's own boilerplate), and a `host:N` / `:N`
+    /// address, including the two-digit well-known ones a clock could shadow.
+    #[test]
+    fn announce_lines_with_a_port_or_a_colon_still_match() {
+        for (line, port) in [
+            ("Listening on port 8080", 8080u16),
+            ("Example app listening on port: 3000", 3000),
+            ("Server listening on port : 8080", 8080),
+            ("serving at :4000", 4000),
+            ("bound to 0.0.0.0:9229", 9229),
+            ("bound to 0.0.0.0:80", 80),
+            ("listening on 127.0.0.1:80", 80),
+            // A numeric-suffixed hostname is not a clock: only a STANDALONE
+            // one or two digit number before the colon reads as an hour.
+            ("bound to api1:80", 80),
+            ("listening on web-1:80", 80),
+        ] {
+            let hits = scan(line);
+            assert_eq!(hits.len(), 1, "{line:?}");
+            assert_eq!(hits[0].port, port, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn url_wins_over_bare_for_the_same_port() {
+        let hits = scan("listening on http://127.0.0.1:5000 — now serving 5000");
+        assert_eq!(hits.iter().filter(|h| h.port == 5000).count(), 1);
+        assert!(hits.iter().any(|h| h.port == 5000 && h.url.is_some()));
+    }
+
+    #[test]
+    fn ignores_public_hosts() {
+        assert!(scan("see https://example.com:8443/docs").is_empty());
+    }
+
+    #[test]
+    fn https_url_without_explicit_port_defaults_to_443() {
+        let hits = scan("ready at https://localhost/");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].port, 443);
+    }
+
+    #[test]
+    fn sniffer_does_not_double_emit_a_banner_via_the_carry() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut s = PortSniffer::new();
+        s.sniff(b"up at http://localhost:3000/\n", &tx);
+        // The banner now lives only in the carried tail; a follow-up chunk that
+        // doesn't reprint it must not re-emit the port.
+        s.sniff(b"$ \n", &tx);
+        let got: Vec<_> = rx.try_iter().collect();
+        assert_eq!(got.len(), 1, "carried banner is not re-emitted: {got:?}");
+        assert_eq!(got[0].port, 3000);
+    }
+
+    #[test]
+    fn sniffer_re_emits_a_port_after_the_server_stops_and_restarts() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut s = PortSniffer::new();
+        s.sniff(b"Serving on http://localhost:8000/\n", &tx);
+        // Server killed: a chunk with no port clears the suppression.
+        s.sniff(b"^C\nKeyboard interrupt received, exiting.\n", &tx);
+        // Restarted: the same port must be reported again so the toast fires.
+        s.sniff(b"Serving on http://localhost:8000/\n", &tx);
+        let got: Vec<_> = rx.try_iter().collect();
+        assert_eq!(got.len(), 2, "restart re-emits the port: {got:?}");
+        assert!(got.iter().all(|h| h.port == 8000));
+    }
+
+    #[test]
+    fn sniffer_catches_a_port_split_across_chunks() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut s = PortSniffer::new();
+        s.sniff(b"Local:  http://localho", &tx);
+        s.sniff(b"st:4173/ ready", &tx);
+        let got: Vec<_> = rx.try_iter().collect();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].port, 4173);
+    }
+
+    /// Every hit `chunks` produce, fed to one sniffer in order.
+    fn sniff_all(chunks: &[&[u8]]) -> Vec<PortHit> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut s = PortSniffer::new();
+        for c in chunks {
+            s.sniff(c, &tx);
+        }
+        rx.try_iter().collect()
+    }
+
+    /// #1449: Vite colours its URL and bolds the port, so the bytes hide
+    /// the URL behind escape codes. The scrape reads the text, not them.
+    #[test]
+    fn sniffer_reads_a_vite_url_through_its_colour_codes() {
+        let got = sniff_all(&[
+            b"  \xe2\x9e\x9c  Local:   \x1b[36mhttp://localhost:\x1b[1m5173\x1b[22m/\x1b[39m\n",
+        ]);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].port, 5173);
+        assert_eq!(got[0].url.as_deref(), Some("http://localhost:5173/"));
+        let bold = sniff_all(&[b"\x1b[1mhttp://127.0.0.1:8000\x1b[0m\n"]);
+        assert_eq!(bold.len(), 1, "{bold:?}");
+        assert_eq!(bold[0].port, 8000);
+        assert_eq!(bold[0].url.as_deref(), Some("http://127.0.0.1:8000"));
+    }
+
+    /// #1449: an escape code split across two reads is still dropped whole,
+    /// and the URL it sat in is reported once, with its port.
+    #[test]
+    fn sniffer_reads_a_url_whose_escape_code_is_split_across_reads() {
+        let got = sniff_all(&[
+            b"Local: \x1b[36mhttp://localhost:\x1b[",
+            b"1m5173\x1b[22m/\x1b[39m\n",
+        ]);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].port, 5173);
+        assert_eq!(got[0].url.as_deref(), Some("http://localhost:5173/"));
+        // An OSC (a window title) split the same way is dropped too.
+        let osc = sniff_all(&[
+            b"\x1b]0;vite ht",
+            b"tp://localhost:1\x07up at http://localhost:4000/\n",
+        ]);
+        assert_eq!(osc.iter().map(|h| h.port).collect::<Vec<_>>(), vec![4000]);
+    }
+
+    /// #1449 negative: a read that ends right after `localhost:` is not a
+    /// URL on port 80; the port is still to come.
+    #[test]
+    fn a_url_cut_before_its_port_is_not_reported_on_port_80() {
+        let got = sniff_all(&[b"Local: http://localhost:", b"5173/\n"]);
+        assert_eq!(got.iter().map(|h| h.port).collect::<Vec<_>>(), vec![5173]);
+    }
+
+    /// #1449: a URL that ends the server's output, with no newline and no
+    /// further read, is held back only until the output goes quiet: the
+    /// reader's flush sends it, once.
+    #[test]
+    fn a_url_ending_the_output_is_sent_by_the_flush_once() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut s = PortSniffer::new();
+        s.sniff(b"Local: \x1b[36mhttp://localhost:5173\x1b[39m", &tx);
+        assert!(rx.try_iter().next().is_none(), "held back, may still grow");
+        assert!(s.has_pending());
+        s.flush(&tx);
+        let got: Vec<_> = rx.try_iter().collect();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].url.as_deref(), Some("http://localhost:5173"));
+        assert!(!s.has_pending());
+        s.sniff(b"\n", &tx);
+        assert!(rx.try_iter().next().is_none(), "not sent a second time");
+    }
+
+    /// #1449 negative: a URL at the very end of a read waits for the next
+    /// read, and is reported then even when nothing more of it arrives.
+    #[test]
+    fn a_url_ending_a_read_is_reported_with_the_next_read() {
+        let got = sniff_all(&[b"up at http://localhost:3000/", b"\n"]);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].url.as_deref(), Some("http://localhost:3000/"));
+        let longer = sniff_all(&[b"up at http://localhost:30", b"00/app\n"]);
+        assert_eq!(longer.len(), 1, "{longer:?}");
+        assert_eq!(longer[0].url.as_deref(), Some("http://localhost:3000/app"));
+    }
+
+    /// #1449 negative: the numbers inside an escape code are never a port.
+    #[test]
+    fn digits_inside_an_escape_code_are_not_a_port() {
+        let got = sniff_all(&[b"server listening\x1b[38:2::255:100:0m on \x1b[0mthe socket\n"]);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn parses_lsof_loopback_listeners_only() {
+        let sample = "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n\
+                      node 123 me 21u IPv4 0xabc 0t0 TCP 127.0.0.1:3000 (LISTEN)\n\
+                      ssh 99 me 5u IPv4 0xdef 0t0 TCP 10.0.0.2:22 (LISTEN)\n";
+        let hits = parse_lsof(sample);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].port, 3000);
+        assert_eq!(hits[0].process.as_deref(), Some("node"));
+    }
+
+    #[test]
+    fn parses_ss_rows_scoped_to_pids() {
+        let sample = "LISTEN 0 511 127.0.0.1:5432 0.0.0.0:* users:((\"postgres\",pid=4242,fd=7))\n\
+                      LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=1,fd=3))\n";
+        let mut pids = HashSet::new();
+        pids.insert(4242);
+        let hits = parse_ss(sample, &pids);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].port, 5432);
+        assert_eq!(hits[0].process.as_deref(), Some("postgres"));
+    }
+
+    #[test]
+    fn url_at_finds_the_link_under_the_cursor() {
+        let line = "  visit http://localhost:3000/app for the UI";
+        // Column inside the URL.
+        assert_eq!(
+            url_at(line, 20).as_deref(),
+            Some("http://localhost:3000/app")
+        );
+        // Column in the surrounding prose: no URL.
+        assert!(url_at(line, 2).is_none());
+    }
+
+    #[test]
+    fn url_at_trims_trailing_punctuation() {
+        let line = "see https://example.com/docs.";
+        assert_eq!(
+            url_at(line, 10).as_deref(),
+            Some("https://example.com/docs")
+        );
+    }
+
+    /// #1355: Wikipedia, MSDN and many docs sites put `(...)` in paths;
+    /// the click opened `…/wiki/Rust_`, a different page.
+    #[test]
+    fn url_at_keeps_parentheses_that_belong_to_the_url() {
+        let line = "see https://en.wikipedia.org/wiki/Rust_(programming_language) for history";
+        assert_eq!(
+            url_at(line, 10).as_deref(),
+            Some("https://en.wikipedia.org/wiki/Rust_(programming_language)")
+        );
+        let line = "docs: https://learn.microsoft.com/en-us/previous-versions/ms123(v=vs.85).";
+        assert_eq!(
+            url_at(line, 10).as_deref(),
+            Some("https://learn.microsoft.com/en-us/previous-versions/ms123(v=vs.85)")
+        );
+    }
+
+    #[test]
+    fn url_at_still_leaves_out_the_parenthesis_around_a_url() {
+        let line = "(see https://x.dev/a)";
+        assert_eq!(url_at(line, 8).as_deref(), Some("https://x.dev/a"));
+        let line = "(docs at https://x.dev/a).";
+        assert_eq!(url_at(line, 12).as_deref(), Some("https://x.dev/a"));
+        let line = "(https://en.wikipedia.org/wiki/Rust_(programming_language))";
+        assert_eq!(
+            url_at(line, 5).as_deref(),
+            Some("https://en.wikipedia.org/wiki/Rust_(programming_language)"),
+            "only the unmatched closing parenthesis is dropped"
+        );
+        let line = "a [link](https://x.dev/b) in markdown";
+        assert_eq!(url_at(line, 12).as_deref(), Some("https://x.dev/b"));
+    }
+
+    #[test]
+    fn loopback_url_port_classifies_dev_servers() {
+        assert_eq!(loopback_url_port("http://localhost:3000/app"), Some(3000));
+        assert_eq!(loopback_url_port("https://127.0.0.1/"), Some(443));
+        assert_eq!(loopback_url_port("http://localhost/"), Some(80));
+        assert!(loopback_url_port("https://example.com:8443/").is_none());
+    }
+
+    #[test]
+    fn loopback_port_rejects_public_bind() {
+        assert_eq!(loopback_port("127.0.0.1:3000"), Some(3000));
+        assert_eq!(loopback_port("*:8080"), Some(8080));
+        assert_eq!(loopback_port("[::1]:9000"), Some(9000));
+        assert_eq!(loopback_port("192.168.1.5:3000"), None);
+    }
+}

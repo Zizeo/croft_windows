@@ -1,0 +1,1044 @@
+//! Per-agent ledger of the files an agent changed while you were looking
+//! elsewhere (#345).
+//!
+//! The daily pain with a coding agent is losing track of what it touched.
+//! croft already owns the file watcher and the agent's pane status, so the
+//! ledger is the join: while an agent pane is `Working`, every workspace
+//! write is attributed to that agent, and each attributed file carries a
+//! REVIEW BASELINE — the content as of the last time you marked it reviewed.
+//! A file whose current content matches its baseline is not in the queue,
+//! which is what makes "mark reviewed" mean something rather than merely
+//! hiding a row.
+//!
+//! Two design points are load-bearing:
+//!
+//! * **A tie attributes to BOTH agents, and says so.** Two agents working at
+//!   once cannot be told apart by a filesystem event, and picking one would
+//!   be a guess presented as a fact. The row is flagged `shared`, and the
+//!   reader sees why the same file sits in two lanes.
+//! * **Attribution needs a working agent, not merely a seated one.** A quiet
+//!   agent's pane is not a reason to blame it for your own save, so a write
+//!   with no agent working is attributed to nobody and never enters a lane.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// One file in one agent's lane.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LaneFile {
+    pub path: PathBuf,
+    /// Content hash when the user last marked it reviewed; `None` until the
+    /// first review, which is what makes a newly-touched file unreviewed.
+    pub reviewed_hash: Option<u64>,
+    /// Milliseconds of the local-history snapshot holding the content that
+    /// became the baseline, so the row can be DIFFED against what the user
+    /// approved rather than only compared to it (#345). `None` when the
+    /// snapshot could not be taken — the store is best-effort, and a row
+    /// with no anchor refuses the diff rather than showing one against a
+    /// baseline it cannot name.
+    pub reviewed_millis: Option<u64>,
+    /// Content hash at the most recent attributed write.
+    pub current_hash: u64,
+    /// How many attributed writes have landed since the last review.
+    pub writes_since_review: u32,
+    /// Monotonic sequence of the most recent attributed write, so the lane
+    /// can be ordered by RECENCY. Without it the ordering was by path,
+    /// which put the file an agent touched an hour ago above the one it
+    /// just wrote — the opposite of what a review queue is for.
+    pub last_write_seq: u64,
+    /// Another agent was also working when this landed, so the attribution
+    /// is ambiguous and is shown as such rather than guessed.
+    pub shared: bool,
+}
+
+impl LaneFile {
+    /// Whether this row belongs in the review queue: the content has moved
+    /// since the baseline (or there is no baseline yet).
+    pub fn unreviewed(&self) -> bool {
+        self.reviewed_hash != Some(self.current_hash)
+    }
+}
+
+/// Every agent's ledger, keyed by agent name. Saved per workspace (#345),
+/// so the queue and its review baselines outlive a restart.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct AgentLedger {
+    lanes: BTreeMap<String, BTreeMap<PathBuf, LaneFile>>,
+    /// Ticks once per recorded write, so every row can be ordered against
+    /// every other regardless of lane.
+    write_seq: u64,
+    /// The file watcher overflowed at least once since the queue was last
+    /// emptied, so every count is a LOWER BOUND: writes happened that never
+    /// reached a lane. Carried here rather than only announced in a status
+    /// line, because a transient line the next keystroke clears would leave
+    /// the user believing a partial queue is a complete one — the one thing
+    /// this module must never do.
+    may_be_incomplete: bool,
+    /// Bumped by every change, so the app saves only when there is
+    /// something new to save. Not itself saved.
+    #[serde(skip)]
+    generation: u64,
+}
+
+/// Files above this are not hashed: the ledger runs on the frame loop
+/// while an agent is working (exactly when writes are frequent), and a
+/// checked-in fixture or generated asset would otherwise be read whole on
+/// every touch. Such a file is recorded at a size-and-mtime stamp instead,
+/// which still changes when it changes.
+pub const MAX_HASH_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A stable content hash. FNV-1a over the bytes: the ledger only ever asks
+/// "is this the same content I showed you", so a fast non-cryptographic
+/// hash is the right tool, and it keeps the baseline to 8 bytes per file
+/// rather than a copy of the content.
+pub fn content_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// What reading a file for its baseline produced.
+///
+/// "Gone" and "unreadable" must never collapse: clearing a row because the
+/// file could not be read this instant marks content the user has NOT seen
+/// as reviewed, and the state is unrecoverable — a later write landing on
+/// the same hash is a no-op, so the unseen content stays clear forever.
+/// That is precisely the promise this module exists to keep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Baseline {
+    /// The content hashed cleanly.
+    Hash(u64),
+    /// The path no longer exists: there is nothing left to review.
+    Gone,
+    /// It exists but could not be read (EMFILE under a build storm, a
+    /// transient lock, EACCES after the agent chmod'd it). The row must
+    /// stay in the queue.
+    Unreadable,
+}
+
+/// The hash of `path`'s current content, distinguishing a vanished file
+/// from one that merely could not be read right now.
+pub fn read_baseline(path: &Path) -> Baseline {
+    // One `metadata` call is cheaper than the read it guards, and it is
+    // also how a too-large file is stamped rather than slurped.
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Baseline::Gone,
+        Err(_) => return Baseline::Unreadable,
+    };
+    if meta.len() > MAX_HASH_BYTES {
+        // With no mtime the stamp would be the LENGTH alone, and every
+        // same-size write to a large file would be invisible with no
+        // signal at all. Fall through to the honest read instead.
+        if let Some(stamp) = stamp_hash(&meta) {
+            return Baseline::Hash(stamp);
+        }
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => Baseline::Hash(content_hash(&bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Baseline::Gone,
+        Err(_) => Baseline::Unreadable,
+    }
+}
+
+/// The stand-in hash for a file too large to read on the frame loop: its
+/// length and mtime, or `None` when the mtime is unavailable — in which
+/// case the caller reads the file rather than standing in with a
+/// length-only stamp that would hide every same-size write. Weaker than
+/// content addressing (a same-size write inside one mtime granule is
+/// missed) but bounded, and the alternative is reading hundreds of
+/// megabytes during a draw.
+fn stamp_hash(meta: &std::fs::Metadata) -> Option<u64> {
+    let mtime = meta.modified().ok()?;
+    let since = mtime.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let mut bytes = meta.len().to_le_bytes().to_vec();
+    bytes.extend_from_slice(&since.as_nanos().to_le_bytes());
+    Some(content_hash(&bytes))
+}
+
+impl AgentLedger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// No lane holds anything: nothing worth saving.
+    pub fn is_empty(&self) -> bool {
+        self.lanes.is_empty()
+    }
+
+    /// Changes since this ledger was made or loaded (see `generation`).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn touch(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// A saved ledger, less rows whose file is gone: a file deleted while
+    /// croft was closed has nothing left to review, and nothing will ever
+    /// report its deletion now.
+    pub fn restored(mut self, exists: impl Fn(&Path) -> bool) -> Self {
+        for lane in self.lanes.values_mut() {
+            lane.retain(|path, _| exists(path));
+        }
+        self.lanes.retain(|_, lane| !lane.is_empty());
+        self.write_seq = self
+            .lanes
+            .values()
+            .flat_map(|l| l.values())
+            .map(|f| f.last_write_seq)
+            .max()
+            .unwrap_or(0)
+            .max(self.write_seq);
+        self.settle_if_empty();
+        self.generation = 0;
+        self
+    }
+
+    /// Record that the watcher dropped events: every count from here on is
+    /// a lower bound until the queue is next emptied.
+    pub fn note_dropped_events(&mut self) {
+        if !self.may_be_incomplete {
+            self.touch();
+        }
+        self.may_be_incomplete = true;
+    }
+
+    /// Whether the queue may be missing files the watcher never reported.
+    pub fn may_be_incomplete(&self) -> bool {
+        self.may_be_incomplete
+    }
+
+    /// Attribute one write of `path` (already hashed) to every agent in
+    /// `working`. With no working agent the write belongs to the user and
+    /// is dropped: attributing it would put your own edits in an agent's
+    /// review queue.
+    ///
+    /// Returns whether any lane changed, so the caller can skip a repaint.
+    pub fn record_write(&mut self, path: &Path, hash: u64, working: &[String]) -> bool {
+        if working.is_empty() {
+            return false;
+        }
+        let shared = working.len() > 1;
+        self.write_seq = self.write_seq.saturating_add(1);
+        let seq = self.write_seq;
+        let mut changed = false;
+        for agent in working {
+            let lane = self.lanes.entry(agent.clone()).or_default();
+            match lane.get_mut(path) {
+                Some(entry) => {
+                    // A write that lands on content the user has already
+                    // reviewed (an agent reverting its own change, say) is
+                    // still a write, but it does not resurrect the row —
+                    // and it is not evidence of ambiguity either, so the
+                    // `shared` promotion rides inside the same guard.
+                    if entry.current_hash != hash {
+                        entry.current_hash = hash;
+                        entry.writes_since_review = entry.writes_since_review.saturating_add(1);
+                        entry.last_write_seq = seq;
+                        entry.shared |= shared;
+                        changed = true;
+                    }
+                }
+                None => {
+                    lane.insert(
+                        path.to_path_buf(),
+                        LaneFile {
+                            path: path.to_path_buf(),
+                            reviewed_hash: None,
+                            reviewed_millis: None,
+                            current_hash: hash,
+                            writes_since_review: 1,
+                            last_write_seq: seq,
+                            shared,
+                        },
+                    );
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.touch();
+        }
+        changed
+    }
+
+    /// The rows in one agent's lane: everything awaiting review first, most
+    /// recently written first within that group, then the reviewed
+    /// remainder. Recency is what a review queue is ordered by — the file
+    /// the agent just touched is the one you want at the top.
+    pub fn lane(&self, agent: &str) -> Vec<&LaneFile> {
+        let Some(lane) = self.lanes.get(agent) else {
+            return Vec::new();
+        };
+        let mut rows: Vec<&LaneFile> = lane.values().collect();
+        rows.sort_by(|a, b| {
+            (
+                !a.unreviewed(),
+                std::cmp::Reverse(a.last_write_seq),
+                &a.path,
+            )
+                .cmp(&(
+                    !b.unreviewed(),
+                    std::cmp::Reverse(b.last_write_seq),
+                    &b.path,
+                ))
+        });
+        rows
+    }
+
+    /// One agent's unreviewed files grouped by the workspace root that owns
+    /// them (#348), each group ordered by the same recency `lane` uses.
+    ///
+    /// `roots` is asked which root owns each path; a file under none of them
+    /// (an agent that wrote outside the workspace) groups under `None`
+    /// rather than being dropped, because a review queue that silently omits
+    /// a file an agent changed is worse than one that says "somewhere else".
+    /// Groups come back in root order, `None` last, so a worktree lane's
+    /// files read as their own section rather than interleaved with the main
+    /// checkout's.
+    pub fn lane_by_root<'a>(
+        &'a self,
+        agent: &str,
+        roots: &'a [PathBuf],
+    ) -> Vec<(Option<&'a Path>, Vec<&'a LaneFile>)> {
+        let owner = |path: &Path| -> Option<&'a Path> {
+            roots
+                .iter()
+                .filter(|r| path.starts_with(r))
+                .max_by_key(|r| r.components().count())
+                .map(PathBuf::as_path)
+        };
+        let mut groups: Vec<(Option<&Path>, Vec<&LaneFile>)> = Vec::new();
+        for file in self.lane(agent).into_iter().filter(|f| f.unreviewed()) {
+            let root = owner(&file.path);
+            match groups.iter_mut().find(|(r, _)| *r == root) {
+                Some((_, files)) => files.push(file),
+                None => groups.push((root, vec![file])),
+            }
+        }
+        // Root order, not first-seen order: the queue should read the same
+        // way twice running, whatever the agent touched most recently.
+        groups.sort_by_key(|(root, _)| match root {
+            Some(r) => roots
+                .iter()
+                .position(|candidate| candidate == r)
+                .unwrap_or(usize::MAX),
+            None => usize::MAX,
+        });
+        groups
+    }
+
+    /// Every unreviewed file across every lane, deduplicated.
+    ///
+    /// One set rather than per-agent lists, because the consumer is the
+    /// Explorer's dot (#345) and a file two agents both wrote is one file
+    /// with one row. [`Self::unreviewed_files`] counts the same thing; this
+    /// hands back the paths so a caller can test membership per row, which
+    /// is what the Explorer's decoration needs.
+    pub fn unreviewed_paths(&self) -> std::collections::HashSet<PathBuf> {
+        self.lanes
+            .values()
+            .flat_map(|lane| lane.values())
+            .filter(|f| f.unreviewed())
+            .map(|f| f.path.clone())
+            .collect()
+    }
+
+    /// Every agent that has a lane, in name order.
+    pub fn agents(&self) -> Vec<&str> {
+        self.lanes.keys().map(String::as_str).collect()
+    }
+
+    /// How many files in `agent`'s lane still await review — the lane
+    /// header's badge.
+    pub fn unreviewed_count(&self, agent: &str) -> usize {
+        self.lanes
+            .get(agent)
+            .map(|lane| lane.values().filter(|f| f.unreviewed()).count())
+            .unwrap_or(0)
+    }
+
+    /// Whether any lane holds `path` unreviewed — the file tree's dot
+    /// decoration.
+    pub fn is_unreviewed(&self, path: &Path) -> bool {
+        self.lanes
+            .values()
+            .any(|lane| lane.get(path).is_some_and(|f| f.unreviewed()))
+    }
+
+    /// Mark one file reviewed in one lane: the CURRENT content becomes the
+    /// baseline, so a later write re-queues it. `current` is the content
+    /// hash now, which may differ from the last attributed write if the
+    /// user edited it themselves in between — reviewing means "I have seen
+    /// what is on disk", not "I have seen what the agent last wrote".
+    ///
+    /// `snapshot_millis` anchors WHICH local-history snapshot holds that
+    /// content, so the row can later be diffed against it. `None` is a
+    /// legitimate outcome, not an error: the store is best-effort, and a row
+    /// without an anchor is still reviewed — it just cannot show a diff.
+    pub fn mark_reviewed(
+        &mut self,
+        agent: &str,
+        path: &Path,
+        current: u64,
+        snapshot_millis: Option<u64>,
+    ) -> bool {
+        let Some(lane) = self.lanes.get_mut(agent) else {
+            return false;
+        };
+        let Some(entry) = lane.get_mut(path) else {
+            return false;
+        };
+        entry.reviewed_hash = Some(current);
+        entry.reviewed_millis = snapshot_millis;
+        entry.current_hash = current;
+        entry.writes_since_review = 0;
+        self.settle_if_empty();
+        self.touch();
+        true
+    }
+
+    /// Mark every file in one lane reviewed, using `read` to see each file's
+    /// current content and, in the same call, the local-history snapshot
+    /// holding exactly those bytes.
+    ///
+    /// Returns `(reviewed, dropped)`: rows whose current content became the
+    /// baseline, and rows removed because the file is gone. They are counted
+    /// apart because telling the user a deleted file was "reviewed" claims
+    /// they looked at something that is not there.
+    pub fn mark_lane_reviewed(
+        &mut self,
+        agent: &str,
+        read: impl Fn(&Path) -> (Baseline, Option<u64>),
+    ) -> (usize, usize) {
+        let Some(lane) = self.lanes.get_mut(agent) else {
+            return (0, 0);
+        };
+        let mut cleared = 0;
+        let mut gone: Vec<PathBuf> = Vec::new();
+        for entry in lane.values_mut() {
+            if !entry.unreviewed() {
+                continue;
+            }
+            // One call per row returns both, from ONE read of the file: a
+            // second read could see different bytes, and the baseline hash
+            // would then describe content the anchor does not hold. Per row,
+            // never once for the lane - a snapshot that failed to record must
+            // not inherit a sibling's anchor.
+            let (baseline, snapshot_millis) = read(&entry.path);
+            match baseline {
+                Baseline::Hash(current) => {
+                    entry.reviewed_hash = Some(current);
+                    entry.reviewed_millis = snapshot_millis;
+                    entry.current_hash = current;
+                    entry.writes_since_review = 0;
+                    cleared += 1;
+                }
+                // Nothing left to review: the row goes rather than sitting
+                // in the queue forever pointing at a file that is not there.
+                Baseline::Gone => gone.push(entry.path.clone()),
+                // Unreadable RIGHT NOW is not reviewed: leave it queued and
+                // do not count it, so the status line's number is honest.
+                Baseline::Unreadable => {}
+            }
+        }
+        for path in &gone {
+            lane.remove(path);
+        }
+        self.settle_if_empty();
+        if cleared + gone.len() > 0 {
+            self.touch();
+        }
+        (cleared, gone.len())
+    }
+
+    /// An empty queue has nothing left to be wrong about, so a
+    /// dropped-event window stops mattering once every row is reviewed.
+    /// Anything still waiting keeps the doubt, since a dropped write may be
+    /// among it.
+    fn settle_if_empty(&mut self) {
+        if self.may_be_incomplete && self.total_unreviewed() == 0 {
+            self.may_be_incomplete = false;
+        }
+    }
+
+    /// Drop `path` from every lane — the file is gone, so there is nothing
+    /// left for anyone to review.
+    pub fn forget_path(&mut self, path: &Path) -> bool {
+        let mut any = false;
+        for lane in self.lanes.values_mut() {
+            any |= lane.remove(path).is_some();
+        }
+        if any {
+            self.settle_if_empty();
+            self.touch();
+        }
+        any
+    }
+
+    /// Drop an agent's lane entirely (it is gone and the user dismissed it).
+    pub fn forget(&mut self, agent: &str) -> bool {
+        let removed = self.lanes.remove(agent).is_some();
+        if removed {
+            self.settle_if_empty();
+            self.touch();
+        }
+        removed
+    }
+
+    /// Total unreviewed ROWS across every lane — the per-lane badges sum to
+    /// this, so a file two agents both touched counts twice, once in each
+    /// lane. For "how many files must the user look at", which is what a
+    /// single global badge means, use [`Self::unreviewed_files`].
+    pub fn total_unreviewed(&self) -> usize {
+        self.lanes
+            .values()
+            .flat_map(|lane| lane.values())
+            .filter(|f| f.unreviewed())
+            .count()
+    }
+
+    /// Distinct FILES awaiting review across every lane. A shared row is one
+    /// file to open, not two: a count that drops by two when the user
+    /// reviews one file is telling them something untrue.
+    ///
+    /// Derived from [`Self::unreviewed_paths`] rather than counted
+    /// separately, so it cannot disagree with the set the Explorer draws.
+    /// It allocates that set to do it, which is why the status chip counts
+    /// the Explorer's own cached copy instead of calling this on every
+    /// frame — this is for callers that have no cache to hand.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn unreviewed_files(&self) -> usize {
+        self.unreviewed_paths().len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_saved_ledger_comes_back_less_deleted_files_and_counts_its_changes() {
+        // #345: the queue and its baselines round-trip; a file deleted
+        // while croft was closed does not come back; `generation` moves
+        // only on real changes, which is what the app saves on.
+        let mut l = AgentLedger::new();
+        let working = [String::from("claude")];
+        assert!(l.record_write(&p("/w/a.rs"), 1, &working));
+        assert!(l.record_write(&p("/w/b.rs"), 2, &working));
+        l.mark_reviewed("claude", &p("/w/b.rs"), 2, Some(77));
+        let g = l.generation();
+        assert!(!l.record_write(&p("/w/a.rs"), 1, &working), "same content");
+        assert!(!l.mark_reviewed("nobody", &p("/w/a.rs"), 1, None));
+        assert!(!l.forget_path(&p("/w/zzz.rs")));
+        assert_eq!(l.generation(), g, "nothing changed, nothing to save");
+        l.note_dropped_events();
+        assert!(l.generation() > g);
+
+        let json = serde_json::to_string(&l).unwrap();
+        let back: AgentLedger = serde_json::from_str(&json).unwrap();
+        let back = back.restored(|path| path != Path::new("/w/gone.rs"));
+        assert_eq!(back.generation(), 0, "a load is not a change");
+        assert_eq!(back.lane("claude").len(), 2);
+        assert!(back.is_unreviewed(&p("/w/a.rs")));
+        assert!(!back.is_unreviewed(&p("/w/b.rs")));
+        let b = back
+            .lane("claude")
+            .into_iter()
+            .find(|f| f.path == p("/w/b.rs"))
+            .unwrap();
+        assert_eq!(b.reviewed_millis, Some(77), "the diff anchor survives");
+        assert!(back.may_be_incomplete());
+
+        let gone = back.restored(|path| path != Path::new("/w/a.rs"));
+        assert_eq!(
+            gone.lane("claude").len(),
+            1,
+            "a deleted file's row is dropped"
+        );
+        assert!(
+            !gone.may_be_incomplete(),
+            "with nothing left unreviewed there is nothing to doubt"
+        );
+        // A write after the load orders after every saved one.
+        let mut gone = gone;
+        gone.record_write(&p("/w/c.rs"), 3, &working);
+        assert_eq!(gone.lane("claude")[0].path, p("/w/c.rs"));
+    }
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    /// The core ledger shape: a working agent's writes land in its lane
+    /// unreviewed, marking reviewed clears them, and a later write
+    /// re-queues the file.
+    #[test]
+    fn a_working_agents_writes_queue_for_review_and_clear_when_marked() {
+        let mut led = AgentLedger::new();
+        let claude = vec![String::from("claude")];
+
+        assert!(led.record_write(&p("/w/src/a.rs"), 1, &claude));
+        assert!(led.record_write(&p("/w/src/b.rs"), 2, &claude));
+        assert_eq!(led.unreviewed_count("claude"), 2);
+        assert_eq!(led.total_unreviewed(), 2);
+        assert!(led.is_unreviewed(&p("/w/src/a.rs")));
+        assert_eq!(led.agents(), vec!["claude"]);
+
+        // Reviewing one clears just that row, and it leaves the lane's
+        // ordering with the unreviewed file first.
+        assert!(led.mark_reviewed("claude", &p("/w/src/a.rs"), 1, None));
+        assert_eq!(led.unreviewed_count("claude"), 1);
+        assert!(!led.is_unreviewed(&p("/w/src/a.rs")));
+        let rows = led.lane("claude");
+        assert_eq!(rows[0].path, p("/w/src/b.rs"), "unreviewed sorts first");
+        assert!(rows[0].last_write_seq > 0);
+        assert_eq!(rows[1].writes_since_review, 0);
+
+        // A NEW write to the reviewed file re-queues it: the baseline is
+        // content, not a dismissal.
+        assert!(led.record_write(&p("/w/src/a.rs"), 99, &claude));
+        assert!(led.is_unreviewed(&p("/w/src/a.rs")));
+        assert_eq!(led.unreviewed_count("claude"), 2);
+
+        // A write that restores the reviewed content does NOT re-queue it.
+        led.mark_reviewed("claude", &p("/w/src/a.rs"), 99, None);
+        assert!(!led.record_write(&p("/w/src/a.rs"), 99, &claude));
+        assert!(!led.is_unreviewed(&p("/w/src/a.rs")));
+    }
+
+    /// A write while two agents are working is attributed to BOTH and
+    /// flagged, rather than guessed at.
+    #[test]
+    fn a_tie_between_two_working_agents_is_shared_not_guessed() {
+        let mut led = AgentLedger::new();
+        let both = vec![String::from("claude"), String::from("codex")];
+        led.record_write(&p("/w/x.rs"), 7, &both);
+
+        assert_eq!(led.agents(), vec!["claude", "codex"]);
+        assert!(led.lane("claude")[0].shared);
+        assert!(led.lane("codex")[0].shared);
+        assert_eq!(led.total_unreviewed(), 2, "the file sits in both lanes");
+        assert_eq!(
+            led.unreviewed_files(),
+            1,
+            "but it is ONE file to open: a chip that drops by two when the \
+             user reviews one file is telling them something untrue"
+        );
+
+        // Reviewing it in one lane leaves the other's row standing: each
+        // agent's queue is its own.
+        led.mark_reviewed("claude", &p("/w/x.rs"), 7, None);
+        assert_eq!(led.unreviewed_count("claude"), 0);
+        assert_eq!(led.unreviewed_count("codex"), 1);
+        assert_eq!(led.total_unreviewed(), 1, "one row left");
+        assert_eq!(
+            led.unreviewed_files(),
+            1,
+            "the chip holds at one file until EVERY lane holding it clears"
+        );
+        assert!(
+            led.is_unreviewed(&p("/w/x.rs")),
+            "the tree dot stays while ANY lane has it unreviewed"
+        );
+
+        // A later solo write clears the shared flag for nobody: the history
+        // of ambiguity stands, but the new write is attributed alone.
+        led.record_write(&p("/w/y.rs"), 8, &[String::from("codex")]);
+        assert!(
+            !led.lane("codex")
+                .iter()
+                .find(|f| f.path == p("/w/y.rs"))
+                .unwrap()
+                .shared
+        );
+    }
+
+    /// With no agent working, a write is the USER's and never enters a lane
+    /// — otherwise your own saves fill an agent's review queue.
+    #[test]
+    fn a_write_with_no_working_agent_belongs_to_nobody() {
+        let mut led = AgentLedger::new();
+        assert!(!led.record_write(&p("/w/mine.rs"), 5, &[]));
+        assert!(led.agents().is_empty());
+        assert_eq!(led.total_unreviewed(), 0);
+        assert!(!led.is_unreviewed(&p("/w/mine.rs")));
+    }
+
+    /// "Mark all reviewed" snapshots what is on DISK now, not what the
+    /// agent last wrote, and a vanished file is cleared rather than stuck.
+    #[test]
+    fn marking_a_whole_lane_baselines_the_current_disk_content() {
+        let mut led = AgentLedger::new();
+        let agent = vec![String::from("claude")];
+        led.record_write(&p("/w/a.rs"), 1, &agent);
+        led.record_write(&p("/w/gone.rs"), 2, &agent);
+        assert_eq!(led.unreviewed_count("claude"), 2);
+
+        // `a.rs` moved on disk since the agent's write (the user edited it);
+        // `gone.rs` no longer exists.
+        let (cleared, dropped) = led.mark_lane_reviewed("claude", |path| {
+            if path == p("/w/a.rs") {
+                (Baseline::Hash(42), None)
+            } else {
+                (Baseline::Gone, None)
+            }
+        });
+        assert_eq!(
+            (cleared, dropped),
+            (1, 1),
+            "one file was reviewed and one was gone: reporting two as \
+             reviewed would claim the user looked at a file that is not there"
+        );
+        assert_eq!(led.unreviewed_count("claude"), 0);
+        let rows = led.lane("claude");
+        assert!(
+            !rows.iter().any(|f| f.path == p("/w/gone.rs")),
+            "a vanished file leaves the lane rather than lingering reviewed"
+        );
+        let a = rows.iter().find(|f| f.path == p("/w/a.rs")).unwrap();
+        assert_eq!(
+            a.reviewed_hash,
+            Some(42),
+            "the baseline is what is on disk now, not the agent's last write"
+        );
+
+        // A subsequent agent write against the disk content re-queues it.
+        led.record_write(&p("/w/a.rs"), 43, &agent);
+        assert_eq!(led.unreviewed_count("claude"), 1);
+
+        assert!(led.forget("claude"));
+        assert!(led.agents().is_empty());
+        assert!(!led.forget("claude"));
+    }
+
+    /// Reviewing records WHICH snapshot became the baseline, not just its
+    /// hash. A hash answers "changed?"; diffing the row against what the
+    /// user actually approved needs the content, and the snapshot millis is
+    /// the anchor that retrieves it (#345).
+    #[test]
+    fn reviewing_records_the_snapshot_it_baselined_against() {
+        let mut led = AgentLedger::new();
+        let agent = vec![String::from("claude")];
+        led.record_write(&p("/w/a.rs"), 1, &agent);
+
+        // Before any review there is no baseline to diff against. Paired
+        // with the positive case below so this cannot pass vacuously.
+        let row = led.lane("claude")[0];
+        assert_eq!(row.reviewed_millis, None, "nothing reviewed yet");
+
+        assert!(led.mark_reviewed("claude", &p("/w/a.rs"), 42, Some(1_700)));
+        let row = led.lane("claude")[0];
+        assert_eq!(
+            row.reviewed_millis,
+            Some(1_700),
+            "the snapshot that became the baseline is retrievable later"
+        );
+        assert_eq!(row.reviewed_hash, Some(42));
+
+        // A later write keeps the anchor: the row is unreviewed AGAINST that
+        // snapshot, which is exactly what the diff needs.
+        led.record_write(&p("/w/a.rs"), 43, &agent);
+        let row = led.lane("claude")[0];
+        assert!(row.unreviewed());
+        assert_eq!(
+            row.reviewed_millis,
+            Some(1_700),
+            "a new write does not erase the baseline it is measured against"
+        );
+    }
+
+    /// A whole-lane review records each row's snapshot too, and a row whose
+    /// content could not be snapshotted records none rather than borrowing
+    /// another row's — a diff against the wrong baseline is worse than none.
+    #[test]
+    fn marking_a_whole_lane_records_each_rows_snapshot() {
+        let mut led = AgentLedger::new();
+        let agent = vec![String::from("claude")];
+        led.record_write(&p("/w/a.rs"), 1, &agent);
+        led.record_write(&p("/w/b.rs"), 2, &agent);
+
+        let (cleared, dropped) = led.mark_lane_reviewed("claude", |path| {
+            if path == p("/w/a.rs") {
+                (Baseline::Hash(10), Some(2_500))
+            } else {
+                // Snapshotting `b.rs` failed (the store is best-effort), so
+                // it gets a baseline hash but no retrievable content.
+                (Baseline::Hash(20), None)
+            }
+        });
+        assert_eq!((cleared, dropped), (2, 0));
+
+        let rows = led.lane("claude");
+        let a = rows.iter().find(|f| f.path == p("/w/a.rs")).unwrap();
+        let b = rows.iter().find(|f| f.path == p("/w/b.rs")).unwrap();
+        assert_eq!(a.reviewed_millis, Some(2_500));
+        assert_eq!(
+            b.reviewed_millis, None,
+            "a row that could not be snapshotted records no anchor rather \
+             than inheriting the other row's"
+        );
+        assert_eq!(b.reviewed_hash, Some(20), "it is still reviewed");
+    }
+
+    /// The queue is ordered by RECENCY, not by path: the file the agent
+    /// just wrote belongs at the top even when its name sorts last.
+    #[test]
+    fn the_lane_lists_the_most_recently_written_file_first() {
+        let mut led = AgentLedger::new();
+        let a = vec![String::from("claude")];
+        led.record_write(&p("/w/a.rs"), 1, &a);
+        led.record_write(&p("/w/z.rs"), 2, &a);
+        assert_eq!(
+            led.lane("claude")[0].path,
+            p("/w/z.rs"),
+            "z.rs was written last, so it heads the queue despite the name"
+        );
+
+        // A new write to the older file moves it back to the top.
+        led.record_write(&p("/w/a.rs"), 3, &a);
+        assert_eq!(led.lane("claude")[0].path, p("/w/a.rs"));
+
+        // Reviewed rows sink below every unreviewed one regardless of when
+        // they were written.
+        led.mark_reviewed("claude", &p("/w/a.rs"), 3, None);
+        assert_eq!(led.lane("claude")[0].path, p("/w/z.rs"));
+        assert_eq!(led.lane("claude")[1].path, p("/w/a.rs"));
+    }
+
+    /// The queue read one worktree at a time (#348): grouping is what
+    /// lets a lane's changes be told from the main checkout's.
+    #[test]
+    fn a_lane_groups_its_files_by_the_root_that_owns_them() {
+        // #348: with a worktree lane in the workspace, the review queue reads
+        // as one section per root, in root order, with anything outside every
+        // root last rather than dropped.
+        let mut led = AgentLedger::new();
+        let repo = PathBuf::from("/w/repo");
+        let lane = PathBuf::from("/w/repo-fix");
+        let roots = vec![repo.clone(), lane.clone()];
+        let working = vec![String::from("claude")];
+        // Written lane-first, so first-seen order differs from root order.
+        led.record_write(&lane.join("src/a.rs"), 1, &working);
+        led.record_write(&repo.join("src/b.rs"), 2, &working);
+        led.record_write(&PathBuf::from("/elsewhere/c.rs"), 3, &working);
+        led.record_write(&lane.join("src/d.rs"), 4, &working);
+
+        let groups = led.lane_by_root("claude", &roots);
+        let shape: Vec<(Option<&Path>, Vec<&Path>)> = groups
+            .iter()
+            .map(|(root, files)| (*root, files.iter().map(|f| f.path.as_path()).collect()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (Some(repo.as_path()), vec![repo.join("src/b.rs").as_path()]),
+                (
+                    Some(lane.as_path()),
+                    // Recency inside the group: d.rs was written after a.rs.
+                    vec![
+                        lane.join("src/d.rs").as_path(),
+                        lane.join("src/a.rs").as_path()
+                    ],
+                ),
+                (None, vec![Path::new("/elsewhere/c.rs")]),
+            ],
+            "root order, recency within, unowned last"
+        );
+
+        // A reviewed file leaves the queue, and an emptied group with it.
+        for f in led
+            .lane("claude")
+            .iter()
+            .map(|f| f.path.clone())
+            .collect::<Vec<_>>()
+        {
+            if f.starts_with(&lane) {
+                let h = led
+                    .lane("claude")
+                    .iter()
+                    .find(|x| x.path == f)
+                    .unwrap()
+                    .current_hash;
+                led.mark_reviewed("claude", &f, h, None);
+            }
+        }
+        let groups = led.lane_by_root("claude", &roots);
+        assert_eq!(
+            groups.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+            vec![Some(repo.as_path()), None],
+            "the lane's group is gone once its files are reviewed"
+        );
+        assert!(
+            led.lane_by_root("nobody", &roots).is_empty(),
+            "an agent with no lane has no groups"
+        );
+
+        // Nested roots: the DEEPER root owns the file, the same rule
+        // `WorkspaceRoots::owning_root` applies, which this re-implements to
+        // stay pure. The two must not drift.
+        let mut led = AgentLedger::new();
+        let inner = repo.join("crates/foo");
+        let nested = vec![repo.clone(), inner.clone()];
+        led.record_write(&inner.join("src/lib.rs"), 1, &working);
+        led.record_write(&repo.join("README.md"), 2, &working);
+        assert_eq!(
+            led.lane_by_root("claude", &nested)
+                .iter()
+                .map(|(r, f)| (*r, f.len()))
+                .collect::<Vec<_>>(),
+            vec![(Some(repo.as_path()), 1), (Some(inner.as_path()), 1)],
+            "the deeper root owns its file, roots still in order"
+        );
+    }
+
+    /// A dropped-events window makes every count a LOWER BOUND, and says
+    /// so until the queue is empty — a warning the next keystroke erases
+    /// would leave the user believing a partial queue was complete.
+    #[test]
+    fn a_dropped_event_window_marks_the_queue_a_lower_bound() {
+        let mut led = AgentLedger::new();
+        let a = vec![String::from("claude")];
+        assert!(!led.may_be_incomplete());
+
+        led.record_write(&p("/w/a.rs"), 1, &a);
+        led.note_dropped_events();
+        assert!(
+            led.may_be_incomplete(),
+            "the watcher overflowed: counts are a floor"
+        );
+
+        // Reviewing SOME of the queue keeps the doubt: a dropped write may
+        // be among what is left.
+        led.record_write(&p("/w/b.rs"), 2, &a);
+        led.mark_reviewed("claude", &p("/w/a.rs"), 1, None);
+        assert!(led.may_be_incomplete());
+
+        // Emptying it through mark_reviewed ALONE must settle it too: the
+        // previous version of this test emptied the queue with
+        // mark_lane_reviewed, so it passed whether or not mark_reviewed
+        // cleared the flag.
+        led.mark_reviewed("claude", &p("/w/b.rs"), 2, None);
+        assert!(
+            !led.may_be_incomplete(),
+            "reviewing the last queued file one-by-one settles the doubt too"
+        );
+
+        // And a lane dropped wholesale settles it as well.
+        led.note_dropped_events();
+        led.record_write(&p("/w/c.rs"), 3, &a);
+        assert!(led.may_be_incomplete());
+        led.forget("claude");
+        assert!(
+            !led.may_be_incomplete(),
+            "a lane dropped with the queue empties it, doubt included"
+        );
+
+        // A file the agent DELETED empties the queue through forget_path,
+        // which is the fourth clearing path and the one no other test
+        // reaches (the whole-lane test removes rows inside
+        // mark_lane_reviewed's Gone arm, a different route).
+        led.note_dropped_events();
+        led.record_write(&p("/w/deleted.rs"), 9, &a);
+        assert!(led.may_be_incomplete());
+        assert!(led.forget_path(&p("/w/deleted.rs")));
+        assert!(
+            !led.may_be_incomplete(),
+            "a queue emptied by a deletion settles the doubt too"
+        );
+
+        // Re-arm for the whole-lane path below.
+        led.note_dropped_events();
+        led.record_write(&p("/w/d.rs"), 4, &a);
+
+        // Emptying it settles the question: nothing is left to be wrong.
+        let (reviewed, _) = led.mark_lane_reviewed("claude", |_| (Baseline::Hash(4), None));
+        assert_eq!(reviewed, 1);
+        assert!(
+            !led.may_be_incomplete(),
+            "an empty queue has nothing left to be a lower bound of"
+        );
+    }
+
+    /// A file that cannot be READ right now is not reviewed. Clearing it
+    /// would mark content the user never saw as seen, and unrecoverably: a
+    /// later write landing on the same hash is a no-op, so the row would
+    /// stay clear forever. This is the promise the module exists to keep.
+    #[test]
+    fn an_unreadable_file_stays_in_the_queue_rather_than_being_cleared() {
+        let mut led = AgentLedger::new();
+        led.record_write(&p("/w/locked.rs"), 100, &[String::from("claude")]);
+        assert_eq!(led.unreviewed_count("claude"), 1);
+
+        // The read fails this instant, whatever the disk holds.
+        let (cleared, dropped) = led.mark_lane_reviewed("claude", |_| (Baseline::Unreadable, None));
+        assert_eq!(
+            (cleared, dropped),
+            (0, 0),
+            "an unreadable file is neither reviewed nor gone"
+        );
+        assert_eq!(
+            led.unreviewed_count("claude"),
+            1,
+            "it stays queued: 'could not read' is not 'reviewed'"
+        );
+
+        // And it is still recoverable once the read succeeds.
+        assert_eq!(
+            led.mark_lane_reviewed("claude", |_| (Baseline::Hash(555), None)),
+            (1, 0)
+        );
+        assert_eq!(led.unreviewed_count("claude"), 0);
+    }
+
+    /// A file too large to read on the frame loop is stamped rather than
+    /// slurped, and a vanished file is distinguished from an unreadable one.
+    #[test]
+    fn baselines_bound_the_read_and_separate_gone_from_unreadable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let small = dir.path().join("small.rs");
+        std::fs::write(&small, b"hello").unwrap();
+        assert_eq!(
+            read_baseline(&small),
+            Baseline::Hash(content_hash(b"hello")),
+            "a small file is content-addressed"
+        );
+        assert_eq!(read_baseline(&dir.path().join("nope.rs")), Baseline::Gone);
+
+        let big = dir.path().join("big.bin");
+        std::fs::write(&big, vec![0u8; (MAX_HASH_BYTES + 1) as usize]).unwrap();
+        let stamped = read_baseline(&big);
+        assert!(matches!(stamped, Baseline::Hash(_)));
+        assert_ne!(
+            stamped,
+            Baseline::Hash(content_hash(b"")),
+            "past the cap the stamp stands in for the content, never reading it"
+        );
+        // The stamp still moves when the file does.
+        std::fs::write(&big, vec![1u8; (MAX_HASH_BYTES + 2) as usize]).unwrap();
+        assert_ne!(read_baseline(&big), stamped);
+    }
+
+    /// The hash is content-addressed and stable, which is what makes a
+    /// baseline comparison meaningful.
+    #[test]
+    fn content_hashing_is_stable_and_distinguishes_content() {
+        assert_eq!(content_hash(b"fn main() {}"), content_hash(b"fn main() {}"));
+        assert_ne!(
+            content_hash(b"fn main() {}"),
+            content_hash(b"fn main() { }")
+        );
+        assert_ne!(content_hash(b""), content_hash(b"\n"));
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("x.rs");
+        std::fs::write(&f, b"hello").unwrap();
+        assert_eq!(read_baseline(&f), Baseline::Hash(content_hash(b"hello")));
+        assert_eq!(read_baseline(&dir.path().join("nope.rs")), Baseline::Gone);
+    }
+}

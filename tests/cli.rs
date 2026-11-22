@@ -1,0 +1,2244 @@
+use assert_cmd::Command;
+
+#[test]
+fn help_flag_prints_usage_and_exits_zero() {
+    let out = Command::cargo_bin("croft").unwrap().arg("--help").assert();
+    let out = out.success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("Usage:"), "stdout was: {stdout}");
+    assert!(stdout.contains("setup-terminal"));
+}
+
+#[test]
+fn version_flag_prints_version() {
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .arg("--version")
+        .assert();
+    let out = out.success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("croft"));
+}
+
+/// #282 end to end, against the real binary: `--version` is a bare `x.y.z`
+/// and the provenance is reachable behind `--build-info`. The unit test pins
+/// the constants and clap's rendering; this pins that the `--build-info`
+/// handler actually runs and prints the verbose form.
+#[test]
+fn build_info_carries_provenance_and_version_does_not() {
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .arg("--build-info")
+        .assert();
+    let out = out.success();
+    let build_info = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(
+        build_info.contains(env!("CARGO_PKG_VERSION")) && build_info.contains("built "),
+        "--build-info carries version and build time: {build_info}"
+    );
+
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .arg("--version")
+        .assert();
+    let out = out.success();
+    let version = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert_eq!(
+        version.trim(),
+        format!("croft {}", env!("CARGO_PKG_VERSION")),
+        "--version stays bare"
+    );
+}
+
+#[test]
+fn setup_terminal_help_works() {
+    Command::cargo_bin("croft")
+        .unwrap()
+        .args(["setup-terminal", "--help"])
+        .assert()
+        .success();
+}
+
+/// The remote launch script runs `croft session-host --probe` (and the
+/// collab-relay twin) over SSH on every connect as a pure liveness check.
+/// A remote macOS host hands SSH sessions the stripped launchd PATH, so if
+/// the GUI-PATH repair ran before the probe early-out, every attach would
+/// stall on a login-shell probe — against the "remote attach never waits"
+/// invariant. The probe subcommands must answer without consulting a shell.
+#[test]
+fn probe_subcommands_answer_instantly_even_with_a_stripped_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let slow_shell = dir.path().join("slow-shell");
+    std::fs::write(&slow_shell, "#!/bin/sh\nsleep 30\n").unwrap();
+    let mut perm = std::fs::metadata(&slow_shell).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    std::fs::set_permissions(&slow_shell, perm).unwrap();
+    for sub in ["session-host", "collab-relay"] {
+        let start = std::time::Instant::now();
+        Command::cargo_bin("croft")
+            .unwrap()
+            .args([sub, "--probe"])
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("SHELL", &slow_shell)
+            .assert()
+            .success();
+        // The discriminant is the 30s sleeping shell: a probe that runs the
+        // PATH repair blocks on it, one that early-outs answers in well
+        // under a second. The measured span also covers the cargo_bin
+        // spawn, which a suite-saturated box once pushed past a 5s ceiling
+        // (#50) — half the sleep keeps the failure mode unreachable while
+        // giving load an order of magnitude more headroom.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(15),
+            "{sub} --probe took {:?} with a stripped PATH",
+            start.elapsed()
+        );
+    }
+}
+
+#[test]
+fn nonexistent_path_fails_cleanly() {
+    Command::cargo_bin("croft")
+        .unwrap()
+        .arg("/nonexistent/path/that/does/not/exist/abc123")
+        .assert()
+        .failure();
+}
+
+/// #917: `croft pr` without a usable GitHub CLI says so in the shell, in
+/// one line naming the fix, instead of opening an editor whose review tab
+/// can never load.
+#[test]
+fn pr_without_a_usable_gh_says_how_to_fix_it_before_starting() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let pr = |expected: &str| {
+        let out = Command::cargo_bin("croft")
+            .unwrap()
+            .args(["pr", "42"])
+            .current_dir(tmp.path())
+            .env("PATH", &bin)
+            .env("HOME", tmp.path())
+            // A token in the environment would vouch for the stand-in.
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("GH_ENTERPRISE_TOKEN")
+            .env_remove("GITHUB_ENTERPRISE_TOKEN")
+            .timeout(std::time::Duration::from_secs(30))
+            .assert()
+            .failure()
+            .code(1);
+        let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+        assert!(stderr.starts_with("croft pr: "), "{stderr}");
+        assert!(stderr.contains(expected), "{stderr}");
+        assert_eq!(stderr.trim().lines().count(), 1, "{stderr}");
+    };
+    pr("install it from https://cli.github.com, then run gh auth login");
+    let gh = bin.join("gh");
+    std::fs::write(&gh, "#!/bin/sh\necho 'no oauth token found' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    pr("not signed in; run gh auth login");
+}
+
+/// A workspace with a devcontainer.json, and a stand-in `docker` that logs
+/// each call to `docker.log` and knows one container for it, made from an
+/// older config with its workspace at `/workspaces/before-the-edit`.
+/// `docker top` lists `$DOCKER_TOP` as its processes, or fails for `fail`.
+#[cfg(unix)]
+fn devcontainer_with_a_stale_container() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws/.devcontainer");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(
+        ws.join("devcontainer.json"),
+        "// A comment added since.\n{ \"image\": \"ubuntu:24.04\" }\n",
+    )
+    .unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let docker = bin.join("docker");
+    std::fs::write(
+        &docker,
+        r#"#!/bin/sh
+echo "$*" >> "$DOCKER_LOG"
+case "$1" in
+  ps) echo c0ffee000001 ;;
+  inspect) case "$3" in
+    *Running*) echo true ;;
+    *Labels*) echo older-config ;;
+    *WorkingDir*) echo /workspaces/before-the-edit ;;
+  esac ;;
+  top) [ "$DOCKER_TOP" = fail ] && exit 1
+    echo 'UID PID PPID C STIME TTY TIME CMD'; echo "$DOCKER_TOP" ;;
+  exec) case "$*" in *uname*) echo x86_64 ;; esac ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    tmp
+}
+
+#[cfg(unix)]
+fn run_devcontainer(tmp: &std::path::Path, args: &[&str], top: &str) -> assert_cmd::assert::Assert {
+    Command::cargo_bin("croft")
+        .unwrap()
+        .arg("devcontainer")
+        .arg(tmp.join("ws"))
+        .args(args)
+        .env("PATH", tmp.join("bin"))
+        .env("HOME", tmp)
+        .env("DOCKER_LOG", tmp.join("docker.log"))
+        .env("DOCKER_TOP", top)
+        .env("CROFT_DEVCONTAINER_BINARY", "/bin/true")
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+}
+
+/// #1110: an edited devcontainer.json used to `docker rm -f` the container
+/// on the next run, killing a croft still running in it with its unsaved
+/// edits and everything made inside it. The container is kept, and the run
+/// says how to replace it. Until then, croft opens in the workspace folder
+/// the container was made with.
+#[cfg(unix)]
+#[test]
+fn devcontainer_keeps_a_container_whose_config_changed() {
+    let tmp = devcontainer_with_a_stale_container();
+    let out = run_devcontainer(tmp.path(), &[], "root 42 0 0 10:01 pts/0 00:00:01 sh").success();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains(
+            "devcontainer.json changed since this container was created; run \
+             `croft devcontainer --rebuild` to recreate it"
+        ),
+        "{stderr}"
+    );
+    let calls = std::fs::read_to_string(tmp.path().join("docker.log")).unwrap();
+    assert!(!calls.contains("rm "), "{calls}");
+    let attach = calls.lines().find(|l| l.starts_with("exec -it")).unwrap();
+    assert!(
+        attach.ends_with("-w /workspaces/before-the-edit c0ffee000001 /usr/local/bin/croft /workspaces/before-the-edit"),
+        "{attach}"
+    );
+}
+
+/// #1110: `--rebuild` refuses while a croft runs in the container from
+/// another terminal, or when docker can't say whether one does, and
+/// replaces it once none does.
+#[cfg(unix)]
+#[test]
+fn devcontainer_rebuild_waits_for_the_croft_running_in_it() {
+    let tmp = devcontainer_with_a_stale_container();
+    let attached = "root 42 0 0 10:01 pts/0 00:00:01 /usr/local/bin/croft /workspaces/ws";
+    let out = run_devcontainer(tmp.path(), &["--rebuild"], attached).failure();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("croft is still running in this container, in another terminal"),
+        "{stderr}"
+    );
+    let log = tmp.path().join("docker.log");
+    let out = run_devcontainer(tmp.path(), &["--rebuild"], "fail").failure();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("can't tell whether croft is running in the container"),
+        "{stderr}"
+    );
+    assert!(!std::fs::read_to_string(&log).unwrap().contains("rm "));
+    run_devcontainer(tmp.path(), &["--rebuild"], "root 7 0 0 10:01 ? 00:00:00 sh").success();
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(calls.contains("rm -f c0ffee000001"), "{calls}");
+}
+
+/// The persisted pair record is the baseline for every `croft pair`
+/// invocation: `--off` (with or without provider flags) and a plain
+/// re-activation must both keep a custom ollama endpoint. Resolving bare
+/// flags in isolation used to clobber the custom URL with the default and
+/// silently converted a disabled ollama record into a cloud claude seat.
+#[test]
+fn pair_off_and_reactivation_keep_the_recorded_backend() {
+    // A SHORT home: the activation path binds a relay socket under
+    // $HOME/.cache/croft/sessions, and the default tempdir base pushes the
+    // path past the AF_UNIX 104-byte limit.
+    let home = tempfile::Builder::new()
+        .prefix("h")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        Command::cargo_bin("croft")
+            .unwrap()
+            .args(args)
+            .arg("--workspace")
+            .arg(ws.path())
+            .env("HOME", home.path())
+            .assert()
+            .success();
+    };
+    run(&[
+        "pair",
+        "--provider",
+        "ollama",
+        "--model",
+        "qwen3-coder:30b",
+        "--base-url",
+        "http://localhost:9999",
+    ]);
+    let record_path = || {
+        let dir = home.path().join(".cache/croft/sessions");
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().ends_with(".pair.json"))
+            .expect("a pair record exists")
+    };
+    let read = || std::fs::read_to_string(record_path()).unwrap();
+    assert!(read().contains("http://localhost:9999"));
+    // Deactivate with provider flags but no URL: the custom URL survives.
+    run(&["pair", "--provider", "ollama", "--off"]);
+    let r = read();
+    assert!(r.contains("\"enabled\":false"), "{r}");
+    assert!(
+        r.contains("http://localhost:9999"),
+        "the default endpoint must not clobber the custom one: {r}"
+    );
+    // Plain re-activation: the whole recorded backend comes back.
+    run(&["pair"]);
+    let r = read();
+    assert!(r.contains("\"enabled\":true"), "{r}");
+    assert!(r.contains("\"provider\":\"ollama\""), "{r}");
+    assert!(r.contains("http://localhost:9999"), "{r}");
+    assert!(r.contains("qwen3-coder:30b"), "{r}");
+    // An explicit provider SWITCH starts fresh: the other backend's
+    // endpoint and model must not ride along into the claude record.
+    run(&["pair", "--provider", "claude"]);
+    let r = read();
+    assert!(r.contains("\"provider\":\"claude\""), "{r}");
+    assert!(
+        !r.contains("http://localhost:9999"),
+        "the ollama endpoint must not survive a provider switch: {r}"
+    );
+    assert!(!r.contains("qwen3-coder:30b"), "{r}");
+    reap_pair_relays(home.path());
+}
+
+/// Activation detaches a relay for the workspace; reap the ones under
+/// `home` so test runs do not accumulate idle processes.
+fn reap_pair_relays(home: &std::path::Path) {
+    let sessions = home.join(".cache/croft/sessions");
+    if let Ok(entries) = std::fs::read_dir(&sessions) {
+        for e in entries.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.to_string_lossy().ends_with(".collab.sock") {
+                let _ = std::process::Command::new("pkill")
+                    .args(["-f", &p.to_string_lossy()])
+                    .status();
+            }
+        }
+    }
+}
+
+/// #1907: the navigator's name persists like its model. A plain `croft pair`
+/// or `croft pair --off` keeps the recorded name instead of renaming the
+/// seat back to `claude`; only an explicit `--name` changes it.
+#[test]
+fn pair_rerun_without_name_keeps_the_recorded_name() {
+    // A SHORT home, for the relay socket's AF_UNIX path limit (see above).
+    let home = tempfile::Builder::new()
+        .prefix("h")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::cargo_bin("croft")
+            .unwrap()
+            .args(args)
+            .arg("--workspace")
+            .arg(ws.path())
+            .env("HOME", home.path())
+            .assert()
+            .success();
+        String::from_utf8(out.get_output().stdout.clone()).unwrap()
+    };
+    let read = || {
+        let dir = home.path().join(".cache/croft/sessions");
+        let path = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().ends_with(".pair.json"))
+            .expect("a pair record exists");
+        std::fs::read_to_string(path).unwrap()
+    };
+    run(&[
+        "pair",
+        "--name",
+        "navigator",
+        "--model",
+        "claude-haiku-4-5-20251001",
+    ]);
+    assert!(read().contains("\"name\":\"navigator\""));
+    run(&["pair", "--off"]);
+    let r = read();
+    assert!(r.contains("\"enabled\":false"), "{r}");
+    assert!(
+        r.contains("\"name\":\"navigator\""),
+        "--off keeps the name: {r}"
+    );
+    let out = run(&["pair"]);
+    let r = read();
+    assert!(r.contains("\"enabled\":true"), "{r}");
+    assert!(
+        r.contains("\"name\":\"navigator\""),
+        "re-activation keeps the name: {r}"
+    );
+    assert!(r.contains("claude-haiku-4-5-20251001"), "{r}");
+    assert!(out.contains("navigator 'navigator' active"), "{out}");
+    run(&["pair", "--name", "other"]);
+    assert!(read().contains("\"name\":\"other\""));
+    reap_pair_relays(home.path());
+}
+
+/// #362 acceptance criterion 3, against the real binary: outside croft the
+/// command exits 1 with a one-line explanation rather than trying to render.
+///
+/// `env_remove` rather than a bare run: this test suite is itself often
+/// launched from a croft pane, where `CROFT_VIEW_SOCK` is set and inherited,
+/// and the test would then quietly exercise the connected path instead.
+#[test]
+fn view_outside_croft_exits_one_with_an_explanation() {
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env_remove("CROFT_VIEW_SOCK")
+        .args(["view", "Cargo.toml"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("croft view needs a croft"),
+        "stderr must say why, was: {stderr}"
+    );
+    assert_eq!(
+        stderr.lines().filter(|l| !l.trim().is_empty()).count(),
+        1,
+        "one line, not a backtrace: {stderr}"
+    );
+}
+
+/// An empty `CROFT_VIEW_SOCK` must read as absent, not as a socket at "".
+#[test]
+fn view_treats_an_empty_socket_variable_as_no_croft_at_all() {
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", "")
+        .args(["view", "Cargo.toml"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("croft view needs a croft"),
+        "stderr was: {stderr}"
+    );
+}
+
+/// A stale socket path (the croft that set it has exited) must name that
+/// situation rather than surfacing a raw connect error.
+#[test]
+fn view_against_a_vanished_croft_says_the_croft_is_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+        .args(["view", "Cargo.toml"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("is gone"),
+        "stderr must name the situation, was: {stderr}"
+    );
+}
+
+/// #362 end to end against the REAL binary: `croft view <file>` connects to
+/// the socket named by the environment, sends the resolved path, and exits 0
+/// on an ok reply.
+///
+/// The unit tests drive the client and server halves in one process, where
+/// they can agree with each other. This stands up a socket the binary knows
+/// nothing about and makes the shipped `croft view` talk to it.
+#[test]
+fn view_sends_the_resolved_path_to_the_socket_and_exits_zero() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let target = tmp.path().join("report.txt");
+    std::fs::write(&target, b"hello").unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        stream.write_all(b"{\"status\":\"ok\"}\n").unwrap();
+        line
+    });
+
+    // Run from a DIFFERENT directory with a RELATIVE argument: the client is
+    // the side that resolves, and running from the file's own directory
+    // would pass even if it did not.
+    Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .current_dir(tmp.path())
+        .args(["view", "report.txt"])
+        .assert()
+        .success();
+
+    // The wire carries the path as raw bytes (a filename is bytes, not
+    // UTF-8), so decode rather than substring-match: asserting on the text
+    // form would pass only for paths that happen to be valid UTF-8, which is
+    // the case the byte encoding exists to stop relying on.
+    let request = server.join().unwrap();
+    let bytes: Vec<u8> = request
+        .trim()
+        .trim_start_matches("{\"path\":[")
+        .trim_end_matches("]}")
+        .split(',')
+        .map(|n| n.trim().parse::<u8>().expect("the wire is a byte array"))
+        .collect();
+    // Canonicalised on both sides: macOS hands a process a cwd under
+    // `/private/var` for a `/var` tempdir, so the client resolves against a
+    // path that is the same directory by a different name and a raw compare
+    // fails there while passing on Linux.
+    let received = std::path::PathBuf::from(String::from_utf8(bytes).unwrap());
+    assert_eq!(
+        received.canonicalize().unwrap_or(received),
+        target.canonicalize().unwrap_or(target.clone()),
+        "the server must receive the path resolved against the client's cwd"
+    );
+}
+
+/// A file that does not exist is refused by the client, before any croft is
+/// asked to open it: the message can then name the path as the user typed it,
+/// resolved against the cwd they typed it in.
+#[test]
+fn view_refuses_a_missing_file_without_bothering_the_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .current_dir(tmp.path())
+        .args(["view", "nope.pdf"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("no such file") && stderr.contains("nope.pdf"),
+        "stderr must name the missing path, was: {stderr}"
+    );
+}
+
+/// The wire carries a path as raw bytes so a filename that is not UTF-8
+/// survives. That is only true if the CLI takes the argument as an
+/// `OsString`: a `String` parameter throws the bytes away one call before
+/// the encoding that preserves them, which is where this started.
+///
+/// Not on macOS: APFS rejects a filename that is not valid UTF-8, so the
+/// fixture cannot be created there and the test would fail for a reason
+/// that has nothing to do with the wire.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn view_transmits_a_non_utf8_filename_byte_for_byte() {
+    use std::ffi::OsStr;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let name = OsStr::from_bytes(b"od\xffd.txt");
+    let target = tmp.path().join(name);
+    std::fs::write(&target, b"x").unwrap();
+    assert!(
+        target.to_str().is_none(),
+        "fixture must be invalid UTF-8, or this test proves nothing"
+    );
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        stream.write_all(b"{\"status\":\"ok\"}\n").unwrap();
+        line
+    });
+
+    Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .current_dir(tmp.path())
+        .arg("view")
+        .arg(name)
+        .assert()
+        .success();
+
+    let request = server.join().unwrap();
+    let bytes: Vec<u8> = request
+        .trim()
+        .trim_start_matches("{\"path\":[")
+        .trim_end_matches("]}")
+        .split(',')
+        .map(|n| n.trim().parse::<u8>().expect("the wire is a byte array"))
+        .collect();
+    assert!(
+        bytes.contains(&0xff),
+        "the 0xff byte must reach the server intact, got {bytes:?}"
+    );
+    assert_eq!(std::path::PathBuf::from(OsStr::from_bytes(&bytes)), target);
+}
+
+/// An `--as` value that cannot become a filename is refused, not ignored:
+/// falling back to the sniff would stage the bytes under a name the user did
+/// not ask for and still report success.
+#[test]
+fn view_refuses_an_as_flag_that_cannot_be_a_file_extension() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .env("HOME", &home)
+        .current_dir(tmp.path())
+        .write_stdin("a,b\n1,2\n")
+        .args(["view", "-", "--as", "../x"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("--as"),
+        "the message must name the flag, was: {stderr}"
+    );
+    // And it refuses without leaving anything behind. `stage_stdin` used to
+    // create `view-stdin/` before it validated the hint, so this refusal
+    // built a directory in the user's real cache dir on its way out. HOME is
+    // redirected here precisely so that is observable rather than invisible.
+    assert!(
+        !home.join(".cache/croft/view-stdin").exists(),
+        "a refused --as must not create the staging directory"
+    );
+}
+
+/// `croft view -` end to end against the shipped binary (#362).
+///
+/// The rejection test above never reaches the staging write, so nothing
+/// covered the success path at the binary level: the file appearing on disk
+/// under a sniffed extension the editor routes on, at 0600, with THAT path
+/// being what the server is told to open. HOME is redirected so the staging
+/// lands in a tempdir rather than the developer's own cache.
+#[test]
+fn view_from_a_pipe_stages_an_owner_only_file_and_sends_its_path() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let sock = tmp.path().join("v.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        stream.write_all(b"{\"status\":\"ok\"}\n").unwrap();
+        line
+    });
+
+    Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .env("HOME", &home)
+        .current_dir(tmp.path())
+        .write_stdin("a,b\n1,2\n")
+        .args(["view", "-"])
+        .assert()
+        .success();
+
+    // Same byte-array decode as the on-disk case: the wire carries a filename
+    // as bytes, and a substring match would only work for UTF-8 paths.
+    let request = server.join().unwrap();
+    let bytes: Vec<u8> = request
+        .trim()
+        .trim_start_matches("{\"path\":[")
+        .trim_end_matches("]}")
+        .split(',')
+        .map(|n| n.trim().parse::<u8>().expect("the wire is a byte array"))
+        .collect();
+    let staged = std::path::PathBuf::from(String::from_utf8(bytes).unwrap());
+
+    assert_eq!(
+        staged.extension().and_then(|e| e.to_str()),
+        Some("csv"),
+        "delimited text must be staged under the extension the sheet viewer \
+         routes on, or it arrives as plain text: {staged:?}"
+    );
+    assert!(
+        staged.starts_with(home.join(".cache").join("croft")),
+        "the staged file belongs under the cache dir, not beside the user's \
+         own files: {staged:?}"
+    );
+    let meta = std::fs::metadata(&staged)
+        .expect("the staged file must exist by the time the server is told about it");
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        0o600,
+        "piped content is owner-only: `vault read ... | croft view -` is the \
+         case this command invites"
+    );
+    assert_eq!(
+        std::fs::read(&staged).unwrap(),
+        b"a,b\n1,2\n",
+        "and it is the bytes that came down the pipe, unaltered"
+    );
+}
+
+/// `--as` on a NAMED file is refused, not ignored (#362).
+///
+/// The flag only ever reached `stage_stdin`, which only runs for `-`, so
+/// `croft view data.log --as csv` opened a text tab and exited 0. The only
+/// signal that the flag did nothing was the file opening in the viewer the
+/// user was trying to override, which is precisely the reasoning the module
+/// already gives for refusing an unusable `--as` value rather than sniffing
+/// past it.
+#[test]
+fn view_refuses_an_as_flag_on_a_named_file_rather_than_ignoring_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let target = tmp.path().join("data.log");
+    std::fs::write(&target, b"a,b\n1,2\n").unwrap();
+    // A listener that would ACCEPT, so a pass here cannot come from the
+    // socket being unreachable.
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .current_dir(tmp.path())
+        .args(["view", "data.log", "--as", "csv"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("--as"),
+        "the message must name the flag that was refused, was: {stderr}"
+    );
+    assert!(
+        stderr.contains("piped"),
+        "and say what it applies to, or the user cannot tell what to do \
+         instead, was: {stderr}"
+    );
+}
+
+/// An empty pipe is refused by name, and stages nothing (#362).
+#[test]
+fn view_from_an_empty_pipe_says_nothing_arrived() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let sock = tmp.path().join("v.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .env("HOME", &home)
+        .current_dir(tmp.path())
+        .write_stdin("")
+        .args(["view", "-"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("nothing arrived on stdin"),
+        "an empty pipe must say so rather than staging a zero-byte file and \
+         reporting success, was: {stderr}"
+    );
+    assert!(
+        !home.join(".cache/croft/view-stdin").exists(),
+        "and it must not create the staging directory either"
+    );
+}
+
+/// #848 end to end: `croft edit --wait` on a file that does not exist yet
+/// creates it empty, asks the croft to open it, and returns once a probe
+/// says its tab closed. That is what `EDITOR="croft edit --wait"` needs from
+/// a tool that names a file it has not written, and it used to be refused.
+#[test]
+fn edit_wait_creates_a_new_file_opens_it_and_returns_once_it_closes() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let target = tmp.path().join("TODO.md");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    // The open, answered ok, then the wait's first probe, answered closed.
+    let server = std::thread::spawn(move || {
+        let replies: [&[u8]; 2] = [
+            b"{\"status\":\"ok\"}\n",
+            b"{\"status\":\"err\",\"message\":\"closed\"}\n",
+        ];
+        let mut requests = Vec::new();
+        for reply in replies {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            stream.write_all(reply).unwrap();
+            requests.push(line);
+        }
+        requests
+    });
+
+    Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .current_dir(tmp.path())
+        .args(["edit", "--wait", "TODO.md"])
+        .assert()
+        .success();
+
+    let requests = server.join().unwrap();
+    assert!(
+        !requests[0].contains("probe"),
+        "first the open: {requests:?}"
+    );
+    assert!(
+        requests[1].contains("\"probe\":true"),
+        "then the wait's probe: {requests:?}"
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"",
+        "the new file was created, empty"
+    );
+}
+
+/// #848: every `croft edit` message said `croft view`. Outside croft it now
+/// names itself, and leaves no empty file behind for a path it cannot open.
+#[test]
+fn edit_outside_croft_names_itself_and_creates_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env_remove("CROFT_VIEW_SOCK")
+        .current_dir(tmp.path())
+        .args(["edit", "new.txt"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("croft edit needs a croft") && !stderr.contains("croft view"),
+        "stderr must name the command the user typed, was: {stderr}"
+    );
+    assert!(!tmp.path().join("new.txt").exists());
+}
+
+/// #848 guard: a new file's folder must exist. `croft edit` into a missing
+/// one is refused before any croft is asked to open it, and creates neither
+/// the file nor the folders above it.
+#[test]
+fn edit_refuses_a_missing_folder_without_bothering_the_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .current_dir(tmp.path())
+        .args(["edit", "no/such/TODO.md"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.starts_with("croft edit: ") && stderr.contains("no such directory"),
+        "stderr must name the command and the reason, was: {stderr}"
+    );
+    assert!(
+        matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "no croft was asked to open anything"
+    );
+    assert!(!tmp.path().join("no").exists(), "no folders were created");
+}
+
+/// #848: with a stale `CROFT_VIEW_SOCK` (the croft that set it has exited),
+/// `croft edit` created the new file, failed to open it, and left the empty
+/// file behind. A failed open takes back the file this call created.
+#[test]
+fn edit_against_a_vanished_croft_leaves_no_new_file_behind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+        .current_dir(tmp.path())
+        .args(["edit", "new.txt"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("croft edit: the croft that opened this pane is gone"),
+        "stderr must name the command and the situation, was: {stderr}"
+    );
+    assert!(
+        !tmp.path().join("new.txt").exists(),
+        "the empty file this call created was left behind"
+    );
+}
+
+/// #848: a croft that answers but refuses to open the new file leaves
+/// nothing behind either.
+#[test]
+fn edit_refused_by_the_croft_leaves_no_new_file_behind() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        stream
+            .write_all(b"{\"status\":\"err\",\"message\":\"cannot open that here\"}\n")
+            .unwrap();
+    });
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .current_dir(tmp.path())
+        .args(["edit", "new.txt"])
+        .assert();
+    server.join().unwrap();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("croft edit: cannot open that here"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !tmp.path().join("new.txt").exists(),
+        "the empty file this call created was left behind"
+    );
+}
+
+/// #848 guard: a failed open takes back only a file THIS call created. A
+/// file that was already there, even an empty one, is never removed.
+#[test]
+fn edit_against_a_vanished_croft_never_removes_an_existing_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (name, body) in [("keep.txt", "keep me"), ("empty.txt", "")] {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        Command::cargo_bin("croft")
+            .unwrap()
+            .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+            .current_dir(tmp.path())
+            .args(["edit", name])
+            .assert()
+            .failure()
+            .code(1);
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some(body),
+            "{name} must survive a failed open untouched"
+        );
+    }
+}
+
+/// #682 end to end: croft over a pty with an image protocol on (iTerm2's,
+/// forced) must not stream images on every keystroke. Before the fix, 20
+/// keystrokes in a file cost about 175 KB of escape output (the minimap and
+/// chrome images re-sent each frame); now they cost a few KB. The budget
+/// sits between the two so a regression fails loudly without being flaky.
+#[cfg(unix)]
+#[test]
+fn typing_with_images_on_does_not_stream_images_per_keystroke() {
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
+    let home = tempfile::tempdir().unwrap();
+    let file = home.path().join("a.rs");
+    std::fs::write(&file, "fn main() {\n    println!(\"hi\");\n}\n".repeat(300)).unwrap();
+
+    let (mut master, mut slave) = (0, 0);
+    let mut ws = libc::winsize {
+        ws_row: 50,
+        ws_col: 160,
+        ws_xpixel: 160 * 9,
+        ws_ypixel: 50 * 18,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut ws,
+            )
+        },
+        0
+    );
+    // Neither end may leak into croft or what it starts: a leaked master
+    // keeps the terminal open after the test closes it, and macOS then
+    // holds a killed croft in its exit until its output is read.
+    for fd in [master, slave] {
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            -1
+        );
+    }
+    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+    let bin = assert_cmd::cargo::cargo_bin("croft");
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("a.rs")
+        .current_dir(home.path())
+        .env("HOME", home.path())
+        .env("TERM", "xterm-256color")
+        .env("TERM_PROGRAM", "iTerm.app")
+        .env("CROFT_FORCE_INLINE_IMAGES", "1")
+        .stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave.try_clone().unwrap());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            libc::ioctl(0, libc::TIOCSCTTY as _, 0);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    drop(slave);
+    unsafe {
+        let flags = libc::fcntl(master, libc::F_GETFL);
+        libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    let mut pty = unsafe { std::fs::File::from_raw_fd(master) };
+    let mut tty = pty.try_clone().unwrap();
+    let mut drain = |for_: Duration| {
+        let mut n = 0usize;
+        let mut buf = [0u8; 1 << 16];
+        let end = Instant::now() + for_;
+        while Instant::now() < end {
+            match pty.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(_) => break,
+            }
+        }
+        n
+    };
+    // Let it start, then dismiss any first-run popup and let that settle.
+    let started = drain(Duration::from_secs(8));
+    assert!(started > 1000, "croft drew nothing ({started} bytes)");
+    use std::io::Write;
+    tty.write_all(b"\x1b").unwrap();
+    drain(Duration::from_secs(2));
+    let mut typed = 0;
+    for _ in 0..20 {
+        tty.write_all(b"x").unwrap();
+        typed += drain(Duration::from_millis(80));
+    }
+    typed += drain(Duration::from_secs(1));
+    let _ = child.kill();
+    // macOS holds a killed process in its exit while output sits unread on
+    // its terminal, so the terminal closes before the wait.
+    drop((pty, tty));
+    let _ = child.wait();
+    assert!(
+        typed < 30_000,
+        "20 keystrokes wrote {typed} bytes: images are being re-sent per frame"
+    );
+}
+
+/// #862 hot exit end to end, on the real binary: croft killed (SIGKILL, so
+/// no quit runs, as in an OOM kill) a few seconds after an edit it never
+/// saved brings the edit back on the next launch of the workspace, as an
+/// unsaved tab, and the file itself is untouched. Before hot exit the text
+/// was gone.
+#[cfg(unix)]
+#[test]
+fn unsaved_edits_survive_a_kill_and_come_back_on_the_next_launch() {
+    use std::io::{Read, Write};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
+    /// croft on a fresh pty in `dir` (also its HOME), and the pty's master.
+    fn spawn(dir: &std::path::Path, args: &[&str]) -> (std::process::Child, std::fs::File) {
+        let (mut master, mut slave) = (0, 0);
+        let mut ws = libc::winsize {
+            ws_row: 40,
+            ws_col: 140,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut ws,
+            )
+        };
+        assert_eq!(opened, 0);
+        // Neither end may leak into croft or what it starts: a leaked master
+        // keeps the terminal open after the test closes it, and macOS then
+        // holds a killed croft in its exit until its output is read.
+        for fd in [master, slave] {
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                -1
+            );
+        }
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("croft"));
+        cmd.args(args)
+            .current_dir(dir)
+            .env("HOME", dir)
+            .env("TERM", "xterm-256color")
+            .env_remove("TERM_PROGRAM")
+            .env_remove("XDG_STATE_HOME")
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave.try_clone().unwrap());
+        // A child that cannot take the pty as its controlling terminal
+        // fails to spawn here, rather than running detached from it.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().unwrap();
+        drop(slave);
+        unsafe {
+            let flags = libc::fcntl(master, libc::F_GETFL);
+            libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        (child, unsafe { std::fs::File::from_raw_fd(master) })
+    }
+    /// What croft writes until `done` holds on everything read so far, or
+    /// until `limit` (a bound for a slow machine, not a wait). The end of
+    /// the terminal (croft exited) stops the read; any other read error
+    /// fails the test rather than passing for the end.
+    fn read_until(
+        pty: &mut std::fs::File,
+        limit: Duration,
+        mut done: impl FnMut(&str) -> bool,
+    ) -> String {
+        let mut out = String::new();
+        let mut buf = [0u8; 1 << 16];
+        let end = Instant::now() + limit;
+        while !done(&out) && Instant::now() < end {
+            match pty.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => out.push_str(&String::from_utf8_lossy(&buf[..k])),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                // Linux reports the slave side closing as EIO.
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                Err(e) => panic!("reading croft's terminal: {e}"),
+            }
+        }
+        out
+    }
+    /// Whether a hot-exit backup under `dir` holds `text`.
+    fn a_backup_holds(dir: &std::path::Path, text: &str) -> bool {
+        let Ok(workspaces) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        workspaces
+            .flatten()
+            .filter_map(|ws| std::fs::read_dir(ws.path()).ok())
+            .flat_map(|files| files.flatten())
+            .filter(|f| f.path().extension().is_some_and(|x| x == "json"))
+            .any(|f| std::fs::read_to_string(f.path()).is_ok_and(|t| t.contains(text)))
+    }
+    let limit = Duration::from_secs(20);
+
+    let home = tempfile::tempdir().unwrap();
+    let file = home.path().join("a.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    // In the state directory, not the cache that cleaners delete (#1578).
+    let backups = home.path().join(".local/state/croft/hot-exit");
+    let (mut child, mut pty) = spawn(home.path(), &["a.txt"]);
+    let started = read_until(&mut pty, limit, |out| out.contains("alpha"));
+    assert!(
+        started.contains("alpha"),
+        "croft never drew a.txt: {started:?}"
+    );
+    // Dismiss anything a first launch shows over the editor. A terminal
+    // reads ESC as Escape only when nothing follows it at once, so this
+    // pause is the protocol's, not a guess at how long croft takes.
+    pty.write_all(b"\x1b").unwrap();
+    read_until(&mut pty, Duration::from_millis(300), |_| false);
+    pty.write_all(b"HOTEXIT").unwrap();
+    // The backup lands 5 s after the last edit; croft is killed outright
+    // once it has. The terminal is read meanwhile, so croft never blocks
+    // on a full one.
+    let end = Instant::now() + limit;
+    while !a_backup_holds(&backups, "HOTEXIT") && Instant::now() < end {
+        read_until(&mut pty, Duration::from_millis(100), |_| false);
+    }
+    assert!(
+        a_backup_holds(&backups, "HOTEXIT"),
+        "a backup holds the edit"
+    );
+    child.kill().unwrap();
+    // macOS holds a killed process in its exit while output sits unread on
+    // its terminal, so the terminal closes before the wait.
+    drop(pty);
+    child.wait().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "alpha\n",
+        "never saved"
+    );
+
+    let (mut child, mut pty) = spawn(home.path(), &[]);
+    let drawn = read_until(&mut pty, limit, |out| {
+        out.contains("HOTEXITalpha") && out.contains("restored 1 unsaved tab")
+    });
+    let _ = child.kill();
+    drop(pty);
+    let _ = child.wait();
+    assert!(
+        drawn.contains("HOTEXITalpha"),
+        "the unsaved edit is back on the next launch"
+    );
+    assert!(
+        drawn.contains("restored 1 unsaved tab"),
+        "and croft says so"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n");
+}
+
+/// #621: a locale as `$LANG` spells it (`de_DE.UTF-8`) seeds the template
+/// from the German catalog and names the file croft will load.
+#[test]
+fn locale_template_accepts_a_full_locale() {
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .args(["locale-template", "de_DE.UTF-8"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    let catalog: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let filled = catalog
+        .as_object()
+        .unwrap()
+        .values()
+        .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+        .count();
+    assert!(filled > 0, "the built-in German entries seed it");
+    assert!(stderr.contains("locales/de.json"), "{stderr}");
+}
+
+/// The text a Rust string literal's body (between its quotes) spells: one
+/// pass over its escapes (`\\`, `\"`, `\'`, `\n`, `\r`, `\t`, `\0`,
+/// `\xNN`, `\u{...}`), as the compiler reads them.
+fn unescape_rust_literal(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('0') => out.push('\0'),
+            Some('x') => {
+                let hex: String = chars.by_ref().take(2).collect();
+                out.push(char::from(u8::from_str_radix(&hex, 16).unwrap()));
+            }
+            Some('u') => {
+                let hex: String = chars.by_ref().skip(1).take_while(|&c| c != '}').collect();
+                out.push(char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap());
+            }
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// #849 review: the scan reads translated strings out of Rust literals, so
+/// it has to spell every escape a literal can hold the way the compiler
+/// does, or a string with a newline or tab would be looked up by the wrong
+/// key.
+#[test]
+fn unescape_rust_literal_reads_every_rust_escape() {
+    for (body, text) in [
+        (r"plain", "plain"),
+        (r#"a \"quoted\" word"#, "a \"quoted\" word"),
+        (r"back\\slash", "back\\slash"),
+        (r"line\nbreak", "line\nbreak"),
+        (r"tab\there", "tab\there"),
+        (r"cr\r", "cr\r"),
+        (r"nul\0", "nul\0"),
+        (r"it\'s", "it's"),
+        (r"hex\x41", "hexA"),
+        (r"\u{2026}\u{1F600}", "\u{2026}\u{1F600}"),
+        (
+            r"\\n stays a backslash and an n",
+            "\\n stays a backslash and an n",
+        ),
+    ] {
+        assert_eq!(unescape_rust_literal(body), text, "{body}");
+    }
+}
+
+/// Every string literal croft hands to `tr` at runtime, read from its own
+/// sources, with the file each came from: `tr("…")` calls, and context-menu
+/// labels, which `ContextMenu::localize` runs through `tr` wholesale. Test
+/// code is skipped: its strings are never shown.
+fn strings_croft_translates() -> std::collections::BTreeMap<String, String> {
+    let lit = r#""((?:[^"\\]|\\.)*)""#;
+    let patterns: Vec<regex::Regex> = [
+        format!(r"\btr\(\s*{lit}\s*\)"),
+        format!(r"MenuEntry::(?:item|header)\(\s*{lit}"),
+        format!(r"MenuEntry::item\(\s*if [^{{]*\{{\s*{lit}\s*\}}\s*else\s*\{{\s*{lit}\s*\}}"),
+        format!(r"MenuEntry::Submenu\s*\{{\s*label:\s*(?:String::from\(\s*)?{lit}"),
+        format!(r"\(\s*String::from\(\s*{lit}\s*\)\s*,\s*MenuAction::"),
+        format!(r"\(\s*{lit}\s*\.(?:to_string|to_owned|into)\(\)\s*,\s*MenuAction::"),
+    ]
+    .iter()
+    .map(|p| regex::Regex::new(p).unwrap())
+    .collect();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut dirs = vec![root.clone()];
+    let mut found = std::collections::BTreeMap::new();
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if !path.ends_with("app/tests") {
+                    dirs.push(path);
+                }
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let text = text
+                .find("#[cfg(test)]\nmod tests")
+                .map_or(text.as_str(), |i| &text[..i]);
+            let file = path.strip_prefix(&root).unwrap().display().to_string();
+            for re in &patterns {
+                for caps in re.captures_iter(text) {
+                    for m in caps.iter().skip(1).flatten() {
+                        found.insert(unescape_rust_literal(m.as_str()), file.clone());
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// #849: `croft locale-template` must offer every string croft translates,
+/// not only the palette titles and whatever a built-in catalog happens to
+/// list. Context-menu labels (Close to the Right, Keep Open, the Customize
+/// Layout headers, ...) and `tr("CodeQL")` were missing from every
+/// language's template, so no translator could ever reach them.
+#[test]
+fn locale_template_lists_every_string_croft_translates() {
+    let found = strings_croft_translates();
+    for known in [
+        "Close to the Right",
+        "Panel Alignment",
+        "CodeQL",
+        "Pin",
+        "Unpin",
+    ] {
+        assert!(
+            found.contains_key(known),
+            "the source scan still sees {known:?}; update it with the code"
+        );
+    }
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .args(["locale-template", "xx"])
+        .assert()
+        .success();
+    let template: std::collections::HashMap<String, String> =
+        serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let missing: Vec<String> = found
+        .iter()
+        .filter(|(s, _)| !template.contains_key(*s))
+        .map(|(s, file)| format!("{s:?} ({file})"))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} string(s) croft translates are missing from the template; add them to \
+         i18n::TRANSLATABLE:\n{}",
+        missing.len(),
+        missing.join("\n")
+    );
+}
+
+/// A French translation in progress, as `locales/fr.json` under a scratch
+/// config directory.
+fn config_with_french_started() -> (tempfile::TempDir, std::path::PathBuf) {
+    let cfg = tempfile::tempdir().unwrap();
+    let file = cfg.path().join("croft/locales/fr.json");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &file,
+        "{\n  \"File: Save\": \"Enregistrer\",\n  \"View: Toggle Terminal\": \"Afficher le terminal\"\n}\n",
+    )
+    .unwrap();
+    (cfg, file)
+}
+
+fn json_object(text: &str) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone()
+}
+
+/// #1148: refreshing a translation in place keeps every value already
+/// translated and adds the strings it lacks.
+#[test]
+fn locale_template_write_keeps_the_translations_already_in_the_file() {
+    let (cfg, file) = config_with_french_started();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .args(["locale-template", "fr", "--write"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    let map = json_object(&std::fs::read_to_string(&file).unwrap());
+    assert_eq!(map["File: Save"], "Enregistrer");
+    assert_eq!(map["View: Toggle Terminal"], "Afficher le terminal");
+    assert!(map.len() > 2, "the missing strings are added");
+    assert!(stderr.contains("locales/fr.json"), "{stderr}");
+}
+
+/// #1148: the printed template carries the user's own translations too, so
+/// saving it elsewhere doesn't drop them.
+#[test]
+fn locale_template_prints_the_users_own_translations() {
+    let (cfg, _file) = config_with_french_started();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .args(["locale-template", "fr"])
+        .assert()
+        .success();
+    let map = json_object(&String::from_utf8(out.get_output().stdout.clone()).unwrap());
+    assert_eq!(map["File: Save"], "Enregistrer");
+}
+
+/// With no file yet, `--write` starts one, creating `locales/`.
+#[test]
+fn locale_template_write_starts_a_new_translation() {
+    let cfg = tempfile::tempdir().unwrap();
+    Command::cargo_bin("croft")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .args(["locale-template", "fr", "--write"])
+        .assert()
+        .success();
+    let map =
+        json_object(&std::fs::read_to_string(cfg.path().join("croft/locales/fr.json")).unwrap());
+    assert_eq!(map["File: Save"], "");
+}
+
+/// A file that isn't a JSON object of strings is left as it is: `--write`
+/// refuses rather than replacing what it can't read.
+#[test]
+fn locale_template_write_leaves_an_unreadable_file_alone() {
+    let (cfg, file) = config_with_french_started();
+    let broken = "{\n  \"File: Save\": \"Enregistrer\",\n";
+    std::fs::write(&file, broken).unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .args(["locale-template", "fr", "--write"])
+        .assert()
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), broken);
+    assert!(stderr.contains("fr.json"), "{stderr}");
+}
+
+/// English needs no translation file: `--write` writes nothing.
+#[test]
+fn locale_template_write_for_english_writes_nothing() {
+    let cfg = tempfile::tempdir().unwrap();
+    Command::cargo_bin("croft")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .args(["locale-template", "en", "--write"])
+        .assert()
+        .failure()
+        .code(1);
+    assert!(!cfg.path().join("croft/locales").exists());
+}
+
+/// #1179: `croft import-vscode | head` closes croft's stdout before the
+/// report is out. The import is written anyway, and croft ends the way any
+/// Unix tool does on a closed pipe instead of panicking with exit code 101.
+#[cfg(unix)]
+#[test]
+fn import_vscode_writes_its_files_when_stdout_is_closed() {
+    use std::os::unix::process::ExitStatusExt;
+    let cfg = tempfile::tempdir().unwrap();
+    let from = tempfile::tempdir().unwrap();
+    std::fs::write(
+        from.path().join("settings.json"),
+        r#"{ "editor.formatOnSave": true }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        from.path().join("keybindings.json"),
+        r#"[{ "key": "ctrl+s", "command": "workbench.action.files.save" }]"#,
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("croft"))
+        .args(["import-vscode", "--from"])
+        .arg(from.path())
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .current_dir(cfg.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The reader is gone before croft has written a byte.
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() || out.status.signal() == Some(13),
+        "a closed pipe ends croft quietly, not with {:?}: {stderr}",
+        out.status
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    let config = std::fs::read_to_string(cfg.path().join("croft/config.json")).unwrap();
+    assert!(config.contains("format_on_save"), "{config}");
+    assert!(cfg.path().join("croft/keybindings.json").is_file());
+}
+
+/// #1179 review: an import that cannot be written says so on stderr even
+/// when stdout is already closed, instead of dying silently at the report's
+/// first line.
+#[cfg(unix)]
+#[test]
+fn import_vscode_reports_a_failed_write_when_stdout_is_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let from = tempfile::tempdir().unwrap();
+    std::fs::write(
+        from.path().join("settings.json"),
+        r#"{ "editor.formatOnSave": true }"#,
+    )
+    .unwrap();
+    // A file where the config directory should be: nothing can be written.
+    let blocked = tmp.path().join("not-a-dir");
+    std::fs::write(&blocked, "").unwrap();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("croft"))
+        .args(["import-vscode", "--from"])
+        .arg(from.path())
+        .env("XDG_CONFIG_HOME", &blocked)
+        .current_dir(tmp.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{:?}", out.status);
+    assert!(
+        stderr.contains("not-a-dir"),
+        "the failure is said: {stderr}"
+    );
+}
+
+/// The real binary on a pty with `HOME` at `dir`, for tests that type raw
+/// terminal bytes at croft and read back what it did. Killed on drop.
+#[cfg(unix)]
+struct PtyCroft {
+    child: std::process::Child,
+    pty: std::mem::ManuallyDrop<std::fs::File>,
+}
+
+#[cfg(unix)]
+impl PtyCroft {
+    fn spawn(dir: &std::path::Path, args: &[&str]) -> Self {
+        Self::spawn_with(dir, args, |_| {})
+    }
+
+    /// `spawn`, with `adjust` handed croft's command last, to change what it
+    /// starts with (its environment) before it starts.
+    fn spawn_with(
+        dir: &std::path::Path,
+        args: &[&str],
+        adjust: impl FnOnce(&mut std::process::Command),
+    ) -> Self {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+
+        let (mut master, mut slave) = (0, 0);
+        let mut ws = libc::winsize {
+            ws_row: 40,
+            ws_col: 140,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &raw mut ws,
+                )
+            },
+            0
+        );
+        // Neither end may leak into croft or what it starts: a leaked master
+        // keeps the terminal open after the test closes it, and macOS then
+        // holds a killed croft in its exit until its output is read.
+        for fd in [master, slave] {
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                -1
+            );
+        }
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("croft"));
+        cmd.args(args)
+            .current_dir(dir)
+            .env("HOME", dir)
+            .env("TERM", "xterm-256color")
+            .env_remove("TERM_PROGRAM")
+            .env_remove("TMUX")
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave.try_clone().unwrap());
+        adjust(&mut cmd);
+        // A child that cannot take the pty as its controlling terminal
+        // fails to spawn here, rather than running detached from it.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().unwrap();
+        drop(slave);
+        unsafe {
+            let flags = libc::fcntl(master, libc::F_GETFL);
+            libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let pty = unsafe { std::fs::File::from_raw_fd(master) };
+        Self {
+            child,
+            pty: std::mem::ManuallyDrop::new(pty),
+        }
+    }
+
+    /// What croft writes until `done` holds, checked on everything read so
+    /// far after every read, or until `limit` (a bound for a slow machine,
+    /// not a wait: a passing run returns as soon as `done` does). The end of
+    /// the terminal (croft exited) stops the read; any other read error
+    /// fails the test rather than passing for the end.
+    fn read_until(
+        &mut self,
+        limit: std::time::Duration,
+        mut done: impl FnMut(&str) -> bool,
+    ) -> String {
+        use std::io::Read;
+        let mut out = String::new();
+        let mut buf = [0u8; 1 << 16];
+        let end = std::time::Instant::now() + limit;
+        while !done(&out) && std::time::Instant::now() < end {
+            match self.pty.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => out.push_str(&String::from_utf8_lossy(&buf[..k])),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                // Linux reports the slave side closing as EIO.
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                Err(e) => panic!("reading croft's terminal: {e}"),
+            }
+        }
+        out
+    }
+
+    /// Type `bytes` as the terminal would send them.
+    fn send(&mut self, bytes: &[u8]) {
+        use std::io::Write;
+        self.pty.write_all(bytes).unwrap();
+    }
+}
+
+/// How long a PTY test waits for croft to show what it is waiting for.
+#[cfg(unix)]
+const PTY_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+#[cfg(unix)]
+impl Drop for PtyCroft {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        // macOS holds a killed process in its exit while output it wrote
+        // sits unread on its terminal, so the terminal closes before the
+        // wait. The kill comes first, so croft never sees the hangup.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.pty) };
+        let _ = self.child.wait();
+    }
+}
+
+/// `base`, what a wait costs on a quiet machine, stretched for the load this
+/// one is under. The rule is `src/test_budget.rs`'s, which this test binary
+/// cannot reach: x2, then x(the harness's threads + the load average) / CPUs,
+/// held between 2 and 4.
+#[cfg(unix)]
+fn spawn_budget(base: std::time::Duration) -> std::time::Duration {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
+    // The flag wins over the variable, the last flag over the rest, as in
+    // libtest itself.
+    let mut threads = std::env::var("RUST_TEST_THREADS").ok();
+    let mut args = std::env::args();
+    while let Some(arg) = args.next() {
+        if let Some(n) = arg.strip_prefix("--test-threads=") {
+            threads = Some(n.to_string());
+        } else if arg == "--test-threads" {
+            threads = args.next();
+        }
+    }
+    let threads = threads
+        .and_then(|n| n.parse::<u32>().ok())
+        .map_or(cpus, f64::from);
+    let mut load = [0f64; 1];
+    // SAFETY: asked for one sample, getloadavg writes at most one.
+    let load = match unsafe { libc::getloadavg(load.as_mut_ptr(), 1) } {
+        1 => load[0],
+        _ => 0.0,
+    };
+    base * 2 * ((threads + load) / cpus).ceil().clamp(2.0, 4.0) as u32
+}
+
+/// #857: what croft's key reader makes of the bytes tmux sends for
+/// Ctrl+Shift+S. tmux 3.2-3.4 with `extended-keys always` (and any tmux
+/// with `extended-keys-format csi-u` for a program that asked) send
+/// `CSI 83;6u`, the uppercase letter with the Shift flag: that must read as
+/// Ctrl+Shift, the Source Control jump. The negative cases must never gain a
+/// Shift: the legacy control byte (what tmux 3.5+ and plain terminals send
+/// for both Ctrl+S and Ctrl+Shift+S) and an uppercase S reported without the
+/// flag stay Ctrl+S, a save; tmux 3.5's default `CSI 27;6;83~` form is not
+/// read as a plain Ctrl+S either.
+#[cfg(unix)]
+#[test]
+fn croft_keys_reads_tmux_ctrl_shift_s_with_the_shift_and_nothing_else_with_one() {
+    let home = tempfile::tempdir().unwrap();
+    let mut croft = PtyCroft::spawn(home.path(), &["keys"]);
+    let banner = croft.read_until(PTY_LIMIT, |out| out.contains("croft keys"));
+    assert!(banner.contains("croft keys"), "no banner: {banner:?}");
+    // Each case is followed by a lone marker key, so the report lines of
+    // one case never run into the next.
+    let cases: [(&str, &[u8]); 4] = [
+        ("tmux CSI u Ctrl+Shift+S", b"\x1b[83;6u"),
+        ("legacy Ctrl+S byte", b"\x13"),
+        ("uppercase S, Ctrl, no Shift flag", b"\x1b[83;5u"),
+        ("tmux 3.5 CSI 27 Ctrl+Shift+S", b"\x1b[27;6;83~"),
+    ];
+    let mut reports = Vec::new();
+    for (i, (name, bytes)) in cases.iter().enumerate() {
+        let marker = format!("code=Char('{i}')");
+        croft.send(bytes);
+        croft.send(format!("{i}").as_bytes());
+        let seen = croft.read_until(PTY_LIMIT, |out| out.contains(&marker));
+        let lines: Vec<String> = seen
+            .lines()
+            .filter(|l| l.contains("code="))
+            .take_while(|l| !l.contains(&marker))
+            .map(|l| l.split("  code=").nth(1).unwrap_or(l).trim().to_string())
+            .collect();
+        assert!(seen.contains(&marker), "{name}: marker lost in {seen:?}");
+        reports.push((*name, lines));
+    }
+    let [csi_u, legacy, no_flag, csi_27] = reports.try_into().unwrap();
+    assert_eq!(
+        csi_u.1,
+        vec!["Char('S')  modifiers=[CONTROL + SHIFT]  kitty=true"],
+        "{}",
+        csi_u.0
+    );
+    assert_eq!(
+        legacy.1,
+        vec!["Char('s')  modifiers=[CONTROL]  kitty=true"],
+        "{}",
+        legacy.0
+    );
+    assert_eq!(
+        no_flag.1,
+        vec!["Char('S')  modifiers=[CONTROL]  kitty=true"],
+        "{}",
+        no_flag.0
+    );
+    assert!(
+        csi_27
+            .1
+            .iter()
+            .all(|l| !l.ends_with("modifiers=[CONTROL]  kitty=true")),
+        "{}: {:?}",
+        csi_27.0,
+        csi_27.1
+    );
+}
+
+/// #857 end to end on the real binary: with a file edited in the editor, the
+/// bytes tmux sends for Ctrl+Shift+S (`CSI 83;6u`) jump to Source Control
+/// and leave the file unsaved; before the fix they saved it. The legacy
+/// Ctrl+S byte, which carries no Shift, still saves.
+#[cfg(unix)]
+#[test]
+fn ctrl_shift_s_as_tmux_sends_it_does_not_save_while_ctrl_s_does() {
+    let home = tempfile::tempdir().unwrap();
+    let file = home.path().join("a.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut croft = PtyCroft::spawn(home.path(), &["a.txt"]);
+    let saved = |want: &str| std::fs::read_to_string(&file).unwrap() == want;
+    let started = croft.read_until(PTY_LIMIT, |out| out.contains("alpha"));
+    assert!(
+        started.contains("alpha"),
+        "croft never drew a.txt: {started:?}"
+    );
+    // Dismiss anything a first launch shows over the editor. A terminal
+    // reads ESC as Escape only when nothing follows it at once (ESC then
+    // `x` is Alt+x), so this one pause is the protocol's, not a guess at
+    // how long croft takes.
+    croft.send(b"\x1b");
+    croft.read_until(std::time::Duration::from_millis(300), |_| false);
+    croft.send(b"x");
+    croft.send(b"\x13");
+    croft.read_until(PTY_LIMIT, |_| saved("xalpha\n"));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "xalpha\n",
+        "setup: the typed x lands in a.txt and Ctrl+S saves it"
+    );
+    croft.send(b"y");
+    croft.send(b"\x1b[83;6u");
+    // Source Control on screen means the chord has been handled, so a save
+    // it made would be on disk by now.
+    let drawn = croft.read_until(PTY_LIMIT, |out| out.contains("SOURCE CONTROL"));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "xalpha\n",
+        "Ctrl+Shift+S with the Shift reported must not save"
+    );
+    assert!(
+        drawn.contains("SOURCE CONTROL"),
+        "Ctrl+Shift+S opens Source Control"
+    );
+}
+
+/// The step labels of a startup trace (`src/startup_trace.rs`), in the order
+/// croft marked them: the table under its `at step cpu step` header, each
+/// line three numbers and then the label, up to the blank line after it.
+#[cfg(unix)]
+fn traced_steps(trace: &str) -> Vec<String> {
+    trace
+        .lines()
+        .skip_while(|line| !line.split_whitespace().eq(["at", "step", "cpu", "step"]))
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.split_whitespace()
+                .skip(3)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
+/// Tenet 1 on the real binary: the steps croft takes before its first frame,
+/// as its startup trace records them, are exactly the ones listed here and
+/// in this order. Order and membership only: how long a step takes varies
+/// with the machine, so no duration is checked.
+#[cfg(unix)]
+#[test]
+fn the_steps_before_the_first_frame_are_exactly_the_known_ones_in_order() {
+    // A new step before the first frame must be added here deliberately,
+    // with a reason, because tenet 1 forbids anything the first frame does
+    // not need: work that can wait runs after it (see `startup_gate`). Every
+    // mark below sits on the one path every launch of the editor takes
+    // (`Cli::run`, then `app::run` and `App::new`, then the main loop's first
+    // pass and the render of its first frame), unconditionally and on
+    // croft's main thread, so none depends on the machine, the terminal or
+    // SSH, and the list is the same for every launch.
+    const BEFORE_FIRST_FRAME: &[&str] = &[
+        "PATH ready",
+        "background work started",
+        "settings, keymap and matchers loaded",
+        "sockets bound",
+        "terminal shell spawned",
+        "file watcher started",
+        // The steps inside `App::new`'s struct literal that read or stat a
+        // file or start a thread, each marked where it runs (#2062): before these,
+        // the whole literal was one step, so a slow one could not be told
+        // apart from the rest.
+        "test runner started",
+        "macros loaded",
+        "settings watcher set up",
+        "snippets loaded",
+        "refused remote hosts read",
+        "extension consents read",
+        "language server manager built",
+        "command history read",
+        "triggers loaded",
+        "agents loaded",
+        "sticky notes read",
+        "editor state built",
+        "editor built",
+        "session restored",
+        "host terminal answered",
+        "screen set up",
+        // The first frame's own parts (#1973): the main loop's first pass
+        // over its polls and drains, in groups, then each part of the screen
+        // the frame draws. Marks only, no work: they split the one step that
+        // used to read "first frame on screen", so a launch that is slow to
+        // draw says which part held it.
+        "file changes read",
+        "background results collected",
+        "agents, ports and collaborators polled",
+        "terminal panes and saves ticked",
+        "highlights and pictures polled",
+        "watchers and dialogs polled",
+        "language servers synced",
+        "lint, gutters and blame synced",
+        "outline and Explorer views synced",
+        "language server replies read",
+        "debugger and tests polled",
+        "AI tools polled",
+        "loop work done",
+        "activity bar drawn",
+        "side bar drawn",
+        "editor drawn",
+        "panel drawn",
+        "status bar and popups drawn",
+        "frame drawn",
+    ];
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, workspace) = (tmp.path().join("home"), tmp.path().join("workspace"));
+    for dir in [&home, &workspace] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    let trace = tmp.path().join("startup-trace.txt");
+    // Nothing inherited but the PATH: no SSH_* to make this a remote launch,
+    // no user configuration, no outer croft or tmux.
+    let mut croft = PtyCroft::spawn_with(&workspace, &[], |cmd| {
+        cmd.env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("TERM", "xterm-256color")
+            .env("SHELL", "/bin/sh")
+            .env("CROFT_STARTUP_TRACE", &trace);
+    });
+    // croft writes the trace once the first frame is on screen, its closing
+    // line last. The host probe goes unanswered, as in the other launch
+    // tests: croft waits out its own short budget for a reply and goes on.
+    // The terminal is read meanwhile, so croft never blocks on a full one.
+    let written = || {
+        std::fs::read_to_string(&trace)
+            .ok()
+            .filter(|t| t.contains("\nFirst frame ") && t.ends_with(".\n"))
+    };
+    // 5s: a quiet machine gets the `PTY_LIMIT` the other launch tests have.
+    let budget = spawn_budget(std::time::Duration::from_secs(5));
+    let screen = croft.read_until(budget, |_| written().is_some());
+    let text = written().unwrap_or_else(|| {
+        panic!("croft wrote no startup trace within {budget:?}; its terminal showed {screen:?}")
+    });
+    let steps = traced_steps(&text);
+    let first_frame = steps
+        .iter()
+        .position(|step| step == "first frame on screen")
+        .unwrap_or_else(|| panic!("the trace has no first frame:\n{text}"));
+    assert_eq!(&steps[..first_frame], BEFORE_FIRST_FRAME, "{text}");
+}
+
+/// `croft edit --sequence-editor`, as git runs it from `GIT_SEQUENCE_EDITOR`,
+/// with git's own editor set to `editor` and no git config in the way.
+fn sequence_editor_command(dir: &std::path::Path, editor: &str) -> Command {
+    let no_config = dir.join("empty.gitconfig");
+    std::fs::write(&no_config, "").unwrap();
+    let mut cmd = Command::cargo_bin("croft").unwrap();
+    cmd.env("GIT_EDITOR", editor)
+        .env("GIT_CONFIG_GLOBAL", &no_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .current_dir(dir);
+    cmd
+}
+
+/// #1452: a shell that outlived its croft (a tmux server started from a
+/// croft pane) keeps `GIT_SEQUENCE_EDITOR` and `CROFT_VIEW_SOCK`. Every
+/// `git rebase -i` there failed with "the croft that opened this pane is
+/// gone". As the sequence editor, croft now hands the plan to git's own
+/// editor instead.
+#[test]
+fn the_sequence_editor_falls_back_to_gits_editor_when_its_croft_is_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    let out = sequence_editor_command(tmp.path(), "echo edited >>")
+        .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    let out = out.success();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("croft is not running; using echo edited >>"),
+        "says which editor it used, was: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&plan).unwrap(),
+        "pick 1234567 one\nedited\n",
+        "git's editor ran on the plan"
+    );
+}
+
+/// #1452: the same with no socket at all (the variable was dropped but
+/// `GIT_SEQUENCE_EDITOR` kept).
+#[test]
+fn the_sequence_editor_falls_back_when_no_croft_socket_is_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    sequence_editor_command(tmp.path(), "echo edited >>")
+        .env_remove("CROFT_VIEW_SOCK")
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert()
+        .success();
+    assert!(
+        std::fs::read_to_string(&plan)
+            .unwrap()
+            .ends_with("edited\n")
+    );
+}
+
+/// #1452: the fallback editor's own failure is git's to see: its exit code
+/// comes back, so git aborts the rebase as it would without croft.
+#[test]
+fn a_failing_fallback_editor_fails_the_sequence_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("git-rebase-todo"), "pick 1234567 one\n").unwrap();
+    let out = sequence_editor_command(tmp.path(), "exit 3;")
+        .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    let out = out.failure().code(3);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("using exit 3;"), "stderr was: {stderr}");
+}
+
+/// #1452 negative: a plain `croft edit` asked for croft by name, so a gone
+/// croft is still an error there and no other editor runs.
+#[test]
+fn a_plain_edit_against_a_gone_croft_still_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("notes.txt");
+    std::fs::write(&plan, "keep\n").unwrap();
+    let out = sequence_editor_command(tmp.path(), "echo edited >>")
+        .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+        .args(["edit", "--wait", "notes.txt"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("the croft that opened this pane is gone"),
+        "stderr was: {stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&plan).unwrap(), "keep\n");
+}
+
+/// #1452 negative: a croft that is running but refuses the file is not a
+/// gone croft. Its refusal stands, and git's editor does not run.
+#[test]
+fn a_croft_that_refuses_the_plan_is_not_replaced_by_gits_editor() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    let sock = tmp.path().join("v.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        stream
+            .write_all(b"{\"status\":\"err\",\"message\":\"cannot open that here\"}\n")
+            .unwrap();
+    });
+    let out = sequence_editor_command(tmp.path(), "echo edited >>")
+        .env("CROFT_VIEW_SOCK", &sock)
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    server.join().unwrap();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("cannot open that here"),
+        "stderr was: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&plan).unwrap(),
+        "pick 1234567 one\n"
+    );
+}
+
+/// #1452 negative: a croft that took the plan and closed without a reply may
+/// have opened it, so git's editor must not open the same plan a second time.
+#[test]
+fn a_croft_that_closes_without_replying_is_not_replaced_by_gits_editor() {
+    use std::io::{BufRead, BufReader};
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    let sock = tmp.path().join("v.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+    });
+    let out = sequence_editor_command(tmp.path(), "echo edited >>")
+        .env("CROFT_VIEW_SOCK", &sock)
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    server.join().unwrap();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(!stderr.contains("not running"), "stderr was: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&plan).unwrap(),
+        "pick 1234567 one\n"
+    );
+}
+
+/// #1452 negative: where git itself names no editor (a dumb terminal with
+/// none set), the fallback fails as git would rather than inventing `vi`.
+#[test]
+fn the_sequence_editor_fails_when_git_names_no_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    let out = sequence_editor_command(tmp.path(), "unused")
+        .env_remove("GIT_EDITOR")
+        .env_remove("VISUAL")
+        .env_remove("EDITOR")
+        .env("TERM", "dumb")
+        .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(!stderr.contains("using"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("the croft that opened this pane is gone"),
+        "stderr was: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&plan).unwrap(),
+        "pick 1234567 one\n"
+    );
+}
+
+/// #1452 negative: with its croft alive the plan opens there, exactly as
+/// before, and git's editor never runs.
+#[test]
+fn a_live_croft_still_gets_the_plan() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    let sock = tmp.path().join("v.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let server = std::thread::spawn(move || {
+        let replies: [&[u8]; 2] = [
+            b"{\"status\":\"ok\"}\n",
+            b"{\"status\":\"err\",\"message\":\"closed\"}\n",
+        ];
+        for reply in replies {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            stream.write_all(reply).unwrap();
+        }
+    });
+    let out = sequence_editor_command(tmp.path(), "echo edited >>")
+        .env("CROFT_VIEW_SOCK", &sock)
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    server.join().unwrap();
+    let out = out.success();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(!stderr.contains("not running"), "stderr was: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&plan).unwrap(),
+        "pick 1234567 one\n"
+    );
+}
+
+/// #1439: off macOS, `setup-ghostty` refuses instead of writing a macOS
+/// path Ghostty never reads there and reporting success.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn setup_ghostty_refuses_off_macos_and_writes_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join(".config/ghostty/config.ghostty");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "font-size = 14\n").unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .args(["setup-ghostty", "-y"])
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("macOS-only"), "stderr was: {stderr}");
+    assert!(!home.path().join("Library").exists());
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        "font-size = 14\n"
+    );
+}

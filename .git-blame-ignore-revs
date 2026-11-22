@@ -1,0 +1,6 @@
+# Pure-formatting commits, skipped by git blame when
+# blame.ignoreRevsFile points at this file (GitHub honours it
+# automatically).
+
+# style: apply the pinned rustfmt across the tree
+ccbfd53867a9b8443f9ecf78c65fe55b29ffb91e

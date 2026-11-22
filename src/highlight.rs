@@ -1,0 +1,3830 @@
+use ratatui::style::{Color, Modifier, Style};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock, RwLock};
+use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
+
+use crate::theme::SyntaxPalette;
+
+/// Order matters: the index assigned by `HighlightConfiguration::configure`
+/// is the same as the index into this slice and into `HIGHLIGHT_STYLES`.
+pub const HIGHLIGHT_NAMES: &[&str] = &[
+    "attribute",
+    "boolean",
+    "comment",
+    "constant",
+    "constant.builtin",
+    "constructor",
+    "function",
+    "function.builtin",
+    "function.macro",
+    "function.method",
+    "keyword",
+    "label",
+    "module",
+    "number",
+    "operator",
+    "property",
+    "punctuation",
+    "punctuation.bracket",
+    "punctuation.delimiter",
+    "punctuation.special",
+    "string",
+    "string.escape",
+    "string.special",
+    "tag",
+    "type",
+    "type.builtin",
+    "variable",
+    "variable.builtin",
+    "variable.parameter",
+    // Markdown: tree-sitter-md's own captures (nvim-treesitter's `text.*`
+    // names) plus the `text.list` / `text.quote` / `text.strike` the
+    // Markdown overlays add. No other bundled grammar captures `text.*`.
+    "text.emphasis",
+    "text.list",
+    "text.literal",
+    "text.quote",
+    "text.reference",
+    "text.strike",
+    "text.strong",
+    "text.title",
+    "text.uri",
+];
+
+const fn rgb(r: u8, g: u8, b: u8) -> Color {
+    Color::Rgb(r, g, b)
+}
+
+/// What an HTML file embeds (#1649): `<style>` is CSS, and `<script>` is
+/// JavaScript when its `type` is absent, empty, or a JavaScript MIME type
+/// (parameters allowed), as a browser runs it. Not the bundled
+/// query, which calls every script JavaScript and would colour a JSON-LD
+/// block or a `<script type="text/template">` as code it is not: JSON
+/// types get JSON, and any other non-JavaScript type stays raw text.
+const HTML_INJECTIONS_QUERY: &str = r#"
+((style_element
+  (raw_text) @injection.content)
+ (#set! injection.language "css"))
+
+((script_element
+  (start_tag) @_start
+  (raw_text) @injection.content)
+ (#not-match? @_start "(?i)\\stype\\s*=")
+ (#set! injection.language "javascript"))
+
+((script_element
+  (start_tag) @_start
+  (raw_text) @injection.content)
+ (#match? @_start "(?i)\\stype\\s*=\\s*(\"\\s*((module|(text|application)/(x-)?(java|ecma)script|text/javascript1\\.[0-5]|text/(jscript|livescript))\\s*(;[^\"]*)?)?\"|'\\s*((module|(text|application)/(x-)?(java|ecma)script|text/javascript1\\.[0-5]|text/(jscript|livescript))\\s*(;[^']*)?)?'|(module|(text|application)/(x-)?(java|ecma)script|text/javascript1\\.[0-5]|text/(jscript|livescript))(;[^\\s>]*)?[\\s/>])")
+ (#set! injection.language "javascript"))
+
+((script_element
+  (start_tag) @_start
+  (raw_text) @injection.content)
+ (#match? @_start "(?i)\\stype\\s*=\\s*[\"']?(importmap|speculationrules|application/(ld\\+)?json)[\"'\\s>]")
+ (#set! injection.language "json"))
+"#;
+
+/// What a Vue or Svelte component embeds (#1632): `<script>` is
+/// TypeScript when its `lang` says `ts` (TSX for `tsx`), else
+/// JavaScript; `<style>` is CSS, whatever preprocessor its `lang` names
+/// (SCSS and Less read close enough as CSS). Parsed with the HTML grammar,
+/// which sees each block as an element with raw text inside.
+const SFC_INJECTIONS_QUERY: &str = r#"
+((style_element
+  (raw_text) @injection.content)
+ (#set! injection.language "css"))
+
+((script_element
+  (start_tag) @_start
+  (raw_text) @injection.content)
+ (#match? @_start "(?i)\\slang\\s*=\\s*[\"']?ts[\"'\\s>]")
+ (#set! injection.language "typescript"))
+
+((script_element
+  (start_tag) @_start
+  (raw_text) @injection.content)
+ (#match? @_start "(?i)\\slang\\s*=\\s*[\"']?tsx[\"'\\s>]")
+ (#set! injection.language "tsx"))
+
+((script_element
+  (start_tag) @_start
+  (raw_text) @injection.content)
+ (#not-match? @_start "(?i)\\slang\\s*=\\s*[\"']?tsx?[\"'\\s>]")
+ (#set! injection.language "javascript"))
+"#;
+
+/// JSX-specific captures appended onto the shared TypeScript/TSX
+/// highlights query. The bundled query has none of these, so JSX
+/// tags and attribute names land in default foreground without it.
+const TSX_JSX_OVERLAY_QUERY: &str = r#"
+(jsx_opening_element name: (_) @tag)
+(jsx_closing_element name: (_) @tag)
+(jsx_self_closing_element name: (_) @tag)
+(jsx_attribute (property_identifier) @attribute)
+"#;
+
+/// Parameter captures appended onto the bundled Python highlights
+/// query. tree-sitter-python emits no @variable.parameter, so every
+/// function and lambda parameter falls through to the broad
+/// (identifier) @variable rule and renders in default foreground.
+/// Appended LAST so these win over that rule under
+/// tree-sitter-highlight's last-match-wins rule. Covers plain,
+/// typed, defaulted, and *args / **kwargs forms.
+const PYTHON_PARAM_OVERLAY_QUERY: &str = r#"
+(parameters (identifier) @variable.parameter)
+(lambda_parameters (identifier) @variable.parameter)
+(typed_parameter (identifier) @variable.parameter)
+(default_parameter name: (identifier) @variable.parameter)
+(typed_default_parameter name: (identifier) @variable.parameter)
+(parameters (list_splat_pattern (identifier) @variable.parameter))
+(parameters (dictionary_splat_pattern (identifier) @variable.parameter))
+(lambda_parameters (list_splat_pattern (identifier) @variable.parameter))
+(lambda_parameters (dictionary_splat_pattern (identifier) @variable.parameter))
+(typed_parameter (list_splat_pattern (identifier) @variable.parameter))
+(typed_parameter (dictionary_splat_pattern (identifier) @variable.parameter))
+"#;
+
+/// Namespace + class heuristics appended LAST onto the bundled Python
+/// highlights query, so they win under tree-sitter-highlight's
+/// last-match-wins rule. This is how Helix/Zed/Neovim colour Python without
+/// the language server: the two biggest cold-open mismatches against ty are
+/// imported class references and module names, and both are recoverable from
+/// syntax alone.
+///
+/// 1. Module names in `import` / `from ... import` statements are coloured
+///    `@module` (yellow), matching ty's `namespace`. The bundled query leaves
+///    them as plain `@variable` (grey), which is the most visible part of the
+///    grey-to-yellow snap on an import-heavy file.
+/// 2. CamelCase identifiers (a capital followed somewhere by a lowercase) are
+///    coloured `@type` (yellow), matching ty's `class`. The bundled query
+///    already singles capitalised names out, but as `@constructor` (blue),
+///    which disagrees with ty's yellow. Restricting to names that contain a
+///    lowercase letter deliberately excludes ALL_CAPS names, which the bundled
+///    `@constant` rule keeps orange (ty calls those plain variables, but
+///    highlighting module-level constants is a deliberate choice and they are
+///    few). PEP 8 makes CamelCase an almost perfect proxy for "class".
+const PYTHON_NAMESPACE_TYPE_OVERLAY_QUERY: &str = r#"
+(import_statement name: (dotted_name (identifier) @module))
+(import_statement name: (aliased_import (dotted_name (identifier) @module)))
+(import_from_statement module_name: (dotted_name (identifier) @module))
+(import_from_statement module_name: (relative_import (dotted_name (identifier) @module)))
+
+((identifier) @type
+ (#match? @type "^[A-Z].*[a-z]"))
+"#;
+
+/// Local-scope query for Python, passed as the locals slot of
+/// `HighlightConfiguration::new`. tree-sitter-python ships none, so without
+/// this a parameter is coloured only at its `def` site (by
+/// `PYTHON_PARAM_OVERLAY_QUERY`); its references in the body fall through to
+/// `(identifier) @variable` (grey) and stay grey until ty's semantic-token
+/// overlay lands, which on a cold, heavy-import file is 1-2s after open. The
+/// locals query lets tree-sitter link each body reference to its in-scope
+/// definition and inherit the definition's colour instantly, the same way
+/// Helix and Zed colour locals without waiting on the language server.
+///
+/// The Rust `tree-sitter-highlight` crate matches the BARE capture names
+/// `local.scope` / `local.definition` / `local.reference` exactly (it does not
+/// understand nvim-treesitter's dotted `@local.definition.parameter`
+/// subtypes), so every capture below uses the bare form. Definition patterns
+/// are listed before the broad `(identifier) @local.reference` so a node that
+/// is both a definition and an identifier is recorded as a definition first
+/// and not re-resolved as a reference.
+const PYTHON_LOCALS_QUERY: &str = r#"
+[
+  (module)
+  (function_definition)
+  (lambda)
+  (class_definition)
+  (list_comprehension)
+  (set_comprehension)
+  (dictionary_comprehension)
+  (generator_expression)
+] @local.scope
+
+(parameters (identifier) @local.definition)
+(lambda_parameters (identifier) @local.definition)
+(typed_parameter (identifier) @local.definition)
+(default_parameter name: (identifier) @local.definition)
+(typed_default_parameter name: (identifier) @local.definition)
+(parameters (list_splat_pattern (identifier) @local.definition))
+(parameters (dictionary_splat_pattern (identifier) @local.definition))
+(lambda_parameters (list_splat_pattern (identifier) @local.definition))
+(lambda_parameters (dictionary_splat_pattern (identifier) @local.definition))
+
+(assignment left: (identifier) @local.definition)
+(assignment left: (pattern_list (identifier) @local.definition))
+(assignment left: (tuple_pattern (identifier) @local.definition))
+(for_statement left: (identifier) @local.definition)
+(for_statement left: (pattern_list (identifier) @local.definition))
+(for_statement left: (tuple_pattern (identifier) @local.definition))
+(for_in_clause left: (identifier) @local.definition)
+(for_in_clause left: (pattern_list (identifier) @local.definition))
+(for_in_clause left: (tuple_pattern (identifier) @local.definition))
+(named_expression (identifier) @local.definition)
+(as_pattern alias: (as_pattern_target) @local.definition)
+
+; Imported module names bind a name in scope, so body references to them
+; (`pydantic` in `pydantic.BaseModel`) resolve here and inherit the def's
+; `@module` colour instantly, the same way parameters do. The `.` anchor binds
+; only the first segment of a dotted import (`import a.b.c` binds `a`); an
+; aliased import binds its alias.
+(import_statement name: (dotted_name . (identifier) @local.definition))
+(import_statement name: (aliased_import alias: (identifier) @local.definition))
+
+(identifier) @local.reference
+"#;
+
+/// Locals overlay appended to the bundled `tree-sitter-typescript`
+/// locals query (used for both TypeScript and TSX). The bundled query
+/// captures `required_parameter` / `optional_parameter` as
+/// `@local.definition` but ships NO `@local.scope` and NO
+/// `@local.reference`, so without this overlay a parameter is coloured
+/// only at its declaration and its body references stay default-coloured
+/// until the language server's semantic-token overlay arrives. Adds the
+/// missing scopes, single-identifier arrow parameters, `const`/`let`/`var`
+/// declarators, and the broad reference capture so tree-sitter links body
+/// references to their in-scope definition and colours them instantly.
+/// Bundled definition patterns precede this overlay's `@local.reference`,
+/// so a definition node is recorded as a definition, not re-resolved as a
+/// reference. Bare capture names only (the Rust highlighter matches them
+/// exactly).
+const TS_LOCALS_OVERLAY_QUERY: &str = r#"
+[
+  (statement_block)
+  (function_declaration)
+  (function_expression)
+  (arrow_function)
+  (method_definition)
+] @local.scope
+
+(arrow_function parameter: (identifier) @local.definition)
+(variable_declarator name: (identifier) @local.definition)
+
+(identifier) @local.reference
+"#;
+
+/// Locals overlay PREPENDED to the bundled `tree-sitter-javascript`
+/// locals query. That bundled query already has scopes, `variable_declarator`
+/// definitions, and a broad `(identifier) @local.reference`, but it captures
+/// only `(pattern/identifier)` as a definition, which a plain
+/// `(formal_parameters (identifier))` parameter is NOT, so function
+/// parameters were never recorded and their body references stayed
+/// default-coloured until the language server replied. Prepending these
+/// parameter-definition patterns (so they precede the bundled reference
+/// capture) records parameters as definitions, letting body references
+/// inherit the parameter colour instantly. Bare capture names only.
+const JS_PARAM_LOCALS_OVERLAY_QUERY: &str = r#"
+(formal_parameters (identifier) @local.definition)
+(arrow_function parameter: (identifier) @local.definition)
+(rest_pattern (identifier) @local.definition)
+"#;
+
+/// Highlights overlay appended to the bundled `tree-sitter-javascript`
+/// highlights query. That query captures no `@variable.parameter` at all
+/// (function parameters fall through to the broad `(identifier) @variable`
+/// and render in default foreground), so unlike Python and TypeScript a JS
+/// parameter was not even coloured at its declaration. Appended LAST so it
+/// wins over the broad `@variable` rule under tree-sitter-highlight's
+/// last-match-wins rule, matching the Python parameter overlay and giving
+/// the locals query a parameter colour to propagate to body references.
+const JS_PARAM_HIGHLIGHTS_OVERLAY_QUERY: &str = r#"
+(formal_parameters (identifier) @variable.parameter)
+(arrow_function parameter: (identifier) @variable.parameter)
+(rest_pattern (identifier) @variable.parameter)
+"#;
+
+/// Broad identifier capture PREPENDED onto the bundled Rust highlights query.
+/// tree-sitter-rust's highlights query has no catch-all `(identifier)` rule
+/// (only specific ones: `@function` calls, `@constant`/`@constructor` by
+/// regex, `@variable.parameter` at declarations, ...), so a parameter's body
+/// reference matches no highlight capture at all. That breaks the locals
+/// machinery: `tree-sitter-highlight` resolves the reference to its
+/// definition's colour but only EMITS that colour when the reference node ALSO
+/// carries a highlights capture (otherwise it skips emission entirely). This
+/// catch-all gives every identifier a carrier capture. Prepended FIRST so the
+/// bundled specific rules follow and win under last-match-wins; only
+/// otherwise-unmatched identifiers take `@variable`, whose grey equals the
+/// previous default foreground, so non-parameter identifiers look unchanged.
+/// Mirrors `JS_PARAM_HIGHLIGHTS_OVERLAY_QUERY`.
+const RUST_IDENTIFIER_OVERLAY_QUERY: &str = r#"(identifier) @variable"#;
+
+/// Appended AFTER the bundled Rust highlights so it wins under last-match-wins.
+/// Colours the two most pervasive tokens that otherwise recolour when
+/// rust-analyzer's semantic overlay lands 1-3s after open (RA cold crate-graph
+/// analysis, unfixable at the LSP layer):
+///   - module/namespace path segments (`std::collections::`) which RA paints
+///     `namespace` (yellow) but tree-sitter leaves grey @variable. Restricted
+///     to lowercase leading segments via `#match?` so capitalized type paths
+///     keep the bundled `@type` rule. Mirrors the bundled capitalized-`@type`
+///     scoped rules but for lowercase -> `@module`.
+///   - enum-variant DECLARATIONS (`enum E { A, B }`) which RA paints
+///     `enumMember` (orange) but tree-sitter colours @constructor (blue-grey).
+///     Variant USES (`E::A`) are deliberately NOT matched: syntactically they
+///     are indistinguishable from a type path or associated const, so
+///     colouring them would mis-paint real types. That residual recolour is
+///     inherent to the combined model (VS Code has it too) and only the LSP
+///     can resolve it.
+const RUST_MODULE_OVERLAY_QUERY: &str = r#"
+((scoped_identifier path: (identifier) @module)
+ (#match? @module "^[a-z]"))
+((scoped_identifier path: (scoped_identifier name: (identifier) @module))
+ (#match? @module "^[a-z]"))
+((scoped_type_identifier path: (identifier) @module)
+ (#match? @module "^[a-z]"))
+((scoped_type_identifier path: (scoped_identifier name: (identifier) @module))
+ (#match? @module "^[a-z]"))
+(enum_variant name: (identifier) @constant)
+"#;
+
+/// Appended AFTER `RUST_MODULE_OVERLAY_QUERY` so it wins under last-match-wins.
+/// Colours `use` declarations the way rust-analyzer resolves them, killing the
+/// most visible cold-open snap: the whole import block at the top of a file,
+/// which the bundled query paints blue/grey and RA repaints yellow ~1-3s later
+/// once crate-graph analysis lands.
+///
+/// This is the Rust counterpart of Python's `PYTHON_NAMESPACE_TYPE_OVERLAY_QUERY`,
+/// but restricted to `use` position rather than a blanket CamelCase rule. In
+/// Rust a blanket `(identifier) @type (#match? "^[A-Z]...")` would collide with
+/// enum variants: `Some` / `None` / `Ok` / `Err` and custom variants are
+/// CamelCase bare identifiers too, yet RA paints them `enumMember` (orange), not
+/// type-yellow, and syntax cannot tell a variant from a type in expression
+/// position. Inside a `use` path there is no such ambiguity: `Some`/`None`/etc.
+/// are prelude items never written in `use`, so every capitalized import name is
+/// a type/trait/struct (yellow) and every lowercase path segment is a module
+/// (yellow `@module`). Empirically (token diff against RA's cached tokens for
+/// the real src/remote.rs) imports are the single biggest type-coloured snap.
+///
+///   - Imported type/trait/struct names -> `@type`. `^[A-Z].*[a-z]` (a capital
+///     plus a lowercase) excludes ALL_CAPS const imports, which RA paints as
+///     `const` (orange) and the bundled `@constant` rule already handles.
+///   - Brace-list module heads (`anyhow` in `anyhow::{...}`, `thread` in
+///     `std::thread::{...}`) which the `scoped_identifier` module overlay does
+///     not reach because a `scoped_use_list` path is not a `scoped_identifier`.
+const RUST_USE_OVERLAY_QUERY: &str = r#"
+((use_declaration argument: (scoped_identifier name: (identifier) @type))
+ (#match? @type "^[A-Z].*[a-z]"))
+((use_list (identifier) @type)
+ (#match? @type "^[A-Z].*[a-z]"))
+((use_as_clause alias: (identifier) @type)
+ (#match? @type "^[A-Z].*[a-z]"))
+
+((scoped_use_list path: (identifier) @module)
+ (#match? @module "^[a-z]"))
+((scoped_use_list path: (scoped_identifier name: (identifier) @module))
+ (#match? @module "^[a-z]"))
+"#;
+
+/// Local-scope query for Rust, passed as the locals slot of
+/// `HighlightConfiguration::new`. tree-sitter-rust ships no locals query, so
+/// without this a parameter is coloured only at its declaration site (by the
+/// bundled `(parameter (identifier) @variable.parameter)` rule); its
+/// references in the body match no highlights capture (the Rust query has no
+/// broad `(identifier) @variable` rule) and fall through to default grey until
+/// rust-analyzer's semantic-token overlay lands, which on a cold crate is
+/// ~25s after open. The locals query lets tree-sitter link each body
+/// reference to its in-scope definition and inherit the definition's colour
+/// instantly, the same way Helix and Zed colour locals without waiting on the
+/// language server.
+///
+/// The Rust `tree-sitter-highlight` crate matches the BARE capture names
+/// `local.scope` / `local.definition` / `local.reference` exactly. Definition
+/// patterns are listed before the broad `(identifier) @local.reference` so a
+/// node that is both a definition and an identifier is recorded as a
+/// definition first and not re-resolved as a reference. A body reference only
+/// inherits a colour when its definition node carries a highlights-query
+/// capture: parameters do (`@variable.parameter`, orange), so their references
+/// turn orange; plain `let` locals do not, so they stay default grey exactly
+/// as before, matching rust-analyzer's own "parameters coloured, locals plain"
+/// scheme. `self` is a dedicated `(self)` node, not an `(identifier)`, so it is
+/// untouched and keeps its `@variable.builtin` colour.
+const RUST_LOCALS_QUERY: &str = r#"
+[
+  (source_file)
+  (function_item)
+  (closure_expression)
+  (block)
+] @local.scope
+
+(parameter (identifier) @local.definition)
+(closure_parameters (identifier) @local.definition)
+(let_declaration pattern: (identifier) @local.definition)
+(for_expression pattern: (identifier) @local.definition)
+
+(identifier) @local.reference
+"#;
+
+/// Overlay query for Lua: maps tree-sitter-lua's fine-grained captures
+/// (@conditional, @repeat, @field, @method, @parameter, @preproc) onto
+/// Highlights for CodeQL `.dbscheme` files (#578). The grammar crate ships
+/// no query, so this one is croft's: table and column names, `@types`,
+/// the column types, annotations, and QLDoc and comments.
+const DBSCHEME_HIGHLIGHTS_QUERY: &str = r##"
+[(line_comment) (block_comment) (qldoc)] @comment
+(tableName) @function
+(column colName: (simpleId) @property)
+(caseDecl discriminator: (simpleId) @property)
+(dbtype) @type
+[(int) (float) (boolean) (date) (string) (varchar)] @type.builtin
+[(unique) (ref) "case" "of"] @keyword
+(annotation "#" @attribute)
+(annotName) @attribute
+(integer) @number
+["(" ")" "[" "]"] @punctuation.bracket
+["," ":" ";" "." "|" "="] @punctuation.delimiter
+"##;
+
+/// Croft's standard HIGHLIGHT_NAMES captures under the last-match-wins rule.
+const LUA_OVERLAY_QUERY: &str = r#"
+(if_statement [ "if" "elseif" "else" "then" "end" ] @keyword)
+(elseif_statement [ "elseif" "then" "end" ] @keyword)
+(else_statement [ "else" "end" ] @keyword)
+(while_statement [ "while" "do" "end" ] @keyword)
+(repeat_statement [ "repeat" "until" ] @keyword)
+(for_statement [ "for" "do" "end" ] @keyword)
+(parameters (identifier) @variable.parameter)
+(field name: (identifier) @property)
+(dot_index_expression field: (identifier) @property)
+(function_declaration name: (method_index_expression method: (identifier) @function.method))
+(function_call name: (method_index_expression method: (identifier) @function.method))
+(hash_bang_line) @comment
+"#;
+
+/// Captures appended LAST onto tree-sitter-md's block highlights query, so
+/// they win under last-match-wins. The bundled query leaves heading markers,
+/// list and task markers, and quote markers on `punctuation.special`, which
+/// every theme paints in the default foreground; these give them the heading,
+/// list and quote styles, colour a whole block quote, and embolden a table's
+/// header row.
+const MARKDOWN_BLOCK_OVERLAY_QUERY: &str = r#"
+[
+  (atx_h1_marker)
+  (atx_h2_marker)
+  (atx_h3_marker)
+  (atx_h4_marker)
+  (atx_h5_marker)
+  (atx_h6_marker)
+  (setext_h1_underline)
+  (setext_h2_underline)
+] @text.title
+[
+  (list_marker_plus)
+  (list_marker_minus)
+  (list_marker_star)
+  (list_marker_dot)
+  (list_marker_parenthesis)
+  (task_list_marker_checked)
+  (task_list_marker_unchecked)
+] @text.list
+(block_quote) @text.quote
+[
+  (block_quote_marker)
+  (block_continuation)
+] @text.quote
+(pipe_table_header (pipe_table_cell) @text.strong)
+"#;
+
+/// Replaces tree-sitter-md's block injection query rather than extending it,
+/// because its patterns cannot work here as written. The block grammar leaves
+/// anonymous hint nodes inside the ranges it hands off (the `*` of `**bold**`
+/// in an `inline`, the brackets of `fn main() {}` in a fence), and
+/// tree-sitter-highlight cuts every child out of an injection's range unless
+/// `injection.include-children` is set, so the injected parser would see the
+/// text with those characters gone. Neovim, whose query this is, excludes only
+/// named children. A second pattern on the same node would inject it twice,
+/// so the whole query is croft's. It also hands table cells to the inline
+/// grammar (a cell has no `inline` child), as nvim-treesitter does, and drops
+/// the bundled query's older "anything between two leading `---`" YAML rule,
+/// since front matter parses as `minus_metadata`.
+const MARKDOWN_BLOCK_INJECTION_QUERY: &str = r#"
+(fenced_code_block
+  (info_string
+    (language) @injection.language)
+  (code_fence_content) @injection.content
+  (#set! injection.include-children))
+
+((html_block) @injection.content
+  (#set! injection.language "html")
+  (#set! injection.include-children))
+
+((minus_metadata) @injection.content
+  (#set! injection.language "yaml")
+  (#set! injection.include-children))
+
+((plus_metadata) @injection.content
+  (#set! injection.language "toml")
+  (#set! injection.include-children))
+
+((inline) @injection.content
+  (#set! injection.language "markdown_inline")
+  (#set! injection.include-children))
+
+((pipe_table_cell) @injection.content
+  (#set! injection.language "markdown_inline")
+  (#set! injection.include-children))
+"#;
+
+/// Captures appended onto tree-sitter-md's inline highlights query, which
+/// leaves strikethrough and email autolinks uncaptured.
+const MARKDOWN_INLINE_OVERLAY_QUERY: &str = r#"
+(strikethrough) @text.strike
+(email_autolink) @text.uri
+"#;
+
+/// The active code-highlight palette. Seeded to the historical Base16-Ocean
+/// defaults so highlighting works before any theme is applied, then overwritten
+/// by `set_syntax_palette` on every theme switch. A process-wide `RwLock`
+/// because both editors and the markdown preview highlight through the same
+/// free functions; the write happens only on a theme switch (rare), reads are
+/// uncontended.
+// ponytail: one RwLock read per token — uncontended, and tree-sitter parsing
+// dominates the pass, so it never shows up. Snapshot per-pass only if a
+// profile ever says otherwise.
+static SYNTAX: RwLock<SyntaxPalette> = RwLock::new(SyntaxPalette::BASE16);
+
+/// Point the highlighter at a new theme's code palette. The app calls this from
+/// `apply_theme` and then re-highlights open editors so the change is visible
+/// immediately (cached spans carry baked colors).
+pub fn set_syntax_palette(palette: SyntaxPalette) {
+    // Under test the shared palette stays Base16. It is process-wide, every
+    // `App::new` pushes its theme's palette (Croft Loch's is not Base16),
+    // and App tests run on threads beside the highlight tests that pin
+    // Base16 colours, so a push here would make those tests pass or fail by
+    // scheduling. A test that needs another palette highlights through the
+    // explicit-palette paths (`highlight_text_with_palette`,
+    // `palette_style_for_name`) instead, or gives its thread a palette of
+    // its own ([`set_thread_syntax_palette`]), which then takes the push.
+    if cfg!(test) {
+        #[cfg(test)]
+        THREAD_SYNTAX.with(|own| {
+            if own.get().is_some() {
+                own.set(Some(palette));
+            }
+        });
+        return;
+    }
+    *SYNTAX.write().unwrap() = palette;
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Under test, the code palette this thread highlights with instead of
+    /// the shared one, when it has one. The screen goldens give their thread
+    /// one, so `App::new`'s push of the theme's palette lands here and the
+    /// editor shows the theme's own code colours, as in the running app,
+    /// while the shared palette other tests pin stays Base16.
+    static THREAD_SYNTAX: std::cell::Cell<Option<SyntaxPalette>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// This thread's own code palette under test, if it has one.
+#[cfg(test)]
+pub(crate) fn thread_syntax_palette() -> Option<SyntaxPalette> {
+    THREAD_SYNTAX.with(std::cell::Cell::get)
+}
+
+/// Give this thread a code palette of its own under test, or `None` to read
+/// the shared one again. The editor's highlight pass carries it to the
+/// worker it starts.
+#[cfg(test)]
+pub(crate) fn set_thread_syntax_palette(palette: Option<SyntaxPalette>) {
+    THREAD_SYNTAX.with(|own| own.set(palette));
+}
+
+/// The palette keyed by capture name, resolved against the active theme's
+/// [`SyntaxPalette`]. Shared by tree-sitter highlighting (via `style_for`) and
+/// by the LSP semantic-token overlay (via `semantic_style_for`) so both layers
+/// paint the same colors.
+fn style_for_name(name: &str) -> Style {
+    #[cfg(test)]
+    if let Some(own) = thread_syntax_palette() {
+        return palette_style_for_name(&own, name);
+    }
+    palette_style_for_name(&SYNTAX.read().unwrap(), name)
+}
+
+/// Map a capture name to a style against a given palette (pure — no global
+/// read, so it is unit-testable with any theme's palette). The bold/italic
+/// emphasis on comments and keywords is structural and stays fixed across
+/// themes; only the colors come from `p`.
+fn palette_style_for_name(p: &SyntaxPalette, name: &str) -> Style {
+    let fg = |c: (u8, u8, u8)| Style::default().fg(rgb(c.0, c.1, c.2));
+    match name {
+        "comment" => fg(p.comment).add_modifier(Modifier::ITALIC),
+        "keyword" | "label" => fg(p.keyword).add_modifier(Modifier::BOLD),
+        "string" | "string.escape" | "string.special" => fg(p.string),
+        "number" | "boolean" | "constant" | "constant.builtin" | "variable.parameter" => {
+            fg(p.constant)
+        }
+        "function" | "function.builtin" | "function.macro" | "function.method" | "constructor"
+        | "property" => fg(p.function),
+        "type" | "type.builtin" | "module" => fg(p.type_),
+        "attribute" | "tag" | "variable.builtin" => fg(p.tag),
+        "operator"
+        | "punctuation"
+        | "punctuation.bracket"
+        | "punctuation.delimiter"
+        | "punctuation.special"
+        | "variable" => fg(p.fg),
+        // Markdown, on the theme's own roles: headings take the keyword hue in
+        // bold (VS Code Dark+'s `markup.heading` is its keyword blue), code
+        // the string hue (`markup.inline.raw`), quotes the comment hue, and
+        // emphasis only restyles the default foreground.
+        "text.title" => fg(p.keyword).add_modifier(Modifier::BOLD),
+        "text.list" => fg(p.keyword),
+        "text.literal" => fg(p.string),
+        "text.quote" => fg(p.comment),
+        "text.reference" => fg(p.function),
+        "text.uri" => fg(p.function).add_modifier(Modifier::UNDERLINED),
+        "text.emphasis" => fg(p.fg).add_modifier(Modifier::ITALIC),
+        "text.strong" => fg(p.fg).add_modifier(Modifier::BOLD),
+        "text.strike" => fg(p.fg).add_modifier(Modifier::CROSSED_OUT),
+        _ => fg(p.fg),
+    }
+}
+
+/// Which tag gets which of the four hues below. Matched case-sensitively at
+/// a word boundary so `todo!()` (a Rust macro, not a comment tag) and
+/// `Autodocking` are left alone.
+const COMMENT_KEYWORDS: &[(&str, TagHue)] = &[
+    ("TODO", TagHue::Info),
+    ("FIXME", TagHue::Alarm),
+    ("XXX", TagHue::Alarm),
+    ("BUG", TagHue::Alarm),
+    ("HACK", TagHue::Odd),
+    ("NOTE", TagHue::Info),
+    ("WARNING", TagHue::Warn),
+    ("OPTIMIZE", TagHue::Warn),
+    ("SAFETY", TagHue::Warn),
+    ("REVIEW", TagHue::Info),
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TagHue {
+    Info,
+    Alarm,
+    Odd,
+    Warn,
+}
+
+impl TagHue {
+    /// The tag colour for a light or a dark theme.
+    ///
+    /// One fixed palette cannot serve both. The original four were picked
+    /// against dark backgrounds and, measured against Croft Light's `#ffffff`
+    /// editor, scored 2.02:1 (cyan), 2.78:1 (red), 2.42:1 (purple) and
+    /// 1.62:1 (yellow) - `WARNING`, the one that most needs reading, was the
+    /// worst. Darkening them for light themes fixes that and would ruin them
+    /// on dark ones, so the choice follows the theme. The dark set is
+    /// unchanged, so no dark theme shifts colour.
+    fn color(self, light: bool) -> Color {
+        match (self, light) {
+            (TagHue::Info, false) => rgb(0x4F, 0xC1, 0xFF),
+            (TagHue::Alarm, false) => rgb(0xFF, 0x6B, 0x6B),
+            (TagHue::Odd, false) => rgb(0xC7, 0x8D, 0xFF),
+            (TagHue::Warn, false) => rgb(0xFF, 0xC1, 0x4F),
+            // 5.0:1 or better on #ffffff, all four.
+            (TagHue::Info, true) => rgb(0x00, 0x5F, 0xB8),
+            (TagHue::Alarm, true) => rgb(0xC0, 0x26, 0x26),
+            (TagHue::Odd, true) => rgb(0x6D, 0x28, 0xD9),
+            (TagHue::Warn, true) => rgb(0x8B, 0x5A, 0x00),
+        }
+    }
+}
+
+/// Whether `style` is one [`comment_keyword_spans`] paints on a tag: BOLD over
+/// one of the tag hues. BOLD alone does not identify a tag - keywords are
+/// BOLD too - so a caller that must keep tags must not key on it alone.
+pub(crate) fn is_comment_tag_style(style: Style) -> bool {
+    let Some(fg) = style.fg else {
+        return false;
+    };
+    style.add_modifier.contains(Modifier::BOLD)
+        && COMMENT_KEYWORDS
+            .iter()
+            .any(|&(_, hue)| fg == hue.color(false) || fg == hue.color(true))
+}
+
+/// Whether the active theme is a light one, inferred from its foreground.
+///
+/// A light theme paints dark text on a light background, so a DARK `fg` means
+/// the background behind it is light. The palette carries no background
+/// field, and this is the signal it does carry.
+fn palette_is_light(p: &SyntaxPalette) -> bool {
+    let (r, g, b) = p.fg;
+    // Rec. 601 luma, the cheap perceptual brightness the rest of the TUI uses.
+    let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+    luma < 128.0
+}
+
+/// Whether the character ENDING at byte `i` is a word character.
+///
+/// The byte-level test was not enough: in UTF-8 prose the continuation bytes
+/// of a letter like `\u{4fee}` are all >= 0x80, so a byte-level test called them
+/// non-word and `\u{4fee}TODO\u{5fa9}` highlighted a tag that is plainly
+/// inside a word. Decoding the neighbour and asking `is_alphanumeric` gets
+/// every script right, not just Latin.
+fn word_char_ends_at(text: &[u8], i: usize) -> bool {
+    // Walk back off any continuation bytes to the character's first byte.
+    let mut s = i;
+    while s > 0 && text[s - 1] & 0b1100_0000 == 0b1000_0000 {
+        s -= 1;
+    }
+    if s == 0 {
+        return false;
+    }
+    s -= 1;
+    std::str::from_utf8(&text[s..i])
+        .ok()
+        .and_then(|t| t.chars().next_back())
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Whether the character STARTING at byte `i` is a word character.
+fn word_char_starts_at(text: &[u8], i: usize) -> bool {
+    // A character is at most 4 bytes; decode the shortest valid prefix.
+    let upto = (i + 4).min(text.len());
+    for e in i + 1..=upto {
+        if let Ok(t) = std::str::from_utf8(&text[i..e])
+            && let Some(c) = t.chars().next()
+        {
+            return c.is_alphanumeric() || c == '_';
+        }
+    }
+    false
+}
+
+/// Split a comment's byte range `[start, end)` of `text` into sub-ranges,
+/// recoloring any [`COMMENT_KEYWORDS`] hit (at a word boundary) with a bold
+/// tag style and leaving the rest at the comment's own `base_style`. Adjacent
+/// same-style ranges are merged so ordinary comments emit exactly one span,
+/// matching the pre-existing cost for a comment with no tags.
+fn comment_keyword_spans(
+    text: &[u8],
+    start: usize,
+    end: usize,
+    base_style: Style,
+    light: bool,
+) -> Vec<(usize, usize, Style)> {
+    let mut out: Vec<(usize, usize, Style)> = Vec::new();
+    let mut push = |s: usize, e: usize, st: Style| {
+        if s >= e {
+            return;
+        }
+        match out.last_mut() {
+            Some((_, last_e, last_st)) if *last_e == s && *last_st == st => *last_e = e,
+            _ => out.push((s, e, st)),
+        }
+    };
+    let mut i = start;
+    while i < end {
+        let before_ok = i == start || !word_char_ends_at(text, i);
+        let mut matched = None;
+        if before_ok {
+            for &(kw, hue) in COMMENT_KEYWORDS {
+                let kw_end = i + kw.len();
+                if kw_end <= end
+                    && &text[i..kw_end] == kw.as_bytes()
+                    && (kw_end == end || !word_char_starts_at(text, kw_end))
+                {
+                    matched = Some((kw_end, hue.color(light)));
+                    break;
+                }
+            }
+        }
+        match matched {
+            Some((kw_end, color)) => {
+                push(i, kw_end, base_style.fg(color).add_modifier(Modifier::BOLD));
+                i = kw_end;
+            }
+            None => {
+                // Advance one byte (not a decoded char) since the keyword
+                // table is ASCII-only and byte-level scanning is enough to
+                // find every match; UTF-8 continuation bytes never satisfy
+                // `before_ok` against an ASCII keyword's first byte anyway.
+                push(i, i + 1, base_style);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum LangKind {
+    Rust,
+    Python,
+    JavaScript,
+    TypeScript,
+    Tsx,
+    Json,
+    Xml,
+    Toml,
+    Yaml,
+    Markdown,
+    Go,
+    Html,
+    Css,
+    Bash,
+    C,
+    Cpp,
+    Lua,
+    Ql,
+    /// A CodeQL database schema (`.dbscheme`, #578).
+    Dbscheme,
+    // Files most repositories carry whatever they are written in (#1226).
+    Java,
+    Ruby,
+    CSharp,
+    Sql,
+    Make,
+    Dockerfile,
+    /// Single-file components (#1632): HTML outside, with `<script>` and
+    /// `<style>` blocks in the language their `lang` attribute names.
+    Vue,
+    Svelte,
+}
+
+/// Display name for a language mode, matching VS Code's status-bar labels.
+/// `None` is a buffer with no recognised grammar.
+pub fn language_label(lang: Option<LangKind>) -> &'static str {
+    match lang {
+        None => "Plain Text",
+        Some(LangKind::Rust) => "Rust",
+        Some(LangKind::Python) => "Python",
+        Some(LangKind::JavaScript) => "JavaScript",
+        Some(LangKind::TypeScript) => "TypeScript",
+        Some(LangKind::Tsx) => "TypeScript JSX",
+        Some(LangKind::Json) => "JSON",
+        Some(LangKind::Xml) => "XML",
+        Some(LangKind::Toml) => "TOML",
+        Some(LangKind::Yaml) => "YAML",
+        Some(LangKind::Markdown) => "Markdown",
+        Some(LangKind::Go) => "Go",
+        Some(LangKind::Html) => "HTML",
+        Some(LangKind::Css) => "CSS",
+        Some(LangKind::Bash) => "Shell Script",
+        Some(LangKind::C) => "C",
+        Some(LangKind::Cpp) => "C++",
+        Some(LangKind::Lua) => "Lua",
+        Some(LangKind::Ql) => "CodeQL",
+        Some(LangKind::Dbscheme) => "CodeQL Database Scheme",
+        Some(LangKind::Java) => "Java",
+        Some(LangKind::Ruby) => "Ruby",
+        Some(LangKind::CSharp) => "C#",
+        Some(LangKind::Sql) => "SQL",
+        Some(LangKind::Make) => "Makefile",
+        Some(LangKind::Dockerfile) => "Dockerfile",
+        Some(LangKind::Vue) => "Vue",
+        Some(LangKind::Svelte) => "Svelte",
+    }
+}
+
+/// The bare tree-sitter grammar handle for `kind` — the parser the
+/// expand-selection node-ancestry fallback walks (#254). Kept beside
+/// `build_config` so a new grammar joins highlighting and selection
+/// growth in one place.
+pub fn language_for(kind: LangKind) -> tree_sitter::Language {
+    match kind {
+        LangKind::Rust => tree_sitter_rust::LANGUAGE.into(),
+        LangKind::Python => tree_sitter_python::LANGUAGE.into(),
+        LangKind::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        LangKind::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        LangKind::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        LangKind::Json => tree_sitter_json::LANGUAGE.into(),
+        LangKind::Xml => tree_sitter_xml::LANGUAGE_XML.into(),
+        LangKind::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
+        LangKind::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+        LangKind::Markdown => tree_sitter_md::LANGUAGE.into(),
+        LangKind::Go => tree_sitter_go::LANGUAGE.into(),
+        LangKind::Html => tree_sitter_html::LANGUAGE.into(),
+        LangKind::Css => tree_sitter_css::LANGUAGE.into(),
+        LangKind::Bash => tree_sitter_bash::LANGUAGE.into(),
+        LangKind::C => tree_sitter_c::LANGUAGE.into(),
+        LangKind::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        LangKind::Lua => tree_sitter_lua::LANGUAGE.into(),
+        LangKind::Ql => tree_sitter_ql::LANGUAGE.into(),
+        LangKind::Dbscheme => tree_sitter_ql_dbscheme::LANGUAGE.into(),
+        LangKind::Java => tree_sitter_java::LANGUAGE.into(),
+        LangKind::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+        LangKind::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+        LangKind::Sql => tree_sitter_sequel::LANGUAGE.into(),
+        LangKind::Make => tree_sitter_make::LANGUAGE.into(),
+        LangKind::Dockerfile => tree_sitter_containerfile::LANGUAGE.into(),
+        LangKind::Vue | LangKind::Svelte => tree_sitter_html::LANGUAGE.into(),
+    }
+}
+
+pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
+    Some(match ext {
+        "rs" => LangKind::Rust,
+        "py" | "pyi" | "pyw" => LangKind::Python,
+        "js" | "mjs" | "cjs" | "jsx" => LangKind::JavaScript,
+        // `.mts` / `.cts` are TypeScript's ES module and CommonJS files, as
+        // `.mjs` / `.cjs` are JavaScript's (#1162).
+        "ts" | "mts" | "cts" => LangKind::TypeScript,
+        "tsx" => LangKind::Tsx,
+        "json" | "jsonc" | "code-workspace" => LangKind::Json,
+        "xml" | "xsd" | "xsl" | "xslt" | "svg" | "plist" => LangKind::Xml,
+        "toml" => LangKind::Toml,
+        "yaml" | "yml" => LangKind::Yaml,
+        "md" | "markdown" => LangKind::Markdown,
+        "go" => LangKind::Go,
+        "html" | "htm" => LangKind::Html,
+        "css" | "scss" | "sass" | "less" => LangKind::Css,
+        "sh" | "bash" | "zsh" => LangKind::Bash,
+        "c" | "h" => LangKind::C,
+        "cpp" | "cc" | "cxx" | "c++" | "C" | "hpp" | "hxx" | "h++" => LangKind::Cpp,
+        "lua" => LangKind::Lua,
+        // CodeQL queries and libraries (#578).
+        "ql" | "qll" => LangKind::Ql,
+        "dbscheme" => LangKind::Dbscheme,
+        "java" => LangKind::Java,
+        "rb" | "rake" | "gemspec" | "ru" => LangKind::Ruby,
+        "cs" | "csx" => LangKind::CSharp,
+        "sql" => LangKind::Sql,
+        "mk" | "mak" => LangKind::Make,
+        "dockerfile" | "containerfile" => LangKind::Dockerfile,
+        "vue" => LangKind::Vue,
+        "svelte" => LangKind::Svelte,
+        _ => return None,
+    })
+}
+
+/// The language for `path`: what `files_associations` gives it (#1574),
+/// else its extension, else a well-known file name with none of its own
+/// (`Dockerfile`, `Makefile`, `Gemfile`, #1226).
+pub fn lang_for_path(path: &std::path::Path) -> Option<LangKind> {
+    // The user's or the workspace's `files_associations` come first (#1574).
+    if let Some(id) = associated_language_id(path) {
+        if id == "plaintext" {
+            return None;
+        }
+        if let Some(lang) = lang_for_language_id(&id) {
+            return Some(lang);
+        }
+    }
+    let name = path.file_name()?.to_str()?;
+    let by_name = match name {
+        "Dockerfile" | "Containerfile" | "dockerfile" | "containerfile" => {
+            Some(LangKind::Dockerfile)
+        }
+        "Makefile" | "makefile" | "GNUmakefile" => Some(LangKind::Make),
+        "Gemfile" | "Rakefile" | "Guardfile" | "Vagrantfile" => Some(LangKind::Ruby),
+        // Tool configs written in JSON with comments (#1084).
+        ".eslintrc" | ".babelrc" | ".swcrc" | ".jshintrc" | ".jscsrc" => Some(LangKind::Json),
+        // `Dockerfile.dev`, `Containerfile.prod`: the suffix names a stage,
+        // not a language.
+        _ if name.starts_with("Dockerfile.") || name.starts_with("Containerfile.") => {
+            Some(LangKind::Dockerfile)
+        }
+        _ => None,
+    };
+    by_name.or_else(|| path.extension()?.to_str().and_then(lang_for_extension))
+}
+
+/// The highlighter language for a VS Code language id (`html`,
+/// `typescriptreact`, `shellscript`), the ids `files_associations` names
+/// (#1574). None for an id croft has no grammar for.
+pub fn lang_for_language_id(id: &str) -> Option<LangKind> {
+    Some(match normalised_language_id(id).as_str() {
+        "rust" => LangKind::Rust,
+        "python" => LangKind::Python,
+        "javascript" | "javascriptreact" => LangKind::JavaScript,
+        "typescript" => LangKind::TypeScript,
+        "typescriptreact" => LangKind::Tsx,
+        "json" => LangKind::Json,
+        "xml" => LangKind::Xml,
+        "toml" => LangKind::Toml,
+        "yaml" => LangKind::Yaml,
+        "markdown" => LangKind::Markdown,
+        "go" => LangKind::Go,
+        "html" => LangKind::Html,
+        "css" | "scss" | "sass" => LangKind::Css,
+        "shellscript" => LangKind::Bash,
+        "c" => LangKind::C,
+        "cpp" => LangKind::Cpp,
+        "lua" => LangKind::Lua,
+        "ql" => LangKind::Ql,
+        "dbscheme" => LangKind::Dbscheme,
+        "java" => LangKind::Java,
+        "ruby" => LangKind::Ruby,
+        "csharp" => LangKind::CSharp,
+        "sql" => LangKind::Sql,
+        "makefile" => LangKind::Make,
+        "dockerfile" => LangKind::Dockerfile,
+        "vue" => LangKind::Vue,
+        "svelte" => LangKind::Svelte,
+        _ => return None,
+    })
+}
+
+/// A language id as VS Code spells it, from the forms people also write
+/// in `files.associations` (`jsonc`, `bash`, `c++`, `text`).
+pub fn normalised_language_id(id: &str) -> String {
+    let id = id.trim().to_ascii_lowercase();
+    match id.as_str() {
+        "jsonc" | "json5" => "json",
+        "js" => "javascript",
+        "jsx" => "javascriptreact",
+        "ts" => "typescript",
+        "tsx" => "typescriptreact",
+        "sh" | "bash" | "zsh" | "shell" => "shellscript",
+        "c++" => "cpp",
+        "cs" | "c#" => "csharp",
+        "md" => "markdown",
+        "yml" => "yaml",
+        "htm" => "html",
+        "make" => "makefile",
+        "py" => "python",
+        "rs" => "rust",
+        "rb" => "ruby",
+        "text" | "txt" | "plain" => "plaintext",
+        _ => return id,
+    }
+    .to_string()
+}
+
+/// Whether `files_associations` can use the language id `id` (#1574):
+/// `plaintext`, or a language croft highlights or has a server for.
+/// `id` is already [`normalised_language_id`].
+pub fn known_language_id(id: &str) -> bool {
+    id == "plaintext"
+        || lang_for_language_id(id).is_some()
+        || crate::lsp::languages::resolve(id).is_some()
+}
+
+/// One workspace's `files_associations` (#1574), ready to match: each glob
+/// with the language id it names, those with a `/` (matched against the
+/// workspace-relative path) ahead of file-name globs, and a longer glob
+/// ahead of a shorter one, so the most specific match wins.
+struct Associations {
+    root: std::path::PathBuf,
+    rules: Vec<AssociationRule>,
+}
+
+struct AssociationRule {
+    matcher: globset::GlobMatcher,
+    by_path: bool,
+    id: String,
+}
+
+static ASSOCIATIONS: RwLock<Vec<Associations>> = RwLock::new(Vec::new());
+
+/// Set the `files_associations` the settings give the workspace at `root`
+/// (#1574), VS Code's `files.associations`: a glob without a `/` matches
+/// the file name (`*.tpl`, `Jenkinsfile`), one with a `/` the path from the
+/// workspace root (`**/templates/*.txt`). An empty map clears them.
+pub fn set_file_associations(
+    root: &std::path::Path,
+    map: &std::collections::BTreeMap<String, String>,
+) {
+    let mut rules: Vec<(usize, AssociationRule)> = map
+        .iter()
+        .filter_map(|(pattern, id)| {
+            // An id croft knows nothing of is dropped here, before ranking,
+            // so it cannot shadow a less specific glob that names a real
+            // language.
+            let id = normalised_language_id(id);
+            if !known_language_id(&id) {
+                return None;
+            }
+            let pattern = pattern.trim().trim_start_matches("./");
+            let glob = globset::GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+                .ok()?;
+            Some((
+                pattern.len(),
+                AssociationRule {
+                    matcher: glob.compile_matcher(),
+                    by_path: pattern.contains('/'),
+                    id,
+                },
+            ))
+        })
+        .collect();
+    rules.sort_by(|(a_len, a), (b_len, b)| b.by_path.cmp(&a.by_path).then(b_len.cmp(a_len)));
+    let mut all = ASSOCIATIONS.write().unwrap_or_else(|e| e.into_inner());
+    all.retain(|a| a.root != root);
+    if !rules.is_empty() {
+        all.push(Associations {
+            root: root.to_path_buf(),
+            rules: rules.into_iter().map(|(_, r)| r).collect(),
+        });
+    }
+}
+
+/// The language id `files_associations` gives `path` (#1574), from the
+/// innermost workspace holding it; None when no glob matches.
+pub fn associated_language_id(path: &std::path::Path) -> Option<String> {
+    let all = ASSOCIATIONS.read().unwrap_or_else(|e| e.into_inner());
+    let found = all
+        .iter()
+        .filter(|a| path.starts_with(&a.root))
+        .max_by_key(|a| a.root.as_os_str().len())?;
+    let rel = path.strip_prefix(&found.root).ok()?;
+    let name = path.file_name()?;
+    found
+        .rules
+        .iter()
+        .find(|r| {
+            if r.by_path {
+                r.matcher.is_match(rel)
+            } else {
+                r.matcher.is_match(name)
+            }
+        })
+        .map(|r| r.id.clone())
+}
+
+/// Map a fenced code block's info string to a highlighter language. Accepts
+/// the common fence names and falls back to the file-extension table. Shared
+/// by the rendered preview and the editor's Markdown injections, so a fence
+/// colours the same in both.
+///
+/// Attributes after the language are not part of it (#1642): rustdoc and
+/// mdBook write `rust,ignore` and `rust,no_run`, Pandoc and Quarto
+/// `{python}`, `{.python .numberLines}` and `{#id .python}`.
+pub fn lang_for_fence(info: &str) -> Option<LangKind> {
+    let info = info.trim_start();
+    let tag = if let Some(attrs) = info.strip_prefix('{') {
+        // A Pandoc attribute list: the language is its first class (or a
+        // bare Quarto word), wherever it sits; `#id` and `key=value`
+        // entries are skipped.
+        let attrs = attrs.split('}').next().unwrap_or("");
+        attrs
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .find(|entry| !entry.is_empty() && !entry.starts_with('#') && !entry.contains('='))
+            .unwrap_or("")
+            .trim_start_matches('.')
+    } else {
+        let word = info.split_whitespace().next().unwrap_or("");
+        word.split(',').next().unwrap_or("")
+    };
+    Some(match tag.to_ascii_lowercase().as_str() {
+        "rust" => LangKind::Rust,
+        "python" => LangKind::Python,
+        "javascript" => LangKind::JavaScript,
+        "typescript" => LangKind::TypeScript,
+        "golang" => LangKind::Go,
+        "shell" | "console" | "terminal" => LangKind::Bash,
+        "codeql" => LangKind::Ql,
+        "csharp" | "c#" => LangKind::CSharp,
+        "ruby" => LangKind::Ruby,
+        "make" | "makefile" => LangKind::Make,
+        "docker" => LangKind::Dockerfile,
+        other => return lang_for_extension(other),
+    })
+}
+
+/// Rename the older nvim-treesitter capture names some bundled queries use
+/// (`@conditional`, `@repeat`, `@field`, ...) to the ones in
+/// [`HIGHLIGHT_NAMES`], so their keywords and fields colour like every
+/// other language's (#1226), and drop the spell-check tags that would
+/// otherwise blank the colour before them (#1465).
+fn standard_captures(query: &str) -> String {
+    static RENAMES: std::sync::OnceLock<[(regex::Regex, &str); 6]> = std::sync::OnceLock::new();
+    let renames = RENAMES.get_or_init(|| {
+        let re = |names: &str| regex::Regex::new(&format!(r"@(?:{names})\b")).expect("static");
+        [
+            (
+                re(r"conditional|include|repeat|exception|storageclass|type\.qualifier"),
+                "@keyword",
+            ),
+            (re("float"), "@number"),
+            (re("field"), "@property"),
+            (re("parameter"), "@variable.parameter"),
+            (re(r"function\.call"), "@function"),
+            (re(r"constant\.macro"), "@constant"),
+        ]
+    });
+    let mut out = query.to_string();
+    for (re, to) in renames {
+        out = re.replace_all(&out, *to).into_owned();
+    }
+    // Spell-check tags carry no colour, and a later capture on the same
+    // node wins: `(comment) @comment @spell` drew comments as plain code
+    // (#1465). Drop them where they follow another capture.
+    static SPELL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let spell =
+        SPELL.get_or_init(|| regex::Regex::new(r"(@[\w.]+)\s+@(?:no)?spell\b").expect("static"));
+    spell.replace_all(&out, "$1").into_owned()
+}
+
+/// A C or C++ char literal is a string, as VS Code colours it, not the
+/// `@number` tree-sitter-c gives it. Bracket-pair colorization skips only
+/// strings and comments, so as a number the `(` in `'('` counted as code and
+/// reddened every later closing brace (#1510). Last, because the last
+/// pattern to capture a node wins.
+const C_CHAR_OVERLAY_QUERY: &str = "(char_literal) @string";
+
+fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
+    let mut cfg = match kind {
+        LangKind::Rust => {
+            // Prepend a broad `(identifier) @variable` carrier so the locals
+            // query can emit a parameter reference's resolved colour (the
+            // tree-sitter-highlight crate only emits a resolved reference when
+            // its node also carries a highlights capture). Bundled specific
+            // rules follow and win under last-match-wins.
+            let highlights = format!(
+                "{}\n{}\n{}\n{}",
+                RUST_IDENTIFIER_OVERLAY_QUERY,
+                tree_sitter_rust::HIGHLIGHTS_QUERY,
+                RUST_MODULE_OVERLAY_QUERY,
+                RUST_USE_OVERLAY_QUERY,
+            );
+            HighlightConfiguration::new(
+                tree_sitter_rust::LANGUAGE.into(),
+                "rust",
+                &highlights,
+                tree_sitter_rust::INJECTIONS_QUERY,
+                RUST_LOCALS_QUERY,
+            )
+            .ok()?
+        }
+        LangKind::Python => {
+            // The bundled Python highlights.scm emits no
+            // @variable.parameter, so parameters render as plain
+            // @variable. Append the overlay LAST so its parameter
+            // captures override the broad (identifier) @variable rule
+            // under tree-sitter-highlight's last-match-wins rule.
+            let combined = format!(
+                "{}\n{}\n{}",
+                tree_sitter_python::HIGHLIGHTS_QUERY,
+                PYTHON_PARAM_OVERLAY_QUERY,
+                PYTHON_NAMESPACE_TYPE_OVERLAY_QUERY,
+            );
+            HighlightConfiguration::new(
+                tree_sitter_python::LANGUAGE.into(),
+                "python",
+                &combined,
+                "",
+                PYTHON_LOCALS_QUERY,
+            )
+            .ok()?
+        }
+        LangKind::JavaScript => {
+            // Prepend parameter-definition captures so plain
+            // `(formal_parameters (identifier))` params (which the bundled
+            // query's `(pattern/identifier)` does not match) are recorded as
+            // definitions and their body references inherit the parameter
+            // colour instantly.
+            let locals = format!(
+                "{}\n{}",
+                JS_PARAM_LOCALS_OVERLAY_QUERY,
+                tree_sitter_javascript::LOCALS_QUERY,
+            );
+            // Append the parameter highlights overlay so JS parameters are
+            // coloured `@variable.parameter` (the bundled query has none); the
+            // locals query then propagates that colour to body references.
+            let highlights = format!(
+                "{}\n{}",
+                tree_sitter_javascript::HIGHLIGHT_QUERY,
+                JS_PARAM_HIGHLIGHTS_OVERLAY_QUERY,
+            );
+            HighlightConfiguration::new(
+                tree_sitter_javascript::LANGUAGE.into(),
+                "javascript",
+                &highlights,
+                tree_sitter_javascript::INJECTIONS_QUERY,
+                &locals,
+            )
+            .ok()?
+        }
+        LangKind::TypeScript => {
+            // The bundled TypeScript highlights.scm captures only @type,
+            // @type.builtin, @variable.parameter, @punctuation.bracket,
+            // and @keyword. All the @function / @function.method /
+            // @property / @constructor / @constant captures live in the
+            // tree-sitter-javascript highlights.scm; the TypeScript
+            // grammar inherits from the JavaScript one but the Rust
+            // tree-sitter-highlight crate does not auto-resolve the
+            // `; inherits:` directive, so the queries have to be
+            // concatenated by hand. JS first so the TS file overrides
+            // it where they overlap (capitalized identifiers as @type
+            // rather than @constructor, etc.). Tree-sitter-highlight
+            // applies last-matching capture on overlapping ranges.
+            let combined = format!(
+                "{}\n{}",
+                tree_sitter_javascript::HIGHLIGHT_QUERY,
+                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            );
+            // The bundled TS locals query has only parameter definitions; the
+            // overlay adds the scopes and reference capture it lacks so body
+            // references colour instantly.
+            let locals = format!(
+                "{}\n{}",
+                tree_sitter_typescript::LOCALS_QUERY,
+                TS_LOCALS_OVERLAY_QUERY,
+            );
+            HighlightConfiguration::new(
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                "typescript",
+                &combined,
+                "",
+                &locals,
+            )
+            .ok()?
+        }
+        LangKind::Tsx => {
+            // Same fix as TypeScript above (JS query prepended for
+            // @function / @property / etc.), plus a JSX overlay
+            // appended LAST so its (jsx_attribute (property_identifier)
+            // @attribute) capture wins over the JS query's broad
+            // (property_identifier) @property capture under
+            // tree-sitter-highlight's last-match-wins rule.
+            let combined = format!(
+                "{}\n{}\n{}",
+                tree_sitter_javascript::HIGHLIGHT_QUERY,
+                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+                TSX_JSX_OVERLAY_QUERY,
+            );
+            // Same locals overlay as TypeScript: bundled param definitions
+            // plus the scopes and reference capture they lack.
+            let locals = format!(
+                "{}\n{}",
+                tree_sitter_typescript::LOCALS_QUERY,
+                TS_LOCALS_OVERLAY_QUERY,
+            );
+            HighlightConfiguration::new(
+                tree_sitter_typescript::LANGUAGE_TSX.into(),
+                "tsx",
+                &combined,
+                "",
+                &locals,
+            )
+            .ok()?
+        }
+        LangKind::Json => HighlightConfiguration::new(
+            tree_sitter_json::LANGUAGE.into(),
+            "json",
+            tree_sitter_json::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Xml => HighlightConfiguration::new(
+            tree_sitter_xml::LANGUAGE_XML.into(),
+            "xml",
+            tree_sitter_xml::XML_HIGHLIGHT_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Toml => HighlightConfiguration::new(
+            tree_sitter_toml_ng::LANGUAGE.into(),
+            "toml",
+            tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Yaml => HighlightConfiguration::new(
+            tree_sitter_yaml::LANGUAGE.into(),
+            "yaml",
+            tree_sitter_yaml::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Markdown => {
+            let highlights = format!(
+                "{}\n{}",
+                tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
+                MARKDOWN_BLOCK_OVERLAY_QUERY,
+            );
+            HighlightConfiguration::new(
+                tree_sitter_md::LANGUAGE.into(),
+                "markdown",
+                &highlights,
+                MARKDOWN_BLOCK_INJECTION_QUERY,
+                "",
+            )
+            .ok()?
+        }
+        LangKind::Go => HighlightConfiguration::new(
+            tree_sitter_go::LANGUAGE.into(),
+            "go",
+            tree_sitter_go::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Html => HighlightConfiguration::new(
+            tree_sitter_html::LANGUAGE.into(),
+            "html",
+            tree_sitter_html::HIGHLIGHTS_QUERY,
+            HTML_INJECTIONS_QUERY,
+            "",
+        )
+        .ok()?,
+        LangKind::Vue | LangKind::Svelte => HighlightConfiguration::new(
+            tree_sitter_html::LANGUAGE.into(),
+            "html",
+            tree_sitter_html::HIGHLIGHTS_QUERY,
+            SFC_INJECTIONS_QUERY,
+            "",
+        )
+        .ok()?,
+        LangKind::Css => HighlightConfiguration::new(
+            tree_sitter_css::LANGUAGE.into(),
+            "css",
+            tree_sitter_css::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Bash => HighlightConfiguration::new(
+            tree_sitter_bash::LANGUAGE.into(),
+            "bash",
+            tree_sitter_bash::HIGHLIGHT_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::C => HighlightConfiguration::new(
+            tree_sitter_c::LANGUAGE.into(),
+            "c",
+            &format!("{}\n{C_CHAR_OVERLAY_QUERY}", tree_sitter_c::HIGHLIGHT_QUERY),
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Cpp => {
+            // tree-sitter-cpp's highlights.scm only adds C++'s captures on
+            // top of C's: its tree-sitter.json lists C's query first, and
+            // tree-sitter-highlight does not follow that, so on its own it
+            // left comments, strings, `#include` and most keywords plain
+            // (#1510). Concatenated by hand, as for TypeScript over JS.
+            let combined = format!(
+                "{}\n{}\n{C_CHAR_OVERLAY_QUERY}",
+                tree_sitter_c::HIGHLIGHT_QUERY,
+                tree_sitter_cpp::HIGHLIGHT_QUERY,
+            );
+            HighlightConfiguration::new(tree_sitter_cpp::LANGUAGE.into(), "cpp", &combined, "", "")
+                .ok()?
+        }
+        LangKind::Lua => {
+            let highlights = format!(
+                "{}\n{}",
+                tree_sitter_lua::HIGHLIGHTS_QUERY,
+                LUA_OVERLAY_QUERY,
+            );
+            HighlightConfiguration::new(
+                tree_sitter_lua::LANGUAGE.into(),
+                "lua",
+                &highlights,
+                tree_sitter_lua::INJECTIONS_QUERY,
+                tree_sitter_lua::LOCALS_QUERY,
+            )
+            .ok()?
+        }
+        // Every capture in the bundled query is already one of
+        // HIGHLIGHT_NAMES, so it needs no overlay.
+        LangKind::Ql => HighlightConfiguration::new(
+            tree_sitter_ql::LANGUAGE.into(),
+            "ql",
+            tree_sitter_ql::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Dbscheme => HighlightConfiguration::new(
+            tree_sitter_ql_dbscheme::LANGUAGE.into(),
+            "ql_dbscheme",
+            DBSCHEME_HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Java => HighlightConfiguration::new(
+            tree_sitter_java::LANGUAGE.into(),
+            "java",
+            tree_sitter_java::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Ruby => HighlightConfiguration::new(
+            tree_sitter_ruby::LANGUAGE.into(),
+            "ruby",
+            tree_sitter_ruby::HIGHLIGHTS_QUERY,
+            "",
+            tree_sitter_ruby::LOCALS_QUERY,
+        )
+        .ok()?,
+        LangKind::CSharp => HighlightConfiguration::new(
+            tree_sitter_c_sharp::LANGUAGE.into(),
+            "c_sharp",
+            tree_sitter_c_sharp::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Sql => HighlightConfiguration::new(
+            tree_sitter_sequel::LANGUAGE.into(),
+            "sql",
+            &standard_captures(tree_sitter_sequel::HIGHLIGHTS_QUERY),
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Make => HighlightConfiguration::new(
+            tree_sitter_make::LANGUAGE.into(),
+            "make",
+            &standard_captures(tree_sitter_make::HIGHLIGHTS_QUERY),
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Dockerfile => HighlightConfiguration::new(
+            tree_sitter_containerfile::LANGUAGE.into(),
+            "dockerfile",
+            &standard_captures(tree_sitter_containerfile::HIGHLIGHTS_QUERY),
+            "",
+            "",
+        )
+        .ok()?,
+    };
+    cfg.configure(HIGHLIGHT_NAMES);
+    Some(cfg)
+}
+
+/// One styled byte-range inside a line.
+///
+/// The offsets are `u32` (#1707): an open file keeps a span per token, the
+/// largest thing it holds, and `usize` offsets made each 32 bytes rather
+/// than 24. Nothing is lost: tree-sitter's own offsets are `u32`, and the
+/// editor refuses files past `MAX_FILE_BYTES`.
+#[derive(Clone, Copy, Debug)]
+pub struct HiSpan {
+    pub start: u32,
+    pub end: u32,
+    pub style: Style,
+}
+
+impl HiSpan {
+    /// A span over the line's bytes `start..end`.
+    pub fn new(start: usize, end: usize, style: Style) -> Self {
+        let narrow = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        Self {
+            start: narrow(start),
+            end: narrow(end),
+            style,
+        }
+    }
+
+    /// The line's bytes this span covers.
+    pub fn range(&self) -> std::ops::Range<usize> {
+        self.start as usize..self.end as usize
+    }
+
+    /// This span cut off at byte `len`, or `None` when it starts there or
+    /// later.
+    pub fn clipped(mut self, len: usize) -> Option<Self> {
+        if self.range().start >= len {
+            return None;
+        }
+        self.end = self.end.min(u32::try_from(len).unwrap_or(u32::MAX));
+        Some(self)
+    }
+}
+
+// One built `HighlightConfiguration` per language, shared process-wide by every
+// editor on every thread. Compiling the (overlay-augmented) tree-sitter queries
+// costs tens of milliseconds; without sharing, each new tab rebuilt them on its
+// first highlight, blocking the first paint. The cache is process-wide (not
+// thread-local) so a background prewarm thread can build the configs while the
+// UI paints, and the UI thread then reads the finished build straight out of
+// the cache. The config is immutable after `build_config` calls `configure` and
+// lives for the rest of the process, so it is leaked to `&'static` once per
+// language (a bounded, one-time cost): an injection callback has to hand
+// tree-sitter a borrow that outlives the highlight pass, which a cached `Arc`
+// cannot.
+static SHARED_CONFIGS: OnceLock<Mutex<HashMap<LangKind, &'static HighlightConfiguration>>> =
+    OnceLock::new();
+
+/// Build once per process and return the shared highlight configuration for
+/// `kind`, or `None` if the language has no tree-sitter config. The expensive
+/// `build_config` runs outside the lock so a UI-thread highlight never blocks
+/// behind the background prewarm; if two threads race, the double-check keeps
+/// the first build and drops the loser's, so only one is ever leaked.
+fn shared_config(kind: LangKind) -> Option<&'static HighlightConfiguration> {
+    let cache = SHARED_CONFIGS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cfg) = cache.lock().unwrap().get(&kind) {
+        return Some(cfg);
+    }
+    let built = build_config(kind)?;
+    let mut guard = cache.lock().unwrap();
+    Some(
+        guard
+            .entry(kind)
+            .or_insert_with(|| Box::leak(Box::new(built))),
+    )
+}
+
+/// tree-sitter-md's inline grammar (emphasis, code spans, links), which the
+/// block grammar injects into every paragraph, heading and table cell as
+/// `markdown_inline`. Not a [`LangKind`]: no file is ever inline Markdown on
+/// its own. Built once per process, like [`shared_config`].
+fn markdown_inline_config() -> Option<&'static HighlightConfiguration> {
+    static INLINE: OnceLock<Option<&'static HighlightConfiguration>> = OnceLock::new();
+    *INLINE.get_or_init(|| {
+        let highlights = format!(
+            "{}\n{}",
+            tree_sitter_md::HIGHLIGHT_QUERY_INLINE,
+            MARKDOWN_INLINE_OVERLAY_QUERY,
+        );
+        let mut cfg = HighlightConfiguration::new(
+            tree_sitter_md::INLINE_LANGUAGE.into(),
+            "markdown_inline",
+            &highlights,
+            tree_sitter_md::INJECTION_QUERY_INLINE,
+            "",
+        )
+        .ok()?;
+        cfg.configure(HIGHLIGHT_NAMES);
+        Some(&*Box::leak(Box::new(cfg)))
+    })
+}
+
+/// The configuration a Markdown injection names: the inline grammar for
+/// `markdown_inline`, else a fenced block's language (`rust`, `py`, ...),
+/// front matter's `yaml` / `toml`, or an HTML block's `html`. An unknown name
+/// (`latex`, a fence tag croft has no grammar for) stays uninjected, so the
+/// block keeps its literal colour.
+fn markdown_injection(name: &str) -> Option<&'static HighlightConfiguration> {
+    if name == "markdown_inline" {
+        return markdown_inline_config();
+    }
+    shared_config(lang_for_fence(name)?)
+}
+
+/// The languages an HTML file embeds (#1649), and only those: the injected
+/// JavaScript names a tagged template's language after its tag, and
+/// `html\`...\`` inside a script must not start another HTML layer.
+fn html_injection(name: &str) -> Option<&'static HighlightConfiguration> {
+    shared_config(match name {
+        "javascript" => LangKind::JavaScript,
+        "css" => LangKind::Css,
+        "json" => LangKind::Json,
+        _ => return None,
+    })
+}
+
+/// The languages a Vue or Svelte component embeds (#1632).
+fn sfc_injection(name: &str) -> Option<&'static HighlightConfiguration> {
+    shared_config(match name {
+        "javascript" => LangKind::JavaScript,
+        "typescript" => LangKind::TypeScript,
+        "tsx" => LangKind::Tsx,
+        "css" => LangKind::Css,
+        _ => return None,
+    })
+}
+
+/// Pre-build the tree-sitter highlight configurations so the first file open
+/// does not pay the query-compilation cost on the paint path. Safe to call from
+/// any thread (the cache is process-wide); call once at startup off the UI
+/// thread. Idempotent.
+pub fn prewarm_configs() {
+    for kind in [
+        LangKind::Rust,
+        LangKind::Python,
+        LangKind::TypeScript,
+        LangKind::Tsx,
+        LangKind::JavaScript,
+    ] {
+        let _ = shared_config(kind);
+    }
+}
+
+pub struct LangRegistry {
+    _private: (),
+}
+
+impl Default for LangRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LangRegistry {
+    pub fn new() -> Self {
+        Self { _private: () }
+    }
+
+    /// Return the shared configuration for `kind`, building it once per process.
+    /// Takes `&mut self` for call-site compatibility, but state lives in the
+    /// process-wide `SHARED_CONFIGS` so all editors reuse one build.
+    pub fn get(&mut self, kind: LangKind) -> Option<&'static HighlightConfiguration> {
+        shared_config(kind)
+    }
+}
+
+/// Highlight `text` and project the events onto per-line span lists.
+/// `line_starts[i]` is the byte offset of the start of line i in `text`.
+pub fn highlight_text(
+    registry: &mut LangRegistry,
+    kind: LangKind,
+    text: &[u8],
+    line_starts: &[usize],
+) -> Vec<Vec<HiSpan>> {
+    highlight_text_with_protected(registry, kind, text, line_starts).0
+}
+
+/// [`highlight_text`] plus the absolute byte ranges the grammar captured as
+/// strings or comments, merged and ascending. Bracket-pair colorization skips
+/// brackets inside them: a `{` in a string literal or a `)` in a comment is
+/// prose, not structure. The innermost capture decides, so the code inside a
+/// template-string interpolation still participates.
+pub fn highlight_text_with_protected(
+    registry: &mut LangRegistry,
+    kind: LangKind,
+    text: &[u8],
+    line_starts: &[usize],
+) -> (Vec<Vec<HiSpan>>, Vec<(usize, usize)>) {
+    // Snapshot the palette once per pass: the write happens only on a theme
+    // switch, and one read beats a lock round-trip per token.
+    let palette = *SYNTAX.read().unwrap();
+    #[cfg(test)]
+    let palette = thread_syntax_palette().unwrap_or(palette);
+    highlight_text_with_palette(registry, kind, text, line_starts, &palette)
+}
+
+/// [`highlight_text`] against an explicit palette (pure in the palette — no
+/// global read, so tests can pin any theme's colors hermetically).
+fn highlight_text_with_palette(
+    registry: &mut LangRegistry,
+    kind: LangKind,
+    text: &[u8],
+    line_starts: &[usize],
+    palette: &SyntaxPalette,
+) -> (Vec<Vec<HiSpan>>, Vec<(usize, usize)>) {
+    let mut per_line: Vec<Vec<HiSpan>> = vec![Vec::new(); line_starts.len()];
+    let mut protected: Vec<(usize, usize)> = Vec::new();
+    let cfg = match registry.get(kind) {
+        Some(c) => c,
+        None => return (per_line, protected),
+    };
+    let mut hl = Highlighter::new();
+    // Markdown resolves its injections (inline text, fenced code, front
+    // matter) and HTML its `<script>` and `<style>` bodies (#1649).
+    // Elsewhere they stay off: other grammars' queries inject by whatever a
+    // template tag or macro happens to be called.
+    let events = match hl.highlight(cfg, text, None, |name| match kind {
+        LangKind::Markdown => markdown_injection(name),
+        LangKind::Html => html_injection(name),
+        LangKind::Vue | LangKind::Svelte => sfc_injection(name),
+        _ => None,
+    }) {
+        Ok(e) => e,
+        Err(_) => return (per_line, protected),
+    };
+
+    let mut stack: Vec<usize> = Vec::new();
+    for ev in events {
+        match ev {
+            Ok(HighlightEvent::HighlightStart(h)) => stack.push(h.0),
+            Ok(HighlightEvent::HighlightEnd) => {
+                stack.pop();
+            }
+            Ok(HighlightEvent::Source { start, end }) => {
+                let name = match stack.last() {
+                    Some(idx) => HIGHLIGHT_NAMES.get(*idx).copied().unwrap_or(""),
+                    None => "",
+                };
+                if name.starts_with("string") || name.starts_with("comment") {
+                    match protected.last_mut() {
+                        // Events arrive in source order; merge touching runs.
+                        Some(last) if last.1 >= start => last.1 = last.1.max(end),
+                        _ => protected.push((start, end)),
+                    }
+                }
+                let style = match stack.last() {
+                    Some(_) => palette_style_for_name(palette, name),
+                    // Uncaptured source takes the palette's default fg, same
+                    // as the `variable`/`punctuation` arm — never a literal.
+                    None => palette_style_for_name(palette, ""),
+                };
+                if name.starts_with("comment") {
+                    // Recolor TODO/FIXME/NOTE/HACK/XXX/BUG tags inside the
+                    // comment body (the "Better Comments" convention) so they
+                    // stand out from ordinary comment prose.
+                    for (s, e, st) in
+                        comment_keyword_spans(text, start, end, style, palette_is_light(palette))
+                    {
+                        project_range(s, e, st, line_starts, &mut per_line);
+                    }
+                } else {
+                    project_range(start, end, style, line_starts, &mut per_line);
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    (per_line, protected)
+}
+
+fn project_range(
+    mut start: usize,
+    end: usize,
+    style: Style,
+    line_starts: &[usize],
+    per_line: &mut [Vec<HiSpan>],
+) {
+    if start >= end || line_starts.is_empty() {
+        return;
+    }
+    // Find the line containing `start`.
+    let mut line_idx = match line_starts.binary_search(&start) {
+        Ok(i) => i,
+        Err(i) => i.saturating_sub(1),
+    };
+    while start < end && line_idx < line_starts.len() {
+        let line_start = line_starts[line_idx];
+        let next_line_start = line_starts.get(line_idx + 1).copied().unwrap_or(usize::MAX);
+        let chunk_end = end.min(next_line_start);
+        // If we ran into the next-line boundary, the last byte before it is the '\n'
+        // separator, which is not part of the line string. Trim it from the span.
+        let on_boundary = chunk_end == next_line_start && line_idx + 1 < line_starts.len();
+        let span_end_abs = if on_boundary && chunk_end > line_start {
+            chunk_end - 1
+        } else {
+            chunk_end
+        };
+        if span_end_abs > start {
+            let span = HiSpan::new(start - line_start, span_end_abs - line_start, style);
+            let line = &mut per_line[line_idx];
+            match line.last_mut() {
+                // Runs the grammar split but that paint alike are one span
+                // (#1707): two in five of a pass's spans continued the one
+                // before in the same style, and each is kept as long as the
+                // tab is open.
+                Some(last) if last.end == span.start && last.style == style => last.end = span.end,
+                _ => line.push(span),
+            }
+        }
+        start = chunk_end;
+        line_idx += 1;
+    }
+}
+
+/// Map a standard LSP semantic-token type name onto a croft capture
+/// name, then to its `Style`. Returns `None` for token types we do not
+/// recolor, so the underlying tree-sitter highlight shows through, which
+/// is the VS Code / Zed "combined" fallback model: semantic wins only
+/// where it has an opinion, otherwise syntax prevails.
+fn semantic_style_for(token_type: &str) -> Option<Style> {
+    let capture = match token_type {
+        // `selfParameter`/`clsParameter` are ty's split of `self`/`cls` out of
+        // the generic `parameter` type; color them like any other parameter.
+        "parameter" | "selfParameter" | "clsParameter" => "variable.parameter",
+        "variable" => "variable",
+        "property" => "property",
+        "function" | "method" => "function",
+        "macro" => "function.macro",
+        "namespace" => "module",
+        "type" | "class" | "enum" | "interface" | "struct" | "typeParameter" => "type",
+        // `builtinConstant` is ty's type for `True`/`False`/`None`/`...`.
+        "enumMember" | "builtinConstant" => "constant",
+        "keyword" | "modifier" => "keyword",
+        "comment" => "comment",
+        "string" => "string",
+        "number" => "number",
+        "regexp" => "string.special",
+        "operator" => "operator",
+        "decorator" => "attribute",
+        "event" | "label" => "label",
+        _ => return None,
+    };
+    Some(style_for_name(capture))
+}
+
+/// Decode an LSP `textDocument/semanticTokens/full` `data` array into
+/// per-line byte-offset spans, ready to overlay on the tree-sitter
+/// highlights. The array is flat groups of 5 u32:
+/// `[deltaLine, deltaStartChar, length, tokenType, tokenModifiers]`,
+/// each field relative to the previous token. `token_type_names` is the
+/// server's legend in index order. LSP positions are UTF-16 code units;
+/// we convert to byte offsets against `text`. Tokens whose type maps to
+/// no croft style are skipped (tree-sitter base shows through).
+pub fn decode_semantic_tokens(
+    data: &[u32],
+    token_type_names: &[String],
+    text: &[u8],
+    line_starts: &[usize],
+) -> Vec<Vec<HiSpan>> {
+    let src = match std::str::from_utf8(text) {
+        Ok(s) => s,
+        Err(_) => return vec![Vec::new(); line_starts.len()],
+    };
+    // The style each legend entry paints, looked up once rather than per
+    // token.
+    let styles: Vec<Option<Style>> = token_type_names
+        .iter()
+        .map(|name| semantic_style_for(name))
+        .collect();
+    let style_of = |ttype: u32| styles.get(ttype as usize).copied().flatten();
+    // Each line's list sized to its tokens up front (#1707): grown by
+    // doubling, about a third of the overlay was spare capacity, kept for
+    // as long as the tab.
+    let mut counts = vec![0usize; line_starts.len()];
+    let mut line: usize = 0;
+    for group in data.chunks_exact(5) {
+        line += group[0] as usize;
+        if line < counts.len() && style_of(group[3]).is_some() {
+            counts[line] += 1;
+        }
+    }
+    let mut per_line: Vec<Vec<HiSpan>> = counts.into_iter().map(Vec::with_capacity).collect();
+    let mut line: usize = 0;
+    let mut col_u16: u32 = 0;
+    for group in data.chunks_exact(5) {
+        let (delta_line, delta_start, length, ttype) = (group[0], group[1], group[2], group[3]);
+        if delta_line > 0 {
+            line += delta_line as usize;
+            col_u16 = delta_start;
+        } else {
+            col_u16 += delta_start;
+        }
+        if line >= line_starts.len() {
+            continue;
+        }
+        let Some(style) = style_of(ttype) else {
+            continue;
+        };
+        let line_start = line_starts[line];
+        let content_end = match line_starts.get(line + 1) {
+            Some(&next) => next.saturating_sub(1).max(line_start),
+            None => src.len(),
+        };
+        let line_str = &src[line_start..content_end];
+        if let Some((b0, b1)) = utf16_span_to_bytes(line_str, col_u16, length)
+            && b1 > b0
+        {
+            per_line[line].push(HiSpan::new(b0, b1, style));
+        }
+    }
+    per_line
+}
+
+/// Convert a UTF-16 `[start, start+len)` column range within a single
+/// line into a byte `[start, end)` range. Returns `None` if the range
+/// falls outside the line. Positions landing exactly at end-of-line are
+/// clamped to the line length.
+fn utf16_span_to_bytes(line: &str, start_u16: u32, len_u16: u32) -> Option<(usize, usize)> {
+    let end_u16 = start_u16.checked_add(len_u16)?;
+    let mut u16_count: u32 = 0;
+    let mut byte = 0usize;
+    let mut b_start: Option<usize> = None;
+    let mut b_end: Option<usize> = None;
+    for ch in line.chars() {
+        if u16_count == start_u16 {
+            b_start = Some(byte);
+        }
+        if u16_count == end_u16 {
+            b_end = Some(byte);
+            break;
+        }
+        u16_count += ch.len_utf16() as u32;
+        byte += ch.len_utf8();
+    }
+    if u16_count == start_u16 {
+        b_start.get_or_insert(byte);
+    }
+    if u16_count == end_u16 {
+        b_end.get_or_insert(byte);
+    }
+    Some((b_start?, b_end?))
+}
+
+/// Build a `line_starts` table from raw bytes.
+pub fn compute_line_starts(text: &[u8]) -> Vec<usize> {
+    let mut out = vec![0usize];
+    for (i, &b) in text.iter().enumerate() {
+        if b == b'\n' {
+            out.push(i + 1);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1574: `files_associations` for a workspace that exists only for
+    /// one test, so no other test's paths are under it.
+    fn associated(map: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let map = map
+            .iter()
+            .map(|(g, id)| (g.to_string(), id.to_string()))
+            .collect();
+        set_file_associations(&root, &map);
+        (tmp, root)
+    }
+
+    #[test]
+    fn an_association_picks_the_language_before_the_extension() {
+        let (_tmp, root) = associated(&[("*.tpl", "html"), ("*.json5", "jsonc")]);
+        assert_eq!(
+            lang_for_path(&root.join("templates/card.tpl")),
+            Some(LangKind::Html)
+        );
+        assert_eq!(lang_for_path(&root.join("a.json5")), Some(LangKind::Json));
+        assert_eq!(
+            lang_for_path(std::path::Path::new("/elsewhere/card.tpl")),
+            None,
+            "outside the workspace"
+        );
+    }
+
+    #[test]
+    fn a_glob_with_a_slash_matches_the_path_in_the_workspace() {
+        let (_tmp, root) = associated(&[("**/templates/*.txt", "html")]);
+        assert_eq!(
+            lang_for_path(&root.join("templates/a.txt")),
+            Some(LangKind::Html)
+        );
+        assert_eq!(
+            lang_for_path(&root.join("site/templates/b.txt")),
+            Some(LangKind::Html)
+        );
+        assert_eq!(lang_for_path(&root.join("a.txt")), None);
+        assert_eq!(lang_for_path(&root.join("templates/deep/c.txt")), None);
+    }
+
+    #[test]
+    fn the_most_specific_association_wins() {
+        let (_tmp, root) = associated(&[
+            ("*.txt", "markdown"),
+            ("**/templates/*.txt", "html"),
+            ("Jenkinsfile", "java"),
+        ]);
+        assert_eq!(
+            lang_for_path(&root.join("templates/a.txt")),
+            Some(LangKind::Html)
+        );
+        assert_eq!(lang_for_path(&root.join("b.txt")), Some(LangKind::Markdown));
+        assert_eq!(
+            associated_language_id(&root.join("ci/Jenkinsfile")).as_deref(),
+            Some("java")
+        );
+    }
+
+    #[test]
+    fn plaintext_switches_highlighting_off_and_an_unknown_id_changes_nothing() {
+        let (_tmp, root) = associated(&[("*.json", "plaintext"), ("*.rs", "klingon")]);
+        assert_eq!(lang_for_path(&root.join("big.json")), None);
+        assert_eq!(lang_for_path(&root.join("main.rs")), Some(LangKind::Rust));
+    }
+
+    #[test]
+    fn an_unknown_id_does_not_shadow_a_less_specific_association() {
+        let (_tmp, root) = associated(&[("*.tpl", "html"), ("templates/*.tpl", "klingon")]);
+        assert_eq!(
+            lang_for_path(&root.join("templates/card.tpl")),
+            Some(LangKind::Html)
+        );
+        assert_eq!(
+            associated_language_id(&root.join("templates/card.tpl")).as_deref(),
+            Some("html")
+        );
+    }
+
+    #[test]
+    fn clearing_the_associations_restores_the_built_in_table() {
+        let (_tmp, root) = associated(&[("*.rs", "python")]);
+        assert_eq!(lang_for_path(&root.join("a.rs")), Some(LangKind::Python));
+        set_file_associations(&root, &std::collections::BTreeMap::new());
+        assert_eq!(lang_for_path(&root.join("a.rs")), Some(LangKind::Rust));
+    }
+
+    #[test]
+    fn every_editor_language_id_maps_back_to_its_language() {
+        for &lang in crate::widgets::editor::SELECTABLE_LANGUAGES {
+            let id = crate::widgets::editor::language_scope_id(Some(lang));
+            assert_eq!(lang_for_language_id(id), Some(lang), "{id}");
+        }
+        for (alias, lang) in [
+            ("jsonc", LangKind::Json),
+            ("bash", LangKind::Bash),
+            ("C++", LangKind::Cpp),
+            ("javascriptreact", LangKind::JavaScript),
+        ] {
+            assert_eq!(lang_for_language_id(alias), Some(lang), "{alias}");
+        }
+        assert_eq!(lang_for_language_id("jinja"), None);
+        assert_eq!(normalised_language_id("Text"), "plaintext");
+    }
+
+    #[test]
+    fn palette_style_resolves_each_role_against_the_theme() {
+        // Pure mapping (no global mutation, so no race with the color-asserting
+        // highlight tests that run in parallel and expect Base16). A theme's
+        // own palette must drive the token colors, with the structural
+        // bold/italic emphasis preserved.
+        let one_dark = crate::theme::Theme::from_id("one-dark-pro").syntax();
+        assert_eq!(
+            palette_style_for_name(&one_dark, "keyword").fg,
+            Some(rgb(0xc6, 0x78, 0xdd))
+        );
+        assert!(
+            palette_style_for_name(&one_dark, "keyword")
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert_eq!(
+            palette_style_for_name(&one_dark, "string").fg,
+            Some(rgb(0x98, 0xc3, 0x79))
+        );
+        assert_eq!(
+            palette_style_for_name(&one_dark, "comment").fg,
+            Some(rgb(0x7f, 0x84, 0x8e))
+        );
+        assert!(
+            palette_style_for_name(&one_dark, "comment")
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        // Semantic-overlay aliases share the tree-sitter colors.
+        assert_eq!(
+            palette_style_for_name(&one_dark, "variable.parameter").fg,
+            palette_style_for_name(&one_dark, "number").fg
+        );
+        // Base16 default is unchanged (built-ins don't regress).
+        assert_eq!(
+            palette_style_for_name(&SyntaxPalette::BASE16, "type").fg,
+            Some(rgb(0xeb, 0xcb, 0x8b))
+        );
+    }
+
+    /// Color of the first occurrence of `needle` on the line at `row`.
+    fn py_color(src: &str, row: usize, needle: &str) -> Option<Color> {
+        let mut reg = LangRegistry::new();
+        let ls = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Python, src.as_bytes(), &ls);
+        let line = src.split('\n').nth(row)?;
+        let col = line.find(needle)?;
+        h[row]
+            .iter()
+            .find(|s| s.range().contains(&col))
+            .and_then(|s| s.style.fg)
+    }
+
+    #[test]
+    fn highlight_python_colors_imported_classes_and_modules_to_match_ty() {
+        // The cold-open snap on an import-heavy file was tree-sitter painting
+        // imported names grey/blue while ty paints them yellow. The namespace +
+        // CamelCase overlay must make the base agree with ty INSTANTLY: module
+        // names in imports and CamelCase class references are both `@module` /
+        // `@type` (yellow #ebcb8b), matching ty's `namespace` / `class`.
+        let yellow = rgb(0xeb, 0xcb, 0x8b);
+        let src = "import pydantic\n\
+from anterior.lib_tasks.schema import Config\n\
+\n\
+def f() -> Config:\n\
+    return pydantic.BaseModel()\n";
+
+        // Module name in `import pydantic`.
+        assert_eq!(
+            py_color(src, 0, "pydantic"),
+            Some(yellow),
+            "import module name"
+        );
+        // Dotted module path segments in a from-import.
+        assert_eq!(
+            py_color(src, 1, "anterior"),
+            Some(yellow),
+            "from-import module head"
+        );
+        assert_eq!(
+            py_color(src, 1, "schema"),
+            Some(yellow),
+            "from-import module tail"
+        );
+        // CamelCase imported class, both at import and as a return annotation.
+        assert_eq!(
+            py_color(src, 1, "Config"),
+            Some(yellow),
+            "imported class name"
+        );
+        assert_eq!(
+            py_color(src, 3, "Config"),
+            Some(yellow),
+            "class as annotation"
+        );
+        // Module reference in the BODY resolves through the locals query and
+        // inherits the namespace colour (this is the part syntax-position rules
+        // alone can't reach).
+        assert_eq!(
+            py_color(src, 4, "pydantic"),
+            Some(yellow),
+            "module base in body"
+        );
+        // The class accessed off the module is a CamelCase reference -> type.
+        assert_eq!(
+            py_color(src, 4, "BaseModel"),
+            Some(yellow),
+            "CamelCase attr ref"
+        );
+    }
+
+    #[test]
+    fn highlight_python_camelcase_overlay_excludes_all_caps_constants() {
+        // The CamelCase rule requires a lowercase letter, so an ALL_CAPS name
+        // is NOT recoloured to type-yellow; it stays on the bundled @constant
+        // rule (orange). This keeps module-level constants highlighted and
+        // avoids turning them yellow.
+        let orange = rgb(0xd0, 0x87, 0x70);
+        let src = "MAX_SIZE = 300\n";
+        assert_eq!(py_color(src, 0, "MAX_SIZE"), Some(orange));
+    }
+
+    #[test]
+    fn highlight_c_produces_spans() {
+        let mut reg = LangRegistry::new();
+        let src = "int main() {\n    return 0;\n}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::C, src.as_bytes(), &line_starts);
+        assert!(
+            !h[0].is_empty(),
+            "line 0 of C source should have highlight spans"
+        );
+    }
+
+    #[test]
+    fn highlight_cpp_produces_spans() {
+        let mut reg = LangRegistry::new();
+        let src = "int main() {\n    return 0;\n}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Cpp, src.as_bytes(), &line_starts);
+        assert!(
+            !h[0].is_empty(),
+            "line 0 of C++ source should have highlight spans"
+        );
+    }
+
+    #[test]
+    fn xml_gets_highlight_spans() {
+        // #197: XML must be pretty-shown like JSON - tags, attributes,
+        // and values get real spans instead of plain text.
+        let mut reg = LangRegistry::default();
+        let src = "<config version=\"1.2\">\n  <name enabled=\"true\">demo</name>\n</config>\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Xml, src.as_bytes(), &line_starts);
+        assert!(!h[0].is_empty(), "the opening tag line has spans");
+        assert!(!h[1].is_empty(), "the attribute line has spans");
+        assert_eq!(lang_for_extension("xml"), Some(LangKind::Xml));
+        assert_eq!(lang_for_extension("xsd"), Some(LangKind::Xml));
+        assert_eq!(lang_for_extension("plist"), Some(LangKind::Xml));
+        assert_eq!(lang_for_extension("svg"), Some(LangKind::Xml));
+    }
+
+    #[test]
+    fn lang_for_extension_known() {
+        assert_eq!(lang_for_extension("rs"), Some(LangKind::Rust));
+        assert_eq!(lang_for_extension("py"), Some(LangKind::Python));
+        assert_eq!(lang_for_extension("ts"), Some(LangKind::TypeScript));
+        assert_eq!(lang_for_extension("mts"), Some(LangKind::TypeScript));
+        assert_eq!(lang_for_extension("cts"), Some(LangKind::TypeScript));
+        assert_eq!(lang_for_extension("tsx"), Some(LangKind::Tsx));
+        assert_eq!(lang_for_extension("js"), Some(LangKind::JavaScript));
+        assert_eq!(lang_for_extension("jsx"), Some(LangKind::JavaScript));
+        assert_eq!(lang_for_extension("json"), Some(LangKind::Json));
+        assert_eq!(lang_for_extension("toml"), Some(LangKind::Toml));
+        assert_eq!(lang_for_extension("yaml"), Some(LangKind::Yaml));
+        assert_eq!(lang_for_extension("yml"), Some(LangKind::Yaml));
+        assert_eq!(lang_for_extension("md"), Some(LangKind::Markdown));
+        assert_eq!(lang_for_extension("go"), Some(LangKind::Go));
+        assert_eq!(lang_for_extension("html"), Some(LangKind::Html));
+        assert_eq!(lang_for_extension("htm"), Some(LangKind::Html));
+        assert_eq!(lang_for_extension("css"), Some(LangKind::Css));
+        assert_eq!(lang_for_extension("scss"), Some(LangKind::Css));
+        assert_eq!(lang_for_extension("less"), Some(LangKind::Css));
+        assert_eq!(lang_for_extension("sh"), Some(LangKind::Bash));
+        assert_eq!(lang_for_extension("c"), Some(LangKind::C));
+        assert_eq!(lang_for_extension("h"), Some(LangKind::C));
+        assert_eq!(lang_for_extension("cpp"), Some(LangKind::Cpp));
+        assert_eq!(lang_for_extension("cc"), Some(LangKind::Cpp));
+        assert_eq!(lang_for_extension("cxx"), Some(LangKind::Cpp));
+        assert_eq!(lang_for_extension("hpp"), Some(LangKind::Cpp));
+        assert_eq!(lang_for_extension("hxx"), Some(LangKind::Cpp));
+    }
+
+    #[test]
+    fn lang_for_extension_unknown() {
+        assert_eq!(lang_for_extension("xyz"), None);
+        assert_eq!(lang_for_extension(""), None);
+    }
+
+    #[test]
+    fn line_starts_empty_input() {
+        assert_eq!(compute_line_starts(b""), vec![0]);
+    }
+
+    #[test]
+    fn line_starts_single_line_no_newline() {
+        assert_eq!(compute_line_starts(b"hello"), vec![0]);
+    }
+
+    #[test]
+    fn line_starts_multiple_lines() {
+        // "a\nbb\nccc"  → starts at 0, 2, 5
+        assert_eq!(compute_line_starts(b"a\nbb\nccc"), vec![0, 2, 5]);
+    }
+
+    #[test]
+    fn line_starts_trailing_newline() {
+        // "a\nb\n" → starts at 0, 2, 4 (an empty trailing line)
+        assert_eq!(compute_line_starts(b"a\nb\n"), vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn line_starts_only_newlines() {
+        assert_eq!(compute_line_starts(b"\n\n\n"), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn registry_caches_configs() {
+        let mut reg = LangRegistry::new();
+        // First call should build and insert.
+        assert!(reg.get(LangKind::Rust).is_some());
+        // Second call should hit the cache and still succeed.
+        assert!(reg.get(LangKind::Rust).is_some());
+    }
+
+    #[test]
+    fn highlight_configs_are_shared_across_editors() {
+        // The query-compilation cost must be paid once per process, not once
+        // per editor tab: a new tab's first paint should never rebuild the
+        // config. Two independent registries must hand out the same build.
+        prewarm_configs();
+        let mut a = LangRegistry::new();
+        let mut b = LangRegistry::new();
+        let ca = a.get(LangKind::Rust).expect("rust config");
+        let cb = b.get(LangKind::Rust).expect("rust config");
+        assert!(
+            std::ptr::eq(ca, cb),
+            "every editor must share one built highlight config"
+        );
+    }
+
+    #[test]
+    fn comment_todo_tag_gets_its_own_bold_span() {
+        let mut reg = LangRegistry::new();
+        let src = "// TODO: fix this\nfn main() {}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+        // Line 0 is "// TODO: fix this" — expect at least two spans on that
+        // line: the plain comment prose and the recolored TODO tag.
+        let line0 = &h[0];
+        assert!(
+            line0.len() >= 2,
+            "expected the TODO tag split out of the comment span, got {line0:?}"
+        );
+        let tag_span = line0
+            .iter()
+            .find(|sp| &src.as_bytes()[sp.range()] == b"TODO")
+            .expect("a span covering exactly \"TODO\"");
+        assert!(
+            tag_span.style.add_modifier.contains(Modifier::BOLD),
+            "TODO tag must be bold"
+        );
+        assert_ne!(
+            tag_span.style.fg,
+            palette_style_for_name(&crate::theme::SyntaxPalette::BASE16, "comment").fg,
+            "TODO tag must use a distinct color from plain comment prose"
+        );
+    }
+
+    #[test]
+    fn todo_macro_call_is_not_mistaken_for_a_comment_tag() {
+        // `todo!()` is a Rust macro invocation, not a comment — it must not
+        // pick up the bold tag color reserved for `// TODO` comments.
+        let mut reg = LangRegistry::new();
+        let src = "fn f() { todo!() }\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+        let hit = h[0]
+            .iter()
+            .find(|sp| src.as_bytes()[sp.range()].eq_ignore_ascii_case(b"todo"));
+        if let Some(sp) = hit {
+            assert!(
+                !sp.style.add_modifier.contains(Modifier::BOLD)
+                    || sp.style.fg != Some(rgb(0x4F, 0xC1, 0xFF)),
+                "todo!() must not be recolored as a comment tag"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_comment_with_no_tag_emits_a_single_merged_span() {
+        // No regression on the common case: a comment with no keyword must
+        // still collapse to one span, not one per byte.
+        let mut reg = LangRegistry::new();
+        let src = "// just a normal comment\nfn main() {}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+        let comment_spans: Vec<_> = h[0]
+            .iter()
+            .filter(|sp| src.as_bytes()[sp.range()].starts_with(b"//"))
+            .collect();
+        assert_eq!(
+            comment_spans.len(),
+            1,
+            "a tag-free comment must stay a single span"
+        );
+        // Counting spans that START with `//` cannot see a per-byte
+        // regression: only the first would match either way. Assert the whole
+        // line is one span, and that it covers the comment end to end.
+        assert_eq!(
+            h[0].len(),
+            1,
+            "the whole comment line is one span: {:?}",
+            h[0]
+        );
+        assert_eq!(h[0][0].start, 0);
+        assert_eq!(
+            h[0][0].end as usize,
+            "// just a normal comment".len(),
+            "the span must cover the complete comment"
+        );
+    }
+
+    /// The release note names the tags by hand, so it can promise one the
+    /// table does not carry - it shipped claiming OPTIMIZE, SAFETY and
+    /// REVIEW while `COMMENT_KEYWORDS` had seven entries. Tie the prose to
+    /// the code: every ALL-CAPS word the note lists must be a real tag.
+    #[test]
+    fn the_release_note_promises_only_tags_that_exist() {
+        let note = include_str!("release_notes/0.1.954.md");
+        let promised: Vec<&str> = note
+            .split(|c: char| !c.is_ascii_uppercase())
+            .filter(|w| w.len() >= 3)
+            .collect();
+        assert!(
+            promised.len() >= 5,
+            "the note should name several tags, found {promised:?}"
+        );
+        for word in promised {
+            assert!(
+                COMMENT_KEYWORDS.iter().any(|(kw, _)| *kw == word),
+                "the note promises {word}, which is not a highlighted tag"
+            );
+        }
+    }
+
+    /// Every tag colour must be readable on the background its theme implies.
+    /// The original fixed palette scored as low as 1.62:1 on Croft Light's
+    /// white editor; WCAG AA wants 4.5:1 for body text. This pins both sets.
+    #[test]
+    fn tag_colours_are_readable_on_their_own_theme() {
+        fn luminance(c: (u8, u8, u8)) -> f64 {
+            fn ch(v: u8) -> f64 {
+                let v = v as f64 / 255.0;
+                if v <= 0.03928 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            }
+            0.2126 * ch(c.0) + 0.7152 * ch(c.1) + 0.0722 * ch(c.2)
+        }
+        fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+            let (la, lb) = (luminance(a), luminance(b));
+            (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+        }
+        fn parts(c: Color) -> (u8, u8, u8) {
+            match c {
+                Color::Rgb(r, g, b) => (r, g, b),
+                other => panic!("tag colour is not rgb: {other:?}"),
+            }
+        }
+        // Croft Light's editor background, and a representative dark one.
+        let white = (0xff, 0xff, 0xff);
+        let dark = (0x28, 0x2a, 0x36);
+        for &(kw, hue) in COMMENT_KEYWORDS {
+            let on_light = contrast(parts(hue.color(true)), white);
+            assert!(
+                on_light >= 4.5,
+                "{kw} on a light theme is {on_light:.2}:1, want >= 4.5:1"
+            );
+            let on_dark = contrast(parts(hue.color(false)), dark);
+            assert!(
+                on_dark >= 4.5,
+                "{kw} on a dark theme is {on_dark:.2}:1, want >= 4.5:1"
+            );
+        }
+    }
+
+    /// The shared palette never leaves Base16 under test: every `App::new`
+    /// pushes its theme's palette (Croft Loch's is its own), and the tests
+    /// here that pin Base16 colours must not pass or fail by which App test
+    /// happened to run beside them.
+    #[test]
+    fn the_shared_palette_stays_base16_under_test() {
+        set_syntax_palette(crate::theme::SyntaxPalette::LOCH);
+        assert_eq!(*SYNTAX.read().unwrap(), SyntaxPalette::BASE16);
+    }
+
+    /// A thread with a palette of its own takes the push the shared palette
+    /// ignores under test and highlights with it; a thread without one
+    /// never sees it.
+    #[test]
+    fn a_thread_with_its_own_palette_takes_the_push_under_test() {
+        let src = b"fn main() {}";
+        let keyword = |h: &[Vec<HiSpan>]| h[0][0].style.fg;
+        let line_starts = compute_line_starts(src);
+        set_thread_syntax_palette(Some(SyntaxPalette::BASE16));
+        set_syntax_palette(SyntaxPalette::LOCH);
+        assert_eq!(thread_syntax_palette(), Some(SyntaxPalette::LOCH));
+        let own = highlight_text(&mut LangRegistry::new(), LangKind::Rust, src, &line_starts);
+        let elsewhere = std::thread::spawn(move || {
+            highlight_text(&mut LangRegistry::new(), LangKind::Rust, src, &line_starts)
+        })
+        .join()
+        .unwrap();
+        set_thread_syntax_palette(None);
+        assert_eq!(
+            keyword(&own),
+            palette_style_for_name(&SyntaxPalette::LOCH, "keyword").fg
+        );
+        assert_eq!(
+            keyword(&elsewhere),
+            palette_style_for_name(&SyntaxPalette::BASE16, "keyword").fg
+        );
+        assert_eq!(*SYNTAX.read().unwrap(), SyntaxPalette::BASE16);
+    }
+
+    /// The light/dark decision comes from the palette's foreground: a dark
+    /// `fg` means a light background behind it.
+    #[test]
+    fn palette_lightness_is_read_from_the_foreground() {
+        let mut light = SyntaxPalette::BASE16;
+        light.fg = (0x24, 0x29, 0x2e);
+        assert!(palette_is_light(&light), "dark fg implies a light theme");
+        let mut dark = SyntaxPalette::BASE16;
+        dark.fg = (0xc0, 0xc5, 0xce);
+        assert!(!palette_is_light(&dark), "light fg implies a dark theme");
+    }
+
+    /// The word-boundary test is byte-level, so in UTF-8 prose the
+    /// continuation bytes either side of a tag both read as non-word and the
+    /// tag is highlighted although it is embedded in a word.
+    #[test]
+    fn a_tag_embedded_in_non_ascii_prose_is_not_a_tag() {
+        let mut reg = LangRegistry::new();
+        let src = "// \u{4fee}TODO\u{5fa9}\nfn main() {}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+        assert_eq!(
+            h[0].len(),
+            1,
+            "TODO between CJK letters is inside a word, so the comment stays \
+             one span: {:?}",
+            h[0]
+        );
+    }
+
+    /// The control: the same tag with ordinary boundaries IS highlighted, so
+    /// the test above cannot pass by disabling tag highlighting entirely.
+    #[test]
+    fn a_tag_with_non_ascii_prose_around_it_still_highlights() {
+        let mut reg = LangRegistry::new();
+        let src = "// \u{4fee}\u{5fa9} TODO here\nfn main() {}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+        assert!(
+            h[0].len() > 1,
+            "a space-delimited TODO after CJK text is still a tag: {:?}",
+            h[0]
+        );
+    }
+
+    #[test]
+    fn highlight_rust_produces_per_line_spans() {
+        let mut reg = LangRegistry::new();
+        let src = "fn main() {\n    let x = 1;\n}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let highlights = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+        // 4 line entries (last "" after trailing newline)
+        assert_eq!(highlights.len(), 4);
+        // Line 0 has "fn" as a keyword — at least one span should land there.
+        assert!(!highlights[0].is_empty(), "line 0 should have spans");
+        // Spans on line 0 should be within line 0's length.
+        let line0_len = "fn main() {".len();
+        for sp in &highlights[0] {
+            assert!(
+                sp.range().start <= line0_len,
+                "span start {} > line len {}",
+                sp.start,
+                line0_len
+            );
+            assert!(
+                sp.range().end <= line0_len,
+                "span end {} > line len {}",
+                sp.end,
+                line0_len
+            );
+            assert!(sp.start <= sp.end);
+        }
+    }
+
+    #[test]
+    fn semantic_tokens_color_parameter_in_body() {
+        // The whole point of the LSP overlay: a parameter referenced in
+        // the function body (where tree-sitter sees only a plain
+        // identifier) must get the parameter color, matching VS Code.
+        let src = "def f(x):\n    return x\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let legend = vec!["parameter".to_string(), "variable".to_string()];
+        // Two `parameter` tokens: `x` in the signature (line 0, col 6)
+        // and `x` in the body (line 1, col 11). Relative-encoded.
+        let data: Vec<u32> = vec![
+            0, 6, 1, 0, 0, // line 0, char 6, len 1, type 0 (parameter)
+            1, 11, 1, 0, 0, // +1 line, char 11, len 1, type 0 (parameter)
+        ];
+        let spans = decode_semantic_tokens(&data, &legend, src.as_bytes(), &line_starts);
+
+        let param_fg = Some(rgb(0xd0, 0x87, 0x70));
+        // Body line: byte col 11 is the `x` in "    return x".
+        let body = "    return x";
+        let col = body.rfind('x').unwrap();
+        let span = spans[1]
+            .iter()
+            .find(|s| s.range().contains(&col))
+            .expect("a semantic span should cover the body parameter `x`");
+        assert_eq!(
+            span.style.fg, param_fg,
+            "parameter referenced in the body should carry the parameter color"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_skip_unmapped_and_handle_unicode() {
+        // Unknown token types are skipped (tree-sitter shows through),
+        // and UTF-16 columns past a multi-byte char convert correctly.
+        let src = "x = \"é\" + ab\n"; // 'é' is 2 bytes / 1 UTF-16 unit
+        let line_starts = compute_line_starts(src.as_bytes());
+        let legend = vec!["bogusType".to_string(), "variable".to_string()];
+        // `ab` starts after: x(1) space(1) =(1) space(1) "(1) é(1 u16) "(1) space(1) +(1) space(1) = col 10
+        let data: Vec<u32> = vec![
+            0, 0, 1, 0, 0, // type 0 = bogus -> skipped
+            0, 10, 2, 1, 0, // type 1 = variable, len 2 -> `ab`
+        ];
+        let spans = decode_semantic_tokens(&data, &legend, src.as_bytes(), &line_starts);
+        assert_eq!(spans[0].len(), 1, "only the mapped token survives");
+        let byte_col = src.find("ab").unwrap();
+        let s = &spans[0][0];
+        assert_eq!(
+            s.range(),
+            byte_col..byte_col + 2,
+            "UTF-16 col converted to the right byte"
+        );
+    }
+
+    /// A span is kept for every token of every open file (#1707), so its
+    /// size is most of what a large file costs.
+    #[test]
+    fn a_span_is_24_bytes() {
+        assert_eq!(std::mem::size_of::<HiSpan>(), 24);
+    }
+
+    /// Runs the grammar splits but that paint alike come back as one span
+    /// (#1707): the line paints the same with fewer spans to keep.
+    #[test]
+    fn neighbouring_runs_of_one_style_are_one_span() {
+        let src = "fn main() {\n    let total = items.len() + other.len(); // count\n}\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let mut reg = LangRegistry::new();
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &ls);
+        assert!(h[1].len() > 4, "{:?}", h[1]);
+        for line in &h {
+            for pair in line.windows(2) {
+                assert!(
+                    pair[0].end != pair[1].start || pair[0].style != pair[1].style,
+                    "{pair:?} paint alike and touch"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn highlight_python_colors_parameters() {
+        // The bundled Python query emits no @variable.parameter; the
+        // appended overlay should color def/lambda parameters with the
+        // parameter style rather than leaving them as default @variable.
+        let mut reg = LangRegistry::new();
+        let src = "def f(text, n=1, *args, **kw):\n    return text\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Python, src.as_bytes(), &line_starts);
+
+        let param_fg = Some(rgb(0xd0, 0x87, 0x70));
+        let default_fg = Some(rgb(0xc0, 0xc5, 0xce));
+        let line0 = "def f(text, n=1, *args, **kw):";
+
+        // Each parameter name on line 0 should carry the parameter color.
+        for name in ["text", "n", "args", "kw"] {
+            let col = line0.find(name).expect("param in source");
+            let span = h[0]
+                .iter()
+                .find(|s| s.range().contains(&col))
+                .unwrap_or_else(|| panic!("no span covers parameter `{name}`"));
+            assert_eq!(
+                span.style.fg, param_fg,
+                "parameter `{name}` should use the parameter color, not {:?}",
+                span.style.fg
+            );
+            assert_ne!(span.style.fg, default_fg);
+        }
+    }
+
+    #[test]
+    fn highlight_python_colors_parameter_references_in_body_via_locals() {
+        // Tree-sitter alone (no LSP) must colour a parameter's REFERENCES in
+        // the function body, not just at the `def` site. Without a locals
+        // query, body references fall through to `(identifier) @variable`
+        // (grey) and only ty's semantic-token overlay recolours them, seconds
+        // later on a cold file. The Python locals query links each body
+        // reference to its in-scope parameter definition so the parameter
+        // colour appears instantly, the way Helix/Zed do it.
+        let mut reg = LangRegistry::new();
+        let src = "def f(text):\n    return text + text\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Python, src.as_bytes(), &line_starts);
+
+        let param_fg = Some(rgb(0xd0, 0x87, 0x70));
+        let default_fg = Some(rgb(0xc0, 0xc5, 0xce));
+        let line1 = "    return text + text";
+
+        // Both body references of `text` on line 1 must carry the parameter
+        // colour, not the default @variable grey.
+        let first = line1.find("text").expect("first body ref");
+        let second = line1[first + 4..].find("text").expect("second body ref") + first + 4;
+        for col in [first, second] {
+            let span = h[1]
+                .iter()
+                .find(|s| s.range().contains(&col))
+                .unwrap_or_else(|| panic!("no span covers body reference at col {col}"));
+            assert_eq!(
+                span.style.fg, param_fg,
+                "body parameter reference at col {col} should use the parameter colour, not {:?}",
+                span.style.fg
+            );
+            assert_ne!(span.style.fg, default_fg);
+        }
+    }
+
+    fn assert_body_param_ref_is_param_colored(lang: LangKind, src: &str, line1: &str) {
+        let mut reg = LangRegistry::new();
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, lang, src.as_bytes(), &line_starts);
+        let param_fg = Some(rgb(0xd0, 0x87, 0x70));
+        let default_fg = Some(rgb(0xc0, 0xc5, 0xce));
+        let first = line1.find("text").expect("first body ref");
+        let second = line1[first + 4..].find("text").expect("second body ref") + first + 4;
+        for col in [first, second] {
+            let span = h[1]
+                .iter()
+                .find(|s| s.range().contains(&col))
+                .unwrap_or_else(|| panic!("{lang:?}: no span covers body reference at col {col}"));
+            assert_eq!(
+                span.style.fg, param_fg,
+                "{lang:?}: body parameter reference at col {col} should use the parameter colour, not {:?}",
+                span.style.fg
+            );
+            assert_ne!(span.style.fg, default_fg);
+        }
+    }
+
+    #[test]
+    fn highlight_typescript_colors_parameter_references_in_body_via_locals() {
+        assert_body_param_ref_is_param_colored(
+            LangKind::TypeScript,
+            "function f(text: string) {\n    return text + text;\n}\n",
+            "    return text + text;",
+        );
+    }
+
+    #[test]
+    fn highlight_tsx_colors_parameter_references_in_body_via_locals() {
+        assert_body_param_ref_is_param_colored(
+            LangKind::Tsx,
+            "function f(text: string) {\n    return text + text;\n}\n",
+            "    return text + text;",
+        );
+    }
+
+    #[test]
+    fn highlight_javascript_colors_parameter_references_in_body_via_locals() {
+        assert_body_param_ref_is_param_colored(
+            LangKind::JavaScript,
+            "function f(text) {\n    return text + text;\n}\n",
+            "    return text + text;",
+        );
+    }
+
+    #[test]
+    fn highlight_rust_colors_parameter_references_in_body_via_locals() {
+        // tree-sitter-rust colours `(parameter (identifier))` orange at the
+        // declaration but ships no locals query, so a parameter's body
+        // references match no highlights capture and fall through to default
+        // grey until rust-analyzer's semantic-token overlay lands, which on a
+        // cold crate is ~25s after open. The Rust locals query links each body
+        // reference to its in-scope parameter definition so the parameter
+        // colour appears instantly, the way Helix/Zed do it.
+        assert_body_param_ref_is_param_colored(
+            LangKind::Rust,
+            "fn f(text: i32) -> i32 {\n    text + text\n}\n",
+            "    text + text",
+        );
+    }
+
+    #[test]
+    fn highlight_rust_keeps_specific_captures_over_broad_identifier_overlay() {
+        // The prepended `(identifier) @variable` carrier (needed so the locals
+        // query can emit a resolved parameter reference) must not swallow the
+        // bundled specific captures under last-match-wins: a function call and
+        // a type name must keep their own colours, not turn @variable grey.
+        let mut reg = LangRegistry::new();
+        let src = "fn run() {\n    let v = compute(x);\n    let p: Parser = v;\n}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+
+        let function = Some(rgb(0x8f, 0xa1, 0xb3));
+        let type_c = Some(rgb(0xeb, 0xcb, 0x8b));
+        let default_fg = Some(rgb(0xc0, 0xc5, 0xce));
+
+        let line1 = "    let v = compute(x);";
+        let call = span_at(&h[1], line1, "compute").expect("call name span");
+        assert_eq!(
+            call.style.fg, function,
+            "call name must keep @function colour"
+        );
+        assert_ne!(call.style.fg, default_fg);
+
+        let line2 = "    let p: Parser = v;";
+        let ty = span_at(&h[2], line2, "Parser").expect("type name span");
+        assert_eq!(ty.style.fg, type_c, "type name must keep @type colour");
+        assert_ne!(ty.style.fg, default_fg);
+    }
+
+    #[test]
+    fn highlight_rust_colors_module_paths_and_enum_variant_defs_to_match_lsp() {
+        // rust-analyzer paints module path segments (`std`, `collections`) as
+        // `namespace` (yellow) and enum-variant declarations (`Light`, `Dark`)
+        // as `enumMember` (orange/constant). tree-sitter-rust leaves the path
+        // segments grey @variable and colours capitalized scoped names
+        // @constructor (blue-grey), so when RA's overlay lands ~1-3s after open
+        // those tokens visibly recolour. Colour them in the tree-sitter base so
+        // the overlay is a no-op for these (the most pervasive recolour, since
+        // every `use`/path has module segments).
+        let mut reg = LangRegistry::new();
+        let src = "use std::collections::HashMap;\nenum Shade { Light, Dark }\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+
+        let module_c = Some(rgb(0xeb, 0xcb, 0x8b)); // @module / @type (yellow)
+        let constant_c = Some(rgb(0xd0, 0x87, 0x70)); // @constant (orange)
+
+        let l0 = "use std::collections::HashMap;";
+        let std_span = span_at(&h[0], l0, "std").expect("std path span");
+        assert_eq!(std_span.style.fg, module_c, "`std` must be module-coloured");
+        let coll_span = span_at(&h[0], l0, "collections").expect("collections span");
+        assert_eq!(
+            coll_span.style.fg, module_c,
+            "`collections` must be module-coloured"
+        );
+
+        let l1 = "enum Shade { Light, Dark }";
+        let light = span_at(&h[1], l1, "Light").expect("Light variant span");
+        assert_eq!(
+            light.style.fg, constant_c,
+            "enum variant declaration must be constant-coloured"
+        );
+        let dark = span_at(&h[1], l1, "Dark").expect("Dark variant span");
+        assert_eq!(dark.style.fg, constant_c);
+    }
+
+    #[test]
+    fn highlight_rust_colors_use_imports_to_match_lsp() {
+        // rust-analyzer paints `use` paths by resolved kind: module segments
+        // (`std`, `collections`, `anyhow`) as `namespace` (yellow) and imported
+        // type/trait/struct names (`BTreeSet`, `Context`, `Result`) as
+        // `struct`/`interface`/`typeAlias` (yellow). The bundled
+        // tree-sitter-rust query colours capitalized use-list items
+        // `@constructor` (blue) and a brace-list module head plain @variable
+        // (grey), so the whole import block snaps blue/grey -> yellow ~1-3s
+        // after open when RA's semantic overlay lands. Colour them in the base
+        // so imports never snap. This is the UNAMBIGUOUS slice of
+        // "CamelCase == type": `Some`/`None`/`Ok`/`Err` never appear in `use`,
+        // so unlike a blanket CamelCase rule there is no enum-variant collision.
+        let mut reg = LangRegistry::new();
+        let src = "use std::collections::BTreeSet;\nuse anyhow::{Context, Result};\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &ls);
+        let yellow = Some(rgb(0xeb, 0xcb, 0x8b));
+
+        let l0 = "use std::collections::BTreeSet;";
+        for (needle, label) in [
+            ("std", "module head `std`"),
+            ("collections", "module segment `collections`"),
+            ("BTreeSet", "imported struct `BTreeSet`"),
+        ] {
+            let sp = span_at(&h[0], l0, needle).unwrap_or_else(|| panic!("no span: {label}"));
+            assert_eq!(sp.style.fg, yellow, "{label}");
+        }
+
+        let l1 = "use anyhow::{Context, Result};";
+        for (needle, label) in [
+            ("anyhow", "brace-list module head `anyhow`"),
+            ("Context", "imported trait `Context` in list"),
+            ("Result", "imported type alias `Result` in list"),
+        ] {
+            let sp = span_at(&h[1], l1, needle).unwrap_or_else(|| panic!("no span: {label}"));
+            assert_eq!(sp.style.fg, yellow, "{label}");
+        }
+    }
+
+    #[test]
+    fn highlight_rust_colors_capitalized_scoped_path_heads_as_types() {
+        // Regression guard for existing behaviour (the bundled
+        // `scoped_identifier path -> @type` rule, kept winning over the
+        // prepended `(identifier) @variable` carrier and the use overlay): the
+        // capitalized head of a `::` path is a type, and rust-analyzer paints it
+        // `struct`/`enum` (yellow). This already holds for real (non-macro)
+        // scoped calls like `String::from(..)`; the empirically-observed blue
+        // `String` tokens that still snap are inside macro token trees
+        // (`vec![..]`, `format!(..)`), where tree-sitter sees only unparsed
+        // identifier tokens and no syntactic rule can recover the type. Those
+        // are left to the LSP/disk cache, matching the 0.1.315 doctrine.
+        let mut reg = LangRegistry::new();
+        let src = "fn g() {\n    let _ = String::from(\"x\");\n    let _ = Command::new(\"y\");\n    let _ = Shade::Dark;\n}\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &ls);
+        let yellow = Some(rgb(0xeb, 0xcb, 0x8b));
+        for (row, line, head) in [
+            (1usize, "    let _ = String::from(\"x\");", "String"),
+            (2, "    let _ = Command::new(\"y\");", "Command"),
+            (3, "    let _ = Shade::Dark;", "Shade"),
+        ] {
+            let sp = span_at(&h[row], line, head).unwrap_or_else(|| panic!("no span: {head}"));
+            assert_eq!(
+                sp.style.fg, yellow,
+                "scoped path head `{head}` must be type-yellow"
+            );
+        }
+    }
+
+    #[test]
+    fn highlight_rust_use_overlay_does_not_yellow_enum_variants_in_body() {
+        // The use-import type rule must NOT leak to expression position: `Some`
+        // referenced in a body is an enum member, which RA paints orange, not
+        // type-yellow. The tree-sitter base cannot disambiguate variant-vs-type
+        // in expression position (the LSP/cache covers that residual), so it
+        // must keep the bundled colour here rather than be turned yellow.
+        // Guards against regressing to a blanket CamelCase->type rule.
+        let mut reg = LangRegistry::new();
+        let src = "fn f() {\n    let _ = Some(1);\n}\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &ls);
+        let yellow = Some(rgb(0xeb, 0xcb, 0x8b));
+        let l1 = "    let _ = Some(1);";
+        let some = span_at(&h[1], l1, "Some").expect("a span covers `Some`");
+        assert_ne!(
+            some.style.fg, yellow,
+            "an enum variant in expression position must not be coloured type-yellow"
+        );
+    }
+
+    #[test]
+    fn project_range_splits_across_lines() {
+        // "abc\ndef" → line_starts [0, 4]; range 1..6 covers "bc" on line 0 and "de" on line 1
+        let line_starts = vec![0usize, 4];
+        let mut per_line: Vec<Vec<HiSpan>> = vec![Vec::new(); 2];
+        let style = Style::default();
+        project_range(1, 6, style, &line_starts, &mut per_line);
+        assert_eq!(per_line[0].len(), 1);
+        assert_eq!(per_line[0][0].start, 1);
+        // Line content "abc" has byte length 3; the '\n' at byte 3 is excluded.
+        assert_eq!(per_line[0][0].end, 3);
+        assert_eq!(per_line[1].len(), 1);
+        assert_eq!(per_line[1][0].start, 0);
+        assert_eq!(per_line[1][0].end, 2);
+    }
+
+    #[test]
+    fn project_range_excludes_newline_at_end_of_line() {
+        // "abc\n" with the next-line entry set: the span 0..4 must end at 3, not 4.
+        let line_starts = vec![0usize, 4];
+        let mut per_line: Vec<Vec<HiSpan>> = vec![Vec::new(); 2];
+        project_range(0, 4, Style::default(), &line_starts, &mut per_line);
+        assert_eq!(per_line[0].len(), 1);
+        assert_eq!(per_line[0][0].end, 3);
+    }
+
+    #[test]
+    fn project_range_within_single_line() {
+        let line_starts = vec![0usize, 5];
+        let mut per_line: Vec<Vec<HiSpan>> = vec![Vec::new(); 2];
+        project_range(1, 4, Style::default(), &line_starts, &mut per_line);
+        assert_eq!(per_line[0].len(), 1);
+        assert_eq!(per_line[0][0].start, 1);
+        assert_eq!(per_line[0][0].end, 4);
+        assert!(per_line[1].is_empty());
+    }
+
+    fn span_at<'a>(spans: &'a [HiSpan], line: &str, needle: &str) -> Option<&'a HiSpan> {
+        let off = line.find(needle)?;
+        let end = off + needle.len();
+        spans
+            .iter()
+            .find(|sp| sp.range().start <= off && sp.range().end >= end)
+    }
+
+    const TAG_COLOR: Color = Color::Rgb(0xbf, 0x61, 0x6a);
+    const ATTRIBUTE_COLOR: Color = Color::Rgb(0xbf, 0x61, 0x6a);
+    const FUNCTION_COLOR: Color = Color::Rgb(0x8f, 0xa1, 0xb3);
+    const PROPERTY_COLOR: Color = Color::Rgb(0x8f, 0xa1, 0xb3);
+
+    #[test]
+    fn tsx_jsx_opening_tag_identifier_gets_tag_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = <div className=\"y\">hi</div>;\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Tsx, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        let div_span = span_at(&h[0], line0, "div").expect(
+            "the 'div' tag identifier in <div ...> must produce at least one highlight span",
+        );
+        assert_eq!(
+            div_span.style.fg,
+            Some(TAG_COLOR),
+            "JSX opening-tag identifier must render in the @tag colour ({TAG_COLOR:?}); a missing or default-foreground span means the TSX query has no jsx_opening_element capture"
+        );
+    }
+
+    #[test]
+    fn tsx_jsx_closing_tag_identifier_gets_tag_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = <div>hi</div>;\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Tsx, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        // Two occurrences of "div" on the line: opening and closing. The
+        // closing tag starts after "</", so find the second one.
+        let first = line0.find("div").unwrap();
+        let second_off = line0[first + 3..].find("div").unwrap() + first + 3;
+        let span = h[0]
+            .iter()
+            .find(|sp| sp.range().start <= second_off && sp.range().end >= second_off + 3)
+            .expect("the closing-tag 'div' in </div> must produce a highlight span");
+        assert_eq!(span.style.fg, Some(TAG_COLOR));
+    }
+
+    #[test]
+    fn tsx_jsx_self_closing_tag_identifier_gets_tag_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = <Icon name=\"plus\" />;\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Tsx, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        let span = span_at(&h[0], line0, "Icon")
+            .expect("self-closing <Icon ... /> must produce a tag-name highlight span");
+        assert_eq!(span.style.fg, Some(TAG_COLOR));
+    }
+
+    #[test]
+    fn tsx_jsx_attribute_name_gets_attribute_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = <div className=\"y\" onClick={f}>hi</div>;\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Tsx, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        for name in ["className", "onClick"] {
+            let span = span_at(&h[0], line0, name)
+                .unwrap_or_else(|| panic!("JSX attribute '{name}' must produce a highlight span"));
+            assert_eq!(
+                span.style.fg,
+                Some(ATTRIBUTE_COLOR),
+                "JSX attribute name '{name}' must render in the @attribute colour"
+            );
+        }
+    }
+
+    /// The issue's C++ sample (#1510): a comment, a preprocessor include,
+    /// keywords, a string and a char literal, each holding a bracket.
+    const CPP_SAMPLE: &str = "// greet the user (politely\n#include <string>\nint main() {\n    std::string s = \"smile :)\";\n    char c = '(';\n    return s.size() + c;\n}\n";
+
+    /// The style of the span over `needle` on whichever line holds it.
+    fn style_of(h: &[Vec<HiSpan>], src: &str, needle: &str) -> Option<Style> {
+        src.lines()
+            .zip(h)
+            .find(|(line, _)| line.contains(needle))
+            .and_then(|(line, spans)| span_at(spans, line, needle))
+            .map(|sp| sp.style)
+    }
+
+    #[test]
+    fn cpp_colours_comments_strings_preprocessor_and_keywords_like_c() {
+        let mut reg = LangRegistry::new();
+        let starts = compute_line_starts(CPP_SAMPLE.as_bytes());
+        let cpp = highlight_text(&mut reg, LangKind::Cpp, CPP_SAMPLE.as_bytes(), &starts);
+        let c = highlight_text(&mut reg, LangKind::C, CPP_SAMPLE.as_bytes(), &starts);
+        let plain = style_for_name("").fg;
+        for needle in ["// greet", "#include", "\"smile :)\"", "return", "int"] {
+            let got = style_of(&cpp, CPP_SAMPLE, needle).map(|s| s.fg);
+            assert!(
+                got.is_some() && got != Some(plain),
+                "C++ leaves {needle:?} in the plain colour"
+            );
+            assert_eq!(
+                got,
+                style_of(&c, CPP_SAMPLE, needle).map(|s| s.fg),
+                "C++ colours {needle:?} as C does"
+            );
+        }
+        // C++'s own captures still apply on top of C's.
+        assert!(style_of(&cpp, CPP_SAMPLE, "std").is_some(), "namespace");
+    }
+
+    #[test]
+    fn a_char_literal_is_a_string_in_c_and_cpp() {
+        let mut reg = LangRegistry::new();
+        let starts = compute_line_starts(CPP_SAMPLE.as_bytes());
+        for kind in [LangKind::C, LangKind::Cpp] {
+            let (h, protected) =
+                highlight_text_with_protected(&mut reg, kind, CPP_SAMPLE.as_bytes(), &starts);
+            assert_eq!(
+                style_of(&h, CPP_SAMPLE, "'('").map(|s| s.fg),
+                style_of(&h, CPP_SAMPLE, "\"smile :)\"").map(|s| s.fg),
+                "{kind:?}: a char literal takes the string colour"
+            );
+            let at = CPP_SAMPLE.find("'('").unwrap() + 1;
+            assert!(
+                protected.iter().any(|&(s, e)| s <= at && at < e),
+                "{kind:?}: the '(' in a char literal is not code"
+            );
+        }
+    }
+
+    #[test]
+    fn typescript_call_expression_function_name_gets_function_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = useMemo(() => 1);\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::TypeScript, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        let span = span_at(&h[0], line0, "useMemo")
+            .expect("call_expression function name 'useMemo' must produce a highlight span");
+        assert_eq!(
+            span.style.fg,
+            Some(FUNCTION_COLOR),
+            "the bundled TS highlights.scm has no @function capture; without concatenating the JS query, call sites like 'useMemo(...)' render in default foreground"
+        );
+    }
+
+    #[test]
+    fn typescript_member_expression_property_gets_property_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = styles.sectionHeader;\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::TypeScript, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        let span = span_at(&h[0], line0, "sectionHeader")
+            .expect("property_identifier in member_expression must produce a highlight span");
+        assert_eq!(span.style.fg, Some(PROPERTY_COLOR));
+    }
+
+    #[test]
+    fn typescript_method_call_property_gets_function_method_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = arr.map(f);\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::TypeScript, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        let span = span_at(&h[0], line0, "map")
+            .expect("method call 'arr.map' must produce a highlight span on 'map'");
+        assert_eq!(
+            span.style.fg,
+            Some(FUNCTION_COLOR),
+            "method-call property must take @function.method (which shares the function colour), not the bare @property colour"
+        );
+    }
+
+    #[test]
+    fn tsx_call_expression_function_name_gets_function_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = useMemo(() => 1);\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Tsx, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        let span = span_at(&h[0], line0, "useMemo")
+            .expect("TSX call_expression function name 'useMemo' must produce a highlight span");
+        assert_eq!(span.style.fg, Some(FUNCTION_COLOR));
+    }
+
+    #[test]
+    fn tsx_member_expression_property_gets_property_color() {
+        let mut reg = LangRegistry::new();
+        let src = "const x = styles.sectionHeader;\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Tsx, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        let span = span_at(&h[0], line0, "sectionHeader")
+            .expect("TSX property_identifier in member_expression must produce a highlight span");
+        assert_eq!(span.style.fg, Some(PROPERTY_COLOR));
+    }
+
+    #[test]
+    fn tsx_jsx_attribute_capture_still_wins_over_generic_property_capture() {
+        // Regression guard for the query-ordering choice: the JS query
+        // (now concatenated before the TS query and JSX overlay) has a
+        // broad `(property_identifier) @property` rule. The JSX overlay
+        // must come AFTER so that on a `jsx_attribute`'s property_identifier
+        // the @attribute capture wins over @property — otherwise JSX
+        // attribute names would silently drift from orange-red to the
+        // slate-blue @property colour.
+        let mut reg = LangRegistry::new();
+        let src = "const x = <div className=\"y\" />;\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Tsx, src.as_bytes(), &line_starts);
+        let line0 = src.lines().next().unwrap();
+        let span = span_at(&h[0], line0, "className")
+            .expect("'className' must still produce a highlight span");
+        assert_eq!(
+            span.style.fg,
+            Some(ATTRIBUTE_COLOR),
+            "JSX attribute name must keep the @attribute colour; if it renders in @property colour, the overlay is ordered before the JS query and needs to move after"
+        );
+    }
+
+    #[test]
+    fn project_range_zero_length_noop() {
+        let line_starts = vec![0usize];
+        let mut per_line: Vec<Vec<HiSpan>> = vec![Vec::new(); 1];
+        project_range(3, 3, Style::default(), &line_starts, &mut per_line);
+        assert!(per_line[0].is_empty());
+    }
+
+    #[test]
+    fn uncaptured_source_follows_the_active_palette_not_base16() {
+        // Bytes tree-sitter's queries do not capture (the whitespace between
+        // tokens, gaps in sparse grammars) must take the ACTIVE palette's
+        // default foreground. Hardcoding Base16 slate there splits a
+        // Gruvbox/Dracula file into two foregrounds: captured `variable`
+        // runs in the theme's cream, uncaptured runs in cold slate.
+        let gruvbox_ish = SyntaxPalette {
+            fg: (0xeb, 0xdb, 0xb2),
+            ..SyntaxPalette::BASE16
+        };
+        let mut reg = LangRegistry::new();
+        let src = "let x = 1;\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let h = highlight_text_with_palette(
+            &mut reg,
+            LangKind::Rust,
+            src.as_bytes(),
+            &ls,
+            &gruvbox_ish,
+        )
+        .0;
+        let slate = Some(rgb(0xc0, 0xc5, 0xce));
+        let cream = Some(rgb(0xeb, 0xdb, 0xb2));
+        assert!(
+            h[0].iter().all(|s| s.style.fg != slate),
+            "no span may keep the Base16 default when the palette differs: {:?}",
+            h[0]
+        );
+        assert!(
+            h[0].iter().any(|s| s.style.fg == cream),
+            "default-foreground spans must use the palette fg: {:?}",
+            h[0]
+        );
+    }
+
+    #[test]
+    fn lua_highlighting_captures_keywords_and_comments() {
+        let mut reg = LangRegistry::new();
+        let src = "local function greet(name)\n    -- comment\n    if name then\n        return 42\n    end\nend\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Lua, src.as_bytes(), &ls);
+        // One entry per line START, which is what `compute_line_starts`
+        // yields - the trailing newline means that is one more than
+        // `src.lines()`. Asserting the relationship rather than the literal
+        // keeps the two from drifting apart on a newline change.
+        assert_eq!(h.len(), ls.len());
+        let lines: Vec<&str> = src.lines().collect();
+        assert!(span_at(&h[0], lines[0], "local").is_some());
+        assert!(span_at(&h[0], lines[0], "greet").is_some());
+        assert!(span_at(&h[1], lines[1], "-- comment").is_some());
+        assert!(span_at(&h[2], lines[2], "if").is_some());
+        assert!(span_at(&h[2], lines[2], "then").is_some());
+        assert!(span_at(&h[3], lines[3], "return").is_some());
+        assert!(span_at(&h[3], lines[3], "42").is_some());
+        assert_eq!(lang_for_extension("lua"), Some(LangKind::Lua));
+    }
+
+    #[test]
+    fn codeql_keywords_classes_and_comments_get_distinct_styles() {
+        let mut reg = LangRegistry::new();
+        let src = "// finds calls\nclass Call extends Expr {\n  Call() { this = this }\n}\n";
+        let ls = compute_line_starts(src.as_bytes());
+        // An explicit palette, so a concurrent theme-switch test cannot
+        // repaint the global one mid-assert.
+        let p = SyntaxPalette::BASE16;
+        let h = highlight_text_with_palette(&mut reg, LangKind::Ql, src.as_bytes(), &ls, &p).0;
+        let lines: Vec<&str> = src.lines().collect();
+        let comment = span_at(&h[0], lines[0], "// finds calls").expect("comment span");
+        let keyword = span_at(&h[1], lines[1], "class").expect("keyword span");
+        let class = span_at(&h[1], lines[1], "Call").expect("class-name span");
+        assert_eq!(comment.style, palette_style_for_name(&p, "comment"));
+        assert_eq!(keyword.style, palette_style_for_name(&p, "keyword"));
+        assert_eq!(class.style, palette_style_for_name(&p, "type"));
+        assert_ne!(keyword.style, class.style);
+        assert_eq!(lang_for_extension("ql"), Some(LangKind::Ql));
+        assert_eq!(lang_for_extension("qll"), Some(LangKind::Ql));
+    }
+
+    #[test]
+    fn a_codeql_dbscheme_highlights_tables_types_and_comments() {
+        let mut reg = LangRegistry::new();
+        let src = "// files\n#keyset[id]\nfiles(unique int id: @file, string name: string ref);\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let p = SyntaxPalette::BASE16;
+        let h =
+            highlight_text_with_palette(&mut reg, LangKind::Dbscheme, src.as_bytes(), &ls, &p).0;
+        let lines: Vec<&str> = src.lines().collect();
+        let style = |line: usize, text: &str| {
+            span_at(&h[line], lines[line], text)
+                .unwrap_or_else(|| panic!("no span for {text}"))
+                .style
+        };
+        assert_eq!(style(0, "// files"), palette_style_for_name(&p, "comment"));
+        assert_eq!(style(1, "keyset"), palette_style_for_name(&p, "attribute"));
+        assert_eq!(style(2, "files"), palette_style_for_name(&p, "function"));
+        assert_eq!(style(2, "unique"), palette_style_for_name(&p, "keyword"));
+        assert_eq!(style(2, "int"), palette_style_for_name(&p, "type.builtin"));
+        assert_eq!(style(2, "@file"), palette_style_for_name(&p, "type"));
+        assert_eq!(style(2, "name"), palette_style_for_name(&p, "property"));
+        assert_eq!(lang_for_extension("dbscheme"), Some(LangKind::Dbscheme));
+    }
+
+    /// #654: Markdown in the editor was all but colourless. The block
+    /// grammar's `text.*` captures had no palette role, its markers sat on the
+    /// default-foreground `punctuation.special`, and no injection was ever
+    /// resolved, so emphasis, code spans, links and fenced code went uncoloured
+    /// too. Each element now takes a theme role, and a fence is coloured by
+    /// its own language.
+    #[test]
+    fn markdown_elements_and_fenced_code_take_theme_styles() {
+        let mut reg = LangRegistry::new();
+        let src = "# Title here\n\
+                   \n\
+                   - item with **bold**, *slanted*, ~~gone~~ and `code`\n\
+                   \n\
+                   > quoted words\n\
+                   \n\
+                   See [the docs](https://example.com).\n\
+                   \n\
+                   | Head |\n\
+                   | ---- |\n\
+                   | `cell` |\n\
+                   \n\
+                   ```rust\n\
+                   fn main() {}\n\
+                   ```\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let p = SyntaxPalette::BASE16;
+        let h =
+            highlight_text_with_palette(&mut reg, LangKind::Markdown, src.as_bytes(), &ls, &p).0;
+        let lines: Vec<&str> = src.lines().collect();
+        let style = |line: usize, text: &str| {
+            span_at(&h[line], lines[line], text)
+                .unwrap_or_else(|| panic!("no span for {text:?} on {:?}", lines[line]))
+                .style
+        };
+        let role = |name: &str| palette_style_for_name(&p, name);
+        assert_eq!(style(0, "#"), role("text.title"));
+        assert_eq!(style(0, "Title"), role("text.title"));
+        assert_eq!(style(2, "-"), role("text.list"));
+        assert_eq!(style(2, "bold"), role("text.strong"));
+        assert_eq!(style(2, "slanted"), role("text.emphasis"));
+        assert_eq!(style(2, "gone"), role("text.strike"));
+        assert_eq!(style(2, "code"), role("text.literal"));
+        assert_eq!(style(4, ">"), role("text.quote"));
+        assert_eq!(style(4, "quoted"), role("text.quote"));
+        assert_eq!(style(6, "the docs"), role("text.reference"));
+        assert_eq!(style(6, "https://example.com"), role("text.uri"));
+        assert_eq!(style(8, "Head"), role("text.strong"));
+        assert_eq!(style(10, "cell"), role("text.literal"));
+        assert_eq!(
+            style(13, "fn"),
+            role("keyword"),
+            "the rust fence is injected"
+        );
+        // Token for token, the fence colours as the same line would in a
+        // `.rs` file.
+        let rust_src = "fn main() {}\n";
+        let rust_ls = compute_line_starts(rust_src.as_bytes());
+        let rust = highlight_text_with_palette(
+            &mut reg,
+            LangKind::Rust,
+            rust_src.as_bytes(),
+            &rust_ls,
+            &p,
+        )
+        .0;
+        for token in ["fn", "main"] {
+            let standalone = span_at(&rust[0], "fn main() {}", token)
+                .expect("rust span")
+                .style;
+            assert_eq!(style(13, token), standalone, "{token} in the fence");
+        }
+        // None of them is the plain foreground a colourless file shows.
+        for name in [
+            "text.title",
+            "text.list",
+            "text.literal",
+            "text.quote",
+            "text.reference",
+            "text.uri",
+            "text.emphasis",
+            "text.strong",
+            "text.strike",
+        ] {
+            assert_ne!(role(name), role("variable"), "{name} is styled");
+        }
+    }
+
+    /// YAML front matter is handed to the YAML grammar, so its keys colour as
+    /// they would in a `.yaml` file rather than as Markdown prose.
+    #[test]
+    fn markdown_front_matter_highlights_as_yaml() {
+        let mut reg = LangRegistry::new();
+        let src = "---\ntitle: Notes\n---\n\n# Notes\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let p = SyntaxPalette::BASE16;
+        let h =
+            highlight_text_with_palette(&mut reg, LangKind::Markdown, src.as_bytes(), &ls, &p).0;
+        let yaml_src = "title: Notes\n";
+        let yaml_ls = compute_line_starts(yaml_src.as_bytes());
+        let yaml = highlight_text_with_palette(
+            &mut reg,
+            LangKind::Yaml,
+            yaml_src.as_bytes(),
+            &yaml_ls,
+            &p,
+        )
+        .0;
+        let in_md = span_at(&h[1], "title: Notes", "title").expect("front matter span");
+        let in_yaml = span_at(&yaml[0], "title: Notes", "title").expect("yaml span");
+        assert_eq!(in_md.style, in_yaml.style);
+        assert_ne!(in_md.style, palette_style_for_name(&p, "variable"));
+    }
+
+    /// Only Markdown resolves injections: an HTML `<script>` stays as it was
+    /// (uninjected), so enabling Markdown's fences changes no other language.
+    /// The style `needle` gets on line `row` of `src` highlighted as `kind`.
+    fn embedded_style(kind: LangKind, src: &str, row: usize, needle: &str) -> Option<Style> {
+        let mut reg = LangRegistry::new();
+        let ls = compute_line_starts(src.as_bytes());
+        let p = SyntaxPalette::BASE16;
+        let h = highlight_text_with_palette(&mut reg, kind, src.as_bytes(), &ls, &p).0;
+        let line = src.lines().nth(row)?;
+        span_at(&h[row], line, needle).map(|sp| sp.style)
+    }
+
+    const PAGE: &str = "<style>\n  body { color: red; }\n</style>\n<script>\n  const greeting = \"hello\";\n</script>\n";
+
+    /// #1649: a `<script>` body is highlighted as JavaScript, the way the
+    /// same line is in a `.js` file.
+    #[test]
+    fn a_script_body_in_html_is_highlighted_as_javascript() {
+        let js = "const greeting = \"hello\";\n";
+        let keyword = embedded_style(LangKind::JavaScript, js, 0, "const");
+        assert!(keyword.is_some());
+        assert_eq!(embedded_style(LangKind::Html, PAGE, 4, "const"), keyword);
+        assert_eq!(
+            embedded_style(LangKind::Html, PAGE, 4, "\"hello\""),
+            embedded_style(LangKind::JavaScript, js, 0, "\"hello\"")
+        );
+        // The tags around it are still HTML's.
+        assert_eq!(
+            embedded_style(LangKind::Html, PAGE, 3, "script"),
+            embedded_style(LangKind::Html, "<p>\n", 0, "p")
+        );
+    }
+
+    const VUE: &str = "<template>\n  <p class=\"msg\">{{ msg }}</p>\n</template>\n<script setup lang=\"ts\">\nconst count: number = 1;\n</script>\n<style scoped>\np { color: red; }\n</style>\n";
+
+    /// #1632: `.vue` and `.svelte` are their own languages, read with the
+    /// HTML grammar.
+    #[test]
+    fn vue_and_svelte_files_have_a_language() {
+        assert_eq!(lang_for_extension("vue"), Some(LangKind::Vue));
+        assert_eq!(lang_for_extension("svelte"), Some(LangKind::Svelte));
+        assert_eq!(
+            lang_for_path(std::path::Path::new("src/App.vue")),
+            Some(LangKind::Vue)
+        );
+        assert!(shared_config(LangKind::Vue).is_some());
+        assert!(shared_config(LangKind::Svelte).is_some());
+    }
+
+    /// #1632: a Vue component's template is HTML, its `lang="ts"` script
+    /// TypeScript and its style CSS, each coloured as in its own file.
+    #[test]
+    fn a_vue_component_highlights_template_script_and_style() {
+        let ts = "const count: number = 1;\n";
+        let number = embedded_style(LangKind::TypeScript, ts, 0, "number");
+        assert!(number.is_some());
+        assert_eq!(embedded_style(LangKind::Vue, VUE, 4, "number"), number);
+        assert_eq!(
+            embedded_style(LangKind::Vue, VUE, 4, "const"),
+            embedded_style(LangKind::TypeScript, ts, 0, "const")
+        );
+        assert_eq!(
+            embedded_style(LangKind::Vue, VUE, 1, "p"),
+            embedded_style(LangKind::Html, "<p>\n", 0, "p")
+        );
+        assert_eq!(
+            embedded_style(LangKind::Vue, VUE, 7, "color"),
+            embedded_style(LangKind::Css, "p { color: red; }\n", 0, "color")
+        );
+        assert!(embedded_style(LangKind::Vue, VUE, 7, "color").is_some());
+    }
+
+    /// #1632: a script with no `lang` (or `lang="js"`) is JavaScript, as in
+    /// Svelte's default, and `lang="tsx"` is TSX.
+    #[test]
+    fn a_component_script_without_lang_ts_is_javascript() {
+        let svelte = "<script>\n  let name = \"world\";\n</script>\n<h1>Hello {name}!</h1>\n";
+        let js = "let name = \"world\";\n";
+        assert_eq!(
+            embedded_style(LangKind::Svelte, svelte, 1, "let"),
+            embedded_style(LangKind::JavaScript, js, 0, "let")
+        );
+        assert!(embedded_style(LangKind::Svelte, svelte, 1, "let").is_some());
+        let tsx = "<script lang=\"tsx\">\nconst n: number = 1;\n</script>\n";
+        assert_eq!(
+            embedded_style(LangKind::Vue, tsx, 1, "number"),
+            embedded_style(LangKind::Tsx, "const n: number = 1;\n", 0, "number")
+        );
+        let js_lang = "<script lang=\"js\">\nconst n = 1;\n</script>\n";
+        assert_eq!(
+            embedded_style(LangKind::Vue, js_lang, 1, "const"),
+            embedded_style(LangKind::JavaScript, "const n = 1;\n", 0, "const")
+        );
+    }
+
+    /// #1632, negative: plain HTML keeps its own rules, so a `lang`
+    /// attribute there (a page language like `lang="ts"` for Tsonga) does
+    /// not make a script TypeScript.
+    #[test]
+    fn html_does_not_read_a_script_lang_attribute() {
+        let page = "<script lang=\"ts\">\nconst n: number = 1;\n</script>\n";
+        assert_eq!(
+            embedded_style(LangKind::Html, page, 1, "const"),
+            embedded_style(LangKind::JavaScript, "const n = 1;\n", 0, "const")
+        );
+        assert_ne!(
+            embedded_style(LangKind::Html, page, 1, "number"),
+            embedded_style(LangKind::TypeScript, "const n: number = 1;\n", 0, "number")
+        );
+    }
+
+    /// #1649: a `<style>` body is highlighted as CSS.
+    #[test]
+    fn a_style_body_in_html_is_highlighted_as_css() {
+        let css = "  body { color: red; }\n";
+        let property = embedded_style(LangKind::Css, css, 0, "color");
+        assert!(property.is_some());
+        assert_eq!(embedded_style(LangKind::Html, PAGE, 1, "color"), property);
+        assert_eq!(
+            embedded_style(LangKind::Html, PAGE, 1, "body"),
+            embedded_style(LangKind::Css, css, 0, "body")
+        );
+    }
+
+    /// #1649: a script whose `type` says JavaScript (or is empty, or has
+    /// MIME parameters) is JavaScript, a JSON type is JSON, and anything
+    /// else (a template) is left alone.
+    #[test]
+    fn a_scripts_type_decides_what_its_body_is_highlighted_as() {
+        let keyword = embedded_style(LangKind::JavaScript, "const x = 1;\n", 0, "const");
+        let module = "<script type=\"module\">\nconst x = 1;\n</script>\n";
+        assert_eq!(embedded_style(LangKind::Html, module, 1, "const"), keyword);
+        let json = r#"{ "name": "croft" }"#;
+        let ld = format!("<script type=\"application/ld+json\">\n{json}\n</script>\n");
+        let key = embedded_style(LangKind::Json, &format!("{json}\n"), 0, "\"name\"");
+        assert!(key.is_some());
+        assert_eq!(embedded_style(LangKind::Html, &ld, 1, "\"name\""), key);
+        for classic in [
+            "<script type=\"\">",
+            "<script type=\"  \">",
+            "<script type=''>",
+            "<script type=\"text/javascript; charset=utf-8\">",
+            "<script type=\" Text/JavaScript \">",
+            "<script type=application/x-javascript>",
+            "<script type=\"text/jscript\">",
+        ] {
+            let page = format!("{classic}\nconst x = 1;\n</script>\n");
+            assert_eq!(
+                embedded_style(LangKind::Html, &page, 1, "const"),
+                keyword,
+                "{classic} runs as a classic script"
+            );
+        }
+        let template = "<script type=\"text/template\">\nconst x = 1;\n</script>\n";
+        assert_ne!(
+            embedded_style(LangKind::Html, template, 1, "const"),
+            keyword,
+            "a template is not JavaScript"
+        );
+    }
+
+    /// Negative (#1649): an empty script, and HTML with neither block,
+    /// highlight as before; and other grammars still resolve no
+    /// injections, so a JavaScript `css` tagged template stays a string.
+    #[test]
+    fn html_without_a_body_to_embed_and_other_languages_are_unchanged() {
+        let empty = "<script></script>\n<h1>Title</h1>\n";
+        assert_eq!(
+            embedded_style(LangKind::Html, empty, 1, "h1"),
+            embedded_style(LangKind::Html, "<h1>Title</h1>\n", 0, "h1")
+        );
+        let tagged = "const s = css`a { color: red }`;\n";
+        assert_ne!(
+            embedded_style(LangKind::JavaScript, tagged, 0, "color"),
+            embedded_style(LangKind::Css, "a { color: red }\n", 0, "color"),
+        );
+    }
+
+    /// #1226: the files most repositories carry, whatever they are written
+    /// in, get a language: by extension, or by a well-known name for the
+    /// ones that have none.
+    #[test]
+    fn common_repository_files_get_a_language() {
+        let cases = [
+            ("Dockerfile", LangKind::Dockerfile),
+            ("Containerfile", LangKind::Dockerfile),
+            ("Dockerfile.dev", LangKind::Dockerfile),
+            ("build.dockerfile", LangKind::Dockerfile),
+            ("Makefile", LangKind::Make),
+            ("GNUmakefile", LangKind::Make),
+            ("rules.mk", LangKind::Make),
+            ("schema.sql", LangKind::Sql),
+            ("App.java", LangKind::Java),
+            ("app.rb", LangKind::Ruby),
+            ("Gemfile", LangKind::Ruby),
+            ("Program.cs", LangKind::CSharp),
+            (".babelrc", LangKind::Json),
+            (".eslintrc", LangKind::Json),
+            ("app.code-workspace", LangKind::Json),
+            // The supported ones still resolve by extension.
+            ("main.rs", LangKind::Rust),
+        ];
+        for (name, want) in cases {
+            let path = std::path::Path::new("/repo/sub").join(name);
+            assert_eq!(lang_for_path(&path), Some(want), "{name}");
+        }
+    }
+
+    /// #1226 negative: a name that only looks like one stays Plain Text.
+    #[test]
+    fn lookalike_file_names_stay_plain_text() {
+        for name in [
+            "README",
+            "notes.txt",
+            "Makefile.am",
+            "mydockerfile",
+            "Dockerfiles",
+        ] {
+            let path = std::path::Path::new("/repo").join(name);
+            assert_eq!(lang_for_path(&path), None, "{name}");
+        }
+    }
+
+    /// #1226: older capture names map onto the standard ones, and a name
+    /// that merely starts like one is left alone.
+    #[test]
+    fn older_capture_names_map_onto_the_standard_ones() {
+        assert_eq!(
+            standard_captures("(a) @conditional (b) @float (c) @field (d) @parameter"),
+            "(a) @keyword (b) @number (c) @property (d) @variable.parameter"
+        );
+        assert_eq!(
+            standard_captures("(a) @fieldset (b) @keyword"),
+            "(a) @fieldset (b) @keyword"
+        );
+    }
+
+    /// #1465: a line comment in SQL and in a Dockerfile is coloured as a
+    /// comment. Both queries tag it `@comment @spell`, and the later,
+    /// colourless `@spell` replaced the comment colour.
+    #[test]
+    fn sql_and_dockerfile_line_comments_are_comments() {
+        let cases = [
+            (
+                LangKind::Sql,
+                "-- line comment\nSELECT 1; -- trailing comment\n/* block comment */\nSELECT 2;\n",
+                vec![
+                    (0, "-- line comment"),
+                    (1, "-- trailing comment"),
+                    (2, "/* block comment */"),
+                ],
+            ),
+            (
+                LangKind::Dockerfile,
+                "# line comment\nFROM alpine:3.20\n# install curl\nRUN apk add curl\n",
+                vec![(0, "# line comment"), (2, "# install curl")],
+            ),
+        ];
+        let p = SyntaxPalette::BASE16;
+        let comment = palette_style_for_name(&p, "comment");
+        for (kind, src, comments) in cases {
+            let mut reg = LangRegistry::new();
+            let ls = compute_line_starts(src.as_bytes());
+            let h = highlight_text_with_palette(&mut reg, kind, src.as_bytes(), &ls, &p).0;
+            for (row, text) in comments {
+                let line = src.lines().nth(row).unwrap();
+                let span = span_at(&h[row], line, text)
+                    .unwrap_or_else(|| panic!("{kind:?}: no span on {text:?}"));
+                assert_eq!(span.style, comment, "{kind:?}: {text:?} is a comment");
+            }
+        }
+    }
+
+    /// #1465 negative: the code beside those comments keeps its own colour.
+    /// Only the comments change.
+    #[test]
+    fn code_beside_sql_and_dockerfile_comments_keeps_its_colour() {
+        let p = SyntaxPalette::BASE16;
+        let keyword = palette_style_for_name(&p, "keyword");
+        for (kind, src, row, word) in [
+            (LangKind::Sql, "-- c\nSELECT 1; -- c\n", 1, "SELECT"),
+            (LangKind::Dockerfile, "# c\nFROM alpine:3.20\n", 1, "FROM"),
+        ] {
+            let mut reg = LangRegistry::new();
+            let ls = compute_line_starts(src.as_bytes());
+            let h = highlight_text_with_palette(&mut reg, kind, src.as_bytes(), &ls, &p).0;
+            let line = src.lines().nth(row).unwrap();
+            let span = span_at(&h[row], line, word)
+                .unwrap_or_else(|| panic!("{kind:?}: no span on {word:?}"));
+            assert_eq!(span.style, keyword, "{kind:?}: {word:?}");
+        }
+    }
+
+    /// #1465: a spell-check tag that follows a colour capture is dropped,
+    /// so it cannot replace the colour. Names that only start like it, and
+    /// captures in a predicate, are left alone.
+    #[test]
+    fn spell_check_tags_never_replace_a_colour_capture() {
+        assert_eq!(
+            standard_captures("(comment) @comment @spell\n(x) @keyword.directive @nospell"),
+            "(comment) @comment\n(x) @keyword.directive"
+        );
+        assert_eq!(
+            standard_captures("(a) @comment @spelling (b) @spell"),
+            "(a) @comment @spelling (b) @spell"
+        );
+    }
+
+    /// #1226: each new grammar loads and colours its keywords.
+    #[test]
+    fn each_new_grammar_colours_its_keywords() {
+        let cases = [
+            (LangKind::Java, "class A { int x = 1; }\n", "class"),
+            (LangKind::Ruby, "def greet\n  puts 1\nend\n", "def"),
+            (LangKind::CSharp, "public class A { }\n", "class"),
+            (
+                LangKind::Sql,
+                "SELECT id FROM users WHERE id = 1;\n",
+                "SELECT",
+            ),
+            (LangKind::Make, "ifeq ($(CC),gcc)\nendif\n", "ifeq"),
+            (LangKind::Dockerfile, "FROM alpine\nRUN echo hi\n", "FROM"),
+        ];
+        let p = SyntaxPalette::BASE16;
+        for (kind, src, keyword) in cases {
+            let mut reg = LangRegistry::new();
+            let ls = compute_line_starts(src.as_bytes());
+            let h = highlight_text_with_palette(&mut reg, kind, src.as_bytes(), &ls, &p).0;
+            let line0 = src.lines().next().unwrap();
+            let span = span_at(&h[0], line0, keyword)
+                .unwrap_or_else(|| panic!("{kind:?}: no span on {keyword:?}"));
+            assert_eq!(
+                span.style,
+                palette_style_for_name(&p, "keyword"),
+                "{kind:?}: {keyword:?} is a keyword"
+            );
+        }
+    }
+}

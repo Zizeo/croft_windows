@@ -1,0 +1,293 @@
+//! Terminal session restore (iTerm2 / WezTerm / Zellij's headline
+//! "never lose my workspace" feature, scoped to croft's terminal panel):
+//! the pane layout — count, order, per-pane cwd and manual name, and which
+//! pane was active — is persisted per workspace root and resurrected on
+//! the next croft launch in that workspace. Panes come back as fresh
+//! shells in their directories (running programs are not re-run).
+//!
+//! One JSON file, `~/.config/croft/terminal_sessions.json`, maps workspace
+//! root → [`SessionRecord`]. Saves happen on structural changes (split /
+//! close / rename / reorder / undo close) and at quit; a trivial record
+//! (one unnamed pane sitting at the workspace root — the default layout)
+//! is pruned so plain workspaces never accumulate entries.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+/// The worktree lane a pane was opened for (#348), so a relaunch brings the
+/// lane back as a lane: same worktree, same branch, and the agent seated
+/// again, rather than an anonymous shell that happens to sit in that
+/// directory. `agent` is the `agents.json` row name, resolved to a launch
+/// line at restore time so an edited row applies.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LaneRecord {
+    /// Lenient on read: a truncated lane object must not make the whole
+    /// store unparsable for every workspace; an empty path is simply not a
+    /// directory, so the pane comes back as an ordinary one.
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The branch the lane was cut from (#348), so "diff against the base"
+    /// survives a restart. `worktree add -b` records no start-point and the
+    /// reflog that does is local and prunable, so this is the only copy that
+    /// outlives the session that made the lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+}
+
+/// One pane to bring back.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PaneRecord {
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Set when the pane is a worktree lane's (#348); omitted otherwise, so
+    /// an older store still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<LaneRecord>,
+    /// The pane's visible output at save time, replayed above the fresh
+    /// prompt so a restored pane is not blank (#249).
+    ///
+    /// Plain text, not the raw byte stream: colours and cursor state are
+    /// lost, but a transcript cannot re-run an escape sequence that moves
+    /// the cursor or clears the screen, and it costs a bounded number of
+    /// lines rather than an unbounded byte log. Empty (and omitted from the
+    /// file) when the pane had no output worth carrying, so an older store
+    /// still parses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript: Vec<String>,
+    /// The pane host holding the pane's shell (#694), when one does: a
+    /// croft that died without closing its panes left it running, and the
+    /// next one reattaches instead of starting a fresh shell. Omitted
+    /// otherwise, so an older store still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+/// How many trailing lines of a pane's output are carried across a restart.
+/// One screenful of context is the point — enough to see what you were doing
+/// — without turning the session store into a log file.
+pub const TRANSCRIPT_LINES: usize = 200;
+
+/// A workspace's terminal panel layout.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionRecord {
+    pub panes: Vec<PaneRecord>,
+    #[serde(default)]
+    pub active: usize,
+}
+
+impl SessionRecord {
+    /// The default layout every workspace starts with; storing it would be
+    /// noise, so [`save_for_root`] prunes it instead.
+    ///
+    /// Transcripts (#249) deliberately do NOT make a record non-trivial. A
+    /// lone unnamed pane at the root is what every workspace starts with, so
+    /// keeping it for its output would grow the store for every directory
+    /// the user ever ran a shell in — including throwaway ones. The
+    /// restore-my-output case that matters is a real panel: two or more
+    /// panes, or a pane the user bothered to name. Those are kept, with
+    /// their transcripts.
+    pub fn is_trivial(&self, root: &str) -> bool {
+        match self.panes.as_slice() {
+            [] => true,
+            // A hosted pane is never trivial: its record is how a croft
+            // that crashes finds the shell again (#694).
+            [only] => only.name.is_none() && only.host.is_none() && same_dir(&only.cwd, root),
+            _ => false,
+        }
+    }
+}
+
+/// Directory equality through symlinks: a pane cwd sampled from the
+/// process table comes back canonicalised (`/private/var/…` on macOS)
+/// while the workspace root string may not be.
+fn same_dir(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// The real store path. The App caches it in a field so tests can point
+/// saves and restores at a tempdir.
+pub fn path() -> PathBuf {
+    crate::paths::config_dir().join("terminal_sessions.json")
+}
+
+/// Load the whole map for READING: a missing file is an empty map (the
+/// normal first-run state); any other failure also reads empty, since a
+/// read-only consumer can do nothing better.
+pub fn load(path: &Path) -> HashMap<String, SessionRecord> {
+    load_checked(path).unwrap_or_default()
+}
+
+/// Load for WRITING: a missing file is `Ok(empty)`, but an unreadable or
+/// unparsable one is an error — the read-modify-write in [`save_for_root`]
+/// must never treat a corrupt store as empty and silently replace every
+/// other workspace's saved layout with just the current one (#157, the
+/// workspace-folder store's #156 hazard verbatim).
+fn load_checked(path: &Path) -> Result<HashMap<String, SessionRecord>, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+/// Read-modify-write one workspace's record; a trivial record removes the
+/// key instead. Runs under [`crate::workspace::update_json_store`]'s
+/// exclusive lock (#157/#158): refuses a store that exists but cannot be
+/// read or parsed, writes atomically through a unique temp file, and
+/// serializes against concurrent croft windows.
+pub fn save_for_root(path: &Path, root: &str, record: SessionRecord) -> Result<(), String> {
+    crate::workspace::update_json_store::<SessionRecord, _>(path, |map| {
+        if record.is_trivial(root) {
+            map.remove(root);
+        } else {
+            map.insert(root.to_string(), record.clone());
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_corrupt_store_is_refused_not_replaced() {
+        // #157: treating a corrupt store as empty and writing over it
+        // silently discarded every other workspace's saved layout.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("sessions.json");
+        std::fs::write(&store, "{ not valid json").unwrap();
+        let record = SessionRecord {
+            panes: vec![PaneRecord {
+                host: None,
+                cwd: String::from("/w/a/sub"),
+                name: Some(String::from("srv")),
+                transcript: Vec::new(),
+                lane: None,
+            }],
+            active: 0,
+        };
+        assert!(
+            save_for_root(&store, "/w/a", record.clone()).is_err(),
+            "a corrupt store must refuse the update"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&store).unwrap(),
+            "{ not valid json",
+            "the corrupt bytes stay untouched"
+        );
+        assert!(load(&store).is_empty(), "read-only loads degrade to empty");
+        let fresh = tmp.path().join("fresh.json");
+        save_for_root(&fresh, "/w/a", record).unwrap();
+        assert_eq!(load(&fresh).get("/w/a").map(|r| r.panes.len()), Some(1));
+    }
+
+    #[test]
+    fn a_lane_pane_round_trips_its_lane_and_an_older_record_has_none() {
+        // #348: the lane travels with the pane, and a store written before
+        // lanes existed still parses with none.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("s.json");
+        let lane = LaneRecord {
+            path: String::from("/work/repo-fix-login"),
+            branch: String::from("agent/fix-login"),
+            agent: Some(String::from("claude")),
+            // A real base, so the round-trip below proves the field
+            // survives rather than that `None` survives (#348).
+            base: Some(String::from("main")),
+        };
+        let rec = SessionRecord {
+            panes: vec![
+                PaneRecord {
+                    host: None,
+                    cwd: String::from("/work/repo"),
+                    name: None,
+                    transcript: Vec::new(),
+                    lane: None,
+                },
+                PaneRecord {
+                    host: None,
+                    cwd: String::from("/work/repo-fix-login"),
+                    name: Some(String::from("Lane: fix-login")),
+                    transcript: Vec::new(),
+                    lane: Some(lane.clone()),
+                },
+            ],
+            active: 1,
+        };
+        save_for_root(&p, "/work/repo", rec).unwrap();
+        let back = load(&p);
+        assert_eq!(back["/work/repo"].panes[1].lane.as_ref(), Some(&lane));
+        assert_eq!(back["/work/repo"].panes[0].lane, None);
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            raw.matches("\"lane\"").count(),
+            1,
+            "omitted where there is none: {raw}"
+        );
+        let older = r#"{"/w": {"panes": [{"cwd": "/w", "name": "srv"}], "active": 0}}"#;
+        std::fs::write(&p, older).unwrap();
+        assert_eq!(load(&p)["/w"].panes[0].lane, None, "an older store parses");
+    }
+
+    #[test]
+    fn save_round_trips_and_trivial_records_prune() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("s.json");
+        let rec = SessionRecord {
+            panes: vec![
+                PaneRecord {
+                    host: None,
+                    cwd: String::from("/repo"),
+                    name: None,
+                    transcript: Vec::new(),
+                    lane: None,
+                },
+                PaneRecord {
+                    host: None,
+                    cwd: String::from("/repo/sub"),
+                    name: Some(String::from("srv")),
+                    transcript: Vec::new(),
+                    lane: None,
+                },
+            ],
+            active: 1,
+        };
+        save_for_root(&p, "/repo", rec.clone()).unwrap();
+        let map = load(&p);
+        assert_eq!(map.get("/repo"), Some(&rec));
+
+        // Back to the default single-pane layout: the key is pruned.
+        save_for_root(
+            &p,
+            "/repo",
+            SessionRecord {
+                panes: vec![PaneRecord {
+                    host: None,
+                    cwd: String::from("/repo"),
+                    name: None,
+                    transcript: Vec::new(),
+                    lane: None,
+                }],
+                active: 0,
+            },
+        )
+        .unwrap();
+        assert!(!load(&p).contains_key("/repo"));
+
+        // Corrupt files load as empty, never panic.
+        std::fs::write(&p, "not json").unwrap();
+        assert!(load(&p).is_empty());
+    }
+}

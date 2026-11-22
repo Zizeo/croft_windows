@@ -1,0 +1,1051 @@
+/// Read the host system clipboard as text.
+///
+/// On macOS, prefer NSPasteboard directly. That avoids spawning `pbpaste`
+/// from croft's already-threaded TUI process, which is both slower and more
+/// brittle under macOS's fork-safety rules.
+///
+/// On Linux, tries `wl-paste`, `xclip`, then `xsel` in that fixed order.
+pub fn read_string() -> Option<String> {
+    #[cfg(test)]
+    {
+        if !test_clip::real_clipboard_opt_in() {
+            return test_clip::mock_read();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(s) = macos::read_string_native() {
+            return Some(s);
+        }
+        read_pbpaste()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::read_string()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_pbpaste() -> Option<String> {
+    let out = std::process::Command::new("pbpaste").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Put `text` on the host system clipboard as UTF-8 plain text. Returns
+/// `true` when the write was acknowledged by the OS pasteboard.
+///
+/// On macOS we go straight to `NSPasteboard.setString:forType:` so the
+/// embedded TUI's Cmd+C lands on the system clipboard with the same
+/// guarantees as a native Cocoa app — independent of whether the host
+/// terminal (iTerm2 etc.) chooses to honour OSC 52, which empirically
+/// it does not in every environment even with `AllowClipboardAccess` set.
+/// `pbcopy` is the second fall-back so we cover the case where the
+/// objc runtime resolves but `NSPasteboard` rejects the write for some
+/// sandboxing reason.
+///
+/// On Linux, tries `wl-copy`, `xclip`, then `xsel` in that fixed order.
+/// Returns `false` only when none of those tools are available, in which
+/// case the caller falls back to OSC 52 (useful for remote SSH sessions).
+pub fn write_string(text: &str) -> bool {
+    // NSPasteboard / NSString cannot carry an embedded NUL — `stringWithUTF8String:`
+    // truncates at the first 0x00 — and silently truncating user data is far
+    // worse than refusing the write. Reject up front so the caller can decide
+    // what to do (terminal selection text already maps NUL to space in
+    // `extract_selection_text`, so this branch is defensive, not load-bearing).
+    if text.as_bytes().contains(&0) {
+        return false;
+    }
+    #[cfg(test)]
+    {
+        if !test_clip::real_clipboard_opt_in() {
+            return test_clip::mock_write(text);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if macos::write_string_native(text) {
+            return true;
+        }
+        write_pbcopy(text)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::write_string(text)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+/// What croft itself last copied, for a paste inside croft to fall back on
+/// where the host clipboard can't be read (#933). On a Linux host with no
+/// `wl-paste`, `xclip` or `xsel`, which is any SSH server, a copy reaches
+/// the user's own machine by OSC 52, and nothing can read that back, so
+/// Ctrl+V and vim's `p` came up empty after every copy and yank.
+///
+/// One for the whole process, as the host clipboard is: a copy is seen by
+/// every paste, whichever thread made it.
+#[cfg(not(test))]
+static LAST_COPY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Keep `text` as croft's last copy, for [`last_copy`].
+pub fn remember_copy(text: &str) {
+    #[cfg(test)]
+    {
+        test_clip::remember_copy(text);
+    }
+    #[cfg(not(test))]
+    {
+        if let Ok(mut last) = LAST_COPY.lock() {
+            *last = Some(text.to_owned());
+        }
+    }
+}
+
+/// The text croft last copied, if it copied anything yet (#933).
+pub fn last_copy() -> Option<String> {
+    #[cfg(test)]
+    {
+        test_clip::last_copy()
+    }
+    #[cfg(not(test))]
+    {
+        LAST_COPY.lock().ok().and_then(|last| last.clone())
+    }
+}
+
+/// Copy `text` by OSC 52: escape bytes on stdout that ask the terminal croft
+/// draws in to set the clipboard of the machine that terminal runs on. Best
+/// effort, since whether the terminal acts on them is its choice. Under test
+/// the request is only recorded, so a test run never sets the developer's
+/// clipboard through the terminal it runs in.
+pub fn send_osc52(text: &str) {
+    #[cfg(test)]
+    {
+        test_clip::record_osc52(text);
+    }
+    #[cfg(not(test))]
+    {
+        use std::io::Write;
+        let bytes = crate::widgets::terminal::osc52_copy_seq(text);
+        let mut out = std::io::stdout();
+        let _ = out.write_all(&bytes);
+        let _ = out.flush();
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    /// Write `text` to the system clipboard on Linux.
+    ///
+    /// Tries `wl-copy`, then `xclip`, then `xsel`. Returns `true`
+    /// when one of them succeeded. Returns `false` when none are installed,
+    /// which happens in headless SSH sessions — the caller sends OSC 52 then.
+    pub fn write_string(text: &str) -> bool {
+        // One deadline for the whole copy, fallbacks included, as for paste.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        write_via(&["wl-copy"], text, deadline)
+            || write_via(&["xclip", "-selection", "clipboard"], text, deadline)
+            || write_via(&["xsel", "--clipboard", "--input"], text, deadline)
+    }
+
+    fn write_via(argv: &[&str], text: &str, deadline: std::time::Instant) -> bool {
+        // Bounded by `deadline`, through the program's exit (#1154): a copy
+        // runs on the UI thread, and a helper that never exits (xclip on an
+        // X display that never answers) froze croft for good. The text goes
+        // in on a thread, so a helper that never reads its stdin can't block
+        // a write past the pipe buffer either.
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        let Ok(mut child) = Command::new(argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+        else {
+            return false;
+        };
+        let Some(mut stdin) = child.stdin.take() else {
+            give_up(&mut child);
+            return false;
+        };
+        let bytes = text.as_bytes().to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let written = stdin.write_all(&bytes).is_ok();
+            drop(stdin);
+            let _ = tx.send(written);
+        });
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if rx.recv_timeout(left) != Ok(true) {
+            give_up(&mut child);
+            return false;
+        }
+        wait_by(&mut child, deadline).is_some_and(|s| s.success())
+    }
+
+    /// Kill a helper croft has stopped waiting on, with everything it
+    /// started, and reap it. Its own group (`process_group(0)` at spawn),
+    /// because a child it forked keeps the pipe open: croft's writer thread
+    /// stayed blocked until that child exited, then wrote into a closed pipe.
+    fn give_up(child: &mut std::process::Child) {
+        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: a negative pid addresses the helper's own process
+            // group; the call only sends a signal.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The helper's exit status, or None (and the helper killed) once
+    /// `deadline` passes first.
+    fn wait_by(
+        child: &mut std::process::Child,
+        deadline: std::time::Instant,
+    ) -> Option<std::process::ExitStatus> {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                _ => {
+                    give_up(child);
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Read text from the system clipboard on Linux.
+    ///
+    /// Tries `wl-paste`, then `xclip`, then `xsel`.
+    pub fn read_string() -> Option<String> {
+        // `--no-newline`: wl-paste appends `\n` to text otherwise. `--type
+        // text`: any text type, never an image's bytes when an image is on
+        // the clipboard.
+        // One deadline for the whole paste, fallbacks included: a fresh
+        // budget per program let three hung readers freeze croft for 6s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        read_via(&["wl-paste", "--no-newline", "--type", "text"], deadline)
+            .or_else(|| read_via(&["xclip", "-selection", "clipboard", "-o"], deadline))
+            .or_else(|| read_via(&["xsel", "--clipboard", "--output"], deadline))
+    }
+
+    fn read_via(argv: &[&str], deadline: std::time::Instant) -> Option<String> {
+        use std::io::Read;
+        // Bounded by `deadline`, through the program's exit: a paste runs on
+        // the UI thread, and a clipboard owner that never answers (a hung X
+        // client holding the selection) would freeze croft for as long as
+        // xclip waits on it.
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let mut child = Command::new(argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .ok()?;
+        let mut stdout = child.stdout.take()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            let _ = tx.send(buf);
+        });
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let Ok(bytes) = rx.recv_timeout(left) else {
+            give_up(&mut child);
+            return None;
+        };
+        // Stdout closing is not exiting: a program can close it and keep
+        // running, so the wait is bounded too.
+        let status = wait_by(&mut child, deadline)?;
+        if !status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        fn soon() -> std::time::Instant {
+            std::time::Instant::now() + std::time::Duration::from_secs(1)
+        }
+
+        /// #1154: a copy helper that never exits is given up on at the
+        /// deadline, and so is one that never reads the text it's handed.
+        #[test]
+        fn a_clipboard_writer_that_never_exits_is_given_up_on() {
+            let started = std::time::Instant::now();
+            assert!(!super::write_via(
+                &["sh", "-c", "cat >/dev/null; sleep 30"],
+                "hi",
+                soon()
+            ));
+            let big = "x".repeat(1 << 20);
+            assert!(!super::write_via(&["sh", "-c", "sleep 30"], &big, soon()));
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "took {:?}",
+                started.elapsed()
+            );
+        }
+
+        /// Whether `pid` has exited (or is a zombie no one has reaped yet),
+        /// polled for up to two seconds.
+        fn gone_soon(pid: &str) -> bool {
+            let stat = format!("/proc/{pid}/stat");
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                let state = std::fs::read_to_string(&stat)
+                    .ok()
+                    .and_then(|s| s.rsplit(") ").next().map(|t| t.starts_with('Z')));
+                if state.unwrap_or(true) {
+                    return true;
+                }
+                if std::time::Instant::now() >= until {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        /// A helper croft gives up on takes what it started with it. A child
+        /// left holding the pipe kept croft's writer thread blocked until it
+        /// exited on its own, and that late write raised SIGPIPE, which
+        /// killed the whole test binary in CI.
+        #[test]
+        fn giving_up_on_a_clipboard_writer_kills_what_it_started() {
+            let dir = tempfile::tempdir().unwrap();
+            let pidfile = dir.path().join("pid");
+            let script = format!("sleep 30 <&0 & echo $! > '{}'; wait", pidfile.display());
+            let big = "x".repeat(1 << 20);
+            assert!(!super::write_via(&["sh", "-c", &script], &big, soon()));
+            let pid = std::fs::read_to_string(&pidfile).unwrap();
+            let pid = pid.trim();
+            assert!(
+                gone_soon(pid),
+                "the helper's child {pid} outlived the give-up"
+            );
+        }
+
+        /// The same for a paste: a reader croft gives up on doesn't leave a
+        /// child holding its stdout.
+        #[test]
+        fn giving_up_on_a_clipboard_reader_kills_what_it_started() {
+            let dir = tempfile::tempdir().unwrap();
+            let pidfile = dir.path().join("pid");
+            let script = format!("sleep 30 & echo $! > '{}'; wait", pidfile.display());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            assert_eq!(super::read_via(&["sh", "-c", &script], deadline), None);
+            let pid = std::fs::read_to_string(&pidfile).unwrap();
+            let pid = pid.trim();
+            assert!(
+                gone_soon(pid),
+                "the helper's child {pid} outlived the give-up"
+            );
+        }
+
+        /// Negative: a helper that copies and exits keeps what it left
+        /// behind, as xclip and wl-copy leave a process serving the
+        /// selection. Only a helper croft gives up on loses its children.
+        #[test]
+        fn a_clipboard_writer_that_copies_keeps_what_it_left_running() {
+            let dir = tempfile::tempdir().unwrap();
+            let pidfile = dir.path().join("pid");
+            let script = format!(
+                "cat >/dev/null; sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}'",
+                pidfile.display()
+            );
+            assert!(super::write_via(&["sh", "-c", &script], "kept", soon()));
+            let pid = std::fs::read_to_string(&pidfile).unwrap();
+            let pid = pid.trim();
+            assert!(!gone_soon(pid), "the selection server {pid} was killed");
+            let _ = std::process::Command::new("kill").arg(pid).status();
+        }
+
+        /// A helper that takes the text and exits still copies, a failing
+        /// one doesn't, and a spent deadline starts nothing.
+        #[test]
+        fn a_clipboard_writer_that_exits_still_copies() {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("clip");
+            let sink = format!("cat > '{}'", out.display());
+            assert!(super::write_via(&["sh", "-c", &sink], "copied", soon()));
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), "copied");
+            assert!(!super::write_via(
+                &["sh", "-c", "cat >/dev/null; exit 1"],
+                "x",
+                soon()
+            ));
+            std::fs::remove_file(&out).unwrap();
+            assert!(!super::write_via(
+                &["sh", "-c", &sink],
+                "late",
+                std::time::Instant::now()
+            ));
+            assert!(!out.exists(), "nothing ran");
+        }
+
+        #[test]
+        fn a_clipboard_reader_that_never_answers_is_given_up_on() {
+            let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let started = std::time::Instant::now();
+            assert_eq!(super::read_via(&["sh", "-c", "sleep 30"], deadline()), None);
+            // Closing stdout and staying alive is bounded too.
+            assert_eq!(
+                super::read_via(&["sh", "-c", "exec 1>&-; sleep 30"], deadline()),
+                None
+            );
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            // A spent deadline starts nothing.
+            let past = std::time::Instant::now();
+            assert_eq!(super::read_via(&["sh", "-c", "printf foo"], past), None);
+            assert_eq!(
+                super::read_via(&["sh", "-c", "printf foo"], deadline()).as_deref(),
+                Some("foo")
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn write_pbcopy(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let Ok(mut child) = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.wait();
+        return false;
+    };
+    if stdin.write_all(text.as_bytes()).is_err() {
+        let _ = child.wait();
+        return false;
+    }
+    drop(stdin);
+    child.wait().map(|st| st.success()).unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) mod macos {
+    use std::ffi::CStr;
+    use std::os::raw::{c_char, c_void};
+
+    type ObjcId = *mut c_void;
+    type Sel = *mut c_void;
+
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const c_char) -> ObjcId;
+        fn sel_registerName(name: *const c_char) -> Sel;
+        fn objc_autoreleasePoolPush() -> *mut c_void;
+        fn objc_autoreleasePoolPop(pool: *mut c_void);
+        fn objc_msgSend();
+    }
+
+    #[link(name = "AppKit", kind = "framework")]
+    unsafe extern "C" {}
+
+    pub fn read_string_native() -> Option<String> {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let result = read_string_native_inner();
+            objc_autoreleasePoolPop(pool);
+            result
+        }
+    }
+
+    unsafe fn read_string_native_inner() -> Option<String> {
+        unsafe {
+            let pasteboard_class = class(b"NSPasteboard\0")?;
+            let pasteboard = msg_send_id(pasteboard_class, sel(b"generalPasteboard\0")?);
+            if pasteboard.is_null() {
+                return None;
+            }
+
+            for type_name in [
+                b"public.utf8-plain-text\0".as_slice(),
+                b"public.plain-text\0".as_slice(),
+                b"public.text\0".as_slice(),
+                b"NSStringPboardType\0".as_slice(),
+            ] {
+                if let Some(value) = pasteboard_string_for_type(pasteboard, type_name) {
+                    return Some(value);
+                }
+            }
+
+            None
+        }
+    }
+
+    unsafe fn pasteboard_string_for_type(
+        pasteboard: ObjcId,
+        type_name: &'static [u8],
+    ) -> Option<String> {
+        unsafe {
+            let string_class = class(b"NSString\0")?;
+            let pasteboard_type = msg_send_id_ptr(
+                string_class,
+                sel(b"stringWithUTF8String:\0")?,
+                type_name.as_ptr().cast(),
+            );
+            if pasteboard_type.is_null() {
+                return None;
+            }
+
+            let value = msg_send_id_id(pasteboard, sel(b"stringForType:\0")?, pasteboard_type);
+            if value.is_null() {
+                return None;
+            }
+            let utf8 = msg_send_ptr(value, sel(b"UTF8String\0")?);
+            if utf8.is_null() {
+                return None;
+            }
+
+            Some(CStr::from_ptr(utf8).to_string_lossy().into_owned())
+        }
+    }
+
+    unsafe fn class(name: &'static [u8]) -> Option<ObjcId> {
+        let c = unsafe { objc_getClass(name.as_ptr().cast()) };
+        (!c.is_null()).then_some(c)
+    }
+
+    unsafe fn sel(name: &'static [u8]) -> Option<Sel> {
+        let s = unsafe { sel_registerName(name.as_ptr().cast()) };
+        (!s.is_null()).then_some(s)
+    }
+
+    unsafe fn msg_send_id(receiver: ObjcId, selector: Sel) -> ObjcId {
+        unsafe {
+            let f: unsafe extern "C" fn(ObjcId, Sel) -> ObjcId =
+                std::mem::transmute(objc_msgSend as *const ());
+            f(receiver, selector)
+        }
+    }
+
+    unsafe fn msg_send_id_ptr(receiver: ObjcId, selector: Sel, arg: *const c_char) -> ObjcId {
+        unsafe {
+            let f: unsafe extern "C" fn(ObjcId, Sel, *const c_char) -> ObjcId =
+                std::mem::transmute(objc_msgSend as *const ());
+            f(receiver, selector, arg)
+        }
+    }
+
+    unsafe fn msg_send_id_id(receiver: ObjcId, selector: Sel, arg: ObjcId) -> ObjcId {
+        unsafe {
+            let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId) -> ObjcId =
+                std::mem::transmute(objc_msgSend as *const ());
+            f(receiver, selector, arg)
+        }
+    }
+
+    unsafe fn msg_send_ptr(receiver: ObjcId, selector: Sel) -> *const c_char {
+        unsafe {
+            let f: unsafe extern "C" fn(ObjcId, Sel) -> *const c_char =
+                std::mem::transmute(objc_msgSend as *const ());
+            f(receiver, selector)
+        }
+    }
+
+    pub fn write_string_native(text: &str) -> bool {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let ok = write_string_inner(text);
+            objc_autoreleasePoolPop(pool);
+            ok
+        }
+    }
+
+    /// Wipe NSPasteboard's contents. Used by the test guard's drop path
+    /// to wipe a leftover test sentinel when no prior clipboard text was
+    /// snapshotted at acquire-time.
+    #[cfg(test)]
+    pub fn clear_native() {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            clear_inner();
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    #[cfg(test)]
+    unsafe fn clear_inner() {
+        unsafe {
+            let Some(pb_class) = class(b"NSPasteboard\0") else {
+                return;
+            };
+            let Some(general_sel) = sel(b"generalPasteboard\0") else {
+                return;
+            };
+            let pasteboard = msg_send_id(pb_class, general_sel);
+            if pasteboard.is_null() {
+                return;
+            }
+            let Some(clear_sel) = sel(b"clearContents\0") else {
+                return;
+            };
+            let _ = msg_send_isize(pasteboard, clear_sel);
+        }
+    }
+
+    unsafe fn write_string_inner(text: &str) -> bool {
+        unsafe {
+            let Some(pb_class) = class(b"NSPasteboard\0") else {
+                return false;
+            };
+            let Some(general_sel) = sel(b"generalPasteboard\0") else {
+                return false;
+            };
+            let pasteboard = msg_send_id(pb_class, general_sel);
+            if pasteboard.is_null() {
+                return false;
+            }
+
+            let Some(clear_sel) = sel(b"clearContents\0") else {
+                return false;
+            };
+            let _ = msg_send_isize(pasteboard, clear_sel);
+
+            let Some(nsstring_class) = class(b"NSString\0") else {
+                return false;
+            };
+            let Some(utf8_sel) = sel(b"stringWithUTF8String:\0") else {
+                return false;
+            };
+
+            let Ok(payload) = std::ffi::CString::new(text) else {
+                return false;
+            };
+            let value = msg_send_id_ptr(nsstring_class, utf8_sel, payload.as_ptr());
+            if value.is_null() {
+                return false;
+            }
+
+            let Ok(type_cstr) = std::ffi::CString::new("public.utf8-plain-text") else {
+                return false;
+            };
+            let type_nsstr = msg_send_id_ptr(nsstring_class, utf8_sel, type_cstr.as_ptr());
+            if type_nsstr.is_null() {
+                return false;
+            }
+
+            let Some(set_string_sel) = sel(b"setString:forType:\0") else {
+                return false;
+            };
+            msg_send_bool_id_id(pasteboard, set_string_sel, value, type_nsstr)
+        }
+    }
+
+    unsafe fn msg_send_isize(receiver: ObjcId, selector: Sel) -> isize {
+        unsafe {
+            let f: unsafe extern "C" fn(ObjcId, Sel) -> isize =
+                std::mem::transmute(objc_msgSend as *const ());
+            f(receiver, selector)
+        }
+    }
+
+    unsafe fn msg_send_bool_id_id(
+        receiver: ObjcId,
+        selector: Sel,
+        arg1: ObjcId,
+        arg2: ObjcId,
+    ) -> bool {
+        unsafe {
+            let f: unsafe extern "C" fn(ObjcId, Sel, ObjcId, ObjcId) -> u8 =
+                std::mem::transmute(objc_msgSend as *const ());
+            f(receiver, selector, arg1, arg2) != 0
+        }
+    }
+}
+
+/// Test-only support for keeping clipboard tests deterministic.
+///
+/// Under `cargo test` the binary's tests run on a shared thread pool. If
+/// `write_string` always went to the real `NSPasteboard`, every test in
+/// the crate that exercises a copy gesture (terminal copy, editor copy,
+/// editor cut, kill-to-EOL, ring-yank, …) would stomp on the host
+/// clipboard concurrently with the clipboard regression tests, and the
+/// round-trip assertions would flake on whichever write landed last.
+///
+/// The chosen design: `write_string` and `read_string` route to a
+/// per-thread mock by default during tests. Tests that need to prove the
+/// real macOS pasteboard path (the FFI bridge in `mod macos`) opt in
+/// explicitly via `lock_clipboard_for_test`, which:
+///   * Acquires a process-global `Mutex` so only one test at a time
+///     drives the real OS clipboard.
+///   * Flips the per-thread `REAL_OPT_IN` cell to `true` so
+///     `write_string` / `read_string` skip the mock for the duration
+///     of the guard.
+#[cfg(test)]
+pub(crate) mod test_clip {
+    use std::cell::{Cell, RefCell};
+    use std::sync::{Mutex, MutexGuard};
+
+    pub(crate) static CLIP_LOCK: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        static REAL_OPT_IN: Cell<bool> = const { Cell::new(false) };
+        static MOCK: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn real_clipboard_opt_in() -> bool {
+        REAL_OPT_IN.with(|c| c.get())
+    }
+
+    pub(crate) fn mock_write(text: &str) -> bool {
+        MOCK.with(|b| *b.borrow_mut() = Some(text.to_string()));
+        true
+    }
+
+    pub(crate) fn mock_read() -> Option<String> {
+        MOCK.with(|b| b.borrow().clone())
+    }
+
+    thread_local! {
+        /// `super::LAST_COPY` in tests: per thread like the mock, so one
+        /// test's copy is never another's paste.
+        static LAST_COPY: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn remember_copy(text: &str) {
+        LAST_COPY.with(|b| *b.borrow_mut() = Some(text.to_string()));
+    }
+
+    pub(crate) fn last_copy() -> Option<String> {
+        LAST_COPY.with(|b| b.borrow().clone())
+    }
+
+    thread_local! {
+        /// What `super::send_osc52` was asked to send on this thread.
+        static OSC52_SENT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn record_osc52(text: &str) {
+        OSC52_SENT.with(|b| b.borrow_mut().push(text.to_string()));
+    }
+
+    /// The OSC 52 copies this thread sent since the last call, oldest first.
+    pub(crate) fn take_osc52_sent() -> Vec<String> {
+        OSC52_SENT.with(|b| std::mem::take(&mut *b.borrow_mut()))
+    }
+
+    /// Read the host clipboard through the platform-native backend, bypassing
+    /// the opt-in routing. Used to snapshot the real clipboard before a
+    /// real-clipboard test runs so it can be restored afterwards.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn native_read() -> Option<String> {
+        #[cfg(target_os = "macos")]
+        {
+            super::macos::read_string_native()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            super::linux::read_string()
+        }
+    }
+
+    /// Restore the host clipboard to `prev` (or wipe it if there was nothing),
+    /// through the platform-native backend.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn native_restore(prev: Option<String>) {
+        match prev {
+            Some(text) => {
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = super::macos::write_string_native(&text);
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = super::linux::write_string(&text);
+                }
+            }
+            None => {
+                #[cfg(target_os = "macos")]
+                {
+                    super::macos::clear_native();
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    // Linux has no "clear"; overwriting with empty is the
+                    // closest equivalent and a no-op when no backend exists.
+                    let _ = super::linux::write_string("");
+                }
+            }
+        }
+    }
+
+    /// Guard returned by `lock_clipboard_for_test`. While held, the
+    /// current thread's `write_string` / `read_string` calls bypass the
+    /// per-thread mock and exercise the real OS clipboard, and no
+    /// other test — in this process or any other — drives the clipboard
+    /// concurrently.
+    ///
+    /// On macOS and Linux the guard also snapshots the system clipboard at
+    /// acquire-time and restores it on drop, so a `cargo test` run never
+    /// leaves a test sentinel (e.g. `croft-terminal-cmdc-<pid>`) sitting
+    /// on the developer's real clipboard for the next paste to surface.
+    /// (On a headless box with no clipboard backend the snapshot is `None`
+    /// and restore is a harmless no-op.)
+    pub(crate) struct ClipboardTestGuard {
+        _mutex: MutexGuard<'static, ()>,
+        /// Cross-process exclusion: a process-per-test runner
+        /// (cargo-nextest) gives every test its own process, so
+        /// `CLIP_LOCK` alone cannot keep two tests off the ONE system
+        /// pasteboard. An exclusive advisory lock on a well-known file
+        /// extends the exclusion across processes; the kernel releases
+        /// it when the file closes on drop — including when a test
+        /// process dies, so a killed test can never wedge the rest.
+        ///
+        /// The lock file lives under the checkout's own `target/`, not
+        /// the shared temp dir: every test process of a run compiles
+        /// from the same checkout (so they agree on the path), and a
+        /// user-owned directory means no other local user can pre-plant
+        /// a symlink at the predictable name and have `open` clobber
+        /// its target.
+        _file_lock: std::fs::File,
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        snapshot: Option<String>,
+    }
+
+    impl ClipboardTestGuard {
+        pub(crate) fn acquire() -> Self {
+            let mutex = CLIP_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let lock_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+            std::fs::create_dir_all(&lock_dir).expect("clipboard test lock dir must exist");
+            let file_lock = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(lock_dir.join("croft-clipboard-test.lock"))
+                .expect("clipboard test lock file must open");
+            loop {
+                match file_lock.lock() {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => panic!("clipboard test file lock failed: {e}"),
+                }
+            }
+            // Snapshot only once BOTH locks are held: until then the
+            // pasteboard may hold another test process's sentinel, and
+            // restoring that on drop would hand it to the next paste.
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            let snapshot = native_read();
+            REAL_OPT_IN.with(|c| c.set(true));
+            Self {
+                _mutex: mutex,
+                _file_lock: file_lock,
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                snapshot,
+            }
+        }
+    }
+
+    impl Drop for ClipboardTestGuard {
+        fn drop(&mut self) {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            native_restore(self.snapshot.take());
+            REAL_OPT_IN.with(|c| c.set(false));
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn lock_clipboard_for_test() -> test_clip::ClipboardTestGuard {
+    test_clip::ClipboardTestGuard::acquire()
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    fn lock_clipboard() -> test_clip::ClipboardTestGuard {
+        lock_clipboard_for_test()
+    }
+
+    fn unique_sentinel(label: &str) -> String {
+        format!(
+            "croft-clip-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )
+    }
+
+    #[test]
+    fn write_string_lands_text_on_nspasteboard_for_pbpaste_to_read() {
+        let _g = lock_clipboard();
+        let sentinel = unique_sentinel("plain");
+        assert!(
+            write_string(&sentinel),
+            "write_string must succeed on macOS via NSPasteboard"
+        );
+        let got = read_string().expect("read_string must surface clipboard text");
+        assert_eq!(
+            got, sentinel,
+            "what we just wrote with NSPasteboard.setString:forType: must be exactly what NSPasteboard.stringForType: returns next - if this ever drifts, Cmd+C in the croft terminal silently fails for the user"
+        );
+    }
+
+    #[test]
+    fn write_string_overwrites_previous_clipboard_contents() {
+        let _g = lock_clipboard();
+        let first = unique_sentinel("first");
+        let second = unique_sentinel("second");
+        assert!(write_string(&first));
+        assert!(write_string(&second));
+        assert_eq!(
+            read_string().as_deref(),
+            Some(second.as_str()),
+            "the second copy must overwrite the first - clearContents+setString:forType: must not append"
+        );
+    }
+
+    #[test]
+    fn write_string_round_trips_unicode_payloads() {
+        let _g = lock_clipboard();
+        let sentinel = format!("héllo · 世界 · 🦀 · {}", unique_sentinel("unicode"));
+        assert!(write_string(&sentinel));
+        assert_eq!(
+            read_string().as_deref(),
+            Some(sentinel.as_str()),
+            "multi-byte UTF-8 must round-trip - the embedded shell happily produces emoji and CJK and the clipboard must not mangle them"
+        );
+    }
+
+    #[test]
+    fn write_string_round_trips_multi_line_payloads() {
+        let _g = lock_clipboard();
+        let body = "first\nsecond\nthird";
+        let sentinel = format!("{body}-{}", unique_sentinel("multiline"));
+        assert!(write_string(&sentinel));
+        let got = read_string().expect("clipboard read");
+        assert_eq!(
+            got, sentinel,
+            "newline-separated terminal selections must round-trip verbatim"
+        );
+    }
+
+    #[test]
+    fn write_string_rejects_payloads_containing_a_nul_byte_without_panicking() {
+        let _g = lock_clipboard();
+        let baseline = unique_sentinel("baseline");
+        assert!(write_string(&baseline));
+        let with_nul = "before\0after";
+        assert!(
+            !write_string(with_nul),
+            "embedded nul byte must surface as a clean false from write_string instead of panicking inside the FFI bridge"
+        );
+        assert_eq!(
+            read_string().as_deref(),
+            Some(baseline.as_str()),
+            "a failed write must not clobber the previous clipboard contents"
+        );
+    }
+
+    #[test]
+    fn macos_native_write_string_succeeds_directly() {
+        let _g = lock_clipboard();
+        let sentinel = unique_sentinel("native-direct");
+        assert!(
+            macos::write_string_native(&sentinel),
+            "the NSPasteboard FFI bridge itself must succeed on macOS - if this fails, pbcopy will be the production fallback and we'll know the bridge regressed"
+        );
+        assert_eq!(read_string().as_deref(), Some(sentinel.as_str()));
+    }
+}
+
+/// Linux-backend parity for the clipboard round-trip the macOS tests above
+/// cover via NSPasteboard. Exercises the real `wl-copy`/`xclip`/`xsel` path
+/// through `write_string`/`read_string` (the test guard snapshots and restores
+/// the developer's clipboard, so no sentinel leaks). On a headless box with
+/// none of those tools installed, `write_string` returns `false` and the test
+/// skips cleanly rather than failing — the same graceful degradation the
+/// production OSC-52 fallback relies on.
+#[cfg(all(test, target_os = "linux"))]
+mod linux_backend_tests {
+    use super::*;
+
+    #[test]
+    fn write_then_read_round_trips_when_a_clipboard_backend_is_available() {
+        let _g = lock_clipboard_for_test();
+        let sentinel = format!(
+            "croft-linux-clip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        if !write_string(&sentinel) {
+            // No wl-copy/xclip/xsel on this box (headless CI/SSH): nothing to
+            // assert against. Treat as skipped, not failed.
+            eprintln!(
+                "linux_backend_tests: no clipboard backend (wl-copy/xclip/xsel) available — skipping"
+            );
+            return;
+        }
+        assert_eq!(
+            read_string().as_deref(),
+            Some(sentinel.as_str()),
+            "a Linux clipboard backend must return exactly what write_string just put on it"
+        );
+    }
+}
+
+/// Parity for platforms with no integrated clipboard backend (e.g. Android,
+/// where the freedesktop tools don't exist): `write_string`/`read_string` must
+/// fail soft — `false` / `None`, never a panic — so the caller's OSC-52
+/// fallback can take over. Mirrors the macOS and Linux coverage above for the
+/// "no native backend" arm of the cfg cascade.
+#[cfg(all(test, not(any(target_os = "macos", target_os = "linux"))))]
+mod other_os_backend_tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_is_a_graceful_no_op_without_a_native_backend() {
+        let _g = lock_clipboard_for_test();
+        assert!(
+            !write_string("croft-no-backend-probe"),
+            "without a native backend, write_string must report false so the caller falls back to OSC 52"
+        );
+        assert_eq!(
+            read_string(),
+            None,
+            "without a native backend, read_string must yield None rather than panic"
+        );
+    }
+}

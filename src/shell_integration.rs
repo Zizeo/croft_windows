@@ -1,0 +1,1539 @@
+//! Shell-integration escape sequences: the OSC 133 / 7 / 9 sniffer and the
+//! shell hooks that emit them.
+//!
+//! Modern terminals (VS Code, Ghostty, iTerm2, WezTerm, Kitty) build their
+//! command-aware features on FinalTerm's OSC 133 semantic prompt marks:
+//! `133;A` prompt start, `133;B` prompt end, `133;C` command output start,
+//! `133;D;<exit>` command finished. OSC 7 reports the shell's cwd, OSC 9
+//! carries a desktop-notification payload, and so do the urxvt form
+//! (`777;notify;title;body`, also Ghostty's, foot's and WezTerm's) and
+//! kitty's (`99;metadata;payload`). OSC 7501 is a program reporting its own
+//! status ([`crate::program_status`]), which agent panes read.
+//!
+//! `alacritty_terminal` drops unknown OSC sequences before they reach any
+//! handler (they are parsed and logged internally), so croft cannot observe
+//! them through the grid. Instead the PTY reader thread tees each raw byte
+//! chunk through [`OscSniffer::scan`] *before* advancing the parser — the
+//! same pattern as the port sniffer and the bracketed-paste sniffer. The
+//! returned chunk offsets let the reader split its `Processor::advance`
+//! calls at each mark so the grid cursor can be sampled exactly where the
+//! mark landed.
+//!
+//! The shell only emits these sequences when integration hooks are
+//! installed. [`ensure_zsh_shim`] materialises a `ZDOTDIR` shim (the VS Code
+//! / Ghostty approach): zsh reads croft's dotfiles, which source the user's
+//! real ones and then add `precmd`/`preexec` hooks that print the marks.
+
+use std::io::Write;
+use std::path::PathBuf;
+
+/// A shell-integration event extracted from the PTY byte stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OscEvent {
+    /// OSC 133;A — the shell is about to draw its prompt.
+    PromptStart,
+    /// OSC 133;B — the prompt is done; user input starts here.
+    PromptEnd,
+    /// OSC 133;C — the command was accepted and its output starts.
+    CommandStart,
+    /// OSC 133;D;<exit> — the command finished. `None` when the shell
+    /// omitted the exit code.
+    CommandEnd(Option<i32>),
+    /// OSC 7;file://host/path — the shell's current working directory plus
+    /// the reporting host (None for an empty authority or a bare path).
+    Cwd(PathBuf, Option<String>),
+    /// OSC 9;<message> — a notification payload. OSC 777 `notify` and
+    /// OSC 99 notifications arrive here too, as `title: body` when they
+    /// carry both.
+    Notify(String),
+    /// OSC 9;4;<state>;<percent> — ConEmu progress (systemd, winget, cargo
+    /// wrappers; Ghostty/WezTerm render it natively): state 0 clears,
+    /// 1 normal, 2 error, 3 indeterminate, 4 warning/paused. Percent is
+    /// clamped to 100 (0 when absent).
+    Progress(u8, u8),
+    /// OSC 1337 `File=…;inline=1:<base64>` (iTerm2's imgcat protocol) — the
+    /// decoded image bytes a program printed into the pane. alacritty drops
+    /// the sequence as unknown OSC, so this tee is the only way the picture
+    /// survives to be drawn as an overlay.
+    InlineImage(Vec<u8>),
+    /// OSC 7501 — a program reporting its own status, or probing whether
+    /// the terminal takes such reports ([`crate::program_status`]).
+    ProgramStatus(crate::program_status::Report),
+}
+
+/// Incremental scanner for the OSC sequences croft cares about. Feed it
+/// every raw PTY chunk in order; it carries partial sequences across chunk
+/// boundaries. Unrelated bytes and unrelated escape sequences are ignored.
+#[derive(Default)]
+pub struct OscSniffer {
+    /// Bytes of an OSC sequence that started near the end of the previous
+    /// chunk but has not terminated yet (capped, see [`CARRY_MAX`]).
+    carry: Vec<u8>,
+    /// A kitty notification whose earlier chunks (`d=0`) arrived and whose
+    /// last one has not.
+    kitty: Option<KittyNote>,
+}
+
+/// The chunks of one kitty OSC 99 notification gathered so far.
+#[derive(Default)]
+struct KittyNote {
+    id: String,
+    title: KittyField,
+    body: KittyField,
+}
+
+/// One field (title or body) of a kitty notification. Base64 chunks are
+/// one continuous stream: a chunk may end mid-quantum and leave its
+/// padding to a later one, so undecoded tail bytes wait in `pending`, and
+/// the decoded bytes become text only once the notification is complete
+/// (a multibyte character may straddle two chunks).
+#[derive(Default, Clone)]
+struct KittyField {
+    bytes: Vec<u8>,
+    pending: Vec<u8>,
+}
+
+/// Base64 for kitty payloads: the protocol allows the padding to be left
+/// off, so it is accepted either way.
+const KITTY_B64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    base64::engine::GeneralPurposeConfig::new()
+        .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+);
+
+impl KittyField {
+    /// Append one chunk's payload; `None` if it is not valid base64.
+    fn push(&mut self, payload: &str, b64: bool) -> Option<()> {
+        use base64::Engine;
+        if !b64 {
+            self.finish()?;
+            self.bytes.extend_from_slice(payload.as_bytes());
+            return Some(());
+        }
+        self.pending.extend_from_slice(payload.trim().as_bytes());
+        // Padding ends a stream segment; otherwise decode whole quanta and
+        // keep the remainder for the next chunk.
+        let n = if self.pending.contains(&b'=') {
+            self.pending.len()
+        } else {
+            self.pending.len() / 4 * 4
+        };
+        let raw = KITTY_B64.decode(&self.pending[..n]).ok()?;
+        self.bytes.extend_from_slice(&raw);
+        self.pending.drain(..n);
+        Some(())
+    }
+
+    /// Decode whatever tail is still pending (an unpadded final chunk).
+    fn finish(&mut self) -> Option<()> {
+        use base64::Engine;
+        if !self.pending.is_empty() {
+            let raw = KITTY_B64.decode(&self.pending).ok()?;
+            self.bytes.extend_from_slice(&raw);
+            self.pending.clear();
+        }
+        Some(())
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len() + self.pending.len()
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+}
+
+/// A sniffed event plus the offset *just past* its terminator, in the
+/// coordinates of the chunk passed to `scan`. The reader thread advances
+/// the VT parser up to `end` before recording the event, so the grid
+/// cursor is sampled exactly where the mark landed.
+pub type SniffedEvent = (usize, OscEvent);
+
+/// Longest partial sequence carried across chunks before giving up (a
+/// legitimate OSC 133/7/9 is far shorter; this bounds a hostile stream).
+const CARRY_MAX: usize = 4096;
+
+/// Carry cap for kitty OSC 99 sequences: the protocol allows a 4096-byte
+/// payload on its own, plus the prefix, metadata and terminator around it.
+const KITTY_CARRY_MAX: usize = CARRY_MAX + 1024;
+
+/// Carry cap for OSC 1337 inline-image sequences, whose base64 body is
+/// legitimately megabytes. Bounds memory against a hostile or runaway
+/// stream; a photo past ~6MB of pixels is dropped rather than buffered
+/// forever. (The carry is re-prepended per 64KB chunk, so accumulation is
+/// quadratic in chunk count — fine at this cap, a streaming accumulator if
+/// bigger images ever matter.)
+const IMAGE_CARRY_MAX: usize = 8 * 1024 * 1024;
+
+/// Which of croft's OSC numbers a sequence carries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OscKind {
+    SemanticPrompt, // 133
+    Cwd,            // 7
+    Notify,         // 9
+    UrxvtNotify,    // 777;notify
+    KittyNotify,    // 99
+    ITerm2File,     // 1337 File= (inline images)
+    ProgramStatus,  // 7501
+}
+
+/// What the bytes starting at an ESC look like.
+enum Classify {
+    /// Not a sequence croft tracks; resume scanning after the ESC.
+    No,
+    /// Could still become one of ours; the chunk ended mid-prefix.
+    NeedMore,
+    /// One of ours; the parameter body starts at this offset past the ESC.
+    Ours(OscKind, usize),
+}
+
+/// How a candidate sequence ended.
+enum Terminator {
+    /// Body ends at `.0`, the full sequence ends at `.1` (both past-ESC).
+    Done(usize, usize),
+    /// No terminator in the available bytes; carry and wait for more.
+    NeedMore,
+    /// An ESC not followed by `\` aborts an OSC; rescan from that offset.
+    Abort(usize),
+}
+
+const OSC_PREFIXES: &[(&[u8], OscKind)] = &[
+    // Order matters: `]1337;` must be tried before `]133;`, whose prefix it
+    // contains — `]133;` would otherwise claim it and misparse the body.
+    (b"]1337;", OscKind::ITerm2File),
+    (b"]133;", OscKind::SemanticPrompt),
+    (b"]777;", OscKind::UrxvtNotify),
+    (b"]7501;", OscKind::ProgramStatus),
+    (b"]7;", OscKind::Cwd),
+    (b"]99;", OscKind::KittyNotify),
+    (b"]9;", OscKind::Notify),
+];
+
+/// A notification's text: `title: body`, or whichever of the two is there.
+fn note_text(title: &str, body: &str) -> Option<String> {
+    match (title.trim().is_empty(), body.trim().is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(title.to_string()),
+        (true, false) => Some(body.to_string()),
+        (false, false) => Some(format!("{title}: {body}")),
+    }
+}
+
+fn classify(bytes: &[u8]) -> Classify {
+    // bytes[0] is the ESC.
+    for (prefix, kind) in OSC_PREFIXES {
+        let avail = &bytes[1..];
+        let n = avail.len().min(prefix.len());
+        if avail[..n] == prefix[..n] {
+            if n < prefix.len() {
+                return Classify::NeedMore;
+            }
+            return Classify::Ours(*kind, 1 + prefix.len());
+        }
+    }
+    Classify::No
+}
+
+/// Find BEL or ST past the body start. An ESC that isn't part of ST aborts.
+fn find_terminator(bytes: &[u8], body_start: usize) -> Terminator {
+    let mut i = body_start;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x07 => return Terminator::Done(i, i + 1),
+            0x1b => {
+                if i + 1 >= bytes.len() {
+                    return Terminator::NeedMore;
+                }
+                if bytes[i + 1] == b'\\' {
+                    return Terminator::Done(i, i + 2);
+                }
+                return Terminator::Abort(i);
+            }
+            _ => i += 1,
+        }
+    }
+    Terminator::NeedMore
+}
+
+/// Decode `%XX` escapes (OSC 7 file URLs percent-encode special chars;
+/// `file_ref::editor_file_uri` reuses this for editor deep-link paths).
+pub(crate) fn percent_decode(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn parse_event(kind: OscKind, body: &[u8]) -> Option<OscEvent> {
+    match kind {
+        OscKind::SemanticPrompt => match body.first()? {
+            b'A' => Some(OscEvent::PromptStart),
+            b'B' => Some(OscEvent::PromptEnd),
+            b'C' => Some(OscEvent::CommandStart),
+            b'D' => {
+                let exit = (body.len() > 2 && body[1] == b';')
+                    .then(|| std::str::from_utf8(&body[2..]).ok()?.parse::<i32>().ok())
+                    .flatten();
+                Some(OscEvent::CommandEnd(exit))
+            }
+            _ => None,
+        },
+        OscKind::Cwd => {
+            // file://host/path — strip the scheme, keep the authority as the
+            // reporting host; a bare absolute path (some shells emit that)
+            // passes through hostless.
+            let (path, host) = if let Some(rest) = body.strip_prefix(b"file://") {
+                let slash = rest.iter().position(|&b| b == b'/')?;
+                let host =
+                    (slash > 0).then(|| String::from_utf8_lossy(&rest[..slash]).into_owned());
+                (&rest[slash..], host)
+            } else if body.first() == Some(&b'/') {
+                (body, None)
+            } else {
+                return None;
+            };
+            let decoded = percent_decode(path);
+            Some(OscEvent::Cwd(
+                PathBuf::from(String::from_utf8_lossy(&decoded).into_owned()),
+                host,
+            ))
+        }
+        OscKind::Notify => {
+            // The `9;4;` sub-namespace is ConEmu progress, not a
+            // notification; anything else after `9;` (including a message
+            // that merely starts with a 4) stays a notification.
+            if let Some(rest) = body.strip_prefix(b"4;") {
+                let mut parts = rest.split(|&b| b == b';');
+                let state = std::str::from_utf8(parts.next().unwrap_or_default())
+                    .ok()?
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|s| *s <= 4)?;
+                let percent = parts
+                    .next()
+                    .and_then(|p| std::str::from_utf8(p).ok())
+                    .and_then(|p| p.parse::<u32>().ok())
+                    .unwrap_or(0)
+                    .min(100) as u8;
+                return Some(OscEvent::Progress(state, percent));
+            }
+            Some(OscEvent::Notify(String::from_utf8_lossy(body).into_owned()))
+        }
+        OscKind::UrxvtNotify => {
+            // `777;notify;title;body`. The other urxvt 777 commands
+            // (`preexec`, `precmd`, …) are none of ours.
+            let rest = String::from_utf8_lossy(body.strip_prefix(b"notify;")?).into_owned();
+            let (title, text) = rest.split_once(';').unwrap_or((rest.as_str(), ""));
+            note_text(title, text).map(OscEvent::Notify)
+        }
+        // Chunked across sequences: `OscSniffer::kitty_chunk` keeps the state.
+        OscKind::KittyNotify => None,
+        OscKind::ProgramStatus => crate::program_status::parse(body).map(OscEvent::ProgramStatus),
+        OscKind::ITerm2File => {
+            let rest = body.strip_prefix(b"File=")?;
+            let colon = rest.iter().position(|&b| b == b':')?;
+            // `inline=1` is what makes the payload a picture to draw; without
+            // it the transfer is a download and none of croft's business.
+            let inline = rest[..colon]
+                .split(|&b| b == b';')
+                .any(|p| p == b"inline=1");
+            if !inline {
+                return None;
+            }
+            use base64::Engine;
+            let b64: Vec<u8> = rest[colon + 1..]
+                .iter()
+                .copied()
+                .filter(|b| !b.is_ascii_whitespace())
+                .collect();
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(&b64)
+                .ok()?;
+            (!data.is_empty()).then_some(OscEvent::InlineImage(data))
+        }
+    }
+}
+
+impl OscSniffer {
+    pub fn scan(&mut self, chunk: &[u8]) -> Vec<SniffedEvent> {
+        let mut out = Vec::new();
+        // Prepend any carried partial sequence; `base` converts combined
+        // offsets back into chunk coordinates.
+        let owned: Vec<u8>;
+        let (buf, base) = if self.carry.is_empty() {
+            (chunk, 0usize)
+        } else {
+            let mut v = std::mem::take(&mut self.carry);
+            v.extend_from_slice(chunk);
+            owned = v;
+            let b = owned.len() - chunk.len();
+            (owned.as_slice(), b)
+        };
+        let mut i = 0;
+        while i < buf.len() {
+            let Some(rel) = buf[i..].iter().position(|&b| b == 0x1b) else {
+                break;
+            };
+            let esc = i + rel;
+            match classify(&buf[esc..]) {
+                Classify::No => i = esc + 1,
+                Classify::NeedMore => {
+                    self.hold(&buf[esc..]);
+                    return out;
+                }
+                Classify::Ours(kind, body_start) => {
+                    match find_terminator(&buf[esc..], body_start) {
+                        Terminator::Done(body_end, seq_end) => {
+                            let body = &buf[esc + body_start..esc + body_end];
+                            let ev = match kind {
+                                OscKind::KittyNotify => self.kitty_chunk(body),
+                                // Past the spec's limit the report is
+                                // ignored whole. One split across reads
+                                // is bounded by the carry, of that size.
+                                OscKind::ProgramStatus
+                                    if seq_end > crate::program_status::SEQUENCE_MAX =>
+                                {
+                                    None
+                                }
+                                _ => parse_event(kind, body),
+                            };
+                            if let Some(ev) = ev {
+                                out.push((esc + seq_end - base, ev));
+                            }
+                            i = esc + seq_end;
+                        }
+                        Terminator::NeedMore => {
+                            self.hold(&buf[esc..]);
+                            return out;
+                        }
+                        Terminator::Abort(off) => i = esc + off,
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// One kitty `99;metadata;payload` sequence. Metadata is `key=value`
+    /// pairs split by `:`: `i` names the notification, `d=0` says more
+    /// chunks follow, `p` says what the payload is (`title`, the default,
+    /// or `body`; icons, buttons and queries are not shown), `e=1` that it
+    /// is base64. The notification goes out with its last chunk.
+    fn kitty_chunk(&mut self, body: &[u8]) -> Option<OscEvent> {
+        let body = String::from_utf8_lossy(body);
+        let (meta, payload) = body.split_once(';')?;
+        let (mut id, mut done, mut kind, mut b64) = ("", true, "title", false);
+        for pair in meta.split(':') {
+            match pair.split_once('=') {
+                Some(("i", v)) => id = v,
+                Some(("d", v)) => done = v != "0",
+                Some(("p", v)) => kind = v,
+                Some(("e", v)) => b64 = v == "1",
+                _ => {}
+            }
+        }
+        let mut note = match self.kitty.take() {
+            Some(n) if n.id == id => n,
+            _ => KittyNote {
+                id: id.to_string(),
+                ..KittyNote::default()
+            },
+        };
+        let field = match kind {
+            "title" => Some(&mut note.title),
+            "body" => Some(&mut note.body),
+            _ => None,
+        };
+        if let Some(field) = field
+            && field.len() + payload.len() <= CARRY_MAX
+        {
+            // Work on a copy so a broken chunk leaves the note untouched.
+            let mut next = field.clone();
+            if next.push(payload, b64).is_none() {
+                if !done {
+                    self.kitty = Some(note);
+                }
+                return None;
+            }
+            *field = next;
+        }
+        if !done {
+            self.kitty = Some(note);
+            return None;
+        }
+        if note.title.finish().is_none() || note.body.finish().is_none() {
+            return None;
+        }
+        note_text(&note.title.text(), &note.body.text()).map(OscEvent::Notify)
+    }
+
+    /// Carry a partial sequence to the next chunk, abandoning runaway ones.
+    /// Inline-image sequences get a far larger allowance — their base64
+    /// bodies are legitimately megabytes — but once one is abandoned it
+    /// stays abandoned (the fuse) so the rest of a huge payload streams by
+    /// without being re-buffered from every later chunk.
+    fn hold(&mut self, partial: &[u8]) {
+        let cap = match classify(partial) {
+            Classify::Ours(OscKind::ITerm2File, _) => IMAGE_CARRY_MAX,
+            Classify::Ours(OscKind::KittyNotify, _) => KITTY_CARRY_MAX,
+            _ => CARRY_MAX,
+        };
+        if partial.len() > cap {
+            self.carry.clear();
+        } else {
+            self.carry = partial.to_vec();
+        }
+    }
+}
+
+/// The zsh hook + bootstrap files, written under
+/// `<config>/shell-integration/zsh/`. zsh reads `$ZDOTDIR/.zshenv`,
+/// `.zprofile` (login), `.zshrc` (interactive), `.zlogin` (login) — each
+/// shim file sources the user's real counterpart from
+/// `$CROFT_USER_ZDOTDIR` so their setup runs unchanged, then `.zshrc`
+/// installs `precmd`/`preexec` hooks emitting OSC 133 marks and the OSC 7
+/// cwd report.
+const ZSH_SHIM_ZSHENV: &str = r#"# croft shell integration bootstrap (auto-generated; do not edit)
+_croft_shim_zdotdir="$ZDOTDIR"
+# A CROFT_USER_ZDOTDIR pointing back at the shim is a poisoned inheritance
+# (croft launched from a croft pane); the user's real dotfiles live in HOME.
+if [[ -n "$CROFT_USER_ZDOTDIR" && "$CROFT_USER_ZDOTDIR" == "$_croft_shim_zdotdir" ]]; then
+  export CROFT_USER_ZDOTDIR="$HOME"
+fi
+ZDOTDIR="${CROFT_USER_ZDOTDIR:-$HOME}"
+[[ "$ZDOTDIR" != "$_croft_shim_zdotdir" && -f "$ZDOTDIR/.zshenv" ]] && builtin source "$ZDOTDIR/.zshenv"
+# The sourced file may be another terminal's injection shim (Ghostty, kitty
+# point ZDOTDIR at their own dir when launching croft as their command);
+# their .zshenv restores the REAL ZDOTDIR when sourced, so whatever it holds
+# now is the user's true dotfile dir. A user .zshenv that re-roots ZDOTDIR
+# (XDG setups) is honoured the same way.
+if [[ -z "$ZDOTDIR" || "$ZDOTDIR" == "$_croft_shim_zdotdir" ]]; then
+  export CROFT_USER_ZDOTDIR="$HOME"
+else
+  export CROFT_USER_ZDOTDIR="$ZDOTDIR"
+fi
+ZDOTDIR="$_croft_shim_zdotdir"
+"#;
+
+const ZSH_SHIM_ZPROFILE: &str = r#"# croft shell integration (auto-generated; do not edit)
+_croft_user="${CROFT_USER_ZDOTDIR:-$HOME}"
+[[ "$_croft_user" != "$ZDOTDIR" && -f "$_croft_user/.zprofile" ]] && ZDOTDIR="$_croft_user" builtin source "$_croft_user/.zprofile"
+"#;
+
+const ZSH_SHIM_ZLOGIN: &str = r#"# croft shell integration (auto-generated; do not edit)
+_croft_user="${CROFT_USER_ZDOTDIR:-$HOME}"
+[[ "$_croft_user" != "$ZDOTDIR" && -f "$_croft_user/.zlogin" ]] && ZDOTDIR="$_croft_user" builtin source "$_croft_user/.zlogin"
+"#;
+
+const ZSH_SHIM_ZSHRC: &str = r#"# croft shell integration (auto-generated; do not edit)
+_croft_user="${CROFT_USER_ZDOTDIR:-$HOME}"
+[[ "$_croft_user" != "$ZDOTDIR" && -f "$_croft_user/.zshrc" ]] && ZDOTDIR="$_croft_user" builtin source "$_croft_user/.zshrc"
+
+# The croft running this pane first on PATH (#1854). croft put it there,
+# but the user's startup files run after, and one that prepends its own
+# dirs (`brew shellenv` does) can put another install's croft ahead of it.
+# A login zsh reads the user's own .zlogin after this file (ZDOTDIR is
+# theirs again by then), so this waits for the first prompt.
+if [[ -o interactive && -n "$CROFT_PANE_BIN" ]]; then
+  builtin autoload -Uz add-zsh-hook
+  _croft_pane_path() {
+    add-zsh-hook -d precmd _croft_pane_path
+    path=("$CROFT_PANE_BIN" ${path:#"$CROFT_PANE_BIN"})
+  }
+  add-zsh-hook precmd _croft_pane_path
+fi
+
+# FinalTerm / OSC 133 semantic prompt marks + OSC 7 cwd, the protocol VS
+# Code, Ghostty, iTerm2 and WezTerm build command navigation on.
+if [[ -o interactive ]] && (( ! ${+_croft_si_installed} )); then
+  typeset -g _croft_si_installed=1
+  typeset -g _croft_b_mark=$'%{\e]133;B\a%}'
+  builtin autoload -Uz add-zsh-hook
+  _croft_preexec() {
+    typeset -g _croft_cmd_inflight=1
+    builtin printf '\033]133;C\007'
+  }
+  _croft_precmd() {
+    local _croft_ec=$?
+    if (( ${+_croft_cmd_inflight} )); then
+      builtin unset _croft_cmd_inflight
+      builtin printf '\033]133;D;%d\007' "$_croft_ec"
+    fi
+    # `%` percent-escaped: the sniffer percent-decodes every OSC 7 path,
+    # so a raw `%41` in a real directory name would decode to `A`.
+    builtin printf '\033]7;file://%s%s\007' "${HOST:-localhost}" "${PWD//\%/%25}"
+    builtin printf '\033]133;A\007'
+    # Mark where the typed command starts (133;B). Themes rebuild PS1 from
+    # their own precmd (which ran before this one), so the zero-width
+    # suffix is re-asserted at every prompt.
+    if [[ "$PS1" != *"$_croft_b_mark" ]]; then
+      PS1+="$_croft_b_mark"
+    fi
+  }
+  add-zsh-hook preexec _croft_preexec
+  add-zsh-hook precmd _croft_precmd
+fi
+
+# Restore the user's ZDOTDIR so nested shells and tools see their own.
+if [[ -n "$CROFT_USER_ZDOTDIR" && "$CROFT_USER_ZDOTDIR" != "$HOME" ]]; then
+  ZDOTDIR="$CROFT_USER_ZDOTDIR"
+else
+  builtin unset ZDOTDIR
+fi
+"#;
+
+/// The user's real dotfile directory for the shim to source. An inherited
+/// `ZDOTDIR` pointing into croft's own shell-integration tree is poisoned
+/// inheritance — a croft launched from a croft pane, whose environment
+/// carries the shim path — and must fall back to `home`, or the shim would
+/// source itself in a recursion loop and the user's rc would never run.
+pub fn resolve_user_zdotdir(
+    inherited: Option<&std::path::Path>,
+    shim_root: &std::path::Path,
+    home: &std::path::Path,
+) -> PathBuf {
+    match inherited {
+        Some(z) if !z.starts_with(shim_root) => z.to_path_buf(),
+        _ => home.to_path_buf(),
+    }
+}
+
+/// The bash bootstrap, read via `$ENV` by an interactive `bash --posix`
+/// (kitty invented the trick; Ghostty copied it). Posix-mode bash reads
+/// ONLY `$ENV` at startup — no /etc/profile, no ~/.bashrc — so the shim
+/// backs out of posix mode, replays the user's real startup files (login
+/// vs non-login), then installs hooks emitting the OSC 133 prompt marks
+/// and the OSC 7 cwd report. Runs on every bash croft spawns, from macOS's
+/// system 3.2 to 5.3+.
+const BASH_SHIM: &str = r#"# croft shell integration bootstrap (auto-generated; do not edit)
+[[ "$-" != *i* ]] && builtin return
+
+if [[ -n "$CROFT_BASH_INJECT" ]]; then
+  builtin unset CROFT_BASH_INJECT
+  builtin set +o posix
+  builtin shopt -u inherit_errexit 2>/dev/null
+  # Restore the user's own $ENV (rarely set for bash) or drop croft's.
+  if [[ -n "$CROFT_BASH_ENV" ]]; then
+    builtin export ENV="$CROFT_BASH_ENV"
+    builtin unset CROFT_BASH_ENV
+  else
+    builtin unset ENV
+  fi
+  # Posix mode defaulted HISTFILE to ~/.sh_history; croft pre-seeded the
+  # bash default and flagged it so children do not inherit the export.
+  if [[ -n "$CROFT_BASH_UNEXPORT_HISTFILE" ]]; then
+    builtin export -n HISTFILE
+    builtin unset CROFT_BASH_UNEXPORT_HISTFILE
+  fi
+  # Replay the startup files posix mode skipped, exactly as bash itself
+  # would have chosen them. A bash too old for posix-mode `$ENV` reads this
+  # file through `--rcfile` instead, which a login bash ignores, so croft
+  # starts it non-login and asks for the login files with CROFT_BASH_LOGIN.
+  if builtin shopt -q login_shell || [[ -n "$CROFT_BASH_LOGIN" ]]; then
+    builtin unset CROFT_BASH_LOGIN
+    [[ -r /etc/profile ]] && builtin source /etc/profile
+    for _croft_rc in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+      if [[ -r "$_croft_rc" ]]; then
+        builtin source "$_croft_rc"
+        break
+      fi
+    done
+  else
+    for _croft_rc in /etc/bash.bashrc /etc/bash/bashrc /etc/bashrc; do
+      if [[ -r "$_croft_rc" ]]; then
+        builtin source "$_croft_rc"
+        break
+      fi
+    done
+    [[ -r "$HOME/.bashrc" ]] && builtin source "$HOME/.bashrc"
+  fi
+  builtin unset _croft_rc
+fi
+
+# The croft running this pane first on PATH (#1854). croft put it there,
+# but the startup files just replayed can put another install's croft
+# ahead of it.
+if [[ -n "$CROFT_PANE_BIN" ]]; then
+  _croft_path=":$PATH:"
+  while [[ "$_croft_path" == *:"$CROFT_PANE_BIN":* ]]; do
+    _croft_path="${_croft_path//:"$CROFT_PANE_BIN":/:}"
+  done
+  _croft_path="${_croft_path#:}"
+  _croft_path="${_croft_path%:}"
+  PATH="$CROFT_PANE_BIN${_croft_path:+:$_croft_path}"
+  builtin unset _croft_path
+fi
+
+# FinalTerm / OSC 133 semantic prompt marks + OSC 7 cwd, the protocol VS
+# Code, Ghostty, iTerm2 and WezTerm build command navigation on.
+if [[ -z "$_croft_si_installed" ]]; then
+  _croft_si_installed=1
+  _croft_b_mark='\[\e]133;B\a\]'
+  _croft_preexec() {
+    _croft_cmd_inflight=1
+    builtin printf '\033]133;C\007'
+  }
+  _croft_precmd() {
+    local _croft_ec=$?
+    if [[ -n "$_croft_cmd_inflight" ]]; then
+      builtin unset _croft_cmd_inflight
+      builtin printf '\033]133;D;%d\007' "$_croft_ec"
+    fi
+    # `%` percent-escaped: the sniffer percent-decodes every OSC 7 path.
+    builtin printf '\033]7;file://%s%s\007' "${HOSTNAME:-localhost}" "${PWD//%/%25}"
+    builtin printf '\033]133;A\007'
+    # Prompt themes rewrite PS1 from their own PROMPT_COMMAND entries, so
+    # the zero-width input-start mark is re-asserted at every prompt.
+    if [[ "$PS1" != *"$_croft_b_mark" ]]; then
+      PS1+="$_croft_b_mark"
+    fi
+  }
+  # DEBUG fires for every simple command, including PROMPT_COMMAND's own
+  # entries; only the first one after the prompt was armed — and not part
+  # of PROMPT_COMMAND itself (an empty Enter goes straight back to it) —
+  # is the user's command. bash-preexec's exact discipline.
+  _croft_debug_trap() {
+    [[ -n "$COMP_LINE" ]] && builtin return
+    [[ -z "$_croft_at_prompt" ]] && builtin return
+    _croft_at_prompt=
+    # `[*]` joins with the first char of IFS: scope it to `;` here or an
+    # ARRAY PROMPT_COMMAND joins with spaces and its own entries never
+    # match, fabricating a command on every empty Enter.
+    # A string PROMPT_COMMAND is joined with newlines below: those part
+    # entries too.
+    local IFS=';'
+    local _croft_pc=";${PROMPT_COMMAND[*]};"
+    case ${_croft_pc//$'\n'/;} in
+      *";$BASH_COMMAND;"*) builtin return ;;
+    esac
+    _croft_preexec
+  }
+  _croft_arm() { _croft_at_prompt=1; }
+  if [[ -n "${bash_preexec_imported:-${__bp_imported:-}}" ]]; then
+    # bash-preexec (iTerm2 integration, Atuin, ...) owns the DEBUG trap;
+    # join its cooperative hook arrays instead of fighting over it.
+    precmd_functions+=(_croft_precmd)
+    preexec_functions+=(_croft_preexec)
+  else
+    if ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3))); then
+      # bash 5.3 funsub runs in the current shell: a trap-free preexec.
+      PS0='${ _croft_preexec; }'"$PS0"
+    elif [[ -z "$(trap -p DEBUG)" ]]; then
+      builtin trap '_croft_debug_trap' DEBUG
+    fi
+    # An existing DEBUG trap (a hand-rolled preexec) is left alone; marks
+    # degrade to prompt + cwd only.
+    # Precmd runs FIRST so nothing clobbers $? before the exit capture;
+    # the arm runs LAST so user entries never read as the next command.
+    if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
+      PROMPT_COMMAND=(_croft_precmd "${PROMPT_COMMAND[@]}" _croft_arm)
+    else
+      # Joined with newlines, not `;`: a user value ending in `;` (zoxide's
+      # init leaves `__zoxide_hook;`) or `&`, or a trailing `# comment`,
+      # made the joined string a syntax error or commented the arm out,
+      # and bash then ran none of it (#1101). A line still cannot start
+      # with `;`, so leading separators are dropped.
+      _croft_nl=$'\n'
+      _croft_pc="${PROMPT_COMMAND#"${PROMPT_COMMAND%%[^[:space:];]*}"}"
+      PROMPT_COMMAND="_croft_precmd$_croft_nl${_croft_pc:+$_croft_pc$_croft_nl}_croft_arm"
+      builtin unset _croft_nl _croft_pc
+    fi
+  fi
+fi
+"#;
+
+/// Write croft's bash `$ENV` shim (idempotently) and return the file path.
+pub fn ensure_bash_shim(config_dir: &std::path::Path) -> std::io::Result<PathBuf> {
+    let dir = config_dir.join("shell-integration").join("bash");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("croft.bash");
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(BASH_SHIM) {
+        let mut f = std::fs::File::create(&path)?;
+        f.write_all(BASH_SHIM.as_bytes())?;
+    }
+    Ok(path)
+}
+
+/// The fish integration, auto-sourced from `<data dir>/fish/vendor_conf.d/`
+/// via a prepended `XDG_DATA_DIRS` entry (the mechanism kitty, Ghostty and
+/// VS Code all use; fish reads vendor_conf.d before the user's config).
+///
+/// fish 4.0+ (the Rust rewrite) emits the OSC 133 marks and the OSC 7 cwd
+/// report natively, for every terminal, on by default — a second emitter
+/// would double-mark each prompt, so like kitty (and unlike Ghostty, which
+/// double-marks) croft's hooks install only on old fish, detected the way
+/// kitty does it: modern fish ships the `forward-char-passive` binding.
+const FISH_INTEGRATION: &str = r#"# croft shell integration (auto-generated; do not edit)
+
+# First: put XDG_DATA_DIRS back so child processes never see croft's
+# injection dir.
+if set -q CROFT_FISH_XDG_DATA_DIR
+    if set -q XDG_DATA_DIRS
+        set --local _croft_i (contains --index -- "$CROFT_FISH_XDG_DATA_DIR" $XDG_DATA_DIRS)
+        and set --erase XDG_DATA_DIRS[$_croft_i]
+        if not set -q XDG_DATA_DIRS[1]
+            set --erase XDG_DATA_DIRS
+        else
+            set --global --export --path XDG_DATA_DIRS $XDG_DATA_DIRS
+        end
+    end
+    set --erase CROFT_FISH_XDG_DATA_DIR
+end
+
+if status is-interactive
+    # The croft running this pane first on PATH (#1854). croft put it there,
+    # but config.fish can put another install's croft ahead of it (`brew
+    # shellenv` does). This file runs before config.fish, so the first
+    # prompt is the earliest point after it.
+    if set -q CROFT_PANE_BIN
+        function _croft_pane_path --on-event fish_prompt
+            functions --erase _croft_pane_path
+            while set --local _croft_i (contains --index -- $CROFT_PANE_BIN $PATH)
+                set --erase PATH[$_croft_i]
+            end
+            set --global --export --prepend PATH $CROFT_PANE_BIN
+        end
+    end
+
+    # fish 4.0+ marks prompts natively (OSC 133 + OSC 7 for every
+    # terminal); emitting again would double-decorate. Old fish (<= 3.7)
+    # lacks the forward-char-passive binding and needs croft's hooks.
+    if not bind --function-names 2>/dev/null | string match -q forward-char-passive
+        function _croft_mark_prompt --on-event fish_prompt --on-event fish_cancel --on-event fish_posterror
+            if test "$_croft_prompt_state" = command
+                # the started command never reported back: close the cycle
+                printf '\e]133;D\a'
+            end
+            set --global _croft_prompt_state prompt
+            printf '\e]7;file://%s%s\a' "$hostname" (string escape --style=url -- "$PWD")
+            printf '\e]133;A\a'
+            _croft_wrap_prompt
+        end
+        # The end of the prompt (133;B) is where the typed command starts;
+        # without it croft cannot tell the command from the prompt, and
+        # records nothing (#1514). fish has no event for it, so croft wraps
+        # the user's fish_prompt. That is defined after this file runs (by
+        # config.fish or a prompt plugin, maybe redefined later), so the
+        # wrap happens on each fish_prompt event, which fires just before
+        # fish draws the prompt, whenever fish_prompt is not croft's wrapper.
+        function _croft_prompt_end
+            printf '\e]133;B\a'
+        end
+        function _croft_wrap_prompt
+            functions -q fish_prompt; or return
+            functions fish_prompt | string match -q '*_croft_prompt_end*'; and return
+            functions --erase _croft_user_prompt
+            functions --copy fish_prompt _croft_user_prompt
+            function fish_prompt
+                _croft_user_prompt
+                _croft_prompt_end
+            end
+        end
+        # Saving or editing fish_prompt (funcsave, `fish_config prompt
+        # save`, which calls funcsave, and funced) must act on the user's
+        # prompt, not croft's wrapper: a saved wrapper would call helpers
+        # that exist only under croft, leaving fish elsewhere without a
+        # prompt. Unwrap first; the next prompt event wraps again.
+        function _croft_unwrap_prompt
+            functions -q _croft_user_prompt; or return 0
+            functions fish_prompt 2>/dev/null | string match -q '*_croft_prompt_end*'; or return 0
+            functions --erase fish_prompt
+            functions --copy _croft_user_prompt fish_prompt
+        end
+        if functions -q funcsave; and not functions -q _croft_funcsave
+            functions --copy funcsave _croft_funcsave
+            function funcsave
+                _croft_unwrap_prompt
+                _croft_funcsave $argv
+            end
+        end
+        if functions -q funced; and not functions -q _croft_funced
+            functions --copy funced _croft_funced
+            function funced
+                _croft_unwrap_prompt
+                _croft_funced $argv
+            end
+        end
+        function _croft_mark_output_start --on-event fish_preexec
+            set --global _croft_prompt_state command
+            printf '\e]133;C\a'
+        end
+        function _croft_mark_output_end --on-event fish_postexec
+            set --local _croft_s $status
+            set --global _croft_prompt_state finished
+            printf '\e]133;D;%s\a' $_croft_s
+        end
+    end
+end
+"#;
+
+/// Write croft's fish `vendor_conf.d` integration (idempotently) and return
+/// the XDG data dir to prepend to `XDG_DATA_DIRS`.
+pub fn ensure_fish_integration(config_dir: &std::path::Path) -> std::io::Result<PathBuf> {
+    let dir = config_dir.join("shell-integration").join("fish");
+    let conf_dir = dir.join("fish").join("vendor_conf.d");
+    std::fs::create_dir_all(&conf_dir)?;
+    let path = conf_dir.join("croft.fish");
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(FISH_INTEGRATION) {
+        let mut f = std::fs::File::create(&path)?;
+        f.write_all(FISH_INTEGRATION.as_bytes())?;
+    }
+    Ok(dir)
+}
+
+/// The `XDG_DATA_DIRS` value for a croft-spawned fish: croft's injection
+/// data dir first, then the inherited value (or the XDG spec default when
+/// unset/empty, so system data dirs stay visible to fish).
+pub fn fish_xdg_data_dirs(data_dir: &std::path::Path, inherited: Option<&str>) -> String {
+    const XDG_DEFAULT: &str = "/usr/local/share:/usr/share";
+    let rest = match inherited {
+        Some(x) if !x.is_empty() => x,
+        _ => XDG_DEFAULT,
+    };
+    format!("{}:{rest}", data_dir.display())
+}
+
+/// Write croft's zsh `ZDOTDIR` shim (idempotently) and return its directory.
+pub fn ensure_zsh_shim(config_dir: &std::path::Path) -> std::io::Result<PathBuf> {
+    let dir = config_dir.join("shell-integration").join("zsh");
+    std::fs::create_dir_all(&dir)?;
+    for (name, content) in [
+        (".zshenv", ZSH_SHIM_ZSHENV),
+        (".zprofile", ZSH_SHIM_ZPROFILE),
+        (".zshrc", ZSH_SHIM_ZSHRC),
+        (".zlogin", ZSH_SHIM_ZLOGIN),
+    ] {
+        let path = dir.join(name);
+        // Rewrite only on content drift so the mtime stays stable.
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(content) {
+            let mut f = std::fs::File::create(&path)?;
+            f.write_all(content.as_bytes())?;
+        }
+    }
+    Ok(dir)
+}
+
+/// Names the pane bin to the shell hooks, which put it back first on PATH
+/// after the user's startup files have run.
+pub const PANE_BIN_ENV: &str = "CROFT_PANE_BIN";
+
+/// The directory a pane puts first on PATH so that `croft` there is the
+/// croft running the pane (#1854), with another install earlier on the
+/// user's PATH (Homebrew's, say) answering nowhere inside croft. It holds
+/// only a `croft` link to `exe`: anything else in it would shadow one of
+/// the user's own tools. Keyed by the binary's path, so windows from two
+/// installs never share one.
+pub fn ensure_pane_bin(
+    cache_dir: &std::path::Path,
+    exe: &std::path::Path,
+) -> std::io::Result<PathBuf> {
+    use sha2::Digest;
+    use std::os::unix::ffi::OsStrExt;
+    let key = format!("{:x}", sha2::Sha256::digest(exe.as_os_str().as_bytes()));
+    let dir = cache_dir.join("pane-bin").join(&key[..16]);
+    let link = dir.join("croft");
+    if std::fs::read_link(&link).ok().as_deref() == Some(exe) {
+        return Ok(dir);
+    }
+    std::fs::create_dir_all(&dir)?;
+    // Made beside and renamed over, so a pane another croft spawns at the
+    // same moment never finds the name missing.
+    let tmp = dir.join(format!(".croft-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(exe, &tmp)?;
+    std::fs::rename(&tmp, &link)?;
+    Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan_all(sniffer: &mut OscSniffer, chunks: &[&[u8]]) -> Vec<OscEvent> {
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend(sniffer.scan(c).into_iter().map(|(_, e)| e));
+        }
+        out
+    }
+
+    #[test]
+    fn sniffs_the_four_osc133_marks_with_both_terminators() {
+        let mut s = OscSniffer::default();
+        // BEL-terminated and ST (ESC \) terminated forms both count.
+        let events = scan_all(
+            &mut s,
+            &[b"\x1b]133;A\x07out\x1b]133;B\x1b\\\x1b]133;C\x07\x1b]133;D;1\x07"],
+        );
+        assert_eq!(
+            events,
+            vec![
+                OscEvent::PromptStart,
+                OscEvent::PromptEnd,
+                OscEvent::CommandStart,
+                OscEvent::CommandEnd(Some(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_image_osc_1337_is_captured_across_chunks() {
+        use base64::Engine;
+        let payload: Vec<u8> = (0u32..600).map(|i| (i % 251) as u8).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&payload);
+        let seq = format!("\x1b]1337;File=name=eC5wbmc=;size=600;inline=1:{b64}\x07");
+        let bytes = seq.as_bytes();
+        // Split inside the params and inside the base64 body: the payload is
+        // far longer than any OSC 133/7/9, so this exercises the large-image
+        // carry path.
+        let mut s = OscSniffer::default();
+        let events = scan_all(&mut s, &[&bytes[..20], &bytes[20..300], &bytes[300..]]);
+        assert_eq!(events, vec![OscEvent::InlineImage(payload.clone())]);
+        // Without inline=1 the payload is a download, not a picture: ignored.
+        let seq = format!("\x1b]1337;File=name=eC5wbmc=:{b64}\x07");
+        assert!(scan_all(&mut s, &[seq.as_bytes()]).is_empty());
+        // Marks flowing after an image still parse (the carry fully resets).
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]133;A\x07"]),
+            vec![OscEvent::PromptStart]
+        );
+    }
+
+    #[test]
+    fn runaway_inline_image_payloads_are_abandoned() {
+        // A payload past the image carry cap is dropped without an event and
+        // without wedging the sniffer for later sequences.
+        let mut s = OscSniffer::default();
+        assert!(s.scan(b"\x1b]1337;File=inline=1:").is_empty());
+        let filler = vec![b'A'; IMAGE_CARRY_MAX + 4096];
+        for chunk in filler.chunks(65536) {
+            assert!(s.scan(chunk).is_empty());
+        }
+        assert!(
+            s.scan(b"\x07").is_empty(),
+            "the oversized image never fires"
+        );
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]133;C\x07"]),
+            vec![OscEvent::CommandStart]
+        );
+    }
+
+    #[test]
+    fn command_end_without_exit_code_yields_none() {
+        let mut s = OscSniffer::default();
+        let events = scan_all(&mut s, &[b"\x1b]133;D\x07"]);
+        assert_eq!(events, vec![OscEvent::CommandEnd(None)]);
+    }
+
+    #[test]
+    fn end_offsets_point_just_past_each_terminator() {
+        let mut s = OscSniffer::default();
+        let chunk = b"ab\x1b]133;A\x07cd";
+        let got = s.scan(chunk);
+        assert_eq!(got, vec![(10, OscEvent::PromptStart)]);
+        // Splitting the chunk at 10 leaves "cd" for the second advance.
+        assert_eq!(&chunk[10..], b"cd");
+    }
+
+    #[test]
+    fn sequences_split_across_chunks_are_reassembled() {
+        let mut s = OscSniffer::default();
+        // Split inside the prefix, inside the body, and before the terminator.
+        assert!(s.scan(b"foo\x1b]13").is_empty());
+        assert!(s.scan(b"3;D;12").is_empty());
+        let got = s.scan(b"7\x07bar");
+        assert_eq!(got, vec![(2, OscEvent::CommandEnd(Some(127)))]);
+    }
+
+    #[test]
+    fn a_lone_trailing_escape_is_carried_not_dropped() {
+        let mut s = OscSniffer::default();
+        assert!(s.scan(b"output\x1b").is_empty());
+        let got = s.scan(b"]133;A\x07");
+        assert_eq!(got, vec![(7, OscEvent::PromptStart)]);
+    }
+
+    #[test]
+    fn osc7_cwd_is_decoded_from_the_file_url() {
+        let mut s = OscSniffer::default();
+        let events = scan_all(
+            &mut s,
+            &[b"\x1b]7;file://mac.local/Users/me/dir%20with%20space\x07"],
+        );
+        assert_eq!(
+            events,
+            vec![OscEvent::Cwd(
+                PathBuf::from("/Users/me/dir with space"),
+                Some(String::from("mac.local"))
+            )]
+        );
+    }
+
+    #[test]
+    fn osc7_carries_the_reporting_host() {
+        let mut s = OscSniffer::default();
+        let events = scan_all(&mut s, &[b"\x1b]7;file://prod-db-1/var/lib\x07"]);
+        assert_eq!(
+            events,
+            vec![OscEvent::Cwd(
+                PathBuf::from("/var/lib"),
+                Some(String::from("prod-db-1"))
+            )]
+        );
+        // An empty authority (file:///path) and a bare path carry no host.
+        let events = scan_all(&mut s, &[b"\x1b]7;file:///tmp\x07\x1b]7;/opt\x07"]);
+        assert_eq!(
+            events,
+            vec![
+                OscEvent::Cwd(PathBuf::from("/tmp"), None),
+                OscEvent::Cwd(PathBuf::from("/opt"), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn osc9_notification_payload_is_extracted() {
+        let mut s = OscSniffer::default();
+        let events = scan_all(&mut s, &[b"\x1b]9;Build finished\x07"]);
+        assert_eq!(
+            events,
+            vec![OscEvent::Notify(String::from("Build finished"))]
+        );
+    }
+
+    #[test]
+    fn urxvt_osc_777_notify_carries_its_title_and_body() {
+        let mut s = OscSniffer::default();
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]777;notify;Build;finished OK\x07"]),
+            vec![OscEvent::Notify(String::from("Build: finished OK"))]
+        );
+        // A body keeps its own semicolons; a title alone or a body alone
+        // stands by itself; a split across chunks still lands.
+        assert_eq!(
+            scan_all(
+                &mut s,
+                &[b"\x1b]777;notify;Tests;3 passed; 1 failed\x1b\\\x1b]777;notify;Only title\x07"]
+            ),
+            vec![
+                OscEvent::Notify(String::from("Tests: 3 passed; 1 failed")),
+                OscEvent::Notify(String::from("Only title")),
+            ]
+        );
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]77", b"7;notify;;just a body\x07"]),
+            vec![OscEvent::Notify(String::from("just a body"))]
+        );
+    }
+
+    #[test]
+    fn other_osc_777_commands_and_an_empty_notify_are_not_notifications() {
+        let mut s = OscSniffer::default();
+        let events = scan_all(
+            &mut s,
+            &[b"\x1b]777;preexec\x07\x1b]777;precmd\x07\x1b]777;notify;;\x07\x1b]777;notify\x07"],
+        );
+        assert!(events.is_empty(), "got: {events:?}");
+        // OSC 7 is still the cwd, not swallowed by the 777 prefix.
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]7;/srv\x07"]),
+            vec![OscEvent::Cwd(PathBuf::from("/srv"), None)]
+        );
+    }
+
+    #[test]
+    fn kitty_osc_99_notifications_are_read() {
+        let mut s = OscSniffer::default();
+        // The simplest form: no metadata, the payload is the title.
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]99;;kitty-style note\x1b\\"]),
+            vec![OscEvent::Notify(String::from("kitty-style note"))]
+        );
+        // A title chunk (d=0) then a body chunk with the same id: one
+        // notification, sent with the last chunk.
+        assert_eq!(scan_all(&mut s, &[b"\x1b]99;i=7:d=0;Build\x1b\\"]), vec![]);
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]99;i=7:p=body;finished OK\x1b\\"]),
+            vec![OscEvent::Notify(String::from("Build: finished OK"))]
+        );
+        // A base64 payload is decoded.
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]99;e=1:p=body;aGkgdGhlcmU=\x07"]),
+            vec![OscEvent::Notify(String::from("hi there"))]
+        );
+        // OSC 9 is still OSC 9, not swallowed by the 99 prefix.
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]9;plain\x07"]),
+            vec![OscEvent::Notify(String::from("plain"))]
+        );
+    }
+
+    #[test]
+    fn kitty_base64_is_one_stream_across_chunks() {
+        let mut s = OscSniffer::default();
+        // "héllo" is aMOpbGxv: split mid-quantum (and mid-"é"), the last
+        // chunk unpadded.
+        assert!(scan_all(&mut s, &[b"\x1b]99;i=1:d=0:e=1;aM\x07"]).is_empty());
+        assert!(scan_all(&mut s, &[b"\x1b]99;i=1:d=0:e=1;Op\x07"]).is_empty());
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]99;i=1:e=1;bGxv\x07"]),
+            vec![OscEvent::Notify(String::from("h\u{e9}llo"))]
+        );
+        // Each chunk padded on its own, and an unpadded single chunk.
+        assert!(scan_all(&mut s, &[b"\x1b]99;i=2:d=0:e=1;aA==\x07"]).is_empty());
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]99;i=2:e=1;aQ\x07"]),
+            vec![OscEvent::Notify(String::from("hi"))]
+        );
+    }
+
+    #[test]
+    fn kitty_full_size_payload_survives_a_split_read() {
+        use base64::Engine;
+        let mut s = OscSniffer::default();
+        let text = "n".repeat(3072);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&text);
+        assert_eq!(b64.len(), 4096);
+        let seq = format!("\x1b]99;i=long:p=title:e=1;{b64}");
+        assert_eq!(
+            scan_all(&mut s, &[seq.as_bytes(), b"\x1b\\"]),
+            vec![OscEvent::Notify(text)]
+        );
+    }
+
+    #[test]
+    fn kitty_chunks_croft_does_not_show_send_nothing() {
+        let mut s = OscSniffer::default();
+        // Icons, buttons, queries and close requests are not notifications,
+        // nor is an empty payload or a broken base64 one.
+        let events = scan_all(
+            &mut s,
+            &[b"\x1b]99;i=1:p=icon;abc\x07\x1b]99;i=1:p=?;\x07\x1b]99;i=1:p=close;\x07\x1b]99;;\x07\x1b]99;e=1;@@@\x07\x1b]99;no-semicolon\x07"],
+        );
+        assert!(events.is_empty(), "got: {events:?}");
+        // An unfinished notification is dropped when a different one
+        // starts; its title does not leak into the new one.
+        assert!(scan_all(&mut s, &[b"\x1b]99;i=a:d=0;stale\x07"]).is_empty());
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]99;i=b;fresh\x07"]),
+            vec![OscEvent::Notify(String::from("fresh"))]
+        );
+    }
+
+    #[test]
+    fn osc_9_4_progress_is_parsed_and_plain_osc_9_stays_notify() {
+        let mut s = OscSniffer::default();
+        // ConEmu progress: state 1 (normal) at 46%.
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]9;4;1;46\x07"]),
+            vec![OscEvent::Progress(1, 46)]
+        );
+        // State 0 clears; percent may be absent. Split across chunks.
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]9;4", b";0\x07"]),
+            vec![OscEvent::Progress(0, 0)]
+        );
+        // Error keeps its percent; out-of-range percents clamp; junk state drops.
+        assert_eq!(
+            scan_all(
+                &mut s,
+                &[b"\x1b]9;4;2;63\x07\x1b]9;4;1;250\x07\x1b]9;4;x;5\x07"]
+            ),
+            vec![OscEvent::Progress(2, 63), OscEvent::Progress(1, 100)]
+        );
+        // A plain OSC 9 notification is untouched, even one starting with 4.
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]9;Build finished\x07"]),
+            vec![OscEvent::Notify(String::from("Build finished"))]
+        );
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]9;4 done\x07"]),
+            vec![OscEvent::Notify(String::from("4 done"))]
+        );
+    }
+
+    #[test]
+    fn osc_7501_reports_and_the_probe_are_read_with_either_terminator() {
+        use crate::program_status::{Report, State};
+        let mut s = OscSniffer::default();
+        assert_eq!(
+            scan_all(
+                &mut s,
+                &[b"\x1b]7501;?\x1b\\\x1b[c\x1b]7501;state=blocked:kind=permission\x07"]
+            ),
+            vec![
+                OscEvent::ProgramStatus(Report::Query),
+                OscEvent::ProgramStatus(Report::Set {
+                    id: String::new(),
+                    state: State::Blocked
+                }),
+            ]
+        );
+        // Split across reads, and beside OSC 7, whose prefix it shares.
+        assert_eq!(
+            scan_all(
+                &mut s,
+                &[b"\x1b]7", b"501;state=work", b"ing\x1b\\\x1b]7;/tmp\x07"]
+            ),
+            vec![
+                OscEvent::ProgramStatus(Report::Set {
+                    id: String::new(),
+                    state: State::Working
+                }),
+                OscEvent::Cwd(PathBuf::from("/tmp"), None),
+            ]
+        );
+        // Over the spec's 4096 bytes the report is ignored, in one read or
+        // split over two; the stream goes on.
+        let pad = "x".repeat(4096);
+        let long = format!("\x1b]7501;state=done:pad={pad}\x07");
+        assert_eq!(scan_all(&mut s, &[long.as_bytes()]), vec![]);
+        let (a, b) = long.as_bytes().split_at(2000);
+        assert_eq!(
+            scan_all(&mut s, &[a, b, b"\x1b]7501;state=idle\x07"]),
+            vec![OscEvent::ProgramStatus(Report::Set {
+                id: String::new(),
+                state: State::Idle
+            })]
+        );
+    }
+
+    #[test]
+    fn unrelated_osc_and_plain_output_are_ignored() {
+        let mut s = OscSniffer::default();
+        // OSC 0 title set, OSC 52 clipboard, CSI colours, plain text.
+        let events = scan_all(
+            &mut s,
+            &[b"\x1b]0;title\x07\x1b]52;c;Zm9v\x07\x1b[31mred\x1b[0m plain"],
+        );
+        assert!(events.is_empty(), "got: {events:?}");
+    }
+
+    #[test]
+    fn a_runaway_unterminated_sequence_is_abandoned() {
+        let mut s = OscSniffer::default();
+        assert!(s.scan(b"\x1b]133;D;").is_empty());
+        // Far more than CARRY_MAX bytes of garbage with no terminator: the
+        // sniffer must abandon the carry rather than buffer forever, and
+        // still work afterwards.
+        for _ in 0..10 {
+            assert!(s.scan(&[b'x'; 1024]).is_empty());
+        }
+        let got = s.scan(b"\x1b]133;A\x07");
+        assert_eq!(got, vec![(8, OscEvent::PromptStart)]);
+    }
+
+    #[test]
+    fn resolve_user_zdotdir_rejects_croft_shim_paths() {
+        let shim_root = std::path::Path::new("/cfg/croft/shell-integration");
+        let home = std::path::Path::new("/Users/me");
+        // Poisoned: inherited ZDOTDIR inside croft's shim tree → HOME.
+        assert_eq!(
+            resolve_user_zdotdir(Some(&shim_root.join("zsh")), shim_root, home),
+            home
+        );
+        // A genuine user ZDOTDIR redirect is honoured.
+        let custom = std::path::Path::new("/Users/me/.config/zsh");
+        assert_eq!(resolve_user_zdotdir(Some(custom), shim_root, home), custom);
+        // No inherited ZDOTDIR → HOME.
+        assert_eq!(resolve_user_zdotdir(None, shim_root, home), home);
+    }
+
+    #[test]
+    fn zsh_shim_writes_all_four_dotfiles_sourcing_the_user_rc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ensure_zsh_shim(tmp.path()).expect("shim must be written");
+        for f in [".zshenv", ".zprofile", ".zshrc", ".zlogin"] {
+            let p = dir.join(f);
+            assert!(p.is_file(), "{f} must exist");
+        }
+        let rc = std::fs::read_to_string(dir.join(".zshrc")).unwrap();
+        assert!(rc.contains("133;A"), "precmd must emit the prompt mark");
+        assert!(rc.contains("133;C"), "preexec must emit the command mark");
+        assert!(rc.contains("133;D"), "precmd must emit the finished mark");
+        assert!(
+            rc.contains("]7;file://"),
+            "precmd must report cwd via OSC 7"
+        );
+        assert!(
+            rc.contains("CROFT_USER_ZDOTDIR"),
+            "the shim must source the user's own rc files"
+        );
+        // Idempotent: a second call rewrites without error.
+        ensure_zsh_shim(tmp.path()).expect("shim rewrite must succeed");
+    }
+
+    #[test]
+    fn fish_native_mark_dialect_is_parsed() {
+        // fish 4.x (the Rust rewrite) emits the marks itself, for every
+        // terminal, in its own dialect: ST-terminated, `A` carrying
+        // `click_events=1`, `C` carrying the URL-escaped command line, and a
+        // bare `D` (no exit code) when it synthesizes a missing output-end
+        // after a cancelled prompt. All must parse.
+        let mut s = OscSniffer::default();
+        let events = scan_all(
+            &mut s,
+            &[b"\x1b]133;A;click_events=1\x1b\\> \x1b]133;B\x1b\\cmd\x1b]133;C;cmdline_url=cmd%20--flag\x1b\\out\x1b]133;D;2\x1b\\"],
+        );
+        assert_eq!(
+            events,
+            vec![
+                OscEvent::PromptStart,
+                OscEvent::PromptEnd,
+                OscEvent::CommandStart,
+                OscEvent::CommandEnd(Some(2)),
+            ]
+        );
+        let bare = scan_all(&mut s, &[b"\x1b]133;D\x1b\\"]);
+        assert_eq!(bare, vec![OscEvent::CommandEnd(None)]);
+    }
+
+    #[test]
+    fn bash_shim_backs_out_of_posix_mode_and_installs_hooks() {
+        // The kitty/Ghostty ENV + --posix injection: an interactive
+        // `bash --posix` reads ONLY $ENV, so the shim must leave posix mode,
+        // replay the user's real startup files (login vs non-login), and
+        // install the OSC 133 / OSC 7 hooks.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = ensure_bash_shim(tmp.path()).expect("shim must be written");
+        assert!(file.is_file(), "croft.bash must exist");
+        let s = std::fs::read_to_string(&file).unwrap();
+        for needle in [
+            "set +o posix",
+            "login_shell",
+            ".bash_profile",
+            ".bashrc",
+            "PROMPT_COMMAND",
+            "133;A",
+            "133;B",
+            "133;C",
+            "133;D",
+            "]7;file://",
+            "HISTFILE",
+        ] {
+            assert!(s.contains(needle), "bash shim must contain {needle:?}");
+        }
+        ensure_bash_shim(tmp.path()).expect("shim rewrite must succeed");
+    }
+
+    #[test]
+    fn fish_integration_writes_a_vendor_conf_that_defers_to_native_marks() {
+        // fish is injected via the standard XDG_DATA_DIRS vendor_conf.d
+        // mechanism. The script must restore XDG_DATA_DIRS first, and only
+        // emit marks itself on old fish (<= 3.7) — modern fish marks
+        // natively, and a second emitter would double-decorate.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = ensure_fish_integration(tmp.path()).expect("must be written");
+        let f = data_dir
+            .join("fish")
+            .join("vendor_conf.d")
+            .join("croft.fish");
+        assert!(
+            f.is_file(),
+            "croft.fish must exist under fish/vendor_conf.d"
+        );
+        let s = std::fs::read_to_string(&f).unwrap();
+        for needle in [
+            "CROFT_FISH_XDG_DATA_DIR",
+            "forward-char-passive",
+            "fish_preexec",
+            "fish_postexec",
+            "functions --copy fish_prompt",
+            "133;A",
+            "133;B",
+            "133;C",
+            "133;D",
+            "]7;file://",
+        ] {
+            assert!(
+                s.contains(needle),
+                "fish integration must contain {needle:?}"
+            );
+        }
+        ensure_fish_integration(tmp.path()).expect("rewrite must succeed");
+    }
+
+    #[test]
+    fn fish_xdg_data_dirs_prepends_and_keeps_the_spec_default() {
+        let d = std::path::Path::new("/cfg/shell-integration/fish");
+        assert_eq!(
+            fish_xdg_data_dirs(d, Some("/a:/b")),
+            "/cfg/shell-integration/fish:/a:/b"
+        );
+        // Unset or empty inherits the XDG spec default, so fish never loses
+        // sight of the system data dirs.
+        for inherited in [None, Some("")] {
+            assert_eq!(
+                fish_xdg_data_dirs(d, inherited),
+                "/cfg/shell-integration/fish:/usr/local/share:/usr/share"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pane_bin_holds_only_a_croft_linked_to_the_running_binary() {
+        let cache = tempfile::tempdir().unwrap();
+        let bins = tempfile::tempdir().unwrap();
+        let exe = bins.path().join("croft");
+        std::fs::write(&exe, "").unwrap();
+        let dir = ensure_pane_bin(cache.path(), &exe).unwrap();
+        assert!(dir.starts_with(cache.path()), "{}", dir.display());
+        assert_eq!(std::fs::read_link(dir.join("croft")).unwrap(), exe);
+        // The dir goes FIRST on a pane's PATH, so anything else in it would
+        // shadow one of the user's own tools.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("croft")]);
+        assert_eq!(ensure_pane_bin(cache.path(), &exe).unwrap(), dir);
+    }
+
+    #[test]
+    fn two_installs_get_two_pane_bins() {
+        // #1854's machine had Homebrew's croft and cargo's: a window from
+        // each must hand its panes its own binary, not whichever wrote last.
+        let cache = tempfile::tempdir().unwrap();
+        let bins = tempfile::tempdir().unwrap();
+        let cargo = bins.path().join("cargo-croft");
+        let brew = bins.path().join("brew-croft");
+        std::fs::write(&cargo, "").unwrap();
+        std::fs::write(&brew, "").unwrap();
+        let cargo_dir = ensure_pane_bin(cache.path(), &cargo).unwrap();
+        let brew_dir = ensure_pane_bin(cache.path(), &brew).unwrap();
+        assert_ne!(cargo_dir, brew_dir);
+        assert_eq!(std::fs::read_link(cargo_dir.join("croft")).unwrap(), cargo);
+        assert_eq!(std::fs::read_link(brew_dir.join("croft")).unwrap(), brew);
+    }
+
+    #[test]
+    fn a_pane_bin_link_naming_another_binary_is_repointed() {
+        let cache = tempfile::tempdir().unwrap();
+        let bins = tempfile::tempdir().unwrap();
+        let exe = bins.path().join("croft");
+        let stranger = bins.path().join("stranger");
+        std::fs::write(&exe, "").unwrap();
+        std::fs::write(&stranger, "").unwrap();
+        let dir = ensure_pane_bin(cache.path(), &exe).unwrap();
+        std::fs::remove_file(dir.join("croft")).unwrap();
+        std::os::unix::fs::symlink(&stranger, dir.join("croft")).unwrap();
+        ensure_pane_bin(cache.path(), &exe).unwrap();
+        assert_eq!(std::fs::read_link(dir.join("croft")).unwrap(), exe);
+    }
+}
