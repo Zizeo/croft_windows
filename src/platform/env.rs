@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// User home directory: `HOME` on Unix; `HOME` -> `USERPROFILE` ->
 /// `HOMEDRIVE` + `HOMEPATH` on Windows.
@@ -162,11 +162,12 @@ pub fn hostname() -> String {
         }
         if len > 0 {
             let mut buf = vec![0u16; len as usize];
-            let ok = unsafe {
-                GetComputerNameExW(ComputerNameDnsHostname, buf.as_mut_ptr(), &mut len)
-            };
-            if ok != 0 {
-                let s = String::from_utf16_lossy(&buf[..len as usize]);
+            let ok =
+                unsafe { GetComputerNameExW(ComputerNameDnsHostname, buf.as_mut_ptr(), &mut len) };
+            if ok != 0
+                && let Some(slice) = buf.get(..len as usize)
+            {
+                let s = String::from_utf16_lossy(slice);
                 if !s.is_empty() {
                     return s;
                 }
@@ -210,6 +211,5 @@ fn find_on_path(exe: &str) -> Option<PathBuf> {
             return Some(candidate);
         }
     }
-    let direct = Path::new(exe);
-    direct.is_file().then(|| direct.to_path_buf())
+    None
 }

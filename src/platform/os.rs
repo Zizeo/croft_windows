@@ -23,7 +23,7 @@ pub fn reveal_in_file_manager(path: &Path) -> Result<&'static str, &'static str>
     #[cfg(windows)]
     {
         let mut arg = std::ffi::OsString::from("/select,");
-        arg.push(path.as_os_str());
+        arg.push(dunce::simplified(path).as_os_str());
         if Command::new("explorer.exe")
             .arg(arg)
             .stdin(Stdio::null())

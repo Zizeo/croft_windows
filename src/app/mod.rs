@@ -6434,10 +6434,11 @@ pub fn run(
             let err = CommandExt::exec(&mut cmd);
             eprintln!("croft self-relaunch failed: {err}");
         }
-        #[cfg(windows)]
+        #[cfg(not(unix))]
         {
-            if let Err(err) = cmd.spawn() {
-                eprintln!("croft self-relaunch failed: {err}");
+            match cmd.status() {
+                Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                Err(err) => eprintln!("croft self-relaunch failed: {err}"),
             }
         }
         return Ok(());
