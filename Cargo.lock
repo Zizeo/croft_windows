@@ -640,6 +640,7 @@ dependencies = [
  "color_quant",
  "crossterm",
  "csv",
+ "dunce",
  "encoding_rs",
  "fancy-regex 0.18.0",
  "flate2",
@@ -722,6 +723,7 @@ dependencies = [
  "ureq 3.3.0",
  "url",
  "webpki-roots 1.0.11",
+ "windows-sys 0.59.0",
  "zip",
 ]
 
@@ -991,6 +993,12 @@ name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
+
+[[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "either"

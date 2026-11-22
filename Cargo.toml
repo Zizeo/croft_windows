@@ -35,9 +35,6 @@ path = "src/main.rs"
 
 # Versions verified against crates.io max_stable_version on 2026-05-02.
 [dependencies]
-# Unix process control: `setsid` to detach a probe subprocess from croft's
-# controlling terminal so it can never hijack the tty (see lsp/install.rs).
-libc = "0.2"
 # Text codec for the status-bar "Reopen / Save with Encoding": decode non-UTF-8
 # files (UTF-16, Windows-1252, Shift-JIS, …) and re-encode on save. Firefox's
 # engine; already in the tree transitively.
@@ -126,7 +123,7 @@ futures = "0.3"
 # and its `waitpid-any` dep fails to compile on android (target_os = "android"
 # is not "linux", so waitpid-any has no backend module). Dropping it lets
 # croft build under Termux while changing nothing on macOS/Linux.
-async-lsp = { version = "0.2", default-features = false, features = ["omni-trait", "stdio", "tracing", "tokio"] }
+async-lsp = { version = "0.2", default-features = false, features = ["omni-trait", "tracing", "tokio"] }
 lsp-types = { version = "0.95", features = ["proposed"] }
 tower = "0.5"
 tui-input = "0.15"
@@ -284,6 +281,25 @@ globset = "0.4.18"
 # is only a dependency off-android.
 [target.'cfg(not(target_os = "android"))'.dependencies]
 trash = "5.2"
+
+[target.'cfg(unix)'.dependencies]
+# Unix process control: `setsid` to detach a probe subprocess from croft's
+# controlling terminal so it can never hijack the tty (see lsp/install.rs).
+libc = "0.2"
+async-lsp = { version = "0.2", default-features = false, features = ["stdio"] }
+
+[target.'cfg(windows)'.dependencies]
+dunce = "1"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_JobObjects",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_UI_Shell",
+] }
 
 [dev-dependencies]
 tempfile = "3.27"
