@@ -17,10 +17,38 @@ pub fn detach_from_tty(cmd: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::{
-            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
-        };
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+}
+
+/// Cloneable handle to terminate a spawned process tree (Unix process group;
+/// Windows Job Object + process PID).
+///
+/// On Windows, holding a `TreeKiller` keeps the underlying
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job Object handle open; dropping the
+/// last clone closes the Job Object and cleans up any surviving descendants.
+#[derive(Clone)]
+pub struct TreeKiller {
+    #[cfg(unix)]
+    pgid: i32,
+    #[cfg(windows)]
+    job: Option<std::sync::Arc<WinHandle>>,
+    #[cfg(windows)]
+    pid: u32,
+}
+
+impl TreeKiller {
+    /// Forcefully terminate every process in the target's tree.
+    pub fn kill_tree(&self) {
+        #[cfg(unix)]
+        if self.pgid > 0 {
+            unsafe {
+                libc::kill(-self.pgid, libc::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        terminate_job(self.job.as_deref(), self.pid);
     }
 }
 
@@ -30,7 +58,7 @@ pub fn detach_from_tty(cmd: &mut Command) {
 pub struct ManagedChild {
     child: Child,
     #[cfg(windows)]
-    job: Option<WinHandle>,
+    job: Option<std::sync::Arc<WinHandle>>,
 }
 
 #[cfg(windows)]
@@ -39,6 +67,11 @@ struct WinHandle(windows_sys::Win32::Foundation::HANDLE);
 #[cfg(windows)]
 unsafe impl Send for WinHandle {}
 
+// SAFETY: `WinHandle` wraps a Win32 Job Object handle passed only to thread-safe
+// Win32 kernel APIs (`TerminateJobObject`, `SetInformationJobObject`, `CloseHandle`).
+#[cfg(windows)]
+unsafe impl Sync for WinHandle {}
+
 #[cfg(windows)]
 impl Drop for WinHandle {
     fn drop(&mut self) {
@@ -46,6 +79,70 @@ impl Drop for WinHandle {
             unsafe {
                 windows_sys::Win32::Foundation::CloseHandle(self.0);
             }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn attach_job_object(child: &Child) -> Option<std::sync::Arc<WinHandle>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+    unsafe {
+        let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if h.is_null() {
+            return None;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let set_ok = SetInformationJobObject(
+            h,
+            JobObjectExtendedLimitInformation,
+            (&raw const info).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        let assign_ok = if set_ok != 0 {
+            AssignProcessToJobObject(h, child.as_raw_handle())
+        } else {
+            0
+        };
+        if assign_ok != 0 {
+            Some(std::sync::Arc::new(WinHandle(h)))
+        } else {
+            CloseHandle(h);
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+fn terminate_job(job: Option<&WinHandle>, pid: u32) {
+    if let Some(job) = job {
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(job.0, 1);
+        }
+    }
+    force_kill_pid(pid);
+}
+
+/// Build a [`TreeKiller`] for an already-spawned `Child` that leads its own
+/// session or process group (for example, configured via [`detach_from_tty`]).
+pub fn tree_killer_for_leader(child: &Child) -> TreeKiller {
+    #[cfg(unix)]
+    {
+        TreeKiller {
+            pgid: i32::try_from(child.id()).unwrap_or(0),
+        }
+    }
+    #[cfg(windows)]
+    {
+        TreeKiller {
+            job: attach_job_object(child),
+            pid: child.id(),
         }
     }
 }
@@ -61,45 +158,14 @@ impl ManagedChild {
         }
         #[cfg(windows)]
         {
-            use std::os::windows::io::AsRawHandle;
             use std::os::windows::process::CommandExt;
-            use windows_sys::Win32::System::JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-                SetInformationJobObject,
-            };
             use windows_sys::Win32::System::Threading::{
                 CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
             };
 
             cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
             let child = cmd.spawn()?;
-            let job = unsafe {
-                let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                if h.is_null() {
-                    None
-                } else {
-                    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-                    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                    let set_ok = SetInformationJobObject(
-                        h,
-                        JobObjectExtendedLimitInformation,
-                        (&raw const info).cast(),
-                        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                    );
-                    let assign_ok = if set_ok != 0 {
-                        AssignProcessToJobObject(h, child.as_raw_handle())
-                    } else {
-                        0
-                    };
-                    if assign_ok != 0 {
-                        Some(WinHandle(h))
-                    } else {
-                        windows_sys::Win32::Foundation::CloseHandle(h);
-                        None
-                    }
-                }
-            };
+            let job = attach_job_object(&child);
             Ok(Self { child, job })
         }
     }
@@ -110,6 +176,25 @@ impl ManagedChild {
 
     pub fn child_mut(&mut self) -> &mut Child {
         &mut self.child
+    }
+
+    /// Transfer ownership of the underlying `Child` together with a cloneable
+    /// [`TreeKiller`] handle.
+    ///
+    /// Unlike [`Self::into_child`], on Windows the `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+    /// Job Object remains active as long as any clone of the returned `TreeKiller`
+    /// stays alive.
+    pub fn split_killer(self) -> (Child, TreeKiller) {
+        #[cfg(unix)]
+        let killer = TreeKiller {
+            pgid: i32::try_from(self.child.id()).unwrap_or(0),
+        };
+        #[cfg(windows)]
+        let killer = TreeKiller {
+            job: self.job,
+            pid: self.child.id(),
+        };
+        (self.child, killer)
     }
 
     /// Transfer ownership of the underlying `Child` out of `ManagedChild`,
@@ -139,7 +224,9 @@ impl ManagedChild {
     pub fn kill_tree(&mut self) {
         #[cfg(unix)]
         {
-            if let Ok(pid) = libc::pid_t::try_from(self.child.id()) {
+            if let Ok(pid) = libc::pid_t::try_from(self.child.id())
+                && pid > 0
+            {
                 unsafe {
                     libc::kill(-pid, libc::SIGKILL);
                 }
@@ -149,11 +236,7 @@ impl ManagedChild {
         }
         #[cfg(windows)]
         {
-            if let Some(job) = self.job.as_ref() {
-                unsafe {
-                    windows_sys::Win32::System::JobObjects::TerminateJobObject(job.0, 1);
-                }
-            }
+            terminate_job(self.job.as_deref(), self.child.id());
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
@@ -173,7 +256,7 @@ pub fn is_pid_alive(pid: u32) -> bool {
             return false;
         }
         unsafe { libc::kill(pid, 0) == 0 }
-            || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(windows)]
     {
@@ -194,32 +277,54 @@ pub fn is_pid_alive(pid: u32) -> bool {
     }
 }
 
-pub fn terminate_pid(pid: u32) -> bool {
+#[cfg(unix)]
+fn send_signal_pid(pid: u32, sig: libc::c_int) -> bool {
     if pid == 0 {
         return false;
     }
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    pid > 0 && unsafe { libc::kill(pid, sig) == 0 }
+}
+
+#[cfg(windows)]
+fn open_and_terminate(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    unsafe {
+        let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let ok = TerminateProcess(h, 1);
+        CloseHandle(h);
+        ok != 0
+    }
+}
+
+pub fn terminate_pid(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        let Ok(pid) = libc::pid_t::try_from(pid) else {
-            return false;
-        };
-        pid > 0 && unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
+        send_signal_pid(pid, libc::SIGTERM)
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
-        };
-        unsafe {
-            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
-            if h.is_null() {
-                return false;
-            }
-            let ok = TerminateProcess(h, 1);
-            CloseHandle(h);
-            ok != 0
-        }
+        open_and_terminate(pid)
+    }
+}
+
+pub fn force_kill_pid(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        send_signal_pid(pid, libc::SIGKILL)
+    }
+    #[cfg(windows)]
+    {
+        open_and_terminate(pid)
     }
 }
 

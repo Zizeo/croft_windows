@@ -152,15 +152,15 @@ pub enum CoverageError {
 }
 
 /// What a cancel (#1534) needs to reach the runner the worker thread is
-/// blocked on: the process group of the child it is streaming, and how
+/// blocked on: a handle to kill the child's process tree, and how
 /// many requests the app has cancelled. Requests are counted on both sides
 /// in channel order, so a cancel covers the request in flight and any the
 /// worker has not picked up yet, and never a later one.
 #[derive(Clone, Default)]
 pub struct RunControl {
-    /// The streaming child's pid, which is its process group (it is
-    /// spawned as a group leader).
-    running: Arc<Mutex<Option<i32>>>,
+    /// Process-tree killer for the streaming child (Unix process group;
+    /// Windows Job Object).
+    running: Arc<Mutex<Option<crate::platform::process::TreeKiller>>>,
     /// Requests numbered up to this one are cancelled.
     cancelled_upto: Arc<AtomicU64>,
 }

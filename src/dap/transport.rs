@@ -109,6 +109,10 @@ pub struct DapTransport {
     /// The adapter / debug-server process, when this transport owns one. A child
     /// TCP session connecting to an already-running server holds `None`.
     child: Option<Child>,
+    /// Process-tree killer paired with `child` (Unix process group; Windows
+    /// Job Object). Kept alive until teardown completes so Windows does not
+    /// close the `KILL_ON_JOB_CLOSE` Job Object before `DISCONNECT_GRACE`.
+    killer: Option<crate::platform::process::TreeKiller>,
     writer: Mutex<Box<dyn Write + Send>>,
     seq: AtomicI64,
     /// Drained by the session: every decoded incoming message (responses,
@@ -180,6 +184,7 @@ impl DapTransport {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning debug adapter `{program}`"))?;
+        let killer = crate::platform::process::tree_killer_for_leader(&child);
 
         let stdin = child.stdin.take().context("adapter stdin missing")?;
         let stdout = child.stdout.take().context("adapter stdout missing")?;
@@ -216,6 +221,7 @@ impl DapTransport {
 
         Ok(DapTransport {
             child: Some(child),
+            killer: Some(killer),
             writer: Mutex::new(Box::new(stdin)),
             seq: AtomicI64::new(0),
             incoming: rx,
@@ -256,8 +262,9 @@ impl DapTransport {
         let child = cmd
             .spawn()
             .with_context(|| format!("spawning debug server `{program}`"))?;
+        let killer = crate::platform::process::tree_killer_for_leader(&child);
         let stream = connect_with_retry(host, port)?;
-        Self::from_stream(stream, Some(child))
+        Self::from_stream(stream, Some((child, killer)))
     }
 
     /// Connect to an already-running DAP debug server over TCP, owning no child
@@ -280,7 +287,10 @@ impl DapTransport {
 
     /// Wire a connected TCP stream into a transport: a reader thread frames the
     /// read half into `incoming`, the write half is the boxed writer.
-    fn from_stream(stream: std::net::TcpStream, child: Option<Child>) -> Result<DapTransport> {
+    fn from_stream(
+        stream: std::net::TcpStream,
+        child: Option<(Child, crate::platform::process::TreeKiller)>,
+    ) -> Result<DapTransport> {
         let reader = stream.try_clone().context("cloning DAP socket for reads")?;
         let writer = stream;
         let (tx, rx): (Sender<Value>, Receiver<Value>) = std::sync::mpsc::channel();
@@ -290,8 +300,13 @@ impl DapTransport {
             .name("dap-reader".into())
             .spawn(move || reader_loop(reader, tx, &seen))
             .context("spawning dap-reader thread")?;
+        let (child, killer) = match child {
+            Some((c, k)) => (Some(c), Some(k)),
+            None => (None, None),
+        };
         Ok(DapTransport {
             child,
+            killer,
             writer: Mutex::new(Box::new(writer)),
             seq: AtomicI64::new(0),
             incoming: rx,
@@ -331,27 +346,21 @@ impl DapTransport {
     }
 }
 
-/// Best-effort terminate an adapter process tree. The adapter was `setsid`'d
-/// at spawn, so its pid is its own process-group id; signalling the whole
-/// group (`killpg`) reaps what it forked into that group too, not just the
-/// direct child. `child.kill()` then covers the direct child
-/// belt-and-suspenders, and `wait()` reaps the zombie so a long-lived croft
-/// never accumulates defunct adapters. debugpy's launcher starts the
-/// debuggee in a group of its own, which `finish_teardown` covers (#1536).
+/// Best-effort terminate an adapter process tree. The adapter was detached at
+/// spawn (`setsid` on Unix so its pid is its own process-group id; Job Object
+/// on Windows via [`TreeKiller`](crate::platform::process::TreeKiller)), so
+/// signalling the whole tree reaps what it spawned too, not just the direct
+/// child. `child.kill()` then covers the direct child belt-and-suspenders, and
+/// `wait()` reaps the zombie so a long-lived croft never accumulates defunct
+/// adapters. debugpy's launcher starts the debuggee in a group of its own, which
+/// `finish_teardown` covers (#1536).
 ///
 /// vscode-js-debug's `watchdog` `setsid`s into a *separate* session, so it
 /// is deliberately outside this group; the graceful `disconnect` handshake
 /// and the startup orphan sweep ([`crate::dap::reaper`]) are what retire it.
-fn kill_tree(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        let pid = child.id() as i32;
-        // SAFETY: `killpg` is a plain libc call; `pid` is this child's pgid
-        // (it `setsid`'d), distinct from croft's, so only the adapter tree
-        // is signalled.
-        unsafe {
-            libc::killpg(pid, libc::SIGKILL);
-        }
+fn kill_tree(child: &mut Child, killer: Option<&crate::platform::process::TreeKiller>) {
+    if let Some(killer) = killer {
+        killer.kill_tree();
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -385,7 +394,12 @@ fn is_running(pid: i32) -> bool {
 /// the deadline), let the debuggee finish exiting, then kill the adapter's
 /// group, and, for a launch, the debuggee the adapter reported if it is
 /// still there.
-fn finish_teardown(mut child: Child, teardown: &(Mutex<Teardown>, Condvar), grace: Duration) {
+fn finish_teardown(
+    mut child: Child,
+    killer: Option<crate::platform::process::TreeKiller>,
+    teardown: &(Mutex<Teardown>, Condvar),
+    grace: Duration,
+) {
     let deadline = Instant::now() + grace;
     let (lock, answered) = teardown;
     let mut seen = lock.lock().unwrap();
@@ -406,7 +420,7 @@ fn finish_teardown(mut child: Child, teardown: &(Mutex<Teardown>, Condvar), grac
             std::thread::sleep(Duration::from_millis(20));
         }
     }
-    kill_tree(&mut child);
+    kill_tree(&mut child, killer.as_ref());
     // Read after the wait: an `exited` that landed meanwhile means the pid
     // is no longer the debuggee's.
     if let Some(pid) = debuggee
@@ -414,7 +428,7 @@ fn finish_teardown(mut child: Child, teardown: &(Mutex<Teardown>, Condvar), grac
         && is_running(pid)
         && let Ok(pid) = u32::try_from(pid)
     {
-        crate::platform::process::terminate_pid(pid);
+        crate::platform::process::force_kill_pid(pid);
     }
 }
 
@@ -503,21 +517,22 @@ impl Drop for DapTransport {
         let Some(mut child) = self.child.take() else {
             return;
         };
+        let killer = self.killer.take();
         if self.teardown.0.lock().unwrap().disconnect.is_none() {
-            kill_tree(&mut child);
+            kill_tree(&mut child, killer.as_ref());
             return;
         }
         // Off the UI thread: Stop Debugging stays instant on screen.
         // The child rides in a shared slot so a failed spawn, which drops
         // the closure, still leaves it here to kill rather than orphan.
         let teardown = self.teardown.clone();
-        let slot = Arc::new(Mutex::new(Some(child)));
+        let slot = Arc::new(Mutex::new(Some((child, killer))));
         let moved = slot.clone();
         let spawned = std::thread::Builder::new()
             .name("dap-teardown".into())
             .spawn(move || {
-                if let Some(child) = moved.lock().unwrap().take() {
-                    finish_teardown(child, &teardown, DISCONNECT_GRACE);
+                if let Some((child, killer)) = moved.lock().unwrap().take() {
+                    finish_teardown(child, killer, &teardown, DISCONNECT_GRACE);
                 }
             });
         match spawned {
@@ -527,8 +542,8 @@ impl Drop for DapTransport {
                 reg.push(handle);
             }
             Err(_) => {
-                if let Some(mut child) = slot.lock().unwrap().take() {
-                    kill_tree(&mut child);
+                if let Some((mut child, killer)) = slot.lock().unwrap().take() {
+                    kill_tree(&mut child, killer.as_ref());
                 }
             }
         }

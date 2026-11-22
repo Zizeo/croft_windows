@@ -185,6 +185,47 @@ fn process_into_child_preserves_liveness() {
 }
 
 #[test]
+fn process_split_killer_tree_killer_and_force_kill_pid() {
+    assert!(!platform::process::force_kill_pid(0));
+
+    let mut cmd = spawn_sleep_command();
+    let managed = platform::process::ManagedChild::spawn_in_group(&mut cmd).unwrap();
+    let pid = managed.id();
+    let (mut child, killer) = managed.split_killer();
+    let killer_clone = killer.clone();
+
+    assert!(child.try_wait().unwrap().is_none());
+    assert!(platform::process::is_pid_alive(pid));
+
+    killer_clone.kill_tree();
+    drop(killer_clone);
+    let _ = child.wait().unwrap();
+    drop(killer);
+    assert!(!platform::process::is_pid_alive(pid));
+
+    let mut cmd = spawn_sleep_command();
+    let mut child = platform::process::ManagedChild::spawn_in_group(&mut cmd)
+        .unwrap()
+        .into_child();
+    let pid = child.id();
+    assert!(platform::process::is_pid_alive(pid));
+    assert!(platform::process::force_kill_pid(pid));
+    let _ = child.wait().unwrap();
+    assert!(!platform::process::is_pid_alive(pid));
+
+    let mut cmd = spawn_sleep_command();
+    platform::process::detach_from_tty(&mut cmd);
+    let mut child = cmd.spawn().unwrap();
+    let pid = child.id();
+    let killer = platform::process::tree_killer_for_leader(&child);
+    assert!(platform::process::is_pid_alive(pid));
+    killer.kill_tree();
+    let _ = child.wait().unwrap();
+    drop(killer);
+    assert!(!platform::process::is_pid_alive(pid));
+}
+
+#[test]
 fn clipboard_utf16_codec_roundtrip_and_nul_rejection() {
     for sample in ["", "hello world", "café naïve", "🚀🦀 Windows\r\nline2"] {
         let encoded = platform::clipboard::encode_utf16_nul(sample).unwrap();
