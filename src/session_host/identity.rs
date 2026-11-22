@@ -29,6 +29,7 @@ pub(crate) fn client_name() -> String {
 /// displaces nothing. That is deliberate: a local attach has no ghost
 /// problem, because a dead unix socket reports EPIPE at once and is pruned
 /// on the next broadcast.
+#[cfg(any(unix, test))]
 pub(crate) fn client_identity() -> String {
     compose_client_identity(
         &std::env::var("CROFT_RELAY_KEY").unwrap_or_default(),
@@ -39,6 +40,7 @@ pub(crate) fn client_identity() -> String {
 /// The composition rule behind [`client_identity`], split out so it can be
 /// tested directly: `set_var` races sibling test threads (#37), so the env
 /// read stays a one-liner and the logic worth asserting lives here.
+#[cfg(any(unix, test))]
 pub(super) fn compose_client_identity(relay_key: &str, nonce: &str) -> String {
     if relay_key.is_empty() || nonce.is_empty() {
         return String::new();

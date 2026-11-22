@@ -18,16 +18,25 @@
 pub mod tls;
 pub mod ws;
 
+#[cfg(unix)]
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::SocketAddr;
+#[cfg(unix)]
+use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
 use crate::session_host::{Control, Frame, FrameReader, encode_bytes_frame, encode_control_frame};
 
 /// Where `croft web` listens unless `--bind` says otherwise.
@@ -42,6 +51,7 @@ pub const PROTOCOL: &str = "croft";
 pub const TOKEN_PROTOCOL_PREFIX: &str = "croft.token.";
 
 /// How often a listener checks that its session is still running.
+#[cfg(unix)]
 const HOST_POLL: Duration = Duration::from_secs(2);
 
 /// What `croft web` was asked to do.
@@ -58,6 +68,7 @@ pub struct Options {
 }
 
 /// `croft web` for the session of `workspace`.
+#[cfg(unix)]
 pub fn run(workspace: &Path, opts: Options) -> Result<()> {
     let root = crate::platform::fs::canonicalize(workspace)
         .with_context(|| format!("{} is not a directory", workspace.display()))?;
@@ -133,7 +144,13 @@ pub fn run(workspace: &Path, opts: Options) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+pub fn run(_workspace: &Path, _opts: Options) -> Result<()> {
+    anyhow::bail!("croft web is not supported on native Windows; run croft in WSL2")
+}
+
 /// Printed when the listener is reachable from other machines.
+#[cfg(any(unix, test))]
 fn exposure_warning(local: SocketAddr, tls: bool) -> String {
     let mut s = format!(
         "croft web: WARNING: {local} is not a loopback address, so other machines can reach this listener. Anyone holding the token can watch the session, and type into it if they are given control."
@@ -149,6 +166,7 @@ fn exposure_warning(local: SocketAddr, tls: bool) -> String {
 /// The listener lives as long as its session: when the host goes, or when
 /// another `croft web` takes the record over (`--off`, `--rotate-token`),
 /// this one exits.
+#[cfg(unix)]
 fn follow_host(socket: &Path, record: &Path) {
     loop {
         std::thread::sleep(HOST_POLL);
@@ -161,6 +179,7 @@ fn follow_host(socket: &Path, record: &Path) {
 /// Whether listener `pid` should keep serving: its record still names it
 /// and its session is still running. A listener whose session ended clears
 /// its record on the way out.
+#[cfg(unix)]
 fn keep_serving(socket: &Path, record: &Path, pid: u32) -> bool {
     if !read_record(record).is_some_and(|r| r.pid == pid) {
         return false;
@@ -172,6 +191,7 @@ fn keep_serving(socket: &Path, record: &Path, pid: u32) -> bool {
     false
 }
 
+#[cfg(unix)]
 fn token() -> Result<String> {
     use ring::rand::SecureRandom;
     let mut bytes = [0u8; 16];
@@ -198,6 +218,7 @@ pub struct Record {
     pub addr: Option<SocketAddr>,
 }
 
+#[cfg(unix)]
 fn write_record(path: &Path, record: &Record) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let json = serde_json::to_string(record)?;
@@ -212,12 +233,14 @@ fn write_record(path: &Path, record: &Record) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn read_record(path: &Path) -> Option<Record> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
 /// The workspace's listener, if its process is still running. A record
 /// left by a listener that was killed is removed.
+#[cfg(unix)]
 pub fn live_record(path: &Path) -> Option<Record> {
     let record = read_record(path)?;
     if pid_alive(record.pid) {
@@ -228,6 +251,12 @@ pub fn live_record(path: &Path) -> Option<Record> {
     }
 }
 
+#[cfg(not(unix))]
+pub fn live_record(_path: &Path) -> Option<Record> {
+    None
+}
+
+#[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
@@ -240,6 +269,7 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 /// Stop the workspace's listener, returning what it was.
+#[cfg(unix)]
 fn stop(path: &Path) -> Option<Record> {
     let record = live_record(path)?;
     // Removing the record first means the listener also exits on its own
@@ -258,6 +288,7 @@ fn stop(path: &Path) -> Option<Record> {
 }
 
 /// What every connection is checked against.
+#[cfg(unix)]
 pub struct Server {
     pub socket: PathBuf,
     pub token: String,
@@ -267,6 +298,7 @@ pub struct Server {
 }
 
 /// Accept connections forever, one thread each.
+#[cfg(unix)]
 pub fn serve(listener: TcpListener, server: Server) {
     let server = Arc::new(server);
     for stream in listener.incoming().flatten() {
@@ -285,12 +317,14 @@ pub fn serve(listener: TcpListener, server: Server) {
 
 /// Either transport a connection arrives on: TCP, or the plaintext side of
 /// a TLS terminator.
+#[cfg(unix)]
 trait Conn: Read + Write + Send + Sized + 'static {
     fn duplicate(&self) -> std::io::Result<Self>;
     fn close(&self);
     fn read_timeout(&self, t: Option<Duration>) -> std::io::Result<()>;
 }
 
+#[cfg(unix)]
 impl Conn for TcpStream {
     fn duplicate(&self) -> std::io::Result<Self> {
         self.try_clone()
@@ -303,6 +337,7 @@ impl Conn for TcpStream {
     }
 }
 
+#[cfg(unix)]
 impl Conn for UnixStream {
     fn duplicate(&self) -> std::io::Result<Self> {
         self.try_clone()
@@ -318,6 +353,7 @@ impl Conn for UnixStream {
 /// The token a client offered, if it also offered `croft` for the server
 /// to select. A browser fails a connection whose reply selects none of the
 /// subprotocols it listed, so the reply names `croft` and never the token.
+#[cfg(any(unix, test))]
 fn offered_token(protocols: Option<&str>) -> Option<&str> {
     let offered: Vec<&str> = protocols?.split(',').map(str::trim).collect();
     if !offered.contains(&PROTOCOL) {
@@ -329,6 +365,7 @@ fn offered_token(protocols: Option<&str>) -> Option<&str> {
 }
 
 /// Compare without leaking how much of the token matched through timing.
+#[cfg(any(unix, test))]
 fn token_matches(offered: Option<&str>, token: &str) -> bool {
     let Some(offered) = offered else {
         return false;
@@ -348,6 +385,7 @@ fn token_matches(offered: Option<&str>, token: &str) -> bool {
 /// closes DNS rebinding: a page at a hostile name that resolves to 127.0.0.1
 /// has an `Origin` and a `Host` that agree with each other, but not with
 /// loopback.
+#[cfg(any(unix, test))]
 fn origin_allowed(origin: Option<&str>, host: Option<&str>, scheme: &str, loopback: bool) -> bool {
     let Some(origin) = origin else {
         return true;
@@ -359,6 +397,7 @@ fn origin_allowed(origin: Option<&str>, host: Option<&str>, scheme: &str, loopba
         && (!loopback || host_is_loopback(host))
 }
 
+#[cfg(any(unix, test))]
 fn host_is_loopback(host: &str) -> bool {
     let name = if let Some(rest) = host.strip_prefix('[') {
         rest.split(']').next().unwrap_or_default()
@@ -371,6 +410,7 @@ fn host_is_loopback(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
+#[cfg(unix)]
 fn handle<C: Conn>(mut conn: C, server: &Server, scheme: &str) -> std::io::Result<()> {
     conn.read_timeout(Some(Duration::from_secs(10)))?;
     let request = ws::read_request(&mut conn)?;
@@ -411,14 +451,19 @@ fn handle<C: Conn>(mut conn: C, server: &Server, scheme: &str) -> std::io::Resul
 
 /// The page (#342): markup, the terminal model and the glue, embedded so
 /// `croft web` needs nothing beside the binary.
+#[cfg(any(unix, test))]
 const INDEX_HTML: &str = include_str!("page/index.html");
+#[cfg(any(unix, test))]
 const TERM_JS: &str = include_str!("page/term.js");
+#[cfg(any(unix, test))]
 const APP_JS: &str = include_str!("page/app.js");
 /// The Nerd Font glyphs croft's icons use, subset by
 /// scripts/web_icon_font.py so a browser needs no font installed.
+#[cfg(any(unix, test))]
 const ICONS_WOFF2: &[u8] = include_bytes!("page/icons.woff2");
 
 /// What the page serves at `target`, as (content type, body).
+#[cfg(any(unix, test))]
 fn page(target: &str) -> Option<(&'static str, &'static [u8])> {
     let path = target.split(['?', '#']).next().unwrap_or_default();
     match path {
@@ -433,6 +478,7 @@ fn page(target: &str) -> Option<(&'static str, &'static [u8])> {
 /// A page response. The Content-Security-Policy allows only the page's own
 /// scripts, inline images decoded from the session, and a WebSocket back to
 /// the host it was loaded from; no other network request can be made.
+#[cfg(any(unix, test))]
 fn page_response(content_type: &str, body: &[u8], host: Option<&str>) -> Vec<u8> {
     // Only a plain host[:port] goes into the policy, so a crafted Host
     // header cannot add directives to it.
@@ -456,6 +502,7 @@ fn page_response(content_type: &str, body: &[u8], host: Option<&str>) -> Vec<u8>
 /// Relay between one WebSocket and one session-host connection until either
 /// side goes. Both directions write to the socket, so the writer is shared
 /// behind a lock and frames never interleave.
+#[cfg(unix)]
 fn bridge<C: Conn>(conn: C, unix: UnixStream) -> std::io::Result<()> {
     let writer = Arc::new(Mutex::new(conn.duplicate()?));
     let host_to_browser = {
@@ -528,6 +575,7 @@ fn bridge<C: Conn>(conn: C, unix: UnixStream) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     #[test]
@@ -635,6 +683,7 @@ mod tests {
         assert!(!tls.contains("plain text"), "{tls}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_record_outlives_its_listener_only_until_it_is_read() {
         let dir = tempfile::tempdir().unwrap();
@@ -670,6 +719,7 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[cfg(unix)]
     fn write_upgrade(
         w: &mut impl Write,
         addr: SocketAddr,
@@ -686,17 +736,20 @@ mod tests {
     }
 
     /// A minimal WebSocket client over the bridge.
+    #[cfg(unix)]
     struct Client {
         tcp: TcpStream,
         decoder: ServerDecoder,
     }
 
     /// Decodes the server's (unmasked) frames.
+    #[cfg(unix)]
     #[derive(Default)]
     struct ServerDecoder {
         buf: Vec<u8>,
     }
 
+    #[cfg(unix)]
     impl ServerDecoder {
         fn push(&mut self, data: &[u8]) -> Vec<(u8, Vec<u8>)> {
             self.buf.extend_from_slice(data);
@@ -728,6 +781,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Client {
         fn connect(addr: SocketAddr, protocols: &str, origin: Option<&str>) -> (TcpStream, String) {
             let mut tcp = TcpStream::connect(addr).unwrap();
@@ -777,6 +831,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn texts(seen: &[(u8, Vec<u8>)]) -> String {
         seen.iter()
             .filter(|(op, _)| *op == 0x1)
@@ -785,6 +840,7 @@ mod tests {
             .join("\n")
     }
 
+    #[cfg(unix)]
     fn bytes(seen: &[(u8, Vec<u8>)]) -> Vec<u8> {
         seen.iter()
             .filter(|(op, _)| *op == 0x2)
@@ -797,6 +853,7 @@ mod tests {
     /// The browser appears in the roster, its keystrokes reach the PTY, both
     /// clients get the same bytes, and closing the socket takes the browser
     /// off the roster.
+    #[cfg(unix)]
     #[test]
     fn a_websocket_client_is_a_participant_like_any_other() {
         let dir = tempfile::tempdir().unwrap();
@@ -971,6 +1028,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_listener_stops_with_its_session_or_its_record() {
         let dir = tempfile::tempdir().unwrap();
@@ -997,6 +1055,7 @@ mod tests {
     /// origin rules, and a client that skips the handshake gets nothing.
     /// The certificate in testdata/ is a self-signed one for `localhost`
     /// made for this test and nothing else.
+    #[cfg(unix)]
     #[test]
     fn the_upgrade_is_served_inside_tls() {
         let here = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web/testdata");

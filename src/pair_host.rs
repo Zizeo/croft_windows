@@ -7,16 +7,21 @@
 //! stdout/stderr: seated inside croft, the pilot's voice is [`PairEvent`]s.
 
 use std::path::Path;
+#[cfg(unix)]
 use std::process::Command;
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::Receiver;
+#[cfg(unix)]
+use std::sync::mpsc::channel;
 
 use anyhow::{Context, Result};
 
 use crate::collab::position;
 use crate::pair::{
-    PairConfig, Pilot, Provider, claude_command, compose_ask_turn, compose_yield_turn,
-    lock_briefly, seat_local, seat_pilot, send_turn, write_user_turn,
+    PairConfig, Pilot, compose_ask_turn, compose_yield_turn, lock_briefly, send_turn,
+    write_user_turn,
 };
+#[cfg(unix)]
+use crate::pair::{Provider, claude_command, seat_local, seat_pilot};
 
 /// What the pilot surfaces to the App, drained by `poll` once per tick.
 #[derive(Debug)]
@@ -81,6 +86,12 @@ impl PairHost {
     /// real claude CLI, or a childless seat over a local Anthropic-compatible
     /// endpoint.
     pub fn spawn(cfg: PairConfig) -> Result<Self> {
+        #[cfg(not(unix))]
+        {
+            let _ = cfg;
+            anyhow::bail!("croft pair is not supported on native Windows; run croft in WSL2")
+        }
+        #[cfg(unix)]
         match &cfg.provider {
             Provider::Claude => {
                 let cmd = claude_command(&cfg)?;
@@ -102,10 +113,21 @@ impl PairHost {
 
     /// Seat the navigator on an explicit command (the e2e tests drive this
     /// with a scripted fake instead of the real claude CLI).
+    #[cfg(unix)]
     pub fn spawn_cmd(socket: &Path, name: &str, task: Option<&str>, cmd: Command) -> Result<Self> {
         let (tx, rx) = channel();
         let pilot = seat_pilot(socket, name, cmd, Some(tx))?;
         Self::seated(pilot, rx, name, task)
+    }
+
+    #[cfg(not(unix))]
+    pub fn spawn_cmd(
+        _socket: &Path,
+        _name: &str,
+        _task: Option<&str>,
+        _cmd: std::process::Command,
+    ) -> Result<Self> {
+        anyhow::bail!("croft pair is not supported on native Windows; run croft in WSL2")
     }
 
     /// Wrap a seated pilot and send its start task, if any.

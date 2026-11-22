@@ -6,6 +6,7 @@ use super::*;
 /// Sidecar file the host keeps next to the socket with the current roster,
 /// so the inner croft (which only has a PTY, not the socket) can poll who is
 /// attached. Written atomically (tmp + rename).
+#[cfg(any(unix, test))]
 pub fn presence_path(socket: &Path) -> PathBuf {
     let mut name = socket.file_name().unwrap_or_default().to_os_string();
     name.push(".presence.json");
@@ -30,6 +31,7 @@ pub fn stale_marker_path(socket: &Path) -> PathBuf {
 /// swap (#238) moves the host onto a new binary without touching the inner
 /// croft, which keeps its version until it relaunches; this is how the inner
 /// croft learns the version a reattaching client would get.
+#[cfg(any(unix, test))]
 pub fn host_version_path(socket: &Path) -> PathBuf {
     let mut name = socket.file_name().unwrap_or_default().to_os_string();
     name.push(".host-version");
@@ -38,6 +40,7 @@ pub fn host_version_path(socket: &Path) -> PathBuf {
 
 /// Record this host's version next to its socket. Best-effort: without it
 /// the inner croft falls back to comparing clients against itself.
+#[cfg(any(unix, test))]
 pub(super) fn write_host_version(socket: &Path) {
     let _ = std::fs::write(host_version_path(socket), env!("CARGO_PKG_VERSION"));
 }

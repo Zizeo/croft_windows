@@ -264,6 +264,7 @@ pub(crate) fn is_alive(_socket: &Path) -> bool {
 /// boundary for every croft socket (the session mux, the collab relay):
 /// another user must never be able to connect. Shared by both binders so the
 /// permission discipline lives in exactly one place.
+#[cfg(unix)]
 pub fn bind_socket_0600(socket: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::io::AsRawFd;
@@ -393,6 +394,7 @@ mod tests {
     /// listener (a stranded session host, invisible to every future client).
     /// Exactly one racer may win; the loser is told the address is in use so
     /// it attaches to the winner instead.
+    #[cfg(unix)]
     #[test]
     fn racing_binds_on_one_target_produce_exactly_one_listener() {
         let dir = tempfile::tempdir().unwrap();
@@ -430,6 +432,7 @@ mod tests {
 
     /// #1368: on a machine where croft never made its sessions folder, the
     /// first bind makes it, owner-only, instead of failing on the lock.
+    #[cfg(unix)]
     #[test]
     fn a_socket_in_a_folder_that_does_not_exist_yet_binds() {
         use std::os::unix::fs::PermissionsExt;
@@ -444,6 +447,7 @@ mod tests {
 
     /// #1368, negative: a sessions folder that already exists is used as
     /// it is; making it is not a reason to change its mode.
+    #[cfg(unix)]
     #[test]
     fn an_existing_socket_folder_is_left_as_it_is() {
         use std::os::unix::fs::PermissionsExt;
@@ -458,6 +462,7 @@ mod tests {
 
     /// A stale socket file (its owner crashed; nobody accepts) must not block
     /// the next creator: the binder proves it dead and replaces it.
+    #[cfg(unix)]
     #[test]
     fn a_dead_stale_socket_file_is_replaced() {
         let dir = tempfile::tempdir().unwrap();
@@ -469,6 +474,7 @@ mod tests {
     }
 
     /// Every croft socket is owner-only from its first observable instant.
+    #[cfg(unix)]
     #[test]
     fn a_bound_socket_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
@@ -485,6 +491,7 @@ mod tests {
     /// raced - two interleaved binds could restore each other's masks
     /// (permanently corrupting the process umask) and one socket could be
     /// created under the caller's loose umask for its whole life.
+    #[cfg(unix)]
     #[test]
     fn concurrent_binds_never_corrupt_the_process_umask_or_a_socket() {
         use std::os::unix::fs::PermissionsExt;

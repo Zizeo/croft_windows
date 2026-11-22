@@ -22,6 +22,7 @@ impl SshControl {
         }
     }
 
+    #[cfg(unix)]
     pub(super) fn start(host: &str) -> Result<Self> {
         let socket_dir = ssh_control_dir()?;
         let socket_path = socket_dir.join("ctl");
@@ -52,6 +53,13 @@ impl SshControl {
             socket_dir,
             socket_path,
         })
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn start(_host: &str) -> Result<Self> {
+        anyhow::bail!(
+            "croft remote is not supported on native Windows (Windows OpenSSH lacks ControlMaster); run croft in WSL2"
+        )
     }
 
     pub(super) fn command(&self) -> Command {
@@ -178,12 +186,15 @@ pub fn ssh_control_dir() -> Result<PathBuf> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("croft-ssh-{}-{now}-{seq}", std::process::id()));
-    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
-    }
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
     builder
         .create(&dir)
         .with_context(|| format!("creating {}", dir.display()))?;

@@ -1,14 +1,21 @@
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(unix)]
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+#[cfg(unix)]
+use std::sync::mpsc::channel;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::remote::{AdoptedMaster, ssh_control_dir};
+use crate::remote::AdoptedMaster;
+#[cfg(unix)]
+use crate::remote::ssh_control_dir;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptKind {
@@ -43,6 +50,7 @@ pub struct SshAuth {
 }
 
 impl SshAuth {
+    #[cfg(unix)]
     pub fn start(host: &str) -> Result<Self> {
         let socket_dir = ssh_control_dir().context("ssh control dir")?;
         let socket_path = socket_dir.join("ctl");
@@ -97,6 +105,13 @@ impl SshAuth {
             authenticated_signaled: false,
             started: Instant::now(),
         })
+    }
+
+    #[cfg(not(unix))]
+    pub fn start(_host: &str) -> Result<Self> {
+        anyhow::bail!(
+            "croft remote is not supported on native Windows (Windows OpenSSH lacks ControlMaster); run croft in WSL2"
+        )
     }
 
     pub fn drain_events(&mut self) -> Vec<SshAuthEvent> {

@@ -76,9 +76,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use crate::collab::{
-    CollabChannel, CollabEvent, CollabRole, CollabSession, ResolvedSpan, position,
-};
+#[cfg(unix)]
+use crate::collab::{CollabChannel, CollabRole};
+use crate::collab::{CollabEvent, CollabSession, ResolvedSpan, position};
 
 // ---------------------------------------------------------------------------
 // Pilot runtime: spawn the claude CLI in stream-json mode, parse its token

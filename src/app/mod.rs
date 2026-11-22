@@ -2262,11 +2262,11 @@ pub struct App {
     /// deliberately, since an unclean exit leaves no `Drop` to run either.
     /// A field carrying a promise the code does not keep is worse than no
     /// field.
-    view_listener: Option<std::os::unix::net::UnixListener>,
+    view_listener: Option<crate::platform::ipc::LocalListener>,
     /// Agent edit approvals (#347): this workspace's hook socket, the
     /// proposals waiting on the user in arrival order, and the popup's
     /// state for the one at the head (`Some` exactly while one waits).
-    hook_listener: Option<std::os::unix::net::UnixListener>,
+    hook_listener: Option<crate::platform::ipc::LocalListener>,
     /// The workspace the hook socket was bound for: an approval
     /// notification's links name it, so `croft decide` finds this croft
     /// (#359).
@@ -4217,6 +4217,7 @@ impl App {
         } else {
             match crate::agent_approval::bind(&root) {
                 Ok(listener) => (Some(listener), None),
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => (None, None),
                 Err(e) => (None, hook_bind_status(&e)),
             }
         };

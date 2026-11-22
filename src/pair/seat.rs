@@ -24,6 +24,7 @@ pub(crate) struct TurnEnd {
 
 /// Connect the pilot's collab seat, retrying briefly (the dispatch just
 /// ensured the relay, but its accept loop may still be coming up).
+#[cfg(unix)]
 pub(super) fn connect_session(socket: &Path, name: &str) -> Result<CollabSession> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -37,6 +38,11 @@ pub(super) fn connect_session(socket: &Path, name: &str) -> Result<CollabSession
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[cfg(not(unix))]
+pub(super) fn connect_session(_socket: &Path, _name: &str) -> Result<CollabSession> {
+    anyhow::bail!("croft pair is not supported on native Windows; run croft in WSL2")
 }
 
 /// A seated pilot: the transport's threads over shared state. Both drivers

@@ -13,18 +13,27 @@
 //! Attaching makes the host repaint (its SIGWINCH jiggle), so the cast opens on
 //! the current screen rather than blank.
 
+#[cfg(unix)]
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
 
+#[cfg(any(unix, test))]
 use crate::asciicast::{Event, Recorder};
+#[cfg(any(unix, test))]
 use crate::session_host::{Control, Frame, Participant};
 
 /// Turns session-host frames into asciicast lines. Pure: the caller supplies
 /// the timestamp and writes the lines, so the rules are testable without a
 /// socket.
+#[cfg(any(unix, test))]
 pub(crate) struct CastState {
     title: String,
     recorder: Option<Recorder>,
@@ -36,6 +45,7 @@ pub(crate) struct CastState {
     utf8_tail: Vec<u8>,
 }
 
+#[cfg(any(unix, test))]
 impl CastState {
     pub(crate) fn new(title: impl Into<String>) -> Self {
         Self {
@@ -105,6 +115,7 @@ impl CastState {
 /// Take the longest valid UTF-8 prefix out of `buf`, leaving an incomplete
 /// trailing sequence for the next frame. Bytes that can never become valid
 /// are replaced (U+FFFD) rather than stalling the stream.
+#[cfg(any(unix, test))]
 fn take_utf8(buf: &mut Vec<u8>) -> String {
     let mut out = String::new();
     loop {
@@ -137,6 +148,7 @@ fn take_utf8(buf: &mut Vec<u8>) -> String {
 /// session to `out` as asciicast lines until the session exits, the host
 /// goes away, `stop` is set, or `until` passes (a test's bound; `None` in
 /// the CLI).
+#[cfg(unix)]
 pub(crate) fn record_to(
     socket: &Path,
     out: &mut impl Write,
@@ -196,6 +208,7 @@ pub(crate) fn record_to(
 
 /// Where a recorder for `socket` leaves its pidfile, for `croft record
 /// --stop` and for a second `croft record` to find.
+#[cfg(unix)]
 fn pid_path(socket: &Path) -> PathBuf {
     socket.with_extension("rec.pid")
 }
@@ -204,6 +217,7 @@ fn pid_path(socket: &Path) -> PathBuf {
 /// signal: a recorder killed before it could remove its pidfile leaves the
 /// pid to be recycled, and `--stop` would then terminate whatever unrelated
 /// process holds it now.
+#[cfg(unix)]
 #[derive(Debug, PartialEq)]
 struct Owner {
     pid: u32,
@@ -214,6 +228,7 @@ struct Owner {
     out: PathBuf,
 }
 
+#[cfg(unix)]
 impl Owner {
     /// This process, recording to `out`.
     fn me(out: &Path) -> Self {
@@ -255,6 +270,7 @@ impl Owner {
 }
 
 /// Whether `cmd`, a process's argv, is croft running `record`.
+#[cfg(unix)]
 fn is_recorder(cmd: &[String]) -> bool {
     let Some((program, args)) = cmd.split_first() else {
         return false;
@@ -266,6 +282,7 @@ fn is_recorder(cmd: &[String]) -> bool {
 }
 
 /// The recorder `pidfile` names, while it still runs.
+#[cfg(unix)]
 fn running_owner(pidfile: &Path) -> Option<Owner> {
     let text = std::fs::read_to_string(pidfile).ok()?;
     Owner::parse(&text).filter(Owner::runs)
@@ -277,6 +294,7 @@ fn running_owner(pidfile: &Path) -> Option<Owner> {
 /// An exclusive lock beside it makes that check and replacement one step:
 /// two recorders starting together each saw the stale file as theirs, and
 /// the second removed the first's new claim.
+#[cfg(unix)]
 fn claim(pidfile: &Path, me: &Owner, workspace: &Path) -> Result<()> {
     use std::os::fd::AsRawFd;
     let lock_path = pidfile.with_extension("lock");
@@ -317,6 +335,7 @@ fn claim(pidfile: &Path, me: &Owner, workspace: &Path) -> Result<()> {
 }
 
 /// Remove `pidfile` if it still names this process.
+#[cfg(unix)]
 fn release(pidfile: &Path) {
     let text = std::fs::read_to_string(pidfile).unwrap_or_default();
     if Owner::parse(&text).is_some_and(|o| o.pid == std::process::id()) {
@@ -327,6 +346,7 @@ fn release(pidfile: &Path) {
 /// `croft record --stop`: SIGTERM the recorder `pidfile` names, only while
 /// it still runs, then wait for it to finish its cast and exit. A pidfile
 /// whose recorder is gone is removed, and nothing is signalled.
+#[cfg(unix)]
 fn stop_recorder(pidfile: &Path, workspace: &Path) -> Result<()> {
     let Some(owner) = running_owner(pidfile) else {
         let _ = std::fs::remove_file(pidfile);
@@ -349,6 +369,7 @@ fn stop_recorder(pidfile: &Path, workspace: &Path) -> Result<()> {
 }
 
 /// Set by SIGINT or SIGTERM in `croft record`: the recording ends.
+#[cfg(unix)]
 static STOP: AtomicBool = AtomicBool::new(false);
 
 /// End the recording on Ctrl-C (SIGINT) and `croft record --stop` (SIGTERM)
@@ -356,6 +377,7 @@ static STOP: AtomicBool = AtomicBool::new(false);
 /// process: the pidfile is then removed and `croft record` exits 0. A
 /// SIGINT the launching shell ignores (a script's background job) stays
 /// ignored.
+#[cfg(unix)]
 fn stop_on_signals() {
     extern "C" fn on_signal(_: libc::c_int) {
         STOP.store(true, Ordering::SeqCst);
@@ -382,6 +404,7 @@ fn stop_on_signals() {
 
 /// `croft record`: record the session running for `workspace` to `out`, or
 /// stop the recorder that is.
+#[cfg(unix)]
 pub fn record(workspace: Option<PathBuf>, out: Option<PathBuf>, stop: bool) -> Result<()> {
     let workspace = match workspace {
         Some(p) => p,
@@ -428,6 +451,13 @@ pub fn record(workspace: Option<PathBuf>, out: Option<PathBuf>, stop: bool) -> R
         });
     release(&pidfile);
     result
+}
+
+#[cfg(not(unix))]
+pub fn record(_workspace: Option<PathBuf>, _out: Option<PathBuf>, _stop: bool) -> Result<()> {
+    anyhow::bail!(
+        "croft record is not supported on native Windows; run croft in WSL2 for persistent sessions"
+    )
 }
 
 #[cfg(test)]
@@ -522,6 +552,7 @@ mod tests {
 
     /// #1058: Ctrl-C and `--stop` only set the flag. The loop sees it while
     /// the session is quiet and returns, the cast written so far intact.
+    #[cfg(unix)]
     #[test]
     fn record_to_returns_once_stop_is_set() {
         let dir = tempfile::tempdir().unwrap();
@@ -565,6 +596,7 @@ mod tests {
 
     /// A stand-in for a running `croft record`: a shell whose argv reads
     /// `croft -c "read x" sh record`, waiting on the stdin the caller holds.
+    #[cfg(unix)]
     fn fake_recorder() -> (std::process::Child, Owner) {
         use std::os::unix::process::CommandExt;
         let child = std::process::Command::new("sh")
@@ -592,6 +624,7 @@ mod tests {
 
     /// #1058: a pidfile left behind names a pid that may since belong to
     /// any process. `--stop` signals none of these, and removes the file.
+    #[cfg(unix)]
     #[test]
     fn stop_never_signals_a_pid_that_is_not_the_recorder() {
         let dir = tempfile::tempdir().unwrap();
@@ -620,6 +653,7 @@ mod tests {
         sleep.wait().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn stop_removes_the_pidfile_of_a_recorder_that_is_gone() {
         let dir = tempfile::tempdir().unwrap();
@@ -634,6 +668,7 @@ mod tests {
     /// #1058: a second recorder for the session is refused while the first
     /// runs, rather than taking the pidfile over and leaving the first
     /// unstoppable. `--stop` ends the first, and then a new one may start.
+    #[cfg(unix)]
     #[test]
     fn a_second_recorder_is_refused_until_stop_ends_the_first() {
         use std::os::unix::process::ExitStatusExt;

@@ -21,6 +21,7 @@
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 
 /// Where the binary goes inside the container.
@@ -404,6 +405,7 @@ pub fn exec_args(dc: &DevContainer, container: &str, argv: &[String], tty: bool)
     out
 }
 
+#[cfg(unix)]
 fn docker(args: &[String]) -> Result<std::process::ExitStatus> {
     Command::new("docker")
         .args(args)
@@ -411,6 +413,7 @@ fn docker(args: &[String]) -> Result<std::process::ExitStatus> {
         .context("running docker (is it installed and on PATH?)")
 }
 
+#[cfg(unix)]
 fn docker_out(args: &[&str]) -> Result<String> {
     let out = Command::new("docker")
         .args(args)
@@ -423,6 +426,7 @@ fn docker_out(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+#[cfg(unix)]
 fn step(msg: &str) {
     eprintln!("devcontainer: {msg}");
 }
@@ -430,6 +434,7 @@ fn step(msg: &str) {
 /// The binary to install into a container of architecture `arch`:
 /// `$CROFT_DEVCONTAINER_BINARY`, else a static cross-build (as `croft <host>`
 /// ships), else this executable.
+#[cfg(unix)]
 fn binary_for(arch: &str) -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("CROFT_DEVCONTAINER_BINARY") {
         return Ok(PathBuf::from(p));
@@ -457,6 +462,7 @@ fn binary_for(arch: &str) -> Result<PathBuf> {
 }
 
 /// Bring up `root`'s dev container and run croft in it on this terminal.
+#[cfg(unix)]
 pub fn up_and_attach(root: &Path, rebuild: bool) -> Result<()> {
     let root = crate::platform::fs::canonicalize(root)
         .with_context(|| format!("opening {}", root.display()))?;
@@ -592,6 +598,11 @@ pub fn up_and_attach(root: &Path, rebuild: bool) -> Result<()> {
         bail!("croft in the container exited with {status}");
     }
     Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn up_and_attach(_root: &Path, _rebuild: bool) -> Result<()> {
+    anyhow::bail!("croft devcontainer is not supported on native Windows; run croft in WSL2")
 }
 
 #[cfg(test)]

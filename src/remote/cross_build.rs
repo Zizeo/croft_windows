@@ -73,35 +73,7 @@ pub(crate) fn cross_build_static(
 /// the 2026-06-12 "horrendous latency on various" root cause. Children
 /// inherit the raised limit. Returns the resulting soft limit.
 pub(crate) fn raise_fd_limit() -> u64 {
-    let mut lim = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
-        return 0;
-    }
-    let ceiling: libc::rlim_t = 1 << 20;
-    let target = if lim.rlim_max == libc::RLIM_INFINITY {
-        ceiling
-    } else {
-        lim.rlim_max.min(ceiling)
-    };
-    // macOS rejects soft limits above kern.maxfilesperproc even when the
-    // hard limit reads as unlimited, so step down through sane sizes
-    // until one sticks. Never lower an already-high limit.
-    for candidate in [target, 65536, 10240] {
-        if candidate <= lim.rlim_cur {
-            break;
-        }
-        let raised = libc::rlimit {
-            rlim_cur: candidate,
-            rlim_max: lim.rlim_max,
-        };
-        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
-            return candidate;
-        }
-    }
-    lim.rlim_cur
+    crate::platform::process::raise_fd_limit()
 }
 
 /// Reason the local cross-build fast path can't run, or `None` if it can. Each

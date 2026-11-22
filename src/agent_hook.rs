@@ -449,18 +449,25 @@ pub struct EditRequest {
 
 /// The croft listening for `cwd`: the socket of the nearest enclosing
 /// workspace that accepts a connection.
-pub(crate) fn connect_croft(cwd: &Path) -> Option<std::os::unix::net::UnixStream> {
+#[cfg(unix)]
+pub(crate) fn connect_croft(cwd: &Path) -> Option<crate::platform::ipc::LocalStream> {
     let cwd = crate::platform::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     cwd.ancestors().find_map(|dir| {
-        std::os::unix::net::UnixStream::connect(crate::session::hook_socket_path(dir)).ok()
+        crate::platform::ipc::LocalStream::connect(crate::session::hook_socket_path(dir)).ok()
     })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn connect_croft(_cwd: &Path) -> Option<crate::platform::ipc::LocalStream> {
+    None
 }
 
 /// Send `request` over `stream` and wait up to `window` for the answer.
 /// Anything short of a well-formed answer in time is "ask": Claude Code's
 /// own prompt takes over rather than the edit going through unseen.
+#[cfg(unix)]
 fn exchange(
-    mut stream: std::os::unix::net::UnixStream,
+    mut stream: crate::platform::ipc::LocalStream,
     request: &EditRequest,
     window: std::time::Duration,
 ) -> Decision {
@@ -481,6 +488,17 @@ fn exchange(
         Ok(reply) => serde_json::from_str(reply.trim())
             .unwrap_or_else(|_| ask("sent an answer it could not read")),
         Err(_) => ask(&format!("did not answer within {} s", window.as_secs())),
+    }
+}
+
+#[cfg(not(unix))]
+fn exchange(
+    _stream: crate::platform::ipc::LocalStream,
+    _request: &EditRequest,
+    _window: std::time::Duration,
+) -> Decision {
+    Decision::Ask {
+        reason: String::from("croft Windows IPC not yet implemented; answer here instead"),
     }
 }
 
@@ -698,6 +716,7 @@ mod tests {
         assert_eq!(left, "{\n  \"model\": \"opus\"\n}\n");
     }
 
+    #[cfg(unix)]
     fn fake_croft(
         reply: Option<&'static str>,
     ) -> (
@@ -726,6 +745,7 @@ mod tests {
         (dir, client, server)
     }
 
+    #[cfg(unix)]
     fn request() -> EditRequest {
         EditRequest {
             agent: "claude-code".into(),
@@ -735,6 +755,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn croft_answer_reaches_the_hook_and_the_request_carries_the_edit() {
         let (_d, client, server) = fake_croft(Some(
@@ -758,6 +779,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn silence_or_garbage_from_croft_is_ask() {
         let (_d, client, _s) = fake_croft(None);

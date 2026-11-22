@@ -16,24 +16,35 @@
 //! when a tool call diffs against it; the main thread blocks on stdin. Both
 //! share the state behind a mutex that is never held across a sleep.
 
+#[cfg(unix)]
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::io::{Read, Write};
 use std::path::Path;
+#[cfg(unix)]
 use std::sync::Mutex;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(unix)]
 use serde_json::{Value, json};
 
+#[cfg(unix)]
 use crate::collab::{CollabChannel, CollabEvent, CollabRole, CollabSession};
+#[cfg(unix)]
 use crate::mcp::client as mcp;
 
 /// How long `collab_open` waits for the owner's snapshot before reporting
 /// that nobody serves this workspace: a hair past the session's own 3s
 /// bootstrap deadline, so the session's verdict always lands first.
+#[cfg(unix)]
 const OPEN_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// The guest session plus peers' last-seen carets (for `collab_status`).
+#[cfg(unix)]
 struct AgentState {
     session: CollabSession,
     peers: HashMap<u64, PeerCaret>,
@@ -42,6 +53,7 @@ struct AgentState {
     workspace: std::path::PathBuf,
 }
 
+#[cfg(unix)]
 struct PeerCaret {
     name: String,
     file: String,
@@ -51,6 +63,7 @@ struct PeerCaret {
 
 /// Connect to the relay as a guest, retrying briefly (the dispatch just
 /// ensured the relay, but its accept loop may still be coming up).
+#[cfg(unix)]
 fn connect_state(socket: &Path, workspace: &Path, name: &str) -> Result<AgentState> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let channel = loop {
@@ -74,6 +87,7 @@ fn connect_state(socket: &Path, workspace: &Path, name: &str) -> Result<AgentSta
 /// One session pump: drain the socket and fold peer carets into the map.
 /// Remote edits need nothing further — the replica inside the session is
 /// already updated, and the agent has no editor buffers to patch.
+#[cfg(unix)]
 fn pump(state: &Mutex<AgentState>) {
     let mut st = state.lock().unwrap();
     let events = st.session.poll(|_| None);
@@ -100,15 +114,18 @@ fn pump(state: &Mutex<AgentState>) {
 }
 
 /// This seat's name and version, as MCP `Implementation`.
+#[cfg(unix)]
 fn server_info() -> Value {
     json!({ "name": "croft-collab", "version": env!("CARGO_PKG_VERSION") })
 }
 
 /// A JSON-RPC error: code, message, and optional `data`.
+#[cfg(unix)]
 type RpcError = (i64, String, Option<Value>);
 
 /// Check a modern request's `_meta`: the version and capabilities are
 /// required, and the version must be one this seat serves statelessly.
+#[cfg(unix)]
 fn check_modern_meta(meta: Option<&Value>) -> Result<(), RpcError> {
     let field = |key| meta.and_then(|m| m.get(key));
     let (Some(version), Some(_)) = (
@@ -143,6 +160,7 @@ fn check_modern_meta(meta: Option<&Value>) -> Result<(), RpcError> {
 /// and the result names its type and this server. Anything else (an
 /// `initialize` handshake and the plain requests after it) is legacy and
 /// answered as before.
+#[cfg(unix)]
 fn handle(state: &Mutex<AgentState>, msg: &Value) -> Option<Value> {
     let method = msg
         .get("method")
@@ -214,17 +232,20 @@ fn handle(state: &Mutex<AgentState>, msg: &Value) -> Option<Value> {
 }
 
 /// A successful `tools/call` result: one text content block.
+#[cfg(unix)]
 fn text_result(text: impl Into<String>) -> Value {
     json!({ "content": [{ "type": "text", "text": text.into() }] })
 }
 
 /// A failed tool execution: per MCP, an `isError` result (the model reads
 /// and recovers from it), not a JSON-RPC protocol error.
+#[cfg(unix)]
 fn error_result(text: impl Into<String>) -> Value {
     json!({ "content": [{ "type": "text", "text": text.into() }], "isError": true })
 }
 
 /// Run one collab tool; `None` means the tool name is unknown.
+#[cfg(unix)]
 fn call_tool(state: &Mutex<AgentState>, tool: &str, args: &Value) -> Option<Value> {
     let file = args
         .get("file")
@@ -323,6 +344,7 @@ fn call_tool(state: &Mutex<AgentState>, tool: &str, args: &Value) -> Option<Valu
 
 /// The five tools this server advertises. Coordinates are 0-based character
 /// positions, matching the collab wire protocol.
+#[cfg(unix)]
 fn tool_definitions() -> Value {
     let file_prop = json!({
         "type": "string",
@@ -390,6 +412,7 @@ fn tool_definitions() -> Value {
 }
 
 /// Serve the MCP loop on stdio until the driving client hangs up (EOF).
+#[cfg(unix)]
 pub fn run(socket: &Path, workspace: &Path, name: String) -> Result<()> {
     let state = std::sync::Arc::new(Mutex::new(connect_state(socket, workspace, &name)?));
     {
@@ -423,7 +446,12 @@ pub fn run(socket: &Path, workspace: &Path, name: String) -> Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(not(unix))]
+pub fn run(_socket: &Path, _workspace: &Path, _name: String) -> Result<()> {
+    anyhow::bail!("croft collab-agent is not supported on native Windows; run croft in WSL2")
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::collab::{CollabChannel, CollabEvent, CollabRole, CollabSession, relay_serve};

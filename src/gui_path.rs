@@ -22,22 +22,30 @@
 //! remember it up front. Only a launch that arrives with launchd's exact PATH
 //! does any of this, so a terminal launch costs nothing.
 
+#[cfg(unix)]
 use std::ffi::OsStr;
+#[cfg(any(unix, test))]
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
+#[cfg(any(unix, test))]
 use std::time::Duration;
 
 /// Exactly what launchd hands a GUI process. Any other PATH came from a
 /// shell that already ran the user's configuration, so we leave it alone.
+#[cfg(unix)]
 const LAUNCHD_DIRS: [&str; 4] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
 /// How long the login shell gets to answer. A shell that hangs on its own rc
 /// file must not leave a probe (and the process it runs in) hanging.
+#[cfg(unix)]
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Markers around the value so an interactive rc file's own chatter (banners,
 /// version notices, `fastfetch`) can never be mistaken for the PATH.
+#[cfg(any(unix, test))]
 const BEGIN: &str = "__CROFT_PATH_BEGIN__";
+#[cfg(any(unix, test))]
 const END: &str = "__CROFT_PATH_END__";
 
 /// Whether this PATH is a GUI launch's stripped inheritance rather than a
@@ -48,6 +56,7 @@ const END: &str = "__CROFT_PATH_END__";
 /// `/Applications/Ghostty.app/Contents/MacOS`, iTerm2 its `utilities`), which
 /// no user's shell would ever do, so their presence is not evidence that a
 /// shell ran.
+#[cfg(any(unix, test))]
 fn is_stripped(path: Option<&str>) -> bool {
     let Some(path) = path.map(str::trim).filter(|p| !p.is_empty()) else {
         return true;
@@ -61,6 +70,7 @@ fn is_stripped(path: Option<&str>) -> bool {
 /// The login shell's PATH ahead of what we already have, with duplicates
 /// dropped. Keeping the inherited entries means the system directories
 /// survive even if the user's shell drops them.
+#[cfg(any(unix, test))]
 fn merge(current: Option<&str>, probed: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
     for entry in probed
@@ -86,6 +96,7 @@ fn merge(current: Option<&str>, probed: &str) -> String {
 /// [`PROBE_TIMEOUT`] in croft itself. `inherited` is what a GUI launch hands
 /// the shell, never a PATH already repaired from memory (see
 /// [`probe_and_remember`]).
+#[cfg(unix)]
 fn probe(shell: &str, inherited: Option<&str>, timeout: Duration) -> Option<String> {
     let mut cmd = probe_cmd(shell);
     match inherited {
@@ -97,6 +108,7 @@ fn probe(shell: &str, inherited: Option<&str>, timeout: Duration) -> Option<Stri
 
 /// The probe invocation for `shell`, before it is spawned. Split from
 /// [`probe`] so a test can inject an environment (`HOME`) around it.
+#[cfg(unix)]
 fn probe_cmd(shell: &str) -> Command {
     let mut cmd = Command::new(shell);
     let name = std::path::Path::new(shell)
@@ -121,6 +133,7 @@ fn probe_cmd(shell: &str) -> Command {
 
 /// Run a prepared probe command and return the PATH it printed, giving up
 /// after `timeout`.
+#[cfg(unix)]
 fn run_probe(mut cmd: Command, timeout: Duration) -> Option<String> {
     // Its own session, so the probe has no controlling terminal. `-l -i`
     // makes the shell interactive, and an interactive zsh takes the
@@ -175,6 +188,7 @@ fn run_probe(mut cmd: Command, timeout: Duration) -> Option<String> {
 }
 
 /// Pull the PATH out from between the markers.
+#[cfg(any(unix, test))]
 fn extract(out: &str) -> Option<String> {
     let (_, rest) = out.split_once(BEGIN)?;
     let (path, _) = rest.split_once(END)?;
@@ -185,6 +199,7 @@ fn extract(out: &str) -> Option<String> {
 /// The PATH to run under, or `None` to keep what we inherited. `known` is the
 /// login shell's PATH as last remembered; it is only asked for when the
 /// inherited PATH needs repairing.
+#[cfg(any(unix, test))]
 fn repaired(current: Option<&str>, known: impl FnOnce() -> Option<String>) -> Option<String> {
     if !is_stripped(current) {
         return None;
@@ -196,12 +211,14 @@ fn repaired(current: Option<&str>, known: impl FnOnce() -> Option<String>) -> Op
 
 /// Where the login shell's PATH is remembered between launches. A cache: it
 /// is rebuilt by the next probe if it goes.
+#[cfg(unix)]
 fn memory_path() -> PathBuf {
     crate::paths::croft_cache_dir().join("login-path")
 }
 
 /// The PATH remembered in `file` for `shell`. A PATH another shell reported
 /// does not count: switching shells must not run croft under the old one's.
+#[cfg(any(unix, test))]
 fn recall(file: &Path, shell: &str) -> Option<String> {
     let text = std::fs::read_to_string(file).ok()?;
     let (who, path) = text.split_once('\n')?;
@@ -211,6 +228,7 @@ fn recall(file: &Path, shell: &str) -> Option<String> {
 
 /// Remember `path` as `shell`'s PATH in `file`. Written beside and renamed
 /// over, so a launch reading it never sees half of one.
+#[cfg(any(unix, test))]
 fn remember(file: &Path, shell: &str, path: &str) -> std::io::Result<()> {
     if recall(file, shell).as_deref() == Some(path) {
         return Ok(());
@@ -231,6 +249,7 @@ fn remember(file: &Path, shell: &str, path: &str) -> std::io::Result<()> {
 /// PATH already repaired from memory: whatever it remembered would come back
 /// in its answer, and a directory taken out of an rc file would never leave.
 /// The shell gets `timeout` to answer, as for [`probe`].
+#[cfg(unix)]
 fn probe_and_remember(shell: &str, inherited: Option<&str>, file: &Path, timeout: Duration) {
     if let Some(path) = probe(shell, inherited, timeout) {
         let _ = remember(file, shell, &path);
@@ -242,6 +261,7 @@ fn probe_and_remember(shell: &str, inherited: Option<&str>, file: &Path, timeout
 /// terminal before that launch; they may wait for the shell, startup never
 /// does. The shell starts under launchd's PATH, not this terminal's, so it
 /// answers exactly what it would for a GUI launch.
+#[cfg(unix)]
 pub fn remember_login_path() {
     let launchd = LAUNCHD_DIRS.join(":");
     probe_and_remember(
@@ -252,8 +272,12 @@ pub fn remember_login_path() {
     );
 }
 
+#[cfg(not(unix))]
+pub fn remember_login_path() {}
+
 /// The user's login shell. launchd sets `SHELL` from the user record for GUI
 /// sessions; zsh is the macOS default when it does not.
+#[cfg(unix)]
 fn login_shell() -> String {
     std::env::var("SHELL")
         .ok()
@@ -263,11 +287,13 @@ fn login_shell() -> String {
 
 /// The PATH a GUI launch inherited, kept by [`repair`] for
 /// [`refresh_in_background`]. Never set on a terminal launch.
+#[cfg(unix)]
 static INHERITED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 /// Put the user's real PATH back when croft was started by the GUI, without
 /// waiting for their shell. Call once at startup, before anything spawns a
 /// child or a thread.
+#[cfg(unix)]
 pub fn repair() {
     let current = std::env::var("PATH").ok();
     if !is_stripped(current.as_deref()) {
@@ -285,6 +311,9 @@ pub fn repair() {
     let _ = INHERITED.set(current);
 }
 
+#[cfg(not(unix))]
+pub fn repair() {}
+
 /// Ask the login shell again, off the startup path, and remember its answer
 /// for the next GUI launch. A no-op unless [`repair`] saw a GUI launch, and
 /// it asks once per process however often it is called. The editor calls it
@@ -293,6 +322,7 @@ pub fn repair() {
 /// still running, and one wedged in its rc files would be left behind, while
 /// an editor session normally runs past the probe's timeout, which kills such
 /// a shell.
+#[cfg(unix)]
 pub fn refresh_in_background() {
     static ASKED: std::sync::Once = std::sync::Once::new();
     let Some(inherited) = INHERITED.get() else {
@@ -308,9 +338,13 @@ pub fn refresh_in_background() {
     });
 }
 
+#[cfg(not(unix))]
+pub fn refresh_in_background() {}
+
 /// Ask `shell` again on a thread of its own, under the `inherited` PATH, and
 /// remember its answer in `file`, for the next launch; `timeout` as for
 /// [`probe`].
+#[cfg(unix)]
 fn spawn_refresh(
     shell: String,
     inherited: Option<String>,
@@ -327,6 +361,7 @@ mod tests {
     /// The probe's deadline stretched for the load the suite puts on this
     /// machine (#307, #2221): a healthy shell can take longer than
     /// [`PROBE_TIMEOUT`] to start while thousands of tests run beside it.
+    #[cfg(unix)]
     fn loaded_timeout() -> Duration {
         crate::test_budget::spawn_budget(PROBE_TIMEOUT)
     }
@@ -337,6 +372,7 @@ mod tests {
     /// failed spawn for a shell with no answer. So the stand-in runs once
     /// here, waiting that out, with `CROFT_STUB_WARMUP` set for a script that
     /// would otherwise do its slow part. Returns the path as the shell name.
+    #[cfg(unix)]
     fn stand_in_shell(path: &Path, script: &str) -> String {
         std::fs::write(path, script).unwrap();
         let mut perm = std::fs::metadata(path).unwrap().permissions();
@@ -467,6 +503,7 @@ mod tests {
     /// #1973: a GUI launch puts the PATH back from memory, at once, however
     /// long the login shell takes; the slow shell's answer is for the next
     /// launch, and lands there.
+    #[cfg(unix)]
     #[test]
     fn a_gui_launch_never_waits_for_the_login_shell() {
         let dir = tempfile::tempdir().unwrap();
@@ -508,6 +545,7 @@ mod tests {
     /// the one repaired from memory: otherwise a directory once remembered
     /// comes back in every answer, and taking it out of an rc file never
     /// takes it off croft's PATH.
+    #[cfg(unix)]
     #[test]
     fn a_directory_taken_out_of_the_rc_files_leaves_the_memory() {
         let dir = tempfile::tempdir().unwrap();
@@ -550,6 +588,7 @@ mod tests {
 
     /// End to end against a real shell: the probe must actually come back with
     /// a PATH, otherwise the markers or the flags are wrong.
+    #[cfg(unix)]
     #[test]
     fn probing_a_real_shell_returns_a_usable_path() {
         let shell = if std::path::Path::new("/bin/zsh").exists() {
@@ -576,6 +615,7 @@ mod tests {
     /// `-l -i -c <script>` shape, contributes a directory the way a login
     /// shell does (into the exported environment), and runs the probe
     /// script through a real `/bin/sh` so the nested quoting is exercised.
+    #[cfg(unix)]
     #[test]
     fn a_dock_launch_ends_up_seeing_the_users_own_directories() {
         let dir = tempfile::tempdir().unwrap();
@@ -610,6 +650,7 @@ mod tests {
     /// shell itself exits. The probe must return the moment the END marker
     /// arrives instead of waiting for an EOF that only comes when the
     /// grandchild eventually dies.
+    #[cfg(unix)]
     #[test]
     fn a_backgrounded_grandchild_does_not_stall_the_probe() {
         let mut cmd = Command::new("/bin/sh");
@@ -630,6 +671,7 @@ mod tests {
     /// tcsh rejects `-l` combined with any other flag (`-l` must be the sole
     /// argument), and fish expands a quoted `$PATH` space-joined. The probe
     /// must still get a colon-joined PATH out of both families.
+    #[cfg(unix)]
     #[test]
     fn a_csh_family_login_shell_still_answers() {
         if !std::path::Path::new("/bin/tcsh").exists() {
@@ -647,6 +689,7 @@ mod tests {
     /// with a leading dash in argv[0]. Runs the real tcsh against a stub
     /// HOME: if `.login` is never sourced, the probe recovered nothing and
     /// the whole module is dead for the csh family.
+    #[cfg(unix)]
     #[test]
     fn a_csh_family_probe_reads_the_login_file() {
         if !std::path::Path::new("/bin/tcsh").exists() {
@@ -675,6 +718,7 @@ mod tests {
     /// background process on its own terminal and enabling raw mode fails
     /// with EIO — a Dock launch "crashes" on arrival. A session of its own
     /// makes the theft impossible.
+    #[cfg(unix)]
     #[test]
     fn the_probe_cannot_touch_crofts_terminal_session() {
         // macOS ps has no session-id keyword (`sess` prints 0), so the
@@ -704,6 +748,7 @@ mod tests {
     }
 
     /// A shell wedged on its own rc file must not wedge croft.
+    #[cfg(unix)]
     #[test]
     fn a_hanging_shell_gives_up_instead_of_blocking_startup() {
         let mut cmd = Command::new("/bin/sh");
@@ -719,6 +764,7 @@ mod tests {
     }
 
     /// And the timeout must not be so eager that a slow rc file loses.
+    #[cfg(unix)]
     #[test]
     fn a_shell_that_answers_within_the_timeout_is_read() {
         let mut cmd = Command::new("/bin/sh");

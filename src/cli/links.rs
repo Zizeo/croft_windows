@@ -5,6 +5,7 @@ use super::*;
 
 /// `croft open-link` (#359): check the link, then become the `croft remote`
 /// or `croft attach` it describes, so the session gets this terminal.
+#[cfg(unix)]
 pub(super) fn open_link(url: &str) -> Result<()> {
     let mut link = crate::deep_link::parse(url)?;
     if let Some(host) = link.host.take() {
@@ -38,19 +39,17 @@ pub(super) fn open_link(url: &str) -> Result<()> {
     if let Some(focus) = link.focus {
         cmd.env("CROFT_FOCUS", focus.as_str());
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        let err = cmd.exec();
-        Err(anyhow::anyhow!("could not start croft: {err}"))
-    }
-    #[cfg(not(unix))]
-    {
-        let status = cmd.status()?;
-        std::process::exit(status.code().unwrap_or(1));
-    }
+    use std::os::unix::process::CommandExt as _;
+    let err = cmd.exec();
+    Err(anyhow::anyhow!("could not start croft: {err}"))
 }
 
+#[cfg(not(unix))]
+pub(super) fn open_link(_url: &str) -> Result<()> {
+    anyhow::bail!("croft open-link is not supported on native Windows; run croft in WSL2")
+}
+
+#[cfg(unix)]
 pub(super) fn local_hostname() -> String {
     std::process::Command::new("hostname")
         .output()
@@ -60,6 +59,7 @@ pub(super) fn local_hostname() -> String {
 }
 
 /// `croft install-link-handler` (#359).
+#[cfg(unix)]
 pub(super) fn install_link_handler() -> Result<()> {
     let exe = std::env::current_exe()?.display().to_string();
     let home = crate::platform::env::home_dir().context("HOME is not set")?;
@@ -78,11 +78,8 @@ pub(super) fn install_link_handler() -> Result<()> {
             );
         }
         std::fs::write(&opener, crate::deep_link::termux_url_opener(&exe))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o755))?;
-        }
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o755))?;
         println!("croft:// links now open croft ({})", opener.display());
         return Ok(());
     }
@@ -105,4 +102,11 @@ pub(super) fn install_link_handler() -> Result<()> {
         ),
     }
     Ok(())
+}
+
+#[cfg(not(unix))]
+pub(super) fn install_link_handler() -> Result<()> {
+    anyhow::bail!(
+        "croft install-link-handler is not supported on native Windows; run croft in WSL2"
+    )
 }

@@ -17,10 +17,15 @@
 //! The session files these commands read and write (socket paths, sidecars,
 //! the liveness probe) live in [`crate::session`], below the session host.
 
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
 
+#[cfg(unix)]
 use crate::session::{
     collab_socket_path, is_alive, is_session_socket, meta_path, mux_socket_path, now_unix,
     read_meta, sessions_dir, socket_path, write_meta_preserving_created,
@@ -30,6 +35,7 @@ use crate::session::{
 /// attach-or-create session on `socket`. Same flags as the remote wrapper:
 /// `-A` attach-or-create, `-E`/`-z` keep dtach's hands off croft's Ctrl
 /// chords, `-r winch` repaints on reattach. Pure so it can be unit-tested.
+#[cfg(any(unix, test))]
 fn dtach_attach_argv(socket: &str, inner: &[String]) -> Vec<String> {
     let mut argv = vec![
         String::from("-A"),
@@ -43,12 +49,14 @@ fn dtach_attach_argv(socket: &str, inner: &[String]) -> Vec<String> {
     argv
 }
 
+#[cfg(unix)]
 fn dtach_on_path() -> bool {
     // dtach with no args prints usage and exits non-zero, but it still *ran* —
     // Ok means the binary is on PATH; Err (ENOENT) means it isn't.
     std::process::Command::new("dtach").output().is_ok()
 }
 
+#[cfg(any(unix, test))]
 fn humanize_age(secs: u64) -> String {
     if secs < 60 {
         format!("{secs}s")
@@ -76,20 +84,7 @@ fn exec_dtach(socket: &Path, inner: &[String]) -> Result<()> {
     Err(err).context("exec dtach")
 }
 
-#[cfg(not(unix))]
-fn exec_dtach(_socket: &Path, _inner: &[String]) -> Result<()> {
-    anyhow::bail!("session persistence requires a Unix host")
-}
-
-/// `croft attach [path]`: attach to (or create) the persistent session for a
-/// workspace via the built-in session host (multiplayer mux; see
-/// docs/MULTIPLAYER.md), which needs no external binary. A workspace with a
-/// live legacy dtach session keeps reattaching through dtach so sessions
-/// started under an older croft are never orphaned.
-///
-/// With `solo`, open an independent viewport instead: this process runs its
-/// own croft (no shared PTY) and replicates shared-file edits with the other
-/// participants over the workspace's collab relay (Phase D).
+#[cfg(unix)]
 pub fn attach(path: Option<PathBuf>, solo: bool) -> Result<()> {
     let workspace = match path {
         Some(p) => p,
@@ -139,7 +134,15 @@ pub fn attach(path: Option<PathBuf>, solo: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+pub fn attach(_path: Option<PathBuf>, _solo: bool) -> Result<()> {
+    anyhow::bail!(
+        "croft attach/ls is not supported on native Windows; run croft in WSL2 for persistent sessions"
+    )
+}
+
 /// One live session in `croft ls`.
+#[cfg(unix)]
 #[derive(Debug)]
 struct SessionRow {
     id: String,
@@ -153,6 +156,7 @@ struct SessionRow {
 
 /// The live persistent sessions under `dir`, pruning any dead session
 /// sockets.
+#[cfg(unix)]
 fn session_rows(dir: &Path) -> Vec<SessionRow> {
     let mut rows: Vec<SessionRow> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -209,6 +213,7 @@ fn session_rows(dir: &Path) -> Vec<SessionRow> {
 }
 
 /// `croft ls`: print the live persistent sessions, pruning any dead sockets.
+#[cfg(unix)]
 pub fn list() -> Result<()> {
     let rows = session_rows(&sessions_dir());
     if rows.is_empty() {
@@ -234,12 +239,21 @@ pub fn list() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+pub fn list() -> Result<()> {
+    anyhow::bail!(
+        "croft attach/ls is not supported on native Windows; run croft in WSL2 for persistent sessions"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::session::*;
 
     /// #343: `croft ls` says which sessions `croft web` exposes, and where.
+    #[cfg(unix)]
     #[test]
     fn ls_shows_where_a_session_is_served_on_the_web() {
         let dir = tempfile::tempdir().unwrap();
@@ -267,11 +281,12 @@ mod tests {
         assert_eq!(rows[0].web.as_deref(), Some("wss://127.0.0.1:7681/"));
     }
 
-    /// A workspace's collab relay socket (`<hash>.collab.sock`) shares the
+    /// The same workspace's live collab relay socket (`<hash>.collab.sock`) shares the
     /// sessions directory and hash keying with the real session socket, and
     /// is a live listener whenever `croft pair` seated a navigator. It is not
     /// a session: `croft ls` used to print it as a phantom `(unknown)` row
     /// whose 8-char id collided with the real session's.
+    #[cfg(unix)]
     #[test]
     fn ls_does_not_report_the_collab_relay_as_a_session() {
         let dir = tempfile::tempdir().unwrap();
@@ -309,6 +324,7 @@ mod tests {
     /// sessions. Only a session's own socket is a session: `ls` lists the
     /// mux and legacy dtach sockets and neither lists, probes nor prunes
     /// anything else, live or dead.
+    #[cfg(unix)]
     #[test]
     fn ls_reports_only_session_sockets_and_leaves_the_rest_alone() {
         let dir = tempfile::tempdir().unwrap();

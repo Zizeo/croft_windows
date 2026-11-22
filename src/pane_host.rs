@@ -31,21 +31,36 @@
 //! [`IDLE_LIMIT`] ends its shell, so hosts of a workspace never reopened do
 //! not run forever.
 
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
+#[cfg(any(unix, test))]
 use alacritty_terminal::Term;
+#[cfg(any(unix, test))]
 use alacritty_terminal::grid::Dimensions;
+#[cfg(any(unix, test))]
 use alacritty_terminal::term::test::TermSize;
+#[cfg(any(unix, test))]
 use alacritty_terminal::term::{Config, TermMode};
+#[cfg(any(unix, test))]
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(unix)]
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+#[cfg(unix)]
 use crate::session_host::{Control, Frame, FrameReader, encode_bytes_frame, encode_control_frame};
+#[cfg(any(unix, test))]
 use crate::widgets::terminal::VoidListener;
 
 /// How long a host with no client keeps its shell before ending it.
@@ -57,6 +72,7 @@ pub const SCROLLBACK_LINES: usize = 2000;
 /// How long a write to the client may block before the client is dropped:
 /// a hung croft must not stall the shell's output (it keeps flowing into
 /// the model, and the next client gets it redrawn).
+#[cfg(unix)]
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What starts a pane host.
@@ -108,6 +124,7 @@ pub fn parse_env(s: &str) -> Option<(String, String)> {
 
 /// Start a detached host for `spec` (a new session, so it outlives this
 /// process and its terminal) and wait for its socket to answer.
+#[cfg(unix)]
 pub fn spawn(spec: &PaneSpec) -> Result<()> {
     let exe = std::env::current_exe().context("resolving croft binary path")?;
     let mut cmd = std::process::Command::new(exe);
@@ -136,10 +153,16 @@ pub fn spawn(spec: &PaneSpec) -> Result<()> {
     anyhow::bail!("the pane host did not start ({})", spec.socket.display())
 }
 
+#[cfg(not(unix))]
+pub fn spawn(_spec: &PaneSpec) -> Result<()> {
+    anyhow::bail!("pane-host is not supported on native Windows")
+}
+
 /// What the model has drawn, as bytes that draw it again on a blank
 /// terminal of the same size: scrollback and screen rows with their colours,
 /// or the alternate screen when a full-screen program holds it, then the
 /// input modes that change what keys and the mouse send, then the cursor.
+#[cfg(any(unix, test))]
 pub fn redraw(term: &Term<VoidListener>) -> Vec<u8> {
     let mut out = String::from("\x1b[0m\x1b[H\x1b[2J\x1b[3J");
     let alt = term.mode().contains(TermMode::ALT_SCREEN);
@@ -183,11 +206,13 @@ pub fn redraw(term: &Term<VoidListener>) -> Vec<u8> {
     out.into_bytes()
 }
 
+#[cfg(any(unix, test))]
 struct Model {
     term: Term<VoidListener>,
     parser: Processor<StdSyncHandler>,
 }
 
+#[cfg(any(unix, test))]
 impl Model {
     fn new(cols: u16, rows: u16) -> Self {
         let cfg = Config {
@@ -202,6 +227,7 @@ impl Model {
     }
 }
 
+#[cfg(unix)]
 struct Pane {
     model: Mutex<Model>,
     /// The attached client's connection, and the one it replaced.
@@ -213,6 +239,7 @@ struct Pane {
     pid: u32,
 }
 
+#[cfg(unix)]
 impl Pane {
     /// Send `frame` to the client, dropping it when the write fails or
     /// blocks past [`CLIENT_WRITE_TIMEOUT`].
@@ -268,6 +295,7 @@ impl Pane {
 
 /// Run the host for `spec` until its shell exits; the exit code is the
 /// shell's.
+#[cfg(unix)]
 pub fn serve(spec: &PaneSpec) -> Result<i32> {
     anyhow::ensure!(!spec.argv.is_empty(), "pane-host needs a command after --");
     if let Some(dir) = spec.socket.parent() {
@@ -374,8 +402,14 @@ pub fn serve(spec: &PaneSpec) -> Result<i32> {
     Ok(code)
 }
 
+#[cfg(not(unix))]
+pub fn serve(_spec: &PaneSpec) -> Result<i32> {
+    anyhow::bail!("pane-host is not supported on native Windows")
+}
+
 /// One client: its Hello attaches it (replacing any other), then its bytes
 /// are the shell's input.
+#[cfg(unix)]
 fn client_thread(pane: &Pane, stream: UnixStream) {
     let Ok(mut rd) = stream.try_clone() else {
         return;
@@ -439,6 +473,7 @@ fn client_thread(pane: &Pane, stream: UnixStream) {
     }
 }
 
+#[cfg(unix)]
 fn same_socket(a: &UnixStream, b: &UnixStream) -> bool {
     use std::os::fd::AsRawFd;
     let stat = |s: &UnixStream| {
@@ -467,10 +502,12 @@ pub fn new_pane_id() -> String {
 }
 
 /// A client's connection to a pane host.
+#[cfg(unix)]
 pub struct PaneClient {
-    stream: UnixStream,
+    stream: crate::platform::ipc::LocalStream,
 }
 
+#[cfg(unix)]
 impl PaneClient {
     /// Attach to the host at `socket` with a `cols`x`rows` view.
     pub fn connect(socket: &Path, cols: u16, rows: u16) -> Result<Self> {
@@ -487,13 +524,13 @@ impl PaneClient {
     }
 
     /// The connection itself, for a pane that drives it directly.
-    pub fn into_stream(self) -> UnixStream {
+    pub fn into_stream(self) -> crate::platform::ipc::LocalStream {
         self.stream
     }
 
     /// A second handle on the connection, for a reader thread.
     #[cfg(test)]
-    pub fn try_clone_stream(&self) -> Result<UnixStream> {
+    pub fn try_clone_stream(&self) -> Result<crate::platform::ipc::LocalStream> {
         Ok(self.stream.try_clone()?)
     }
 
@@ -509,11 +546,28 @@ impl PaneClient {
     }
 }
 
+#[cfg(not(unix))]
+pub struct PaneClient;
+
+#[cfg(not(unix))]
+impl PaneClient {
+    /// Attach to the host at `socket` with a `cols`x`rows` view.
+    pub fn connect(_socket: &Path, _cols: u16, _rows: u16) -> Result<Self> {
+        anyhow::bail!("pane-host is not supported on native Windows")
+    }
+
+    /// The connection itself, for a pane that drives it directly.
+    pub fn into_stream(self) -> crate::platform::ipc::LocalStream {
+        crate::platform::ipc::LocalStream
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Read frames from `s` until `done` says the collected ones suffice.
+    #[cfg(unix)]
     fn read_until(s: &mut UnixStream, done: impl Fn(&[Frame]) -> bool) -> Vec<Frame> {
         s.set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
@@ -532,6 +586,7 @@ mod tests {
         got
     }
 
+    #[cfg(unix)]
     fn text(frames: &[Frame]) -> String {
         frames
             .iter()
@@ -603,6 +658,7 @@ mod tests {
         assert!(out.ends_with("\x1b[?25l"), "hidden cursor: {out:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_shell_outlives_its_client_and_a_new_client_sees_what_it_missed() {
         let tmp = tempfile::tempdir().unwrap();

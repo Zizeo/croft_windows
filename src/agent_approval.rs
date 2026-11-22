@@ -3,9 +3,10 @@
 //! lands so it can be shown as a diff and approved or denied.
 
 use std::collections::VecDeque;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+use crate::platform::ipc::{LocalListener, LocalStream};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -133,7 +134,8 @@ fn apply_edit(text: &str, edit: &Value) -> Result<String, String> {
 
 /// Listen for this workspace's hook requests. Non-blocking, so draining it
 /// never stalls a frame.
-pub fn bind(workspace: &Path) -> std::io::Result<UnixListener> {
+#[cfg(unix)]
+pub fn bind(workspace: &Path) -> std::io::Result<LocalListener> {
     let root =
         crate::platform::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let listener = crate::session::bind_socket_0600(&crate::session::hook_socket_path(&root))?;
@@ -141,10 +143,18 @@ pub fn bind(workspace: &Path) -> std::io::Result<UnixListener> {
     Ok(listener)
 }
 
+#[cfg(not(unix))]
+pub fn bind(_workspace: &Path) -> std::io::Result<LocalListener> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Windows IPC not yet implemented",
+    ))
+}
+
 /// A proposal waiting for the user, with the connection its answer goes
 /// back on.
 pub struct Pending {
-    stream: UnixStream,
+    stream: LocalStream,
     pub request: EditRequest,
     pub proposal: Proposal,
     pub arrived: Instant,
@@ -159,12 +169,18 @@ pub struct Pending {
 impl Pending {
     /// Send `decision` to the waiting hook. A hook that has already given
     /// up (its own window passed) is simply gone; nothing is owed to it.
+    #[cfg(unix)]
     pub fn answer(mut self, decision: &Decision) {
         use std::io::Write;
         if let Ok(mut line) = serde_json::to_string(decision) {
             line.push('\n');
             let _ = self.stream.write_all(line.as_bytes());
         }
+    }
+
+    #[cfg(not(unix))]
+    pub fn answer(mut self, decision: &Decision) {
+        let _ = (&mut self.stream, decision);
     }
 
     /// Past the hook's own window: it has answered "ask" by itself, so the
@@ -177,12 +193,14 @@ impl Pending {
 /// How long a new connection gets to deliver its request line. The hook
 /// writes it straight after connecting, so this only bounds a peer that
 /// connects and says nothing.
+#[cfg(unix)]
 const REQUEST_DEADLINE: Duration = Duration::from_millis(50);
 
 /// Take every waiting connection off `listener`. Requests that make a
 /// proposal are queued; one whose edit cannot be worked out is answered
 /// "ask" at once, since there is nothing to show.
-pub fn accept_into(listener: &UnixListener, queue: &mut VecDeque<Pending>) -> bool {
+#[cfg(unix)]
+pub fn accept_into(listener: &LocalListener, queue: &mut VecDeque<Pending>) -> bool {
     let mut changed = false;
     while let Ok((stream, _)) = listener.accept() {
         let _ = stream.set_nonblocking(false);
@@ -235,9 +253,15 @@ pub fn accept_into(listener: &UnixListener, queue: &mut VecDeque<Pending>) -> bo
     changed
 }
 
+#[cfg(not(unix))]
+pub fn accept_into(_listener: &LocalListener, _queue: &mut VecDeque<Pending>) -> bool {
+    false
+}
+
 /// A fresh one-time token: 128 random bits as hex. Empty only if the
 /// system RNG fails, and an empty token never matches anything, so such a
 /// proposal is answered in the popup alone.
+#[cfg(unix)]
 fn new_token() -> String {
     use ring::rand::SecureRandom;
     let mut bytes = [0u8; 16];
@@ -255,12 +279,14 @@ pub struct RemoteDecision {
     pub allow: bool,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Serialize, Deserialize)]
 struct DecideLine {
     decide: RemoteDecision,
 }
 
 /// What `croft decide` hears back.
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecideReply {
     pub ok: bool,
@@ -268,8 +294,9 @@ pub struct DecideReply {
     pub message: String,
 }
 
+#[cfg(unix)]
 impl DecideReply {
-    fn send(&self, mut stream: UnixStream) {
+    fn send(&self, mut stream: LocalStream) {
         use std::io::Write;
         if let Ok(mut line) = serde_json::to_string(self) {
             line.push('\n');
@@ -283,6 +310,7 @@ pub const NOTIFICATION_DENY: &str = "denied from a croft notification";
 
 /// Equal without an early exit, so the time a wrong guess takes says
 /// nothing about how much of it was right.
+#[cfg(unix)]
 fn same_token(a: &str, b: &str) -> bool {
     a.len() == b.len()
         && a.bytes()
@@ -294,6 +322,7 @@ fn same_token(a: &str, b: &str) -> bool {
 /// Answer the live proposal `decision.token` names, and take it off the
 /// queue so the token cannot answer twice. A token that matches nothing
 /// (already answered, expired, or never issued) answers nothing.
+#[cfg(unix)]
 fn decide_by_token(
     queue: &mut VecDeque<Pending>,
     decision: &RemoteDecision,
@@ -330,6 +359,7 @@ fn decide_by_token(
 
 /// `croft decide` (#359): answer the proposal `token` names, through the
 /// croft serving `cwd`, without attaching to it.
+#[cfg(unix)]
 pub fn send_decision(cwd: &Path, decision: &RemoteDecision) -> Result<String, String> {
     use std::io::Write;
     let mut stream = crate::agent_hook::connect_croft(cwd)
@@ -354,8 +384,14 @@ pub fn send_decision(cwd: &Path, decision: &RemoteDecision) -> Result<String, St
     }
 }
 
+#[cfg(not(unix))]
+pub fn send_decision(cwd: &Path, _decision: &RemoteDecision) -> Result<String, String> {
+    Err(format!("no croft is open for {}", cwd.display()))
+}
+
 /// How long `croft decide` waits for the running croft, which reads the
 /// hook socket once a frame.
+#[cfg(unix)]
 const DECIDE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Keys that arrive this soon after the popup appears are ignored, so an
@@ -796,6 +832,7 @@ mod tests {
         assert!(rows.contains(&(' ', "a".into())));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_request_is_queued_and_its_answer_reaches_the_hook() {
         use std::io::{BufRead, Write};
@@ -803,12 +840,12 @@ mod tests {
         let file = dir.path().join("a.rs");
         std::fs::write(&file, "let x = 1;\n").unwrap();
         let sock = dir.path().join("h.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let listener = LocalListener::bind(&sock).unwrap();
         listener.set_nonblocking(true).unwrap();
         let mut queue = VecDeque::new();
         assert!(!accept_into(&listener, &mut queue), "nothing waiting yet");
 
-        let mut hook = UnixStream::connect(&sock).unwrap();
+        let mut hook = LocalStream::connect(&sock).unwrap();
         let req = EditRequest {
             agent: "claude-code".into(),
             tool: "Edit".into(),
@@ -840,14 +877,15 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_edit_that_cannot_be_previewed_is_answered_ask_at_once() {
         use std::io::{BufRead, Write};
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("h.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let listener = LocalListener::bind(&sock).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let mut hook = UnixStream::connect(&sock).unwrap();
+        let mut hook = LocalStream::connect(&sock).unwrap();
         let req = EditRequest {
             agent: "claude-code".into(),
             tool: "Edit".into(),
@@ -868,16 +906,17 @@ mod tests {
 
     /// Queue one proposal for `file` through `listener`, as a hook would,
     /// and return the hook's end of the connection.
+    #[cfg(unix)]
     fn queue_one(
-        listener: &UnixListener,
+        listener: &LocalListener,
         sock: &Path,
         dir: &Path,
         queue: &mut VecDeque<Pending>,
-    ) -> UnixStream {
+    ) -> LocalStream {
         use std::io::Write;
         let file = dir.join(format!("f{}.rs", queue.len()));
         std::fs::write(&file, "let x = 1;\n").unwrap();
-        let mut hook = UnixStream::connect(sock).unwrap();
+        let mut hook = LocalStream::connect(sock).unwrap();
         let req = EditRequest {
             agent: "claude-code".into(),
             tool: "Edit".into(),
@@ -891,15 +930,16 @@ mod tests {
 
     /// Send `decide` on the socket as `croft decide` does, let the app's
     /// pass pick it up, and return the reply `croft decide` would print.
+    #[cfg(unix)]
     fn decide(
-        listener: &UnixListener,
+        listener: &LocalListener,
         sock: &Path,
         queue: &mut VecDeque<Pending>,
         token: &str,
         allow: bool,
     ) -> DecideReply {
         use std::io::{BufRead, Write};
-        let mut client = UnixStream::connect(sock).unwrap();
+        let mut client = LocalStream::connect(sock).unwrap();
         let line = serde_json::to_string(&DecideLine {
             decide: RemoteDecision {
                 token: token.into(),
@@ -916,18 +956,20 @@ mod tests {
         serde_json::from_str(reply.trim()).unwrap()
     }
 
-    fn hook_answer(hook: UnixStream) -> Decision {
+    #[cfg(unix)]
+    fn hook_answer(hook: LocalStream) -> Decision {
         use std::io::BufRead;
         let mut line = String::new();
         std::io::BufReader::new(hook).read_line(&mut line).unwrap();
         serde_json::from_str(line.trim()).unwrap()
     }
 
+    #[cfg(unix)]
     #[test]
     fn each_proposal_gets_its_own_token_and_starts_unnotified() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("h.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let listener = LocalListener::bind(&sock).unwrap();
         listener.set_nonblocking(true).unwrap();
         let mut queue = VecDeque::new();
         let _a = queue_one(&listener, &sock, dir.path(), &mut queue);
@@ -938,11 +980,12 @@ mod tests {
         assert!(!queue[0].notified && !queue[1].notified);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_token_answers_its_own_proposal_once_from_outside_the_popup() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("h.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let listener = LocalListener::bind(&sock).unwrap();
         listener.set_nonblocking(true).unwrap();
         let mut queue = VecDeque::new();
         let first = queue_one(&listener, &sock, dir.path(), &mut queue);
@@ -974,11 +1017,12 @@ mod tests {
         assert!(queue.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_wrong_empty_or_expired_token_answers_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("h.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let listener = LocalListener::bind(&sock).unwrap();
         listener.set_nonblocking(true).unwrap();
         let mut queue = VecDeque::new();
         let _hook = queue_one(&listener, &sock, dir.path(), &mut queue);

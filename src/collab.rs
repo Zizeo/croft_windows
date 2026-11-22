@@ -28,6 +28,7 @@
 //! The app side (`App::poll_collab`, src/app/mod.rs) feeds buffer text in
 //! and applies the returned [`CollabEvent`]s to open tabs.
 
+#[cfg(unix)]
 use std::io::{Read, Write};
 
 use cola::{Deletion, Insertion, Replica};
@@ -557,6 +558,7 @@ impl CollabMsg {
 /// the client's job, so the relay never inspects an op. Runs until the socket
 /// closes; one thread per client. Distinct socket from the PTY mux
 /// (`<hash>.collab.sock`), so it never carries terminal bytes.
+#[cfg(unix)]
 pub fn relay_serve(socket: &std::path::Path) -> anyhow::Result<()> {
     // Attach-or-create: a live relay already owns the socket; binding over
     // it would strand that relay's connected clients mid-session. The
@@ -598,8 +600,14 @@ pub fn relay_serve(socket: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+pub fn relay_serve(_socket: &std::path::Path) -> anyhow::Result<()> {
+    anyhow::bail!("collab relay is not supported on native Windows; run croft in WSL2")
+}
+
 /// The argv (after the croft binary itself) that serves a relay on `socket`.
 /// Pure so it can be unit-tested.
+#[cfg(any(unix, test))]
 fn detached_relay_argv(socket: &std::path::Path) -> Vec<String> {
     vec![
         String::from("collab-relay"),
@@ -612,6 +620,7 @@ fn detached_relay_argv(socket: &std::path::Path) -> Vec<String> {
 /// one detached (same null-stdio + setsid pattern as
 /// `session_host::spawn_detached_server`, so it outlives this participant's
 /// terminal) and wait for it to bind.
+#[cfg(unix)]
 pub fn ensure_relay(socket: &std::path::Path) -> anyhow::Result<()> {
     use anyhow::Context;
     if crate::session::is_alive(socket) {
@@ -642,6 +651,11 @@ pub fn ensure_relay(socket: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+pub fn ensure_relay(_socket: &std::path::Path) -> anyhow::Result<()> {
+    anyhow::bail!("collab relay is not supported on native Windows; run croft in WSL2")
+}
+
 /// Which side of the collab session this process is (see docs/MULTIPLAYER.md):
 /// the owner is the mux's inner croft — it answers bootstrap requests,
 /// allocates site ids, and is the only participant that writes shared files
@@ -656,7 +670,9 @@ pub enum CollabRole {
 /// of [`CollabMsg`]s, mirroring `session_host::InnerChannel` (the launch
 /// side puts the socket and role in the environment; the app connects).
 pub struct CollabChannel {
+    #[cfg(unix)]
     stream: std::os::unix::net::UnixStream,
+    #[cfg(unix)]
     reader: crate::session_host::FrameReader,
     pub role: CollabRole,
     /// Latched on EOF or a hard error: the relay hung up. Nothing clears
@@ -708,6 +724,7 @@ impl CollabChannel {
         Some((socket, role))
     }
 
+    #[cfg(unix)]
     pub fn connect(socket: &std::path::Path, role: CollabRole) -> Option<Self> {
         let stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
         // Non-blocking so the app's per-tick drain never stalls the render
@@ -721,6 +738,11 @@ impl CollabChannel {
         })
     }
 
+    #[cfg(not(unix))]
+    pub fn connect(_socket: &std::path::Path, _role: CollabRole) -> Option<Self> {
+        None
+    }
+
     /// True once the relay hung up (EOF or a failed write): the channel is
     /// unusable and its owner should drop it and reconnect.
     pub fn is_dead(&self) -> bool {
@@ -730,6 +752,7 @@ impl CollabChannel {
     /// Broadcast one message to the other participants. Returns false when
     /// the relay is gone (which also latches [`Self::is_dead`], so the
     /// session surfaces the loss even though callers fire-and-forget).
+    #[cfg(unix)]
     pub fn send(&mut self, msg: &CollabMsg) -> bool {
         let sent = crate::session_host::write_frame_blocking(&mut self.stream, &msg.encode());
         if !sent {
@@ -738,9 +761,16 @@ impl CollabChannel {
         sent
     }
 
+    #[cfg(not(unix))]
+    pub fn send(&mut self, _msg: &CollabMsg) -> bool {
+        self.dead = true;
+        false
+    }
+
     /// Drain every message waiting on the channel, in arrival order.
     /// Non-blocking; malformed frames are skipped (a newer peer may speak a
     /// larger CollabMsg — ignoring what this side cannot parse beats dying).
+    #[cfg(unix)]
     pub fn drain(&mut self) -> Vec<CollabMsg> {
         let mut msgs = Vec::new();
         let mut buf = [0u8; 16384];
@@ -770,6 +800,11 @@ impl CollabChannel {
             }
         }
         msgs
+    }
+
+    #[cfg(not(unix))]
+    pub fn drain(&mut self) -> Vec<CollabMsg> {
+        Vec::new()
     }
 }
 
@@ -1398,19 +1433,23 @@ impl Drop for CollabSession {
 /// peer as wedged and dropping it. Shorter than the clients' own
 /// frame-write deadline, so the relay recovers (and traffic resumes for
 /// healthy peers) before any client gives its connection up for dead.
+#[cfg(unix)]
 const RELAY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 // The ordering above is a recovery guarantee, not a coincidence: hold it
 // against future edits to either constant.
+#[cfg(unix)]
 const _: () = assert!(
     RELAY_WRITE_TIMEOUT.as_millis() < crate::session_host::WRITE_FRAME_DEADLINE.as_millis()
 );
 
+#[cfg(unix)]
 type Peer = std::sync::Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>;
 
 /// One connection: reassemble whole frames from this peer and forward each,
 /// atomically, to every other peer. Reframing (not raw byte forwarding) is
 /// what keeps two senders' frames from interleaving mid-message at a receiver.
+#[cfg(unix)]
 fn relay_client(
     mut rx: std::os::unix::net::UnixStream,
     me: &Peer,
@@ -1745,6 +1784,7 @@ mod tests {
     /// peer on the same relay) is skipped by drain, never an error — this is
     /// the interop guarantee the new stream messages rely on against 0.1.633
     /// peers.
+    #[cfg(unix)]
     #[test]
     fn drain_skips_unknown_wire_variants() {
         use std::io::Write;
@@ -1994,6 +2034,7 @@ mod tests {
     /// this test was known for. Routing-through-accept is immune: an
     /// inherited duplicate shares OUR queue, while a thief that rebound the
     /// path would swallow the fresh connect and accept() would come up dry.
+    #[cfg(unix)]
     #[test]
     fn a_live_relay_is_not_stolen_from() {
         use std::os::unix::net::UnixListener;
@@ -2028,6 +2069,7 @@ mod tests {
     }
 
     /// Start a relay on a temp socket and connect a session to it in `role`.
+    #[cfg(unix)]
     fn session_pair() -> (tempfile::TempDir, CollabSession, CollabSession) {
         use std::time::{Duration, Instant};
         let dir = tempfile::tempdir().unwrap();
@@ -2055,6 +2097,7 @@ mod tests {
 
     /// Pump both sessions until `done` says so or the deadline passes,
     /// collecting every event per side. The owner serves one file.
+    #[cfg(unix)]
     fn pump(
         owner: &mut CollabSession,
         guest: &mut CollabSession,
@@ -2076,6 +2119,7 @@ mod tests {
     /// #1147: an owner that stops heartbeating (a crash, no goodbye) is
     /// taken for gone once [`OWNER_GONE_AFTER`] lapses, and the guest's live
     /// files go local-only so it can save them.
+    #[cfg(unix)]
     #[test]
     fn a_silent_owner_is_taken_for_gone_after_the_heartbeat_lapses() {
         let (_dir, mut owner, mut guest) = session_pair();
@@ -2105,6 +2149,7 @@ mod tests {
 
     /// A guest that never heard a heartbeat (an owner too old to send one)
     /// never decides the owner left, and an owner's own session never does.
+    #[cfg(unix)]
     #[test]
     fn no_heartbeat_heard_means_no_owner_left() {
         let (_dir, mut owner, mut guest) = session_pair();
@@ -2131,6 +2176,7 @@ mod tests {
     /// The full slice-4 handshake headlessly: a guest bootstraps a file from
     /// the owner through the relay, edits it, and the owner's replica
     /// converges; carets travel too.
+    #[cfg(unix)]
     #[test]
     fn collab_sessions_bootstrap_and_converge_through_the_relay() {
         let (_dir, mut owner, mut guest) = session_pair();
@@ -2168,6 +2214,7 @@ mod tests {
 
     /// Sticky notes (#367) travel between sessions, and a joiner's request
     /// reaches only the owner.
+    #[cfg(unix)]
     #[test]
     fn collab_sessions_carry_sticky_notes_and_the_joiners_request() {
         let (_dir, mut owner, mut guest) = session_pair();
@@ -2198,6 +2245,7 @@ mod tests {
     /// Stream state and cancel travel between sessions without any doc being
     /// live (they are session-level, not doc-gated: the pilot may broadcast
     /// before the file bootstraps, and anyone may cancel).
+    #[cfg(unix)]
     #[test]
     fn collab_sessions_carry_stream_state_and_cancel() {
         let (_dir, mut owner, mut guest) = session_pair();
@@ -2221,6 +2269,7 @@ mod tests {
     }
 
     /// Concurrent edits on both sides converge to the identical text.
+    #[cfg(unix)]
     #[test]
     fn collab_sessions_concurrent_edits_converge() {
         let (_dir, mut owner, mut guest) = session_pair();
@@ -2245,6 +2294,7 @@ mod tests {
     /// No echo: once both sides converge and re-extract their (unchanged)
     /// buffers, the wire goes quiet — an op re-emitted for a remote edit
     /// would bounce between peers forever.
+    #[cfg(unix)]
     #[test]
     fn collab_sessions_do_not_echo_applied_remote_edits() {
         let (_dir, mut owner, mut guest) = session_pair();
@@ -2274,6 +2324,7 @@ mod tests {
 
     /// A guest with no owner on the relay stops waiting after the deadline
     /// instead of gating input forever.
+    #[cfg(unix)]
     #[test]
     fn bootstrap_times_out_without_an_owner() {
         let (_dir, _owner, mut guest) = session_pair();
@@ -2306,6 +2357,7 @@ mod tests {
     /// peer's writes AND blocked their reader threads on the same mutex —
     /// a three-process deadlock. A bounded write drops the wedged peer and
     /// traffic keeps flowing to the rest.
+    #[cfg(unix)]
     #[test]
     fn a_wedged_peer_cannot_deadlock_the_relay() {
         use std::io::Write;
@@ -2382,6 +2434,7 @@ mod tests {
     /// and reconnect. EOF used to read exactly like an idle socket, so a
     /// guest kept typing into a buffer whose ops reached nobody — with
     /// saves still gated, the work existed only in RAM.
+    #[cfg(unix)]
     #[test]
     fn a_dead_relay_marks_the_session_disconnected() {
         let dir = tempfile::tempdir().unwrap();
@@ -2418,6 +2471,7 @@ mod tests {
     /// which permanently breaks convergence. Seeding the counter from the
     /// owner's process id keeps every owner incarnation's allocations
     /// disjoint.
+    #[cfg(unix)]
     #[test]
     fn an_owner_seeds_site_ids_from_its_process_id() {
         let (_dir, mut owner, mut guest) = session_pair();
@@ -2440,6 +2494,7 @@ mod tests {
     /// into the 3s input gate, forever — unable to ever type or save. After
     /// the give-up, request_file must be a no-op; only an explicit rejoin
     /// (the collab agent's collab_open retry) re-arms the bootstrap.
+    #[cfg(unix)]
     #[test]
     fn a_timed_out_file_stays_local_only_through_re_requests() {
         let (_dir, _owner, mut guest) = session_pair();
@@ -2480,6 +2535,7 @@ mod tests {
     /// resend past the deadline: an owner whose relay connection registered
     /// between 1.5s and 3s was never re-asked, and the guest silently
     /// degraded that file to local-only editing.
+    #[cfg(unix)]
     #[test]
     fn snapshot_resend_backs_off_but_stays_inside_the_bootstrap_window() {
         use std::time::{Duration, Instant};
@@ -2545,6 +2601,7 @@ mod tests {
     /// lost for good: the relay has no replay, so the guest must re-send
     /// while bootstrapping and an owner that appears moments later still
     /// answers.
+    #[cfg(unix)]
     #[test]
     fn guest_resends_snapshot_request_until_an_owner_answers() {
         use std::time::{Duration, Instant};
@@ -2604,6 +2661,7 @@ mod tests {
 
     /// End-to-end transport: two participants connected through the relay
     /// exchange an op and converge, with the relay never inspecting it.
+    #[cfg(unix)]
     #[test]
     fn ops_converge_through_the_relay() {
         use crate::session_host::{Frame, FrameReader};

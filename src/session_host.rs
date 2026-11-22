@@ -16,42 +16,69 @@
 //! message (see [`Control`]), the same compact-JSON convention as
 //! `crate::mcp::transport`.
 
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(unix)]
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
 mod attach;
+#[cfg(unix)]
 mod connection;
+#[cfg(unix)]
 mod detach_chord;
+#[cfg(unix)]
 mod frame_write;
 mod identity;
+#[cfg(unix)]
 mod inner_channel;
+#[cfg(unix)]
 mod launch;
+#[cfg(unix)]
 mod outbox;
 mod protocol;
+#[cfg(unix)]
 mod pty;
 mod roster;
+#[cfg(unix)]
 mod server;
 mod sidecars;
+#[cfg(unix)]
 mod swap;
+#[cfg(unix)]
 use attach::*;
+#[cfg(unix)]
 use connection::*;
+#[cfg(unix)]
 use detach_chord::*;
+#[cfg(unix)]
 pub(crate) use frame_write::WRITE_FRAME_DEADLINE;
+#[cfg(unix)]
 pub(crate) use frame_write::write_frame_blocking;
+#[cfg(unix)]
 use frame_write::*;
 pub(crate) use identity::client_name;
+#[cfg(unix)]
 use identity::*;
+#[cfg(unix)]
 pub use launch::attach_or_create;
-#[cfg(test)]
+#[cfg(all(unix, test))]
 use launch::*;
+#[cfg(unix)]
 use outbox::*;
 pub use protocol::Control;
 pub use protocol::Frame;
@@ -59,23 +86,30 @@ pub use protocol::FrameReader;
 pub use protocol::Participant;
 pub use protocol::encode_bytes_frame;
 pub use protocol::encode_control_frame;
-#[cfg(test)]
+#[cfg(all(unix, test))]
 use protocol::*;
+#[cfg(unix)]
 use pty::*;
+#[cfg(any(unix, test))]
 pub use roster::min_winsize;
 pub use roster::session_version;
 pub use roster::sole_detach_target;
 pub use roster::stale_client_notice;
 pub use roster::stale_client_notice_on_change;
 use roster::*;
+#[cfg(unix)]
 pub use server::serve;
-#[cfg(test)]
+#[cfg(all(unix, test))]
 pub(crate) use server::serve_with_token;
+#[cfg(unix)]
 use server::*;
 pub use sidecars::read_host_version;
 pub use sidecars::read_presence;
+#[cfg(unix)]
 pub use sidecars::stale_marker_path;
+#[cfg(unix)]
 use sidecars::*;
+#[cfg(unix)]
 use swap::*;
 
 /// The raw handles a serve wrapper must carry across its own exec: the
@@ -83,6 +117,7 @@ use swap::*;
 /// the backlog during the swap), the PTY master (so the inner croft never
 /// sees HUP), and the inner child's pid (exec preserves the parent/child
 /// relationship, so the successor can still wait on it).
+#[cfg(unix)]
 struct HandoffFds {
     listener: std::os::fd::RawFd,
     master: std::os::fd::RawFd,
@@ -98,11 +133,13 @@ struct HandoffFds {
 /// else. When the queue exceeds [`CLIENT_QUEUE_LIMIT`] the client is marked
 /// dead and its queue dropped; the writer thread then exits and the client
 /// thread deregisters it, exactly as for a peer that closed the connection.
+#[cfg(unix)]
 struct Outbox {
     queue: Mutex<OutboxState>,
     wake: std::sync::Condvar,
 }
 
+#[cfg(unix)]
 #[derive(Default)]
 struct OutboxState {
     /// Frames awaiting delivery, oldest first.
@@ -126,6 +163,7 @@ struct OutboxState {
     delivered: u64,
 }
 
+#[cfg(unix)]
 struct Client {
     id: u64,
     name: String,
@@ -152,6 +190,7 @@ struct Client {
     client_id: String,
 }
 
+#[cfg(unix)]
 struct Host {
     clients: Mutex<Vec<Client>>,
     next_id: AtomicU64,
@@ -190,6 +229,7 @@ struct Host {
 /// participants UI grant/revoke write control and disconnect clients.
 /// Fire-and-forget writes; the host answers through the presence sidecar,
 /// which the app already polls.
+#[cfg(unix)]
 pub struct InnerChannel {
     stream: UnixStream,
     /// Decoder for host frames (typing attribution) on this channel.
@@ -208,5 +248,58 @@ pub struct InnerChannel {
     pub host_version: PathBuf,
 }
 
-#[cfg(test)]
+#[cfg(not(unix))]
+pub fn serve(_socket: &Path, _workspace: Option<&Path>, _inner: &[String]) -> Result<i32> {
+    anyhow::bail!(
+        "session-host is not supported on native Windows; run croft in WSL2 for persistent sessions"
+    )
+}
+
+#[cfg(not(unix))]
+pub fn attach_or_create(
+    _socket: &Path,
+    _workspace: Option<&Path>,
+    _inner: &[String],
+) -> Result<i32> {
+    anyhow::bail!(
+        "session-host is not supported on native Windows; run croft in WSL2 for persistent sessions"
+    )
+}
+
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct InnerChannel {
+    pub presence: PathBuf,
+    pub stale_marker: PathBuf,
+    pub host_version: PathBuf,
+}
+
+#[cfg(not(unix))]
+impl InnerChannel {
+    pub fn from_env() -> Option<Self> {
+        None
+    }
+
+    pub fn connect(_socket: &Path, _token: &str) -> Option<Self> {
+        None
+    }
+
+    pub fn drain_typing(&mut self) -> Vec<u64> {
+        Vec::new()
+    }
+
+    pub fn is_dead(&self) -> bool {
+        true
+    }
+
+    pub fn set_control(&mut self, _id: u64, _grant: bool) -> bool {
+        false
+    }
+
+    pub fn kick(&mut self, _id: u64) -> bool {
+        false
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests;
