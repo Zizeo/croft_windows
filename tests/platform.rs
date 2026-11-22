@@ -116,9 +116,22 @@ fn fs_executable_lock_and_link() {
 }
 
 #[test]
-fn process_liveness_and_managed_child_kill_tree() {
-    assert!(platform::process::is_pid_alive(std::process::id()));
+fn fs_create_file_link_already_exists_does_not_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target.txt");
+    let existing = dir.path().join("existing.txt");
+    std::fs::write(&target, b"new content").unwrap();
+    std::fs::write(&existing, b"original content").unwrap();
 
+    let err = platform::fs::create_file_link(&target, &existing).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        std::fs::read_to_string(&existing).unwrap(),
+        "original content"
+    );
+}
+
+fn spawn_sleep_command() -> std::process::Command {
     #[cfg(windows)]
     let mut cmd = {
         let mut c = std::process::Command::new("powershell.exe");
@@ -134,10 +147,39 @@ fn process_liveness_and_managed_child_kill_tree() {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    cmd
+}
 
+#[test]
+fn process_liveness_and_managed_child_kill_tree() {
+    assert!(platform::process::is_pid_alive(std::process::id()));
+
+    let mut cmd = spawn_sleep_command();
     let mut managed = platform::process::ManagedChild::spawn_in_group(&mut cmd).unwrap();
     let pid = managed.id();
     assert!(platform::process::is_pid_alive(pid));
     managed.kill_tree();
+    assert!(!platform::process::is_pid_alive(pid));
+}
+
+#[test]
+fn process_into_child_preserves_liveness() {
+    let mut cmd = spawn_sleep_command();
+    let managed = platform::process::ManagedChild::spawn_in_group(&mut cmd).unwrap();
+    let pid = managed.id();
+    let mut child = managed.into_child();
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "into_child() must leave child running"
+    );
+    assert!(
+        platform::process::is_pid_alive(pid),
+        "into_child() must not kill child PID {pid}"
+    );
+
+    child.kill().unwrap();
+    child.wait().unwrap();
     assert!(!platform::process::is_pid_alive(pid));
 }

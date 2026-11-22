@@ -112,7 +112,27 @@ impl ManagedChild {
         &mut self.child
     }
 
+    /// Transfer ownership of the underlying `Child` out of `ManagedChild`,
+    /// leaving the child running (on Windows, `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+    /// is cleared before the job handle is dropped).
     pub fn into_child(self) -> Child {
+        #[cfg(windows)]
+        if let Some(ref job) = self.job {
+            use windows_sys::Win32::System::JobObjects::{
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                SetInformationJobObject,
+            };
+            unsafe {
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = 0;
+                SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    (&raw const info).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+            }
+        }
         self.child
     }
 

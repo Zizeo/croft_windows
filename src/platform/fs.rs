@@ -30,12 +30,14 @@ pub fn is_executable(path: &Path) -> bool {
         let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
             return false;
         };
-        let dot_ext = format!(".{}", ext.to_ascii_uppercase());
         let pathext = std::env::var("PATHEXT")
             .unwrap_or_else(|_| String::from(".COM;.EXE;.BAT;.CMD"));
-        pathext
-            .split(';')
-            .any(|e| e.trim().eq_ignore_ascii_case(&dot_ext))
+        pathext.split(';').any(|entry| {
+            entry
+                .trim()
+                .strip_prefix('.')
+                .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+        })
     }
 }
 
@@ -99,9 +101,14 @@ pub fn create_file_link(target: &Path, link: &Path) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        if std::fs::hard_link(target, link).is_ok() {
-            return Ok(());
+        match std::fs::hard_link(target, link) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
+            Err(e) if link.symlink_metadata().is_ok() => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("link path already exists: {e}"),
+            )),
+            Err(_) => std::fs::copy(target, link).map(|_| ()),
         }
-        std::fs::copy(target, link).map(|_| ())
     }
 }
