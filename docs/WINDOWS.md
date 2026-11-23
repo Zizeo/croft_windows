@@ -1,57 +1,129 @@
 # croft on Windows
 
-Short version: **run croft inside WSL2, hosted in a graphics-capable terminal (WezTerm).** Native Windows (PowerShell / `conhost`) is not supported and is unlikely to be worth supporting, for the reasons below. For what croft does and the full keyboard surface see the [README](../README.md) and [KEYBINDINGS.md](KEYBINDINGS.md).
+Short version: **build this fork natively and run `croft.exe` in Windows Terminal or WezTerm with
+a Nerd Font.** No WSL2 is required. The port keeps the upstream feature set, with the exceptions
+listed under [Limitations](#limitations). For what croft does see the [README](../README.md), and
+for the full keyboard surface see [KEYBINDINGS.md](KEYBINDINGS.md).
 
-## WSL2 works today (it is the Linux build)
+`croft` is based on [vitali87/croft](https://github.com/vitali87/croft); the native Windows support
+described here lives in this fork. The port plan and per-area status are in
+[Windows_Port.md](../Windows_Port.md).
 
-croft has no separate "Windows" target. Inside WSL2 you are running real Linux, so croft's normal `x86_64-unknown-linux-gnu` build compiles and runs **unmodified**, with the full feature set: PTYs, file watching, language servers, the `Ctrl` command modifier, and `croft remote <host>`. Everything in [LINUX.md](LINUX.md) applies verbatim.
+## Build
 
-```bash
-# inside your WSL2 distro (Ubuntu, Debian, etc.)
-cargo install croft-software --locked
+Prerequisites: Windows 10/11 x86_64, the MSVC C++ build tools, and a Rust toolchain (1.97+).
+
+```powershell
+git clone git@github.com:Zizeo/croft_windows.git
+cd croft_windows
+cargo install --path . --locked
 ```
 
-What WSL does **not** change is the terminal. A WSL shell renders into whatever Windows terminal emulator hosts it, and that choice decides whether you get the full icon/image UI or the degraded text fallback:
+`croft.exe` lands in `%USERPROFILE%\.cargo\bin`. For a local build only, use
+`cargo build --release` and run `.\target\release\croft.exe`.
 
-| Host terminal for the WSL shell | Result |
-|---------------------------------|--------|
-| **WezTerm** (Windows build, pointed at the WSL shell) | Full UI. WezTerm implements the iTerm2 OSC-1337 and Kitty graphics protocols croft draws with, so activity-bar icons, file icons, the hero image, and PDF / image / spreadsheet previews all render. **Recommended.** |
-| **Windows Terminal** (the default WSL host) | croft runs, but image-less: icons fall back to Nerd Font glyphs, and image and PDF previews to half-block characters under a metadata-header line. croft shows its one-time "switch terminal" nudge on launch. |
-| Legacy `conhost` console | Same image-less fallback, and a worse Nerd Font / truecolor story. |
+## Pick the terminal first
 
-So the practical setup is WSL2 for the OS, WezTerm for the terminal, and a Nerd Font configured in WezTerm. See [LINUX.md](LINUX.md) for the font and dependency notes, which all apply inside WSL.
+The terminal decides whether croft's graphics render. croft's visual identity — activity-bar icons,
+file-type icons, the hero illustration, and inline image, PDF and spreadsheet previews — is painted
+with the iTerm2 OSC 1337 and Kitty graphics protocols, with sixel as a runtime-probed fallback.
 
-## Why native Windows (PowerShell / conhost) is not supported
+| Host terminal | Result |
+|---------------|--------|
+| **WezTerm** (Windows build) | Full UI: OSC 1337 and Kitty graphics, plus the Kitty keyboard protocol. **Recommended.** |
+| **Windows Terminal** 1.22+ | Full UI on recent builds: sixel graphics, probed through DA1 and `CSI 16 t` for cell pixel geometry. |
+| Legacy `conhost.exe` (including the default window a bare `powershell.exe` opens) | croft runs, but image-less: Nerd Font glyphs for icons, half-block characters for image previews. croft shows its one-time "switch terminal" nudge on launch. |
 
-It is tempting to read "Windows is not supported" as "nobody ported the PTY yet," but the PTY is the *least* of it. croft uses [`portable-pty`](https://crates.io/crates/portable-pty) (`Cargo.toml`), the WezTerm crate that already abstracts Windows ConPTY, so the pseudo-terminal layer is not the blocker. Three layers are, in increasing order of difficulty.
+Whatever you choose, set a Nerd Font as the terminal font, and make sure truecolor is enabled
+(Windows Terminal enables it by default; in WezTerm set `term = "wezterm"` and use a truecolor
+color scheme).
 
-### 1. Direct POSIX syscalls (mechanical, but everywhere)
+## Shells
 
-`libc` is a hard dependency and croft calls it directly on several paths. None exist on Windows, and none is behind a `cfg(windows)` branch, so the crate does not even compile for `*-pc-windows-msvc` today:
+The embedded terminal discovers these profiles on Windows:
 
-- `src/iterm2_inline.rs` — `libc::poll` / `pollfd` / `POLLIN` for the sixel DA1 capability probe (a timed raw read of stdin).
-- `src/remote.rs` — `getrlimit` / `setrlimit` on `RLIMIT_NOFILE` to raise the open-file limit before spawning PTYs, watchers, LSPs, and the cross-link.
-- `src/dap/transport.rs`, `src/lsp/install.rs` — `setsid` / `getsid` to detach spawned adapters and servers into their own process group.
-- `src/widgets/file_tree.rs` — `localtime_r` for mtime formatting and the `EXDEV` cross-device-rename fallback.
+* PowerShell 7+ — `pwsh.exe` (default when installed)
+* Windows PowerShell 5.1 — `powershell.exe`
+* `cmd.exe`
+* Git Bash — `C:\Program Files\Git\bin\bash.exe`
+* WSL — `wsl.exe`, for running the Linux build's own commands inside a pane
 
-Porting these is busywork rather than research: each needs a Win32 equivalent (`WaitForMultipleObjects` / overlapped I/O, `SetHandleInformation` or job objects, `CreateProcess` flags, `GetDiskFreeSpaceEx`, `localtime_s`) behind a `cfg(windows)` arm. Doable, but it touches many modules.
+Shell integration is a generated PowerShell script at
+`<config_dir>\shell-integration\powershell\shellIntegration.ps1`. croft launches PowerShell with
+`-NoLogo -NoExit -ExecutionPolicy Bypass -File <shim>`, which:
 
-### 2. macOS / Linux-only glue
+* prepends `CROFT_PANE_BIN` to `PATH`, so `croft view` and friends inside a pane reach the running
+  instance;
+* sources `$PROFILE.CurrentUserAllHosts` and `$PROFILE.CurrentUserCurrentHost` first, so Oh My Posh,
+  Starship and custom prompts keep working (set `CROFT_PS_NO_PROFILE=1` to skip);
+* wraps `prompt` to emit `OSC 133;A`/`B`/`D` and `OSC 7` with a `file:///C:/...` working directory,
+  and hooks PSReadLine's `Enter` for `OSC 133;C`. That is what gives you prompt navigation, command
+  duration, split-inherited working directories and idle-shell detection without POSIX
+  `tcgetpgrp`.
 
-Several integrations are written for the two supported OSes and silently no-op elsewhere:
+Set `CROFT_SHELL_INTEGRATION=0` to launch a plain `-NoLogo` PowerShell instead.
 
-- **Clipboard** (`src/clipboard.rs`) goes through `NSPasteboard` on macOS and `wl-copy` / `xclip` / `xsel` on Linux; the `cfg(not(any(macos, linux)))` arm returns nothing, so copy/paste would be dead on native Windows until a Win32 clipboard backend is added.
-- **Cmd-chord delivery, the drag-out helper, and the `setup-iterm2` / `setup-ghostty` commands** are macOS-and-iTerm2 specific and have no Windows analogue.
+Conversely, if `pwsh` starts with `-File <shim>` and then immediately exits, check the PowerShell
+execution policy for that user scope; the bypass flag applies only to croft's own launch.
 
-### 3. The graphics model is the real wall, and it is terminal-deep, not OS-deep
+## Files, saves and processes
 
-This is the decisive one. croft's visual identity is painted with the **iTerm2 OSC-1337** inline-image protocol and the **Kitty graphics protocol** (with sixel as a runtime-probed fallback): activity-bar icons, file-type icons, the no-repo hero illustration, the editor/welcome background, and every PDF / image / spreadsheet preview. croft assumes a terminal speaking at least one of these.
+Atomic saves retry through transient NTFS sharing violations (`ERROR_ACCESS_DENIED`,
+`ERROR_SHARING_VIOLATION`) caused by Defender, the Search Indexer, or a language server holding a
+handle. Real read-only protection still fails immediately rather than being retried. Spawned tasks,
+run configurations and debug adapters are placed in Win32 Job Objects so stopping them kills the
+whole process tree.
 
-The stock Windows console stack (`conhost`, and the Windows Terminal that fronts PowerShell) implements **none** of them. So even with every syscall above ported and the binary running cleanly under PowerShell, the result would be the image-less fallback: Nerd Font glyphs for icons and half-block characters for image previews — exactly the degraded mode croft already warns about at startup, on any OS.
+## Remote development
 
-The only way to get the real UI on Windows is a terminal emulator implementing the protocols, which in practice means **WezTerm** (cross-platform, speaks both). And once you run WezTerm on Windows, the natural way to give it a POSIX environment is WSL — which puts you back at the supported Linux build. That is why the recommendation is "WSL2 + WezTerm" rather than a native port: the port's best case still requires WezTerm, and WSL gets you there without rewriting the syscall and clipboard layers.
+`croft remote <host>` and `croft sync-config` work natively through the Windows OpenSSH client
+(`ssh.exe`). Because Windows OpenSSH has no `ControlMaster` sockets, every connection is a fresh
+SSH session, which makes the first connect and reconnect marginally slower than on macOS or Linux.
 
-## Summary
+## Local IPC and deep links
 
-- **Use croft on Windows via WSL2**, hosted in WezTerm, with a Nerd Font configured. This is fully supported as the Linux build.
-- **Native PowerShell / conhost is not supported** and is not on the roadmap: it would need Windows branches for every `libc` call plus a Win32 clipboard backend, and even then the stock Windows console cannot render croft's graphics, so the payoff is capped at the image-less fallback unless you run WezTerm anyway.
+`croft view <file>`, `croft edit --wait <file>`, `croft hook` (Claude Code pre-tool approvals) and
+`croft://` links work through capability-token-authenticated loopback TCP listeners in the croft
+cache directory. Register the deep-link handler once with `croft install-link-handler`, which writes
+`HKCU\Software\Classes\croft` — user-scope only, no administrator elevation. Leftover descriptor
+files from crashed instances are swept on startup by checking whether the owning PID is still
+alive.
+
+## Limitations
+
+These features are built on POSIX daemons or OpenSSH `ControlMaster` sockets and are not available
+in the native Windows build. Run the upstream Linux build under WSL2 when you need them:
+
+* `croft attach` (persistent, joinable sessions) and `croft ls`
+* `croft record` and `croft web`
+* `croft pair` and `croft collab` (AI seats and multiplayer)
+* `croft devcontainer`
+* `croft pane-host` / `croft session-host` internals behind the above
+
+Also note:
+
+* The full internal test suite is not yet ported. `cargo test --test platform` runs on Windows;
+  `cargo test --bin croft` still contains Unix-only tests, and Windows CI is not configured.
+* No prebuilt Windows binaries are published by this fork; build from source.
+
+## Keybindings
+
+croft's command modifier is `Ctrl` on Windows. `F1` opens the in-app reference.
+
+Inside PowerShell panes croft's shim also remaps two `PSReadLine` keys so its own actions reach
+the editor: `Ctrl+e` becomes `EndOfLine` and `Ctrl+u` becomes `BackwardDeleteLine`. Other `Ctrl`
+chords may be swallowed by the host terminal or by Windows itself; if a shortcut does not arrive,
+check the terminal's own keybinding list first, then remap in croft's keybinding settings. See
+[KEYBINDINGS.md](KEYBINDINGS.md).
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---------|--------------|
+| Icons render as `[?]` boxes | The terminal font is not a Nerd Font, or the patched font is not selected for the profile. |
+| Icons render as glyphs but previews show half blocks | Running under legacy `conhost.exe`, or a terminal without sixel/OSC 1337 support. Switch to WezTerm or Windows Terminal 1.22+. |
+| Images look blurry or wrongly sized | The host ignored `CSI 16 t`; croft falls back to the console font size, which can be off at non-default zoom. |
+| A pane does not pick up the current directory | Shell integration did not load; confirm the shell is `pwsh.exe`/`powershell.exe` and that `CROFT_SHELL_INTEGRATION` is not `0`. |
+| Tasks fail with syntax errors | The task was written with POSIX quoting for a PowerShell pane. croft quotes for the pane's shell; split POSIX-only tasks into a Git Bash or WSL profile. |
+| Save fails with "access denied" on a writable file | Something is holding an exclusive handle (Defender, indexer, LSP). croft retries briefly; retry the save, or exclude the workspace from real-time scanning. |
+| `croft view` opens nothing | A firewall prompt for loopback TCP was declined, or a stale descriptor file remains in the croft cache directory. Restart croft and retry. |

@@ -1,7 +1,7 @@
 # Installing croft
 
 Every way to get croft onto a machine: Homebrew, prebuilt binaries through cargo or straight
-from a release, and building from source. The [README](../README.md#install) keeps the short
+from a release, and building from source. The [README](../README.md#build-and-install) keeps the short
 version; what croft needs from your system is in its [Requirements](../README.md#requirements).
 
 ## Homebrew
