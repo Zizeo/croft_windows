@@ -449,7 +449,6 @@ pub struct EditRequest {
 
 /// The croft listening for `cwd`: the socket of the nearest enclosing
 /// workspace that accepts a connection.
-#[cfg(unix)]
 pub(crate) fn connect_croft(cwd: &Path) -> Option<crate::platform::ipc::LocalStream> {
     let cwd = crate::platform::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     cwd.ancestors().find_map(|dir| {
@@ -457,15 +456,9 @@ pub(crate) fn connect_croft(cwd: &Path) -> Option<crate::platform::ipc::LocalStr
     })
 }
 
-#[cfg(not(unix))]
-pub(crate) fn connect_croft(_cwd: &Path) -> Option<crate::platform::ipc::LocalStream> {
-    None
-}
-
 /// Send `request` over `stream` and wait up to `window` for the answer.
 /// Anything short of a well-formed answer in time is "ask": Claude Code's
 /// own prompt takes over rather than the edit going through unseen.
-#[cfg(unix)]
 fn exchange(
     mut stream: crate::platform::ipc::LocalStream,
     request: &EditRequest,
@@ -488,17 +481,6 @@ fn exchange(
         Ok(reply) => serde_json::from_str(reply.trim())
             .unwrap_or_else(|_| ask("sent an answer it could not read")),
         Err(_) => ask(&format!("did not answer within {} s", window.as_secs())),
-    }
-}
-
-#[cfg(not(unix))]
-fn exchange(
-    _stream: crate::platform::ipc::LocalStream,
-    _request: &EditRequest,
-    _window: std::time::Duration,
-) -> Decision {
-    Decision::Ask {
-        reason: String::from("croft Windows IPC not yet implemented; answer here instead"),
     }
 }
 

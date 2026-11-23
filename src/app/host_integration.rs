@@ -84,7 +84,6 @@ impl App {
     /// the false-green shape this repo's own guidance names. Given this seam a
     /// test can hand in a deliberately NON-blocking stream and assert the
     /// reply is `Ok`, which fails everywhere if the call below is dropped.
-    #[cfg(unix)]
     pub(super) fn answer_view_client(
         &mut self,
         mut stream: crate::platform::ipc::LocalStream,
@@ -992,7 +991,6 @@ impl App {
     /// that stood up an App would otherwise leave a live socket in the real
     /// cache dir and set the one-shot global for every OTHER test in the same
     /// process.
-    #[cfg(unix)]
     pub(super) fn bind_view_socket() -> Option<crate::platform::ipc::LocalListener> {
         if cfg!(test) {
             return None;
@@ -1056,18 +1054,12 @@ impl App {
         Some(listener)
     }
 
-    #[cfg(not(unix))]
-    pub(super) fn bind_view_socket() -> Option<crate::platform::ipc::LocalListener> {
-        None
-    }
-
     /// Accept whatever `croft view` clients have queued and open their files.
     ///
     /// Returns whether anything changed, so the frame loop redraws. Every
     /// connection is answered before the next is accepted, which is right
     /// here: a request is one path and the work is opening a tab, so a
     /// thread per client would buy nothing and cost the editor's `&mut self`.
-    #[cfg(unix)]
     pub fn drain_view_requests(&mut self) -> bool {
         // The drain is bounded by TIME rather than by a connection count.
         // A per-frame cap of N clients still bounds the frame at N times the
@@ -1122,17 +1114,11 @@ impl App {
         }
     }
 
-    #[cfg(not(unix))]
-    pub fn drain_view_requests(&mut self) -> bool {
-        false
-    }
-
     /// Open one requested path, answering with what the user should see.
     ///
     /// The path arrives absolute (the client resolved it against the pane's
     /// own cwd, which croft only approximates), so the checks here are about
     /// whether the file can be shown, not about where it is.
-    #[cfg(any(unix, test))]
     pub(super) fn apply_view_request(&mut self, path: &Path) -> crate::view_ipc::ViewReply {
         use crate::view_ipc::ViewReply;
         // The invariant `view_ipc`'s header states, actually enforced. The
@@ -1298,7 +1284,6 @@ impl App {
 
     /// Answer `croft edit --wait`'s poll (#620): whether `path` is still open
     /// in any tab of any group. Opens nothing.
-    #[cfg(any(unix, test))]
     pub(super) fn probe_view_path(&self, path: &Path) -> crate::view_ipc::ViewReply {
         let canon = crate::platform::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let is_it =
@@ -1596,14 +1581,12 @@ pub(super) fn prepare_view_listener(
 }
 
 #[cfg(not(unix))]
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(super) fn prepare_view_listener(
-    _path: &Path,
+    path: &Path,
 ) -> std::io::Result<crate::platform::ipc::LocalListener> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "Windows IPC not yet implemented",
-    ))
+    let listener = crate::platform::ipc::LocalListener::bind(path)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
 }
 
 /// Why the `croft view` socket could not be bound, if it could not.
@@ -1659,7 +1642,6 @@ pub(super) fn hook_bind_status(e: &std::io::Error) -> Option<String> {
 /// a moment later. `kill(pid, 0)` has no such window. The cost is that a
 /// recycled PID keeps one dead file indefinitely, which is a stale byte
 /// rather than a stolen socket.
-#[cfg(any(unix, test))]
 pub(crate) fn sweep_dead_view_sockets(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1719,7 +1701,6 @@ pub(crate) fn sweep_dead_view_sockets(dir: &Path) {
 /// Takes the directory listing rather than reading it: this is called once per
 /// dead socket, and a cache dir holding N stale sockets was costing N full
 /// listings at launch.
-#[cfg(any(unix, test))]
 pub(super) fn sweep_dead_bind_stages(names: &[(String, PathBuf)], pid: u32) {
     let prefix = format!(".s{pid}-");
     for (name, path) in names {
@@ -1736,7 +1717,6 @@ pub(super) fn sweep_dead_bind_stages(names: &[(String, PathBuf)], pid: u32) {
 /// module's own rationale names `vault read … | croft view -`, and without any
 /// sweep every such pipe left a permanent copy on disk the user was never told
 /// about.
-#[cfg(any(unix, test))]
 pub(super) const STAGED_STDIN_RETENTION: std::time::Duration =
     std::time::Duration::from_secs(60 * 60 * 24);
 
@@ -1764,7 +1744,6 @@ pub(super) const STAGED_STDIN_RETENTION: std::time::Duration =
 /// Runs at launch, from `sweep_dead_view_sockets`, so a file staged inside a
 /// long-lived session survives until the next croft starts, and now survives
 /// that too for as long as its holder is running.
-#[cfg(any(unix, test))]
 pub(super) fn sweep_staged_stdin(dir: &Path) {
     let staged = dir.join("view-stdin");
     let Ok(entries) = std::fs::read_dir(&staged) else {

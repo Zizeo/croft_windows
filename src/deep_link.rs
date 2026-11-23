@@ -261,6 +261,12 @@ pub fn desktop_entry(croft_bin: &str) -> String {
     )
 }
 
+/// The Windows registry command template stored under
+/// `HKCU\Software\Classes\croft\shell\open\command`.
+pub fn windows_registry_command(croft_bin: &str) -> String {
+    format!("\"{croft_bin}\" open-link \"%1\"")
+}
+
 /// Termux's `~/bin/termux-url-opener`: `croft://` links open croft, and
 /// anything else keeps Termux's usual handling.
 pub fn termux_url_opener(croft_bin: &str) -> String {

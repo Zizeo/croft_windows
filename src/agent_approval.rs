@@ -144,11 +144,12 @@ pub fn bind(workspace: &Path) -> std::io::Result<LocalListener> {
 }
 
 #[cfg(not(unix))]
-pub fn bind(_workspace: &Path) -> std::io::Result<LocalListener> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "Windows IPC not yet implemented",
-    ))
+pub fn bind(workspace: &Path) -> std::io::Result<LocalListener> {
+    let root =
+        crate::platform::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let listener = LocalListener::bind(crate::session::hook_socket_path(&root))?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
 }
 
 /// A proposal waiting for the user, with the connection its answer goes
@@ -169,18 +170,12 @@ pub struct Pending {
 impl Pending {
     /// Send `decision` to the waiting hook. A hook that has already given
     /// up (its own window passed) is simply gone; nothing is owed to it.
-    #[cfg(unix)]
     pub fn answer(mut self, decision: &Decision) {
         use std::io::Write;
         if let Ok(mut line) = serde_json::to_string(decision) {
             line.push('\n');
             let _ = self.stream.write_all(line.as_bytes());
         }
-    }
-
-    #[cfg(not(unix))]
-    pub fn answer(mut self, decision: &Decision) {
-        let _ = (&mut self.stream, decision);
     }
 
     /// Past the hook's own window: it has answered "ask" by itself, so the
@@ -193,13 +188,11 @@ impl Pending {
 /// How long a new connection gets to deliver its request line. The hook
 /// writes it straight after connecting, so this only bounds a peer that
 /// connects and says nothing.
-#[cfg(unix)]
 const REQUEST_DEADLINE: Duration = Duration::from_millis(50);
 
 /// Take every waiting connection off `listener`. Requests that make a
 /// proposal are queued; one whose edit cannot be worked out is answered
 /// "ask" at once, since there is nothing to show.
-#[cfg(unix)]
 pub fn accept_into(listener: &LocalListener, queue: &mut VecDeque<Pending>) -> bool {
     let mut changed = false;
     while let Ok((stream, _)) = listener.accept() {
@@ -253,15 +246,9 @@ pub fn accept_into(listener: &LocalListener, queue: &mut VecDeque<Pending>) -> b
     changed
 }
 
-#[cfg(not(unix))]
-pub fn accept_into(_listener: &LocalListener, _queue: &mut VecDeque<Pending>) -> bool {
-    false
-}
-
 /// A fresh one-time token: 128 random bits as hex. Empty only if the
 /// system RNG fails, and an empty token never matches anything, so such a
 /// proposal is answered in the popup alone.
-#[cfg(unix)]
 fn new_token() -> String {
     use ring::rand::SecureRandom;
     let mut bytes = [0u8; 16];
@@ -279,14 +266,12 @@ pub struct RemoteDecision {
     pub allow: bool,
 }
 
-#[cfg(unix)]
 #[derive(Debug, Serialize, Deserialize)]
 struct DecideLine {
     decide: RemoteDecision,
 }
 
 /// What `croft decide` hears back.
-#[cfg(any(unix, test))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecideReply {
     pub ok: bool,
@@ -294,7 +279,6 @@ pub struct DecideReply {
     pub message: String,
 }
 
-#[cfg(unix)]
 impl DecideReply {
     fn send(&self, mut stream: LocalStream) {
         use std::io::Write;
@@ -310,7 +294,6 @@ pub const NOTIFICATION_DENY: &str = "denied from a croft notification";
 
 /// Equal without an early exit, so the time a wrong guess takes says
 /// nothing about how much of it was right.
-#[cfg(unix)]
 fn same_token(a: &str, b: &str) -> bool {
     a.len() == b.len()
         && a.bytes()
@@ -322,7 +305,6 @@ fn same_token(a: &str, b: &str) -> bool {
 /// Answer the live proposal `decision.token` names, and take it off the
 /// queue so the token cannot answer twice. A token that matches nothing
 /// (already answered, expired, or never issued) answers nothing.
-#[cfg(unix)]
 fn decide_by_token(
     queue: &mut VecDeque<Pending>,
     decision: &RemoteDecision,
@@ -359,7 +341,6 @@ fn decide_by_token(
 
 /// `croft decide` (#359): answer the proposal `token` names, through the
 /// croft serving `cwd`, without attaching to it.
-#[cfg(unix)]
 pub fn send_decision(cwd: &Path, decision: &RemoteDecision) -> Result<String, String> {
     use std::io::Write;
     let mut stream = crate::agent_hook::connect_croft(cwd)
@@ -384,14 +365,8 @@ pub fn send_decision(cwd: &Path, decision: &RemoteDecision) -> Result<String, St
     }
 }
 
-#[cfg(not(unix))]
-pub fn send_decision(cwd: &Path, _decision: &RemoteDecision) -> Result<String, String> {
-    Err(format!("no croft is open for {}", cwd.display()))
-}
-
 /// How long `croft decide` waits for the running croft, which reads the
 /// hook socket once a frame.
-#[cfg(unix)]
 const DECIDE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Keys that arrive this soon after the popup appears are ignored, so an

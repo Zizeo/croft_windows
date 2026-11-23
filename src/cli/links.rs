@@ -5,7 +5,6 @@ use super::*;
 
 /// `croft open-link` (#359): check the link, then become the `croft remote`
 /// or `croft attach` it describes, so the session gets this terminal.
-#[cfg(unix)]
 pub(super) fn open_link(url: &str) -> Result<()> {
     let mut link = crate::deep_link::parse(url)?;
     if let Some(host) = link.host.take() {
@@ -39,23 +38,26 @@ pub(super) fn open_link(url: &str) -> Result<()> {
     if let Some(focus) = link.focus {
         cmd.env("CROFT_FOCUS", focus.as_str());
     }
-    use std::os::unix::process::CommandExt as _;
-    let err = cmd.exec();
-    Err(anyhow::anyhow!("could not start croft: {err}"))
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let err = cmd.exec();
+        Err(anyhow::anyhow!("could not start croft: {err}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = cmd
+            .status()
+            .map_err(|err| anyhow::anyhow!("could not start croft: {err}"))?;
+        if !status.success() {
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        Ok(())
+    }
 }
 
-#[cfg(not(unix))]
-pub(super) fn open_link(_url: &str) -> Result<()> {
-    anyhow::bail!("croft open-link is not supported on native Windows; run croft in WSL2")
-}
-
-#[cfg(unix)]
 pub(super) fn local_hostname() -> String {
-    std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+    crate::platform::env::hostname()
 }
 
 /// `croft install-link-handler` (#359).
@@ -104,9 +106,59 @@ pub(super) fn install_link_handler() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+/// `croft install-link-handler` (#359) on Windows via `HKCU\Software\Classes\croft`.
+#[cfg(windows)]
 pub(super) fn install_link_handler() -> Result<()> {
-    anyhow::bail!(
-        "croft install-link-handler is not supported on native Windows; run croft in WSL2"
-    )
+    let exe = std::env::current_exe()?;
+    let exe = crate::platform::fs::canonicalize(&exe).unwrap_or(exe);
+    let cmd_val = crate::deep_link::windows_registry_command(&exe.display().to_string());
+    let run_reg = |args: &[&str]| -> Result<()> {
+        let out = std::process::Command::new("reg.exe")
+            .args(args)
+            .output()
+            .context("running `reg.exe`")?;
+        if !out.status.success() {
+            let detail = String::from_utf8_lossy(&out.stderr);
+            anyhow::bail!("reg.exe {} failed: {}", args.join(" "), detail.trim());
+        }
+        Ok(())
+    };
+    run_reg(&[
+        "add",
+        r"HKCU\Software\Classes\croft",
+        "/ve",
+        "/t",
+        "REG_SZ",
+        "/d",
+        "URL:croft Protocol",
+        "/f",
+    ])?;
+    run_reg(&[
+        "add",
+        r"HKCU\Software\Classes\croft",
+        "/v",
+        "URL Protocol",
+        "/t",
+        "REG_SZ",
+        "/d",
+        "",
+        "/f",
+    ])?;
+    run_reg(&[
+        "add",
+        r"HKCU\Software\Classes\croft\shell\open\command",
+        "/ve",
+        "/t",
+        "REG_SZ",
+        "/d",
+        &cmd_val,
+        "/f",
+    ])?;
+    println!(r"croft:// links now open croft (HKCU\Software\Classes\croft)");
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(super) fn install_link_handler() -> Result<()> {
+    anyhow::bail!("croft install-link-handler is not supported on this platform")
 }

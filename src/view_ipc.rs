@@ -24,7 +24,6 @@
 //! approximation refreshed on a timer. The client holds the truth, so it
 //! resolves before sending and the server only ever sees absolute paths.
 
-#[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -244,7 +243,6 @@ pub fn split_location(cwd: &Path, arg: &Path) -> Option<(PathBuf, (usize, usize)
 /// the request is one short line to a croft that is about to read it, and a
 /// bounded write would need the same deadline machinery for a case no client
 /// can reach.
-#[cfg(unix)]
 pub fn send(socket: &Path, req: &ViewRequest) -> std::io::Result<ViewReply> {
     let first = send_once(socket, req)?;
     // ONE retry, and only on the one refusal that says nothing about this
@@ -281,14 +279,12 @@ pub const FRAME_BUDGET_REFUSAL: &str = "the request did not arrive within the fr
 /// read error as `unreadable request: {e}`), so a reworded refusal fails to
 /// match here and the retry turns itself off rather than firing on the wrong
 /// reply.
-#[cfg(unix)]
 fn retryable_refusal() -> ViewReply {
     ViewReply::Err {
         message: format!("unreadable request: {FRAME_BUDGET_REFUSAL}"),
     }
 }
 
-#[cfg(unix)]
 fn send_once(socket: &Path, req: &ViewRequest) -> std::io::Result<ViewReply> {
     let mut stream = crate::platform::ipc::LocalStream::connect(socket)?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
@@ -311,7 +307,6 @@ fn send_once(socket: &Path, req: &ViewRequest) -> std::io::Result<ViewReply> {
 /// as malformed, as it is when the write went through, and not as a croft
 /// that is gone: that would send git's sequence editor to its fallback for
 /// a croft that answered.
-#[cfg(unix)]
 fn exchange(
     stream: &mut crate::platform::ipc::LocalStream,
     req: &ViewRequest,
@@ -323,7 +318,12 @@ fn exchange(
         .write_all(line.as_bytes())
         .and_then(|()| stream.flush())
     {
-        if e.kind() != std::io::ErrorKind::BrokenPipe {
+        if !matches!(
+            e.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+        ) {
             return Err(e);
         }
         // `InvalidData` is the one read error with bytes behind it (a reply
@@ -338,7 +338,6 @@ fn exchange(
 }
 
 /// Croft's one-line answer to a request, within the client's 5s.
-#[cfg(unix)]
 fn read_reply(stream: &crate::platform::ipc::LocalStream) -> std::io::Result<ViewReply> {
     let reply = read_line_by_deadline(
         stream,
@@ -394,7 +393,6 @@ pub const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 /// errno's. Returning it directly refused the peer promptly but reported
 /// `EAGAIN`, which is also what a socket left non-blocking reports, so two
 /// unrelated defects produced identical text.
-#[cfg(unix)]
 pub fn read_line_by_deadline(
     stream: &crate::platform::ipc::LocalStream,
     deadline: std::time::Instant,
@@ -474,7 +472,6 @@ pub fn read_line_by_deadline(
 ///
 /// The byte cap and the deadline are separate bounds: the cap stops one
 /// enormous line, the deadline stops a slow one. Neither substitutes.
-#[cfg(unix)]
 pub fn read_request(
     stream: &crate::platform::ipc::LocalStream,
     deadline: std::time::Instant,
@@ -484,7 +481,6 @@ pub fn read_request(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-#[cfg(unix)]
 pub fn write_reply(
     stream: &mut crate::platform::ipc::LocalStream,
     reply: &ViewReply,
@@ -611,33 +607,29 @@ pub fn stdin_extension(bytes: &[u8], hint: Option<&str>) -> anyhow::Result<Optio
 /// Kept in croft's cache dir rather than `/tmp` so the file survives a
 /// tmpreaper mid-session and sits with the rest of croft's scratch state;
 /// named by pid and a counter so two pipes in the same pane cannot collide.
-#[cfg(unix)]
 pub fn stage_stdin(cache_dir: &Path, bytes: &[u8], hint: Option<&str>) -> anyhow::Result<PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    // Owner-only, both of them. Whatever came down the pipe was chosen by
-    // the user, not by croft, and `vault read … | croft view -` or a piped
-    // `.env` is exactly the case this command invites; the default mode
-    // would leave it world-readable in a predictable path under the cache
-    // dir. Possession of the account is already the trust boundary for
-    // every other croft socket and staging path, and this joins them.
-    use std::os::unix::fs::DirBuilderExt;
     // Validate the hint BEFORE creating anything. `croft view - --as ../x` is
     // a refusal, and a refusal must not leave a `view-stdin/` behind in the
     // user's real cache dir on its way out: the integration test for that
     // rejection runs against `~/.cache/croft`, so it was doing exactly this.
     let ext = stdin_extension(bytes, hint)?;
     let dir = cache_dir.join("view-stdin");
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)?;
+    let mut dir_builder = std::fs::DirBuilder::new();
+    dir_builder.recursive(true);
+    crate::platform::fs::set_private_dir_mode(&mut dir_builder);
+    dir_builder.create(&dir)?;
     // `DirBuilder`'s mode applies only when it CREATES, so a staging
     // directory left by an older croft (or by anything else) keeps whatever
     // mode it had. The contents are 0600 either way, so what a loose mode
     // leaks is the names, and `vault read … | croft view -` puts a
     // recognisable name in there.
-    let _ = std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o700));
+    }
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let stem = format!("stdin-{}-{n}", std::process::id());
     let name = match ext {
@@ -713,9 +705,7 @@ pub fn holder_of_staged(name: &str) -> Option<u32> {
 /// a recycled pid it met a months-old file and `croft view -` failed with
 /// "File exists" forever. The collision is with the dead rather than with a
 /// live competitor, so the answer is to step past it, not to refuse.
-#[cfg(unix)]
 pub(crate) fn stage_at(dir: &Path, name: &str, bytes: &[u8]) -> anyhow::Result<PathBuf> {
-    use std::os::unix::fs::OpenOptionsExt as _;
     let mut attempt = 0;
     loop {
         let suffixed = if attempt == 0 {
@@ -727,12 +717,10 @@ pub(crate) fn stage_at(dir: &Path, name: &str, bytes: &[u8]) -> anyhow::Result<P
             }
         };
         let path = dir.join(&suffixed);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        crate::platform::fs::set_private_file_mode(&mut opts);
+        match opts.open(&path) {
             Ok(mut f) => {
                 std::io::Write::write_all(&mut f, bytes)?;
                 // Absolute for the same reason the socket path is: `-` is the
@@ -760,7 +748,6 @@ pub(crate) fn stage_at(dir: &Path, name: &str, bytes: &[u8]) -> anyhow::Result<P
 /// exactly N cannot tell a legal N-byte payload from a truncated larger one,
 /// and reading one byte more can. Split out of `run` because that argument is
 /// an off-by-one nobody could test through stdin.
-#[cfg(any(unix, test))]
 fn read_capped<R: std::io::Read>(reader: R, cap: u64) -> anyhow::Result<Vec<u8>> {
     use std::io::Read as _;
     let mut buf = Vec::new();
@@ -782,7 +769,6 @@ pub const PROBE_CLOSED: &str = "closed";
 pub const PROBE_OPEN: &str = "open";
 
 /// How often `croft edit --wait` asks whether its tab is still open.
-#[cfg(unix)]
 const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// `croft edit [--wait] <path>` (#620): open `path` in the hosting croft
@@ -791,7 +777,6 @@ const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 /// croft that goes away counts as closed: git then carries on with the file
 /// as it was last saved, rather than hanging forever. A path that does not
 /// exist yet is created empty first, as any `$EDITOR` would start it (#848).
-#[cfg(unix)]
 pub fn edit(target: &std::ffi::OsStr, wait: bool, cache_dir: &Path) -> anyhow::Result<()> {
     run(Verb::Edit, target, None, cache_dir)?;
     if !wait {
@@ -818,14 +803,6 @@ pub fn edit(target: &std::ffi::OsStr, wait: bool, cache_dir: &Path) -> anyhow::R
     }
 }
 
-#[cfg(not(unix))]
-pub fn edit(_target: &std::ffi::OsStr, _wait: bool, _cache_dir: &Path) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "croft view/edit is not yet supported on native Windows (planned in Sub-project 5)"
-    )
-}
-
-#[cfg(any(unix, test))]
 #[derive(Debug, PartialEq, Eq)]
 enum WaitStep {
     Poll,
@@ -837,7 +814,6 @@ enum WaitStep {
 /// the wait: the tab closed, or croft is gone. A busy frame, a slow reply or
 /// any other refusal is asked again, because returning early lets git run
 /// the plan the user is still editing.
-#[cfg(any(unix, test))]
 fn wait_step(reply: std::io::Result<ViewReply>) -> WaitStep {
     use std::io::ErrorKind as K;
     match reply {
@@ -876,14 +852,20 @@ impl Verb {
     }
 }
 
-/// Which file a `croft edit` call created: its device and inode. A call
-/// that cannot open the file takes back only this one, never a file
-/// something else has put at the same path since.
+/// Which file a `croft edit` call created: its device/inode on Unix or
+/// creation timestamp on Windows. A call that cannot open the file takes back
+/// only this one, never a file something else has put at the same path since.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Created {
     dev: u64,
     ino: u64,
+}
+
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Created {
+    created: Option<std::time::SystemTime>,
 }
 
 /// The absolute path `target` names, resolved against `cwd` and checked
@@ -897,13 +879,11 @@ struct Created {
 /// so `EDITOR="croft edit --wait"` works for tools that name a file they
 /// have not written yet (#848). A missing directory is still an error: an
 /// editor creates a file, not the folders above it.
-#[cfg(unix)]
 fn resolve_target(
     verb: Verb,
     cwd: &Path,
     target: &Path,
 ) -> anyhow::Result<(PathBuf, Option<Created>)> {
-    use std::os::unix::fs::MetadataExt;
     let v = verb.name();
     let path = resolve(cwd, target);
     if path.exists() {
@@ -928,9 +908,21 @@ fn resolve_target(
         // Read from the handle, so it names the file this call made. Without
         // it nothing can be shown to be ours, and nothing is taken back.
         Ok(file) => {
-            let created = file.metadata().ok().map(|m| Created {
-                dev: m.dev(),
-                ino: m.ino(),
+            let created = file.metadata().ok().map(|m| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    Created {
+                        dev: m.dev(),
+                        ino: m.ino(),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    Created {
+                        created: m.created().ok(),
+                    }
+                }
             });
             Ok((path, created))
         }
@@ -943,14 +935,12 @@ fn resolve_target(
 
 /// A resolved target, what made it, and the 0-based (line, column) its
 /// `:line[:col]` suffix named, if any (#1606).
-#[cfg(unix)]
 type Located = (PathBuf, Option<Created>, Option<(usize, usize)>);
 
 /// [`resolve_target`] for an argument that may end in `:line[:col]`, with
 /// the 0-based (line, column) that suffix names (#1606). The file before
 /// the suffix is opened rather than `edit` creating an empty file named
 /// `file:line`.
-#[cfg(unix)]
 fn resolve_located(verb: Verb, cwd: &Path, target: &Path) -> anyhow::Result<Located> {
     if let Some((path, at)) = split_location(cwd, target) {
         return Ok((path, None, Some(at)));
@@ -961,7 +951,6 @@ fn resolve_located(verb: Verb, cwd: &Path, target: &Path) -> anyhow::Result<Loca
 
 /// `croft view <path>` / `croft view -`, and the opening half of `croft
 /// edit`, with `verb` saying which of the two the user typed.
-#[cfg(unix)]
 pub fn run(
     verb: Verb,
     target: &std::ffi::OsStr,
@@ -1015,18 +1004,6 @@ pub fn run(
     opened
 }
 
-#[cfg(not(unix))]
-pub fn run(
-    _verb: Verb,
-    _target: &std::ffi::OsStr,
-    _as_hint: Option<&str>,
-    _cache_dir: &Path,
-) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "croft view/edit is not yet supported on native Windows (planned in Sub-project 5)"
-    )
-}
-
 /// No croft to open the file in: `CROFT_VIEW_SOCK` is unset, or the croft
 /// that set it is gone. Told apart from a croft that refused the file, so
 /// git's sequence editor can fall back to git's own editor (#1452).
@@ -1042,13 +1019,24 @@ impl std::fmt::Display for NoCroft {
 impl std::error::Error for NoCroft {}
 
 /// Remove the file `created` names from `path`: only while that same file
-/// is still there and still empty. Compared by device and inode, not by
-/// path, and without following a link put in its place.
-#[cfg(unix)]
+/// is still there and still empty. Compared by device and inode on Unix (or
+/// file creation timestamp on Windows), without following a link put in its
+/// place.
 fn take_back(path: &Path, created: Created) {
-    use std::os::unix::fs::MetadataExt;
-    let ours = std::fs::symlink_metadata(path)
-        .is_ok_and(|m| m.dev() == created.dev && m.ino() == created.ino && m.len() == 0);
+    let ours = std::fs::symlink_metadata(path).is_ok_and(|m| {
+        if m.len() != 0 {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            m.dev() == created.dev && m.ino() == created.ino
+        }
+        #[cfg(not(unix))]
+        {
+            m.is_file() && m.created().ok() == created.created
+        }
+    });
     if ours {
         let _ = std::fs::remove_file(path);
     }
@@ -1056,7 +1044,6 @@ fn take_back(path: &Path, created: Created) {
 
 /// Ask the croft listening on `socket` to open `path`, naming the command
 /// `v` in every refusal.
-#[cfg(unix)]
 fn open_in_croft(
     v: &str,
     socket: &Path,

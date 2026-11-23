@@ -718,3 +718,65 @@ fn fs_rename_and_write_retrying_recover_from_sharing_violation_and_refuse_readon
         std::fs::set_permissions(&ro, perms).unwrap();
     }
 }
+
+#[test]
+fn ipc_local_listener_nonblocking_roundtrip_auth_and_cleanup() {
+    use std::io::{BufRead, BufReader, ErrorKind, Write};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let sock_path = tmp.path().join("view-test.sock");
+
+    let listener = platform::ipc::LocalListener::bind(&sock_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    // Non-blocking listener reports WouldBlock when idle.
+    let err = listener.accept().unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::WouldBlock);
+
+    // Concurrent bind while live returns AddrInUse and does not leave a broken
+    // probe connection in `listener`'s accept queue.
+    #[cfg(windows)]
+    {
+        let dup = platform::ipc::LocalListener::bind(&sock_path).unwrap_err();
+        assert_eq!(dup.kind(), ErrorKind::AddrInUse);
+        let idle = listener.accept().unwrap_err();
+        assert_eq!(idle.kind(), ErrorKind::WouldBlock);
+    }
+
+    // Valid client connects and sends a pipelined request before accept() runs.
+    let mut client = platform::ipc::LocalStream::connect(&sock_path).unwrap();
+    client.write_all(b"ping\n").unwrap();
+    client.flush().unwrap();
+
+    let (mut server, _) = listener.accept().unwrap();
+    server.set_nonblocking(false).unwrap();
+    let mut server_reader = BufReader::new(&server);
+    let mut line = String::new();
+    server_reader.read_line(&mut line).unwrap();
+    assert_eq!(line, "ping\n");
+
+    server.write_all(b"pong\n").unwrap();
+    server.flush().unwrap();
+    let mut client_reader = BufReader::new(&client);
+    let mut reply = String::new();
+    client_reader.read_line(&mut reply).unwrap();
+    assert_eq!(reply, "pong\n");
+
+    // Unauthorized loopback connection with wrong capability token is rejected.
+    #[cfg(windows)]
+    {
+        let mut rogue = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        rogue.write_all(b"wrong-token\n").unwrap();
+        rogue.flush().unwrap();
+        let auth_err = listener.accept().unwrap_err();
+        assert_eq!(auth_err.kind(), ErrorKind::PermissionDenied);
+    }
+
+    drop(listener);
+    #[cfg(windows)]
+    {
+        assert!(!sock_path.exists(), "descriptor must be removed on drop");
+        let rebound = platform::ipc::LocalListener::bind(&sock_path).unwrap();
+        drop(rebound);
+    }
+}

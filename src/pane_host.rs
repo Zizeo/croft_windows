@@ -547,7 +547,7 @@ impl PaneClient {
 }
 
 #[cfg(not(unix))]
-pub struct PaneClient;
+pub struct PaneClient(std::convert::Infallible);
 
 #[cfg(not(unix))]
 impl PaneClient {
@@ -558,7 +558,7 @@ impl PaneClient {
 
     /// The connection itself, for a pane that drives it directly.
     pub fn into_stream(self) -> crate::platform::ipc::LocalStream {
-        crate::platform::ipc::LocalStream
+        match self.0 {}
     }
 }
 
