@@ -409,6 +409,7 @@ mod tests {
 
     /// #868 guard: the refresh that reads argv leaves threads out. A 3.14
     /// process running several threads is one row, not one per thread.
+    #[cfg(unix)]
     #[test]
     fn a_threaded_target_is_listed_once() {
         let Some(python) = python_314() else {

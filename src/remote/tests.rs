@@ -568,6 +568,7 @@ fn the_source_sync_ships_only_build_inputs() {
 
 /// Stage a remote source dir holding both legitimate content and every
 /// kind of junk a previous croft could have left behind.
+#[cfg(unix)]
 fn staged_remote_source(home: &std::path::Path) -> std::path::PathBuf {
     let source = home.join(".cache/croft/source");
     std::fs::create_dir_all(source.join("target/remote-fast")).unwrap();
@@ -581,6 +582,7 @@ fn staged_remote_source(home: &std::path::Path) -> std::path::PathBuf {
     source
 }
 
+#[cfg(unix)]
 fn assert_prep_outcome(source: &std::path::Path) {
     assert!(
         source.join("target/remote-fast").is_dir(),
@@ -616,6 +618,7 @@ fn assert_prep_outcome(source: &std::path::Path) {
 /// would re-ship the whole tree every sync and race a concurrent
 /// `cargo install` reading it. The test runs the real command against a
 /// staged HOME.
+#[cfg(unix)]
 #[test]
 fn the_remote_dir_prep_evicts_stale_entries_but_keeps_cache_and_inputs() {
     let checkout = tempfile::tempdir().unwrap();
@@ -649,6 +652,7 @@ fn the_remote_dir_prep_evicts_stale_entries_but_keeps_cache_and_inputs() {
 /// symlink onto a bigger volume. `find` does not follow a symlinked start
 /// point on its own, silently cleaning nothing with a success exit code,
 /// so the prep must dereference it explicitly.
+#[cfg(unix)]
 #[test]
 fn the_remote_dir_prep_follows_a_symlinked_source_dir() {
     let checkout = tempfile::tempdir().unwrap();
@@ -736,20 +740,25 @@ fn the_pinned_toolchain_has_every_cross_target() {
         return;
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let installed: Vec<&str> = text.lines().map(str::trim).collect();
-    let missing: Vec<&str> = crate::cli::CROSS_TARGETS
-        .iter()
-        .copied()
-        .filter(|t| !installed.contains(t))
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "the pinned toolchain is missing {missing:?}, so every remote \
+    #[cfg(not(unix))]
+    let _ = text;
+    #[cfg(unix)]
+    {
+        let installed: Vec<&str> = text.lines().map(str::trim).collect();
+        let missing: Vec<&str> = crate::cli::CROSS_TARGETS
+            .iter()
+            .copied()
+            .filter(|t| !installed.contains(t))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the pinned toolchain is missing {missing:?}, so every remote \
              update will compile croft on the remote box instead of shipping \
              a prebuilt binary. Fix from inside this checkout, so the \
              rust-toolchain.toml override applies:\n    rustup target add {}",
-        missing.join(" ")
-    );
+            missing.join(" ")
+        );
+    }
 }
 
 /// The target query and the build must ask the SAME toolchain.
@@ -966,6 +975,7 @@ fn relay_session_id_matches_dtach_socket_and_is_deterministic() {
     assert!(dtach_socket_path(Some("/srv/app")).contains(&relay_session_id("/srv/app")));
 }
 
+#[cfg(unix)]
 #[test]
 fn cross_tool_search_dirs_cover_gui_launch_tool_locations() {
     // launchd hands a Croft.app / Ghostty launch a stripped PATH; the
@@ -986,6 +996,7 @@ fn cross_tool_search_dirs_cover_gui_launch_tool_locations() {
     assert!(dirs.contains(&PathBuf::from("/usr/local/bin")));
 }
 
+#[cfg(unix)]
 #[test]
 fn cross_tool_lookup_finds_home_cargo_bin_outside_inherited_path() {
     use std::os::unix::fs::PermissionsExt;
@@ -1142,7 +1153,7 @@ fn a_lost_session_turns_off_every_mode_croft_turned_on() {
         }
     }
     assert!(
-        modes >= 4,
+        modes >= if cfg!(unix) { 4 } else { 3 },
         "the takeover's modes were all read: {takeover:?}"
     );
     assert!(
@@ -1190,6 +1201,7 @@ fn a_lost_session_leaves_the_alt_screen_last_and_its_colours_come_back_on_resume
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn the_ssh_control_dir_is_fresh_and_owner_only() {
     use std::os::unix::fs::PermissionsExt;
@@ -1252,6 +1264,7 @@ fn a_pulled_folder_leaves_its_hidden_entries_behind() {
     assert_eq!(list(&home, "-dash").trim(), "-dash");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_pull_refuses_hidden_paths_and_links_into_them() {
     // Not `tempdir()`: its `.tmpXXXX` name is itself hidden.
@@ -1690,15 +1703,18 @@ fn remote_install_marks_the_build_for_the_oom_killer_first() {
         .unwrap();
     let install = command.find("cargo install --path").unwrap();
     assert!(adj < install, "the score must be set before the compile");
-    let out = Command::new("sh")
-        .args(["-n", "-c", &command])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    #[cfg(unix)]
+    {
+        let out = Command::new("sh")
+            .args(["-n", "-c", &command])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
@@ -2207,23 +2223,26 @@ fn remote_install_command_ensures_c_toolchain_unconditionally() {
 
 #[test]
 fn a_relay_request_is_claimed_by_exactly_one_pump() {
-    // `mkdir` without -p on the id: the second pump's mkdir fails.
-    let tmp = tempfile::tempdir().unwrap();
-    let inbox = tmp.path().join("inbox").display().to_string();
-    let run = |cmd: String| {
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .status()
-            .unwrap()
-            .success()
-    };
-    assert!(run(claim_command(&inbox, "open-1-2")));
-    assert!(
-        !run(claim_command(&inbox, "open-1-2")),
-        "a second claim loses"
-    );
-    assert!(run(claim_command(&inbox, "open-1-3")));
+    #[cfg(unix)]
+    {
+        // `mkdir` without -p on the id: the second pump's mkdir fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("inbox").display().to_string();
+        let run = |cmd: String| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(run(claim_command(&inbox, "open-1-2")));
+        assert!(
+            !run(claim_command(&inbox, "open-1-2")),
+            "a second claim loses"
+        );
+        assert!(run(claim_command(&inbox, "open-1-3")));
+    }
     assert_eq!(
         super::parse_relay_request("open\topen-1\thttps://x/")
             .and_then(|r| r.id().map(str::to_string)),
@@ -2499,6 +2518,7 @@ fn source_sync_honors_the_bulk_lane_and_allow_lists_the_build_inputs() {
 // 256-fd soft limit, the zig linker needed ~250 rlibs open at once and
 // died with ProcessFdQuotaExceeded, and the installer silently fell
 // back to compiling on the remote box under the live session.
+#[cfg(unix)]
 #[test]
 fn raise_fd_limit_lifts_the_soft_limit_beyond_the_linkers_needs() {
     let soft = raise_fd_limit();

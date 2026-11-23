@@ -617,6 +617,7 @@ fn wait_for_codeql_db_job(app: &mut App) {
 }
 
 /// A one-database CodeQL zip (Java) at `dir/<name>.zip`.
+#[cfg(unix)]
 fn codeql_db_zip(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     use std::io::Write as _;
     let zp = dir.join(format!("{name}.zip"));
@@ -632,6 +633,7 @@ fn codeql_db_zip(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
 /// A stand-in `gh`: lists one `python` database, and downloads `zip` once
 /// a `go` file appears in `dir` (or after five seconds), as a large
 /// database takes its time.
+#[cfg(unix)]
 fn slow_fake_gh(dir: &std::path::Path, zip: &std::path::Path) -> std::path::PathBuf {
     let gh = dir.join("gh");
     std::fs::write(
@@ -653,6 +655,7 @@ fn slow_fake_gh(dir: &std::path::Path, zip: &std::path::Path) -> std::path::Path
     gh
 }
 
+#[cfg(unix)]
 #[test]
 fn adding_a_codeql_database_from_github_returns_at_once_and_lands_later() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -707,6 +710,7 @@ fn adding_a_codeql_database_from_github_returns_at_once_and_lands_later() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn a_failed_github_download_says_why_and_adds_nothing() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -2126,6 +2130,7 @@ fn real_published_pack_runs_on_the_selected_database() {
 }
 
 /// Wait for the AST Viewer's read to land, or fail after `secs`.
+#[cfg(unix)]
 fn wait_for_codeql_ast(app: &mut App, secs: u64) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
     while !app.drain_codeql_ast() {
@@ -4139,6 +4144,7 @@ fn codeql_pack_fixture(tmp: &std::path::Path, bin: &std::path::Path) -> App {
 }
 
 /// Drain until one query run lands (the next of a pack run may start).
+#[cfg(unix)]
 fn drain_one_codeql_run(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !app.drain_codeql_run() {
@@ -4648,6 +4654,7 @@ fn copy_codeql_version_copies_croft_the_cli_and_the_platform() {
 /// Offline stand-ins for the CodeQL CLI's network calls (#578): the
 /// latest release is `latest`, and a download copies `zip` (or fails with
 /// `offline` when there is none), noting each URL asked for in `urls`.
+#[cfg(unix)]
 fn offline_codeql_net(
     latest: &str,
     zip: Option<std::path::PathBuf>,
@@ -4667,6 +4674,7 @@ fn offline_codeql_net(
 }
 
 /// Drain the CLI download until it lands, or fail after a few seconds.
+#[cfg(unix)]
 fn wait_for_codeql_cli_download(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while app.codeql_cli_download.is_some() {
@@ -4680,6 +4688,7 @@ fn wait_for_codeql_cli_download(app: &mut App) {
 }
 
 /// Drain the CLI update check until it lands, or fail after a few seconds.
+#[cfg(unix)]
 fn wait_for_codeql_cli_check(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !app.drain_codeql_cli_check() {
@@ -4814,6 +4823,7 @@ fn codeql_cli_download_keeps_the_settings_cli_and_reports_failures() {
 }
 
 /// Drain the database upgrade until it lands, or fail after a few seconds.
+#[cfg(unix)]
 fn wait_for_codeql_upgrade(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !app.drain_codeql_upgrade() {
@@ -4996,7 +5006,9 @@ fn a_codeql_databases_source_is_added_to_the_workspace() {
         let mut app = codeql_app(ws);
         app.workspace_folders_path = tmp.path().join("folders.json");
         let has_root = |app: &App, p: &std::path::Path| {
-            app.roots.iter().any(|r| r == p.canonicalize().unwrap())
+            app.roots
+                .iter()
+                .any(|r| r == crate::platform::fs::canonicalize(p).unwrap())
         };
 
         app.run_command(Command::CodeqlAddDatabaseSource);
@@ -5032,7 +5044,7 @@ fn a_codeql_databases_source_is_added_to_the_workspace() {
 
         // Extracted once: adding it again reuses the folder as it is.
         std::fs::write(extracted.join("mine.txt"), "kept").unwrap();
-        app.remove_workspace_folder(extracted.canonicalize().unwrap());
+        app.remove_workspace_folder(crate::platform::fs::canonicalize(&extracted).unwrap());
         assert!(!has_root(&app, &extracted));
         app.set_sidebar_view(SidebarView::CodeQL);
         app.focus = Pane::Tree;
@@ -5043,7 +5055,7 @@ fn a_codeql_databases_source_is_added_to_the_workspace() {
 
         // A database replaced at the same path has a new src.zip: it is
         // extracted afresh and the out-of-date copy dropped.
-        app.remove_workspace_folder(extracted.canonicalize().unwrap());
+        app.remove_workspace_folder(crate::platform::fs::canonicalize(&extracted).unwrap());
         let mut z = zip::ZipWriter::new(std::fs::File::create(zip_db.join("src.zip")).unwrap());
         z.start_file("proj/main.go", opts).unwrap();
         z.write_all(b"package main // v2\n").unwrap();
@@ -5270,7 +5282,11 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
         assert_eq!(app.editor.path.as_deref(), Some(created.as_path()));
         assert!(app.focus == Pane::Editor);
         assert!(app.codeql.queries[0].queries.contains(&created), "listed");
-        assert!(app.status.contains("pack/find-calls.ql"), "{}", app.status);
+        assert!(
+            app.status.replace('\\', "/").contains("pack/find-calls.ql"),
+            "{}",
+            app.status
+        );
         assert!(!pack.join("sub").exists());
 
         // The same name again is refused on the status line.
@@ -5891,6 +5907,7 @@ fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn codeql_run_variant_analysis_bundles_the_query_and_posts_it_to_the_controller() {
     // #578: VS Code's "CodeQL: Run Variant Analysis". The open query is
@@ -6128,6 +6145,7 @@ echo '{{"id": 4242, "actions_workflow_run_id": 99, "skipped_repositories": {{"no
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn codeql_variant_results_are_fetched_once_and_opened_per_repository() {
     // #578: a finished variant analysis's results. Each repository with
@@ -6416,6 +6434,7 @@ out="${{4#--output=}}"; printf '"name","count"\n"x","1"\n' > "$out"
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn codeql_code_search_adds_the_repositories_it_finds_to_the_selected_list() {
     // #578: VS Code's "Add repositories with GitHub Code Search". The search
@@ -6784,9 +6803,6 @@ fn a_missing_codeql_fails_at_once() {
     let dir = tempfile::tempdir().unwrap();
     let started = std::time::Instant::now();
     let err = App::codeql_stdout(&dir.path().join("codeql"), &[]).unwrap_err();
-    assert!(
-        err.starts_with("could not run codeql: No such file"),
-        "{err}"
-    );
+    assert!(err.starts_with("could not run codeql: "), "{err}");
     assert!(started.elapsed() < std::time::Duration::from_millis(200));
 }

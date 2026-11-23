@@ -47,6 +47,7 @@ pub const PROTOCOL_VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion"
 pub const CLIENT_INFO_KEY: &str = "io.modelcontextprotocol/clientInfo";
 pub const CLIENT_CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
 /// The `_meta` key a modern result names its server under.
+#[cfg(unix)]
 pub const SERVER_INFO_KEY: &str = "io.modelcontextprotocol/serverInfo";
 
 /// A modern server that does not serve the requested version (`data.supported`
@@ -622,6 +623,7 @@ mod tests {
 
     /// The env a test sidecar runs with: just PATH, so `/bin/sh` finds
     /// `head` and `tr`.
+    #[cfg(unix)]
     fn path_env() -> BTreeMap<String, String> {
         std::env::var("PATH")
             .map(|p| BTreeMap::from([(String::from("PATH"), p)]))
@@ -630,6 +632,7 @@ mod tests {
 
     /// A sidecar that crashes on import (the pinned mcp-server-time under
     /// mcp 2.x) must say why, not report a generic timeout (#1297).
+    #[cfg(unix)]
     #[test]
     fn a_server_that_dies_before_answering_names_its_error() {
         let script = "echo 'Traceback (most recent call last):' >&2; \
@@ -654,6 +657,7 @@ mod tests {
 
     /// A server that dies without a word still says it exited, rather than
     /// that it timed out.
+    #[cfg(unix)]
     #[test]
     fn a_silent_server_exit_is_reported_as_an_exit() {
         let err = McpClient::connect(
@@ -672,6 +676,7 @@ mod tests {
 
     /// Negative: a server that logs far past the 64 KiB pipe buffer before
     /// answering still answers, since stderr is drained, not left to fill.
+    #[cfg(unix)]
     #[test]
     fn a_server_logging_past_the_pipe_buffer_still_answers() {
         let script = format!(
@@ -689,10 +694,12 @@ mod tests {
     }
 
     /// A modern server's reply to the probe (id 1).
+    #[cfg(unix)]
     const DISCOVERED: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}}}}"#;
 
     /// A stand-in server running `script` under `/bin/sh`, its era settled by
     /// a probe that gives up after `probe_timeout`.
+    #[cfg(unix)]
     fn connect_sh(script: &str, probe_timeout: Duration) -> Result<McpClient> {
         let args = [String::from("-c"), script.to_string()];
         let mut client = McpClient::spawn(
@@ -709,6 +716,7 @@ mod tests {
 
     /// A modern server answers the probe and gets no `initialize`: the next
     /// line it reads is the request, carrying croft's `_meta`.
+    #[cfg(unix)]
     #[test]
     fn a_modern_server_is_spoken_to_with_per_request_meta() {
         let script = format!(
@@ -725,6 +733,7 @@ mod tests {
 
     /// A legacy server rejects the probe and gets the `initialize` handshake,
     /// then plain requests with no `_meta`.
+    #[cfg(unix)]
     #[test]
     fn a_legacy_server_that_rejects_the_probe_gets_initialize() {
         let script = r#"read l; echo '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}'
@@ -739,6 +748,7 @@ mod tests {
     }
 
     /// A legacy server that ignores the probe is legacy once it times out.
+    #[cfg(unix)]
     #[test]
     fn a_legacy_server_silent_on_the_probe_gets_initialize() {
         let script = r#"read l; read l; case "$l" in *'"method":"initialize"'*) ;; *) exit 1;; esac
@@ -752,6 +762,7 @@ mod tests {
     /// A modern server too slow for the probe window answers it late and
     /// rejects the fallback `initialize`, in either order: croft still ends
     /// up modern.
+    #[cfg(unix)]
     #[test]
     fn a_modern_server_slow_to_answer_the_probe_is_still_modern() {
         let reject =

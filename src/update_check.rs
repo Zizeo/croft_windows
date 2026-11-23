@@ -953,6 +953,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn apply_refuses_a_planted_symlink_at_the_temp_name() {
         let dir = tempfile::tempdir().unwrap();
@@ -1045,6 +1046,7 @@ mod tests {
             "the failed apply left the target alone"
         );
     }
+    #[cfg(unix)]
     #[test]
     fn a_release_binary_is_staged_without_building() {
         use crate::remote_prebuilt::{NotPublished, Signature};
@@ -1110,6 +1112,7 @@ mod tests {
     /// #1844: a release server out of reach is not crates.io out of reach
     /// (cargo honours a proxy this client does not), so the build still
     /// runs. When it cannot run either, the network is named as the reason.
+    #[cfg(unix)]
     #[test]
     fn an_unreachable_release_server_still_builds_and_names_the_network_if_that_fails() {
         use crate::remote_prebuilt::{Signature, Unreachable};

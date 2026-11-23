@@ -7,6 +7,7 @@ const NO_EXTENSIONS: &str = "";
 
 /// A user extensions folder with CodeQL added, whose runner comes with
 /// it (#1842).
+#[cfg(unix)]
 fn codeql_added() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("codeql")).unwrap();
@@ -797,6 +798,7 @@ fn cargo_json_artifact_lines_yield_the_unit_test_binary() {
 /// cargo's JSON does not say which target defines a test; with several
 /// harnesses each is asked to `--list` the name (fast, runs nothing) and
 /// the first that knows it wins.
+#[cfg(unix)]
 #[test]
 fn probe_picks_the_harness_that_actually_lists_the_test() {
     use std::os::unix::fs::PermissionsExt;
@@ -1115,7 +1117,9 @@ fn a_js_suite_click_anchors_the_name_filter_to_the_describe_chain() {
 #[test]
 fn coverage_runs_keep_each_runners_output_and_write_lcov_into_the_dir() {
     let dir = Path::new("/t/cov");
-    let py = coverage_args(Runner::Pytest, dir);
+    let norm =
+        |v: Vec<String>| -> Vec<String> { v.into_iter().map(|s| s.replace('\\', "/")).collect() };
+    let py = norm(coverage_args(Runner::Pytest, dir));
     assert!(
         py.contains(&"--cov-report=lcov:/t/cov/lcov.info".to_string()),
         "{py:?}"
@@ -1123,16 +1127,16 @@ fn coverage_runs_keep_each_runners_output_and_write_lcov_into_the_dir() {
     assert!(
         py.contains(&"--cov-branch".to_string()) && py.contains(&PYTEST_RUN_VERBOSITY.to_string())
     );
-    let vi = coverage_args(Runner::Vitest, dir);
+    let vi = norm(coverage_args(Runner::Vitest, dir));
     assert!(vi.contains(&"--reporter=tap-flat".to_string()));
     assert!(
         vi.contains(&"--coverage.reportsDirectory=/t/cov".to_string()),
         "{vi:?}"
     );
-    let je = coverage_args(Runner::Jest, dir);
+    let je = norm(coverage_args(Runner::Jest, dir));
     assert!(je.contains(&"--json".to_string()));
     assert!(je.contains(&"--coverageDirectory=/t/cov".to_string()));
-    let ca = coverage_args(Runner::Cargo, dir);
+    let ca = norm(coverage_args(Runner::Cargo, dir));
     assert_eq!(ca[0], "llvm-cov");
     assert_eq!(ca.last().unwrap(), "/t/cov/lcov.info");
     assert_eq!(coverage_report(dir), Path::new("/t/cov/lcov.info"));
@@ -1415,6 +1419,7 @@ exit 1"#
 }
 
 /// What `f` sends: the cases by name and status, and the run's verdict.
+#[cfg(unix)]
 fn collect_responses(
     root: &Path,
     f: impl Fn(&Path, &EpochTx),
@@ -1463,6 +1468,7 @@ fn maturin_project(root: &Path) {
 
 /// What `f` sends through a sender that records which runner listed
 /// each test, as the worker loop's does.
+#[cfg(unix)]
 fn collect_with_owners(
     root: &Path,
     owners: &RefCell<BTreeMap<String, Runner>>,
@@ -2179,6 +2185,7 @@ fn a_js_project_with_no_test_files_lists_as_empty_not_failed() {
 }
 
 /// Run everything in `root` on this thread: the cases reported, in order.
+#[cfg(unix)]
 fn run_all_of(root: &Path) -> Vec<(String, TestStatus)> {
     let (tx, rx) = std::sync::mpsc::channel();
     let etx = EpochTx {

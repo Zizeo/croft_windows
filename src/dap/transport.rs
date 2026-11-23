@@ -688,6 +688,7 @@ mod tests {
     /// child into its own session. Assert the spawned child's session id differs
     /// from ours. (Spawns `sleep` as a stand-in adapter; the reader thread just
     /// hits EOF when it exits.)
+    #[cfg(unix)]
     #[test]
     fn spawned_adapter_is_detached_into_its_own_session() {
         let cwd = std::env::temp_dir();
@@ -709,6 +710,7 @@ mod tests {
     /// `process` event, then serves `disconnect` per `mode`: `answer` waits
     /// 100 ms, ends the debuggee when asked to, and replies; `silent`
     /// never replies.
+    #[cfg(unix)]
     const FAKE_ADAPTER: &str = r#"
 import json, os, subprocess, sys, time
 mode = sys.argv[1]
@@ -741,9 +743,11 @@ while True:
 
     /// `join_teardowns` joins every test's teardowns; one at a time, so
     /// none returns before its own thread is done.
+    #[cfg(unix)]
     static TEARDOWN_TESTS: Mutex<()> = Mutex::new(());
 
     /// Spawn the stand-in and return it with its debuggee's pid.
+    #[cfg(unix)]
     fn fake_session(mode: &str) -> (DapTransport, i32, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let script = dir.path().join("adapter.py");
@@ -763,6 +767,7 @@ while True:
     }
 
     /// Alive and not a zombie (an unreaped child of a killed adapter).
+    #[cfg(unix)]
     fn running(pid: i32) -> bool {
         // SAFETY: signal 0 only checks that the pid exists.
         if unsafe { libc::kill(pid, 0) } != 0 {
@@ -777,6 +782,7 @@ while True:
     }
 
     /// SIGKILL lands asynchronously: give a just-killed pid a moment.
+    #[cfg(unix)]
     fn ends_soon(pid: i32) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while running(pid) {
@@ -788,6 +794,7 @@ while True:
         true
     }
 
+    #[cfg(unix)]
     fn end(pid: i32) {
         // SAFETY: test cleanup of a pid this test started.
         unsafe {
@@ -795,6 +802,7 @@ while True:
         }
     }
 
+    #[cfg(unix)]
     fn disconnect(terminate: bool) -> Value {
         json!({"type": "request", "command": "disconnect",
                "arguments": {"terminateDebuggee": terminate}})
@@ -803,6 +811,7 @@ while True:
     /// #1536: Stop Debugging sends `disconnect` and drops the session at
     /// once. The adapter must get to answer before it is killed, or it
     /// never ends the debuggee, which runs on under PID 1.
+    #[cfg(unix)]
     #[test]
     fn a_dropped_session_lets_the_adapter_end_the_debuggee() {
         let _one = TEARDOWN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -824,6 +833,7 @@ while True:
     /// #1536 backstop: an adapter that never answers `disconnect` is
     /// killed after the grace period, and the debuggee it reported is
     /// ended too (its own session puts it out of the adapter's group).
+    #[cfg(unix)]
     #[test]
     fn a_silent_adapter_does_not_leave_its_debuggee_running() {
         let _one = TEARDOWN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -857,6 +867,7 @@ while True:
     /// #1536 negative: an attach session disconnects with
     /// `terminateDebuggee: false`. croft did not start that process, so the
     /// teardown leaves it running.
+    #[cfg(unix)]
     #[test]
     fn an_attached_process_is_left_running() {
         let _one = TEARDOWN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -872,6 +883,7 @@ while True:
     /// #1536 negative: without a `disconnect` there is nothing to wait for,
     /// so the adapter is killed at once, as before, and no reported pid is
     /// signalled.
+    #[cfg(unix)]
     #[test]
     fn a_session_dropped_without_disconnect_is_killed_at_once() {
         let _one = TEARDOWN_TESTS.lock().unwrap_or_else(|e| e.into_inner());

@@ -35,7 +35,7 @@ mod state;
 mod turns;
 mod voice;
 use apply::*;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use claude_cli::FAKE_CLAUDE;
 pub(crate) use claude_cli::claude_command;
 use claude_cli::*;
@@ -49,7 +49,7 @@ pub use provider::PairConfig;
 pub use provider::Provider;
 use provider::*;
 pub use repl::run;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use repl::*;
 pub(crate) use seat::Pilot;
 pub(crate) use seat::seat_local;
@@ -135,5 +135,5 @@ pub(crate) struct PairState {
     last_seen: std::collections::HashMap<String, String>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;

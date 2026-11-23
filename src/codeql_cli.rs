@@ -334,7 +334,7 @@ pub fn download_and_install(
 
 /// Write a stand-in release archive to `zip` for tests: `codeql/codeql`
 /// holding `launcher`, and a tool, both executable, plus a plain file.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub fn write_test_archive(zip: &Path, launcher: &str) {
     use std::io::Write;
     let mut z = zip::ZipWriter::new(std::fs::File::create(zip).unwrap());

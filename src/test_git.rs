@@ -75,6 +75,7 @@ pub(crate) fn app_git(dir: &Path) -> Command {
 /// developer's `init.defaultBranch` says.
 pub(crate) fn git_init(dir: &Path) {
     git_ok(dir, &["init", "-q", "-b", "main"]);
+    git_ok(dir, &["config", "core.autocrlf", "false"]);
 }
 
 /// [`git_init`], then [`TEST_GIT_NAME`] as the repository's own identity,

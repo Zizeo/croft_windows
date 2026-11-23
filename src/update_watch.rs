@@ -298,8 +298,12 @@ fn parse_installed_binary(output: &str) -> Option<PathBuf> {
             .strip_prefix("Installing ")
             .or_else(|| line.strip_prefix("Replacing "))?;
         let path = std::path::Path::new(rest.trim());
-        (path.is_absolute() && path.file_name() == Some(std::ffi::OsStr::new("croft")))
-            .then(|| path.to_path_buf())
+        (path.is_absolute()
+            && matches!(
+                path.file_name().and_then(|s| s.to_str()),
+                Some("croft" | "croft.exe")
+            ))
+        .then(|| path.to_path_buf())
     })
 }
 
@@ -568,14 +572,21 @@ mod tests {
 
     #[test]
     fn installed_binary_is_parsed_from_cargo_output_not_progress_lines() {
-        let output = "  Installing croft-software v0.1.758 (/repo)\n\
+        let dest = if cfg!(windows) {
+            r"C:\custom\root\bin\croft.exe"
+        } else {
+            "/custom/root/bin/croft"
+        };
+        let output = format!(
+            "  Installing croft-software v0.1.758 (/repo)\n\
                          Compiling croft-software v0.1.758\n\
                         Finished `release` profile [optimized] target(s) in 57s\n\
-                       Replacing /custom/root/bin/croft\n\
-                        Replaced package `croft-software v0.1.758` with `croft-software v0.1.758`\n";
+                       Replacing {dest}\n\
+                        Replaced package `croft-software v0.1.758` with `croft-software v0.1.758`\n"
+        );
         assert_eq!(
-            parse_installed_binary(output),
-            Some(PathBuf::from("/custom/root/bin/croft")),
+            parse_installed_binary(&output),
+            Some(PathBuf::from(dest)),
             "the binary line, not the package-progress line, names the destination"
         );
         assert_eq!(parse_installed_binary("nothing relevant"), None);

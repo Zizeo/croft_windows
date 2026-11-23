@@ -1203,9 +1203,11 @@ mod tests {
     #[test]
     fn a_name_that_exists_or_has_no_file_before_the_suffix_is_not_split() {
         let dir = big_txt();
+        #[cfg(unix)]
         std::fs::write(dir.path().join("a:1"), "x").unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         for arg in [
+            #[cfg(unix)]
             "a:1",
             "big.txt",
             "nope.txt:3",
@@ -1218,14 +1220,18 @@ mod tests {
         ] {
             assert_eq!(split_location(dir.path(), Path::new(arg)), None, "{arg}");
         }
-        // `croft edit` of a new name ending in a number still creates it.
-        let (path, created, at) =
-            resolve_located(Verb::Edit, dir.path(), Path::new("notes:2")).unwrap();
-        assert_eq!(path, dir.path().join("notes:2"));
-        assert!(created.is_some() && at.is_none());
-        let (path, created, at) =
-            resolve_located(Verb::Edit, dir.path(), Path::new("a:1")).unwrap();
-        assert_eq!((path, created, at), (dir.path().join("a:1"), None, None));
+        // `croft edit` of a new name ending in a number still creates it
+        // (`:` is invalid in Windows filenames, reserved for ADS).
+        #[cfg(unix)]
+        {
+            let (path, created, at) =
+                resolve_located(Verb::Edit, dir.path(), Path::new("notes:2")).unwrap();
+            assert_eq!(path, dir.path().join("notes:2"));
+            assert!(created.is_some() && at.is_none());
+            let (path, created, at) =
+                resolve_located(Verb::Edit, dir.path(), Path::new("a:1")).unwrap();
+            assert_eq!((path, created, at), (dir.path().join("a:1"), None, None));
+        }
     }
 
     /// #848: `croft edit TODO.md` on a file not yet on disk was refused, so

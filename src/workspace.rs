@@ -460,17 +460,14 @@ fn relative_or_absolute(base: &Path, target: &Path) -> String {
         return target.display().to_string();
     }
     let ups = base.len() - common;
-    let mut out = PathBuf::new();
-    for _ in 0..ups {
-        out.push("..");
-    }
+    let mut parts: Vec<String> = vec![String::from(".."); ups];
     for c in &tgt[common..] {
-        out.push(c.as_os_str());
+        parts.push(c.as_os_str().to_string_lossy().into_owned());
     }
-    if out.as_os_str().is_empty() {
+    if parts.is_empty() {
         return String::from(".");
     }
-    out.display().to_string()
+    parts.join("/")
 }
 
 /// True when `path` names a VS Code workspace file.
@@ -482,6 +479,7 @@ pub fn is_workspace_file(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn json_stores_are_written_owner_only() {
         use std::os::unix::fs::PermissionsExt;
@@ -565,6 +563,7 @@ mod tests {
     /// they never typed and cannot recover from the file. Only a spelling
     /// that would otherwise go absolute gets retried through canonical
     /// forms.
+    #[cfg(unix)]
     #[test]
     fn a_deliberate_folder_symlink_is_written_as_the_user_named_it() {
         let tmp = tempfile::tempdir().unwrap();
@@ -609,6 +608,7 @@ mod tests {
     /// `parse_workspace_file` joins onto the file's own directory and then
     /// canonicalises, so the OS resolves `..` after traversing the link,
     /// which is what makes the round trip safe.
+    #[cfg(unix)]
     #[test]
     fn a_relative_entry_resolves_through_a_symlinked_walk() {
         let tmp = tempfile::tempdir().unwrap();
@@ -645,6 +645,7 @@ mod tests {
     /// the two sharing just the root component — `relative_or_absolute`
     /// then wrote an ABSOLUTE path and the workspace file stopped being
     /// portable, which is the one thing it promises.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_folder_still_writes_relative() {
         let tmp = tempfile::tempdir().unwrap();
@@ -734,7 +735,10 @@ mod tests {
         let parsed = parse_workspace_file(&file).unwrap();
         assert_eq!(
             parsed,
-            vec![a.canonicalize().unwrap(), b.canonicalize().unwrap()]
+            vec![
+                crate::platform::fs::canonicalize(&a).unwrap(),
+                crate::platform::fs::canonicalize(&b).unwrap(),
+            ]
         );
 
         // A file INSIDE a folder still relativizes: itself as `.`, the
@@ -742,7 +746,10 @@ mod tests {
         let inside = a.join("self.code-workspace");
         write_workspace_file(
             &inside,
-            &[a.canonicalize().unwrap(), b.canonicalize().unwrap()],
+            &[
+                crate::platform::fs::canonicalize(&a).unwrap(),
+                crate::platform::fs::canonicalize(&b).unwrap(),
+            ],
         )
         .unwrap();
         let raw2 = std::fs::read_to_string(&inside).unwrap();
@@ -750,23 +757,29 @@ mod tests {
         assert!(raw2.contains("../beta"), "sibling uses ..: {raw2}");
         assert_eq!(
             parse_workspace_file(&inside).unwrap(),
-            vec![a.canonicalize().unwrap(), b.canonicalize().unwrap()]
+            vec![
+                crate::platform::fs::canonicalize(&a).unwrap(),
+                crate::platform::fs::canonicalize(&b).unwrap(),
+            ]
         );
 
         // Comments and absolute paths parse too; order is preserved.
         let commented = tmp.path().join("c.code-workspace");
+        let b_json = serde_json::to_string(&b.display().to_string()).unwrap();
         std::fs::write(
             &commented,
             format!(
-                "{{\n  // the arrangement\n  \"folders\": [\n    {{ \"path\": \"{}\" }},\n    {{ \"path\": \"alpha\" }}\n  ]\n}}\n",
-                b.display()
+                "{{\n  // the arrangement\n  \"folders\": [\n    {{ \"path\": {b_json} }},\n    {{ \"path\": \"alpha\" }}\n  ]\n}}\n",
             ),
         )
         .unwrap();
         let parsed = parse_workspace_file(&commented).unwrap();
         assert_eq!(
             parsed,
-            vec![b.canonicalize().unwrap(), a.canonicalize().unwrap()]
+            vec![
+                crate::platform::fs::canonicalize(&b).unwrap(),
+                crate::platform::fs::canonicalize(&a).unwrap(),
+            ]
         );
 
         // Malformed: a real error, never an empty default.
@@ -787,7 +800,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             parse_workspace_file(&jsonc).unwrap(),
-            vec![a.canonicalize().unwrap(), b.canonicalize().unwrap()]
+            vec![
+                crate::platform::fs::canonicalize(&a).unwrap(),
+                crate::platform::fs::canonicalize(&b).unwrap(),
+            ]
         );
         let mixed = tmp.path().join("mixed.code-workspace");
         std::fs::write(
@@ -822,7 +838,7 @@ mod tests {
     /// `wsx` holding the team file, beside `wsx_lib` and `extra`.
     fn team_workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = crate::platform::fs::canonicalize(tmp.path()).unwrap();
         for d in ["wsx", "wsx_lib", "extra"] {
             std::fs::create_dir(root.join(d)).unwrap();
         }

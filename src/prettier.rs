@@ -217,14 +217,14 @@ mod tests {
         tmp
     }
 
-    const BIN: (&str, &str) = ("node_modules/.bin/prettier", "");
+    const TEST_BIN: (&str, &str) = (BIN, "");
 
     #[test]
     fn a_prettierrc_and_a_local_prettier_select_it() {
-        let tmp = project(&[(".prettierrc", "{}"), BIN, ("app.ts", "")]);
+        let tmp = project(&[(".prettierrc", "{}"), TEST_BIN, ("app.ts", "")]);
         assert_eq!(
             for_file(&tmp.path().join("app.ts")),
-            Some(tmp.path().join("node_modules/.bin/prettier"))
+            Some(tmp.path().join(BIN))
         );
     }
 
@@ -238,7 +238,7 @@ mod tests {
             "prettier.config.js",
             "prettier.config.mjs",
         ] {
-            let tmp = project(&[(name, ""), BIN, ("a.js", "")]);
+            let tmp = project(&[(name, ""), TEST_BIN, ("a.js", "")]);
             assert!(for_file(&tmp.path().join("a.js")).is_some(), "{name}");
         }
     }
@@ -247,7 +247,7 @@ mod tests {
     fn a_prettier_key_in_package_json_is_a_config() {
         let tmp = project(&[
             ("package.json", r#"{"name":"x","prettier":{"semi":false}}"#),
-            BIN,
+            TEST_BIN,
             ("a.tsx", ""),
         ]);
         assert!(for_file(&tmp.path().join("a.tsx")).is_some());
@@ -257,13 +257,13 @@ mod tests {
     fn a_monorepo_package_finds_the_root_config_and_prettier() {
         let tmp = project(&[
             (".prettierrc", "{}"),
-            BIN,
+            TEST_BIN,
             ("packages/web/package.json", r#"{"name":"web"}"#),
             ("packages/web/src/page.css", ""),
         ]);
         assert_eq!(
             for_file(&tmp.path().join("packages/web/src/page.css")),
-            Some(tmp.path().join("node_modules/.bin/prettier"))
+            Some(tmp.path().join(BIN))
         );
     }
 
@@ -274,7 +274,7 @@ mod tests {
                 "package.json",
                 r#"{"name":"x","devDependencies":{"prettier":"3"}}"#,
             ),
-            BIN,
+            TEST_BIN,
             ("a.ts", ""),
         ]);
         assert_eq!(for_file(&tmp.path().join("a.ts")), None);
@@ -288,7 +288,12 @@ mod tests {
 
     #[test]
     fn files_prettier_does_not_format_keep_their_server() {
-        let tmp = project(&[(".prettierrc", "{}"), BIN, ("main.rs", ""), ("x.py", "")]);
+        let tmp = project(&[
+            (".prettierrc", "{}"),
+            TEST_BIN,
+            ("main.rs", ""),
+            ("x.py", ""),
+        ]);
         assert_eq!(for_file(&tmp.path().join("main.rs")), None);
         assert_eq!(for_file(&tmp.path().join("x.py")), None);
     }

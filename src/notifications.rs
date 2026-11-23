@@ -924,6 +924,7 @@ mod tests {
     /// the program with the notification in its environment, and that a
     /// failing program is an error (which `deliver_all` retries and logs)
     /// rather than a panic.
+    #[cfg(unix)]
     #[test]
     fn a_command_sink_runs_with_the_notification_in_its_environment() {
         let dir = tempfile::tempdir().unwrap();
@@ -967,6 +968,7 @@ mod tests {
 
     /// A sink's program is a notifier, not a job: one that hangs is killed
     /// at the bound rather than pinning the delivery worker.
+    #[cfg(unix)]
     #[test]
     fn a_hung_command_sink_is_killed_at_the_bound() {
         let started = std::time::Instant::now();
@@ -1036,6 +1038,7 @@ mod tests {
     /// The queue delivers: an event with a command sink lands in the file
     /// the program writes, from the worker thread, without the caller
     /// waiting on anything.
+    #[cfg(unix)]
     #[test]
     fn emit_delivers_through_the_worker_queue() {
         let dir = tempfile::tempdir().unwrap();

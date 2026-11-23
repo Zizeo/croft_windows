@@ -43,7 +43,7 @@ pub use new_and_rename::create_target_dir_for;
 pub use new_and_rename::rename_in;
 pub use new_and_rename::rename_target;
 pub use new_and_rename::validate_new_name;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use new_and_rename::*;
 use sticky::*;
 

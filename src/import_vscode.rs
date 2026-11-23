@@ -796,6 +796,7 @@ pub fn find_installed_themes(label: &str, extension_dirs: &[PathBuf]) -> Vec<Pat
                 };
                 let rel = Path::new(rel);
                 let escapes = rel.is_absolute()
+                    || rel.has_root()
                     || rel
                         .components()
                         .any(|c| matches!(c, std::path::Component::ParentDir));

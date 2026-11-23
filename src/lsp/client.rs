@@ -2294,6 +2294,16 @@ mod tests {
         let inlay_flag = Arc::new(AtomicBool::new(false));
         let (diag_tx, _diag_rx) = std_mpsc::channel();
         let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let ws = if cfg!(windows) {
+            r"C:\tmp\ws"
+        } else {
+            "/tmp/ws"
+        };
+        let ws_uri = if cfg!(windows) {
+            "file:///C:/tmp/ws"
+        } else {
+            "file:///tmp/ws"
+        };
         let mut router = ClientState::router(
             "rust-analyzer".into(),
             sem_flag,
@@ -2302,7 +2312,7 @@ mod tests {
             diag_tx,
             prog_tx,
             vec![WorkspaceFolder {
-                uri: Url::from_file_path("/tmp/ws").unwrap(),
+                uri: Url::from_file_path(ws).unwrap(),
                 name: "ws".into(),
             }],
             Default::default(),
@@ -2318,7 +2328,7 @@ mod tests {
             .expect("the client must answer workspace/workspaceFolders with its folder list, not decline it");
         assert_eq!(
             value,
-            json!([{ "uri": "file:///tmp/ws", "name": "ws" }]),
+            json!([{ "uri": ws_uri, "name": "ws" }]),
             "the reply is the same folder list initialize carried"
         );
     }
@@ -2487,6 +2497,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_probe_separates_a_process_that_stays_alive_from_one_that_exits() {
         // The probe rests on the child's stdin staying an OPEN PIPE: a
@@ -2521,6 +2532,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     #[should_panic(expected = "handshake failed")]
     fn a_server_that_runs_but_never_answers_initialize_fails_the_test() {

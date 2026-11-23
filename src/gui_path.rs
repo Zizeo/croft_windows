@@ -24,11 +24,11 @@
 
 #[cfg(unix)]
 use std::ffi::OsStr;
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Command, Stdio};
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 use std::time::Duration;
 
 /// Exactly what launchd hands a GUI process. Any other PATH came from a
@@ -43,9 +43,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Markers around the value so an interactive rc file's own chatter (banners,
 /// version notices, `fastfetch`) can never be mistaken for the PATH.
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 const BEGIN: &str = "__CROFT_PATH_BEGIN__";
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 const END: &str = "__CROFT_PATH_END__";
 
 /// Whether this PATH is a GUI launch's stripped inheritance rather than a
@@ -56,7 +56,7 @@ const END: &str = "__CROFT_PATH_END__";
 /// `/Applications/Ghostty.app/Contents/MacOS`, iTerm2 its `utilities`), which
 /// no user's shell would ever do, so their presence is not evidence that a
 /// shell ran.
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn is_stripped(path: Option<&str>) -> bool {
     let Some(path) = path.map(str::trim).filter(|p| !p.is_empty()) else {
         return true;
@@ -70,7 +70,7 @@ fn is_stripped(path: Option<&str>) -> bool {
 /// The login shell's PATH ahead of what we already have, with duplicates
 /// dropped. Keeping the inherited entries means the system directories
 /// survive even if the user's shell drops them.
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn merge(current: Option<&str>, probed: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
     for entry in probed
@@ -188,7 +188,7 @@ fn run_probe(mut cmd: Command, timeout: Duration) -> Option<String> {
 }
 
 /// Pull the PATH out from between the markers.
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn extract(out: &str) -> Option<String> {
     let (_, rest) = out.split_once(BEGIN)?;
     let (path, _) = rest.split_once(END)?;
@@ -199,7 +199,7 @@ fn extract(out: &str) -> Option<String> {
 /// The PATH to run under, or `None` to keep what we inherited. `known` is the
 /// login shell's PATH as last remembered; it is only asked for when the
 /// inherited PATH needs repairing.
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn repaired(current: Option<&str>, known: impl FnOnce() -> Option<String>) -> Option<String> {
     if !is_stripped(current) {
         return None;
@@ -218,7 +218,7 @@ fn memory_path() -> PathBuf {
 
 /// The PATH remembered in `file` for `shell`. A PATH another shell reported
 /// does not count: switching shells must not run croft under the old one's.
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn recall(file: &Path, shell: &str) -> Option<String> {
     let text = std::fs::read_to_string(file).ok()?;
     let (who, path) = text.split_once('\n')?;
@@ -228,7 +228,7 @@ fn recall(file: &Path, shell: &str) -> Option<String> {
 
 /// Remember `path` as `shell`'s PATH in `file`. Written beside and renamed
 /// over, so a launch reading it never sees half of one.
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn remember(file: &Path, shell: &str, path: &str) -> std::io::Result<()> {
     if recall(file, shell).as_deref() == Some(path) {
         return Ok(());
@@ -354,7 +354,7 @@ fn spawn_refresh(
     std::thread::spawn(move || probe_and_remember(&shell, inherited.as_deref(), &file, timeout))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

@@ -452,6 +452,7 @@ mod tests {
     /// #1359: F5 in a configured CMake project builds the project and
     /// debugs the executable that compiles the file, even from a source
     /// it shares with no other target, and leaves nothing in `src/`.
+    #[cfg(unix)]
     #[test]
     fn a_cmake_project_builds_its_target_for_debugging() {
         if !have(&["cmake", "c++"]) {

@@ -319,10 +319,13 @@ mod tests {
     /// output for the three seeded manifests, signed by a throwaway ed25519 key.
     /// Proves `ring` (the client) accepts an openssl-produced signature (CI).
     const FIXTURE_INDEX: &[u8] = include_bytes!("testdata/index.json");
+    #[cfg(unix)]
     const FIXTURE_SIG: &[u8] = include_bytes!("testdata/index.json.sig");
+    #[cfg(unix)]
     const FIXTURE_PUBKEY_HEX: &str =
         "82935866e991e71a7fc86e375b2d4c6c5f4e96e739d5f470f911abd94813fbb4";
 
+    #[cfg(unix)]
     fn hex_decode(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)
@@ -362,6 +365,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn ring_verifies_an_openssl_produced_signature() {
         let pubkey = hex_decode(FIXTURE_PUBKEY_HEX);

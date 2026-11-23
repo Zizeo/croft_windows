@@ -2689,6 +2689,7 @@ fn resize_must_force_a_full_text_repaint_on_every_protocol() {
 /// lock: it cannot host, so holding the flock only blocks the window that
 /// can. The failed spawner un-appoints itself and releases; the next window
 /// acquires and seats.
+#[cfg(unix)]
 #[test]
 fn a_failed_spawner_releases_the_lock_so_another_window_can_host() {
     use std::time::{Duration, Instant};

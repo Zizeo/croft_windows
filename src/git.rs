@@ -170,6 +170,8 @@ pub use worktrees::pr_worktree_keep_reason;
 pub use worktrees::pr_worktree_path;
 pub use worktrees::remote_for_slug;
 pub use worktrees::remove_worktree_lane;
+#[cfg(windows)]
+pub use worktrees::worktree_is_locked;
 #[cfg(test)]
 use worktrees::*;
 

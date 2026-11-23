@@ -73,6 +73,7 @@ fn an_esc_leaving_a_comment_box_or_insert_mode_is_not_half_of_esc_esc() {
     assert!(app.zen_mode, "the Esc that left Insert mode did not count");
 }
 
+#[cfg(unix)]
 #[test]
 fn cmd_k_n_annotates_the_selection_and_a_click_shows_the_note() {
     let tmp = tempfile::tempdir().unwrap();
@@ -272,6 +273,7 @@ fn turn_note_summary_only_names_a_single_file() {
 /// boxes: its NOTE fence, plus its prose commentary ("Reviewing."), which
 /// lands as a comment box at the turn's origin — never in OUTPUT (boxes are
 /// the navigator's single voice).
+#[cfg(unix)]
 #[test]
 fn turn_done_status_keeps_the_notes_visible() {
     use std::time::{Duration, Instant};
@@ -466,6 +468,7 @@ fn a_failed_ask_submit_keeps_the_typed_draft() {
 /// Enter in a focused comment box sends the reply turn: the composed
 /// message (note context, the reply, the edit-on-request rule, numbered
 /// buffer) reaches the pilot's claude stdin, and the focus releases.
+#[cfg(unix)]
 #[test]
 fn enter_in_a_focused_comment_box_sends_the_reply_turn() {
     use std::time::{Duration, Instant};
@@ -884,7 +887,7 @@ fn the_review_queue_names_the_lane_each_agents_files_are_in() {
     app.lane_agent = None;
     app.create_worktree_lane("fix login");
     let repo = app.roots.primary().to_path_buf();
-    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+    let lane = crate::platform::fs::canonicalize(&tmp.path().join("repo-fix-login")).unwrap();
 
     let working = vec![String::from("claude")];
     app.agent_ledger
@@ -946,7 +949,7 @@ fn a_grouped_review_queue_row_survives_the_status_bar() {
     app.lane_agent = None;
     app.create_worktree_lane("fix login");
     let repo = app.roots.primary().to_path_buf();
-    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+    let lane = crate::platform::fs::canonicalize(&tmp.path().join("repo-fix-login")).unwrap();
     let working = vec![String::from("claude")];
     for i in 0..4 {
         app.agent_ledger
@@ -1022,6 +1025,7 @@ fn a_single_root_review_queue_reads_as_it_always_did() {
 /// A git repo holding `a.rs` and a fake `gh` that answers the review
 /// calls (#366, #368): (tempdir, repo root, a.rs, gh's call log, the last
 /// review payload, the gh script).
+#[cfg(unix)]
 fn review_fixture() -> (
     tempfile::TempDir,
     std::path::PathBuf,
@@ -1069,6 +1073,7 @@ esac
 }
 
 /// An app on the review fixture, with git's view of the repo in place.
+#[cfg(unix)]
 fn review_app(root: &std::path::Path, f: &std::path::Path, gh: &std::path::Path) -> App {
     let mut app = App::new(root.to_path_buf()).unwrap();
     app.review_gh = gh.display().to_string();
@@ -1087,6 +1092,7 @@ fn review_app(root: &std::path::Path, f: &std::path::Path, gh: &std::path::Path)
 /// #366's write side end to end against a fake `gh`: threads load with
 /// their GraphQL resolution, a reply and a resolve go to GitHub off the
 /// frame loop, and a pending comment is submitted with the chosen verdict.
+#[cfg(unix)]
 #[test]
 fn review_threads_can_be_replied_to_resolved_and_a_review_submitted() {
     let (_tmp, root, f, log, stdin, gh) = review_fixture();
@@ -1146,6 +1152,7 @@ fn review_threads_can_be_replied_to_resolved_and_a_review_submitted() {
 /// Pending comments belong to the PR they were written on: once the
 /// branch's PR changes, they neither post there nor mix with new ones, and
 /// a failed export settles none of the notes it carried.
+#[cfg(unix)]
 #[test]
 fn pending_comments_stay_with_their_pull_request() {
     let (_tmp, root, f, _log, stdin, gh) = review_fixture();
@@ -1208,6 +1215,7 @@ fn only_the_submissions_own_failure_ends_it() {
 /// #368: the navigator's notes and pending comments are previewed, then
 /// posted as one review with the navigator's marked as AI-authored; a note
 /// off the diff lands in the summary, and posted notes leave the editor.
+#[cfg(unix)]
 #[test]
 fn comments_export_to_the_pull_request_after_a_preview() {
     let (_tmp, root, f, log, stdin, gh) = review_fixture();
@@ -1441,6 +1449,7 @@ fn delete_note_below_the_last_note_deletes_nothing() {
 
 /// A comment written while a review is being submitted stays pending, and a
 /// second submit while the first runs is refused rather than posted twice.
+#[cfg(unix)]
 #[test]
 fn a_submit_in_flight_keeps_new_comments_and_refuses_a_second_submit() {
     let (_tmp, root, f, _log, _stdin, gh) = review_fixture();
@@ -1543,6 +1552,7 @@ fn review_pull_request_is_a_palette_command_with_a_number_prompt() {
 
 /// #365: the review tab's `gh` calls run off the UI thread, and a pasted
 /// URL from another repository opens that repository's pull request.
+#[cfg(unix)]
 #[test]
 fn a_pr_review_loads_off_the_ui_thread_and_a_url_keeps_its_repository() {
     use std::os::unix::fs::PermissionsExt;
@@ -1603,6 +1613,7 @@ esac
 
 /// #917: a PR review that cannot load because gh is missing or signed out
 /// says how to fix that, not "No such file or directory (os error 2)".
+#[cfg(unix)]
 #[test]
 fn a_pr_review_without_a_usable_gh_says_how_to_fix_it() {
     use std::os::unix::fs::PermissionsExt;
@@ -1628,6 +1639,7 @@ fn a_pr_review_without_a_usable_gh_says_how_to_fix_it() {
 /// #917: Review: Add Comment and Submit Review look the PR up on the UI
 /// thread; a missing or signed-out gh says how to fix it there too, not
 /// that the branch has no PR.
+#[cfg(unix)]
 #[test]
 fn the_review_comment_pr_lookup_without_a_usable_gh_says_how_to_fix_it() {
     use std::os::unix::fs::PermissionsExt;
@@ -1663,6 +1675,7 @@ fn the_review_comment_pr_lookup_without_a_usable_gh_says_how_to_fix_it() {
 /// for a moment ("Text file busy") while another process still holds it open
 /// for writing. The PR lookup behind Add Comment and Submit Review waits that
 /// moment out, as croft's other `gh` calls do, instead of reporting it.
+#[cfg(unix)]
 #[test]
 fn the_review_comment_pr_lookup_waits_out_a_briefly_busy_gh() {
     use std::io::Write as _;
@@ -1693,6 +1706,7 @@ fn the_review_comment_pr_lookup_waits_out_a_briefly_busy_gh() {
 }
 
 /// Load x/y#42 through `gh` and wait for its viewed-state read to settle.
+#[cfg(unix)]
 fn open_synced_pr(app: &mut App) {
     app.submit_pr_number("42");
     crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "gh pr view", || {
@@ -1705,6 +1719,7 @@ fn open_synced_pr(app: &mut App) {
 /// ticks, DISMISSED (changed since viewed) and UNVIEWED untick even a
 /// local mark, and the local store follows. Toggling sends the matching
 /// mutation; a failed one keeps the local mark and says so once.
+#[cfg(unix)]
 #[test]
 fn pr_viewed_state_syncs_with_github() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -1823,6 +1838,7 @@ fn pr_viewed_state_syncs_with_github() {
 
 /// #365: when gh cannot read the viewed state (signed out, not GitHub),
 /// review behaves as before: local marks, no error, no mutations.
+#[cfg(unix)]
 #[test]
 fn pr_viewed_state_stays_local_without_github() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -1868,6 +1884,7 @@ fn pr_viewed_state_stays_local_without_github() {
 
 /// #365: a file toggled while GitHub's viewed state is still loading keeps
 /// the person's mark, and it is sent once the PR's id is known.
+#[cfg(unix)]
 #[test]
 fn a_toggle_before_github_answers_wins_and_is_sent() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -1908,6 +1925,7 @@ fn a_toggle_before_github_answers_wins_and_is_sent() {
 
 /// #365: an open review tab whose checks are still running re-reads them
 /// in the background, and says when the last one finishes.
+#[cfg(unix)]
 #[test]
 fn running_pr_checks_refresh_themselves_until_they_finish() {
     use std::os::unix::fs::PermissionsExt;
@@ -1966,6 +1984,7 @@ echo '{"number": 42, "title": "t", "url": "https://github.com/x/y/pull/42", "aut
 /// #365: Review Pull Request lists the open PRs to pick from (off the UI
 /// thread), picking one opens it by URL, and the last row asks for a
 /// number instead. When gh cannot list, the prompt opens directly.
+#[cfg(unix)]
 #[test]
 fn review_pull_request_picks_from_the_open_prs() {
     use crate::widgets::command_palette::Command;
@@ -2064,7 +2083,7 @@ fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
         git(&up, &["update-ref", "refs/pull/579/head", &head]);
         git(&up, &["reset", "-q", "--hard", "HEAD~1"]);
         git(tmp.path(), &["clone", "-q", up.to_str().unwrap(), "app"]);
-        let root = tmp.path().join("app").canonicalize().unwrap();
+        let root = crate::platform::fs::canonicalize(&tmp.path().join("app")).unwrap();
 
         let mut app = App::new(root.clone()).unwrap();
         app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
@@ -2078,7 +2097,7 @@ fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
                 app.pr_checkout_rx.is_none()
             },
         );
-        let checkout = tmp.path().join("app-pr-579").canonicalize().unwrap();
+        let checkout = crate::platform::fs::canonicalize(&tmp.path().join("app-pr-579")).unwrap();
         assert!(app.status.contains("checked out"), "{}", app.status);
         assert!(
             app.roots.iter().any(|r| r == checkout),
@@ -2132,7 +2151,7 @@ fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
                 app.pr_checkout_rx.is_none()
             },
         );
-        let checkout = tmp.path().join("app-pr-579").canonicalize().unwrap();
+        let checkout = crate::platform::fs::canonicalize(&tmp.path().join("app-pr-579")).unwrap();
         app.editor.open(&checkout.join("a.txt")).unwrap();
         app.editor.dirty = true;
         app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());

@@ -383,6 +383,7 @@ mod tests {
 
     /// A fake `gh` that logs its arguments and stdin, answers `pr diff`
     /// with a one-hunk diff, and fails when told to.
+    #[cfg(unix)]
     fn fake_gh(dir: &Path, fail: bool) -> String {
         let path = dir.join("gh");
         let script = format!(
@@ -431,6 +432,7 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_reply_posts_to_the_threads_replies_endpoint() {
         let tmp = tempfile::tempdir().unwrap();
@@ -460,6 +462,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_submitted_review_sends_inline_and_folded_comments_and_the_verdict() {
         let tmp = tempfile::tempdir().unwrap();
@@ -502,6 +505,7 @@ mod tests {
         assert!(sent["body"].as_str().unwrap().contains("a.rs:31"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_refusal_reports_ghs_own_reason() {
         let tmp = tempfile::tempdir().unwrap();
@@ -523,6 +527,7 @@ mod tests {
 
     /// #917: a missing or signed-out gh is named as such, not reported as
     /// a branch without a PR or as "No such file or directory".
+    #[cfg(unix)]
     #[test]
     fn a_missing_or_signed_out_gh_says_how_to_fix_it() {
         use std::os::unix::fs::PermissionsExt as _;

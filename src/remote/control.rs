@@ -195,7 +195,7 @@ pub(super) fn ssh_exec(host: &str, socket: &Path, cmd: &str) -> bool {
 /// `create_dir_all` accepted a directory another local user had made first,
 /// who could then plant a `ctl` that reads as "authenticated" or swap in a
 /// socket of their own. The create fails if the name already exists.
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 pub fn ssh_control_dir() -> Result<PathBuf> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

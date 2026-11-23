@@ -1173,6 +1173,7 @@ fn a_markdown_preview_save_keeps_the_map() {
 /// #465: a viewer runs the declared program on the file in a pane of its own,
 /// with `{file}` replaced by the file's path, and the pane takes focus. The
 /// program here is `sh`, so nothing has to be installed for the test.
+#[cfg(unix)]
 #[test]
 fn opening_a_file_in_a_viewer_runs_the_tool_on_it_in_a_new_terminal_pane() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1287,6 +1288,7 @@ fn a_viewer_asks_for_consent_before_its_first_run() {
 
 /// Allowing a viewer records the consent and resumes the open that asked;
 /// a prefs write that fails is said in the status rather than swallowed.
+#[cfg(unix)]
 #[test]
 fn allowing_a_viewer_records_consent_and_resumes_the_open() {
     const EXT: &str = r#"
@@ -1351,6 +1353,7 @@ extensions = ["csv"]
 /// The Explorer row and the palette row for a viewer are built from the
 /// same config dir the click resolves them through: a viewer installed only
 /// under the app's dir gets its row, and the row opens.
+#[cfg(unix)]
 #[test]
 fn a_viewer_row_is_built_and_resolved_through_the_same_config_dir() {
     const EXT: &str = r#"
@@ -1458,6 +1461,7 @@ fn a_vanished_viewer_is_reported_from_the_menu_and_the_consent_prompt() {
 
 /// #465: the palette row reaches the viewer route (not the MCP command path)
 /// and guards on the active file before anything is spawned.
+#[cfg(unix)]
 #[test]
 fn a_viewer_palette_row_guards_on_the_active_file() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2050,7 +2054,9 @@ fn sheet_scroll(app: &App) -> (usize, usize) {
 
 #[test]
 fn arrow_keys_page_through_an_open_pdf() {
-    require_pdf_backend();
+    if !require_pdf_backend() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("doc.pdf");
     write_three_page_pdf(&path);
@@ -2083,7 +2089,9 @@ fn arrow_keys_page_through_an_open_pdf() {
 
 #[test]
 fn a_pdf_opened_from_the_explorer_pages_with_the_arrow_keys() {
-    require_pdf_backend();
+    if !require_pdf_backend() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     write_three_page_pdf(&tmp.path().join("doc.pdf"));
 
@@ -2105,7 +2113,9 @@ fn a_pdf_opened_from_the_explorer_pages_with_the_arrow_keys() {
 
 #[test]
 fn the_wheel_pages_a_pdf_under_the_pointer() {
-    require_pdf_backend();
+    if !require_pdf_backend() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("doc.pdf");
     write_three_page_pdf(&path);
@@ -2127,7 +2137,9 @@ fn the_wheel_pages_a_pdf_under_the_pointer() {
 /// immediately (the paging test above depends on that).
 #[test]
 fn a_wheel_flick_over_a_pdf_coalesces_to_one_page_step() {
-    require_pdf_backend();
+    if !require_pdf_backend() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("doc.pdf");
     write_three_page_pdf(&path);
@@ -2149,7 +2161,9 @@ fn a_wheel_flick_over_a_pdf_coalesces_to_one_page_step() {
 /// no PDF viewer wraps on scroll.)
 #[test]
 fn the_wheel_does_not_wrap_a_pdf_at_its_ends() {
-    require_pdf_backend();
+    if !require_pdf_backend() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("doc.pdf");
     write_three_page_pdf(&path);
@@ -2176,7 +2190,9 @@ fn the_wheel_does_not_wrap_a_pdf_at_its_ends() {
 /// gesture, not a repeat - an app-global cooldown swallowed it.
 #[test]
 fn the_wheel_cooldown_does_not_leak_across_pdf_documents() {
-    require_pdf_backend();
+    if !require_pdf_backend() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let a = tmp.path().join("a.pdf");
     let b = tmp.path().join("b.pdf");
@@ -2317,7 +2333,9 @@ fn an_image_preview_swallows_navigation_without_disturbing_the_buffer() {
 /// produce two different payloads.
 #[test]
 fn turning_a_pdf_page_rebakes_the_inline_image_overlay() {
-    require_pdf_backend();
+    if !require_pdf_backend() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("doc.pdf");
     write_three_page_pdf(&path);
@@ -2356,7 +2374,9 @@ fn turning_a_pdf_page_rebakes_the_inline_image_overlay() {
 /// keyboard on the tree, so every page-turn key walked the file list instead.
 #[test]
 fn a_pdf_opened_with_one_click_in_the_explorer_pages_with_the_arrow_keys() {
-    require_pdf_backend();
+    if !require_pdf_backend() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     write_three_page_pdf(&tmp.path().join("doc.pdf"));
 
@@ -2445,7 +2465,9 @@ fn a_spreadsheet_opened_over_a_markdown_preview_takes_the_keys() {
 
 #[test]
 fn a_pdf_opened_over_a_markdown_preview_pages_with_the_keys() {
-    require_pdf_backend();
+    if !require_pdf_backend() {
+        return;
+    }
     let (_tmp, mut app) = markdown_preview_then_one_click("doc.pdf", write_three_page_pdf);
 
     app.handle_key(key(KeyCode::PageDown, KeyModifiers::NONE))
@@ -3884,7 +3906,7 @@ fn the_poll_watches_a_sqlite_tabs_log_and_no_other_tabs() {
     app.editor.open(&txt).unwrap();
     app.editor.open_in_new_tab(&db).unwrap();
     let polled = app.polled_open_file_paths();
-    let real_dir = std::fs::canonicalize(tmp.path()).unwrap();
+    let real_dir = crate::platform::fs::canonicalize(tmp.path()).unwrap();
     assert!(polled.contains(&real_dir.join("big.db-wal")), "{polled:?}");
     assert!(
         !polled.contains(&tmp.path().join("notes.txt-wal"))

@@ -260,6 +260,7 @@ fn remote_launched_drop_queues_pull_request_via_relay_log() {
 /// terminal may silently refuse — while the status line claimed success either
 /// way. The drop relay already pulls the local clipboard for paste; this is the
 /// same road in the other direction.
+#[cfg(unix)]
 #[test]
 fn copying_on_a_relay_session_pushes_the_text_to_the_local_clipboard() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -698,6 +699,7 @@ fn relay_request_ids_are_unique_per_request() {
 /// channel, drops the session, and reconnects through the normal backoff
 /// path. Before detection existed, `is_live` stayed true forever and the
 /// guest typed into a buffer whose ops reached nobody.
+#[cfg(unix)]
 #[test]
 fn losing_the_relay_reconnects_instead_of_typing_into_the_void() {
     use std::time::{Duration, Instant};
@@ -1214,6 +1216,7 @@ fn a_fleet_run_whose_thread_crashed_lets_the_next_one_run() {
 /// #363 end to end: a fleet run's results open as tiles in the Fleet tab,
 /// `s` saves the whole run to a file, `d` switches to full output, Enter
 /// opens a shell pane on the selected host, and Esc closes the tab.
+#[cfg(unix)]
 #[test]
 fn a_fleet_run_opens_tiles_that_save_and_open_a_shell() {
     let tmp = tempfile::tempdir().unwrap();

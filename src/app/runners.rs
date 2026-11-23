@@ -2637,7 +2637,11 @@ pub(super) fn stage_block(dir: &Path, interpreter: &str, code: &str) -> std::io:
         std::process::id(),
         now_millis()
     ));
-    if path.to_string_lossy().contains(['\'', '\\', '\n', '\r']) {
+    #[cfg(unix)]
+    let bad_chars = ['\'', '\\', '\n', '\r'];
+    #[cfg(not(unix))]
+    let bad_chars = ['\'', '\n', '\r'];
+    if path.to_string_lossy().contains(bad_chars) {
         return Err(std::io::Error::other("the block path cannot be quoted"));
     }
     let mut opts = std::fs::OpenOptions::new();

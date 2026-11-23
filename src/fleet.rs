@@ -736,6 +736,7 @@ mod tests {
         assert_eq!(differing_lines("a\nb\nc\n", "a\nc\n"), vec!["- b"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn localhost_runs_locally_and_is_timed() {
         let r = run_on_hosts(
@@ -754,6 +755,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn output_is_kept_when_a_background_child_holds_the_pipe() {
         let mut cmd = std::process::Command::new("sh");
@@ -763,6 +765,7 @@ mod tests {
         assert_eq!(r.output, "started");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_command_printing_more_than_a_pipe_buffer_completes() {
         let mut cmd = std::process::Command::new("sh");

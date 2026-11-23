@@ -537,10 +537,13 @@ fn hot_exit_backs_up_an_unsaved_buffer_once_it_settles() {
         Some("xalpha")
     );
     assert_eq!((tab.cursor_row, tab.cursor_col), (0, 1));
-    use std::os::unix::fs::PermissionsExt;
-    let file = &hot_exit_files(cache.path(), tmp.path())[0];
-    let mode = std::fs::metadata(file).unwrap().permissions().mode();
-    assert_eq!(mode & 0o777, 0o600, "it holds unsaved text: owner-only");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let file = &hot_exit_files(cache.path(), tmp.path())[0];
+        let mode = std::fs::metadata(file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "it holds unsaved text: owner-only");
+    }
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
     assert!(!app.quit);
 }
@@ -1369,6 +1372,7 @@ fn hot_exit_does_not_restore_another_workspaces_backup() {
 /// window on the workspace) is neither restored nor removed by this one.
 /// This one is named by its pid alone, as backups were before hot exit
 /// recorded start times: a live pid is then taken to be its croft.
+#[cfg(unix)]
 #[test]
 fn hot_exit_leaves_a_running_crofts_backup_alone() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1702,6 +1706,7 @@ fn hot_exit_restores_the_rest_of_a_backup_that_also_held_a_second_copy() {
 /// #862 hot exit negative: a backup whose pid and start time are both
 /// those of a running process is that croft's live copy: neither restored
 /// nor removed.
+#[cfg(unix)]
 #[test]
 fn hot_exit_leaves_the_backup_of_a_process_still_running_alone() {
     let tmp = tempfile::tempdir().unwrap();

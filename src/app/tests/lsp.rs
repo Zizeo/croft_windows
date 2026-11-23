@@ -4292,7 +4292,7 @@ fn a_question_without_actions_is_only_a_message() {
 #[test]
 fn show_document_opens_the_file_with_the_range_selected() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    let root = crate::platform::fs::canonicalize(tmp.path()).unwrap();
     let file = root.join("main.go");
     std::fs::write(
         &file,
@@ -4371,7 +4371,7 @@ fn show_document_answers_false_for_a_file_that_will_not_open() {
 #[test]
 fn show_document_without_take_focus_leaves_focus_where_it_was() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    let root = crate::platform::fs::canonicalize(tmp.path()).unwrap();
     let file = root.join("main.go");
     std::fs::write(&file, "package main\n").unwrap();
     let mut app = App::new(root).unwrap();
@@ -4588,11 +4588,16 @@ fn a_pushed_and_pulled_finding_with_different_data_is_one_row() {
 fn a_pulled_copy_with_related_locations_is_not_dropped_for_a_pushed_one_without() {
     use crate::lsp::manager::DiagnosticsUpdate;
     let mut store = std::collections::HashMap::new();
-    let path = PathBuf::from("/w/main.rs");
+    let path = if cfg!(windows) {
+        PathBuf::from(r"C:\w\main.rs")
+    } else {
+        PathBuf::from("/w/main.rs")
+    };
+    let uri = lsp_types::Url::from_file_path(&path).unwrap();
     let copy = |related: bool| {
         let here = lsp_types::DiagnosticRelatedInformation {
             location: lsp_types::Location {
-                uri: lsp_types::Url::parse("file:///w/main.rs").unwrap(),
+                uri: uri.clone(),
                 range: Default::default(),
             },
             message: "immutable borrow occurs here".into(),
@@ -4798,6 +4803,7 @@ fn tool_dir(tmp: &Path, tools: &[&str]) -> std::ffi::OsString {
 }
 
 /// An App with `name` open, holding a badly indented script.
+#[cfg(unix)]
 fn app_with_script(tmp: &tempfile::TempDir, name: &str) -> (App, PathBuf) {
     let file = tmp.path().join(name);
     std::fs::write(&file, "greet()   {\necho \"hello $1\"\n    }\n").unwrap();
@@ -4877,6 +4883,7 @@ fn an_empty_format_reply_from_another_server_does_not_blame_shfmt() {
 /// Register (or, with no names, unregister) bash-language-server for
 /// shell scripts, as the `lsp-bash` extension being enabled or disabled
 /// would.
+#[cfg(unix)]
 fn register_bash_servers(app: &mut App, names: &[&'static str]) {
     app.lsp
         .as_mut()

@@ -1742,8 +1742,8 @@ fn a_folder_member_resolves_in_that_workspace_folder() {
     };
     let rc = resolve(&members[1], &ctx).unwrap();
     assert_eq!(
-        rc.program.as_deref(),
-        Some(web.join("main.py").to_string_lossy().as_ref())
+        rc.program.as_deref().map(Path::new),
+        Some(web.join("main.py").as_path())
     );
     assert_eq!(
         rc.cwd.as_deref(),
@@ -2377,7 +2377,7 @@ fn cargo_builds_the_program_or_says_why_not() {
     };
     let exe = build_cargo_program(&spec, w).unwrap();
     assert!(exe.is_file(), "{}", exe.display());
-    assert_eq!(exe.file_name().unwrap(), "rc");
+    assert_eq!(exe.file_stem().unwrap(), "rc");
     std::fs::write(w.join("src/main.rs"), "fn main() { let x: u8 = \"no\"; }\n").unwrap();
     let err = build_cargo_program(&spec, w).unwrap_err();
     assert!(

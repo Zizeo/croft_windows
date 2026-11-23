@@ -92,8 +92,20 @@ pub fn locations(result: &Value) -> Vec<(PathBuf, u32, u32)> {
 mod tests {
     use super::*;
 
+    fn test_path(p: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:{p}"))
+        } else {
+            PathBuf::from(p)
+        }
+    }
+
+    fn test_uri(p: &str) -> String {
+        Url::from_file_path(test_path(p)).unwrap().into()
+    }
+
     fn uri() -> Url {
-        Url::from_file_path("/w/src/main.rs").unwrap()
+        Url::from_file_path(test_path("/w/src/main.rs")).unwrap()
     }
 
     /// #1626: the caret requests carry the document and position, the
@@ -101,7 +113,7 @@ mod tests {
     #[test]
     fn each_request_carries_the_params_rust_analyzer_reads() {
         let p = RaRequest::ExpandMacro.params(&uri(), 4, 9);
-        assert_eq!(p["textDocument"]["uri"], "file:///w/src/main.rs");
+        assert_eq!(p["textDocument"]["uri"], uri().as_str());
         assert_eq!(p["position"]["line"], 4);
         assert_eq!(p["position"]["character"], 9);
         assert_eq!(
@@ -110,7 +122,7 @@ mod tests {
         );
         let cargo = RaRequest::OpenCargoToml.params(&uri(), 1, 2);
         assert!(cargo.get("position").is_none());
-        assert_eq!(cargo["textDocument"]["uri"], "file:///w/src/main.rs");
+        assert_eq!(cargo["textDocument"]["uri"], uri().as_str());
         assert!(RaRequest::ReloadWorkspace.params(&uri(), 1, 2).is_null());
         assert_eq!(RaRequest::ExpandMacro.method(), "rust-analyzer/expandMacro");
     }
@@ -140,23 +152,17 @@ mod tests {
     #[test]
     fn locations_read_a_location_a_list_and_location_links() {
         let loc = json!({
-            "uri": "file:///w/src/lib.rs",
+            "uri": test_uri("/w/src/lib.rs"),
             "range": { "start": { "line": 3, "character": 4 }, "end": { "line": 3, "character": 9 } },
         });
-        assert_eq!(
-            locations(&loc),
-            vec![(PathBuf::from("/w/src/lib.rs"), 3, 4)]
-        );
+        assert_eq!(locations(&loc), vec![(test_path("/w/src/lib.rs"), 3, 4)]);
         assert_eq!(locations(&json!([loc, loc])).len(), 2);
         let link = json!([{
-            "targetUri": "file:///w/Cargo.toml",
+            "targetUri": test_uri("/w/Cargo.toml"),
             "targetRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 9, "character": 0 } },
             "targetSelectionRange": { "start": { "line": 1, "character": 7 }, "end": { "line": 1, "character": 12 } },
         }]);
-        assert_eq!(
-            locations(&link),
-            vec![(PathBuf::from("/w/Cargo.toml"), 1, 7)]
-        );
+        assert_eq!(locations(&link), vec![(test_path("/w/Cargo.toml"), 1, 7)]);
     }
 
     /// #1626 negative: `null`, or a location outside any file, jumps

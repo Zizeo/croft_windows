@@ -3037,7 +3037,7 @@ pub fn parse_dropped_paths(s: &str) -> Vec<PathBuf> {
 pub fn parse_foreign_dropped_paths(s: &str) -> Vec<PathBuf> {
     parsed_drop_tokens(s)
         .into_iter()
-        .filter(|p| p.is_absolute())
+        .filter(|p| p.is_absolute() || p.has_root())
         .filter(|p| !is_iterm2_inline_image_drop(p))
         .collect()
 }
@@ -3062,7 +3062,7 @@ pub(super) fn is_pure_path_payload(s: &str) -> bool {
     }
     tokens.iter().all(|t| {
         normalise_dropped_token(t)
-            .map(|p| p.is_absolute())
+            .map(|p| p.is_absolute() || p.has_root())
             .unwrap_or(false)
     })
 }
@@ -3099,7 +3099,9 @@ pub(super) fn is_iterm2_inline_image_drop(p: &Path) -> bool {
     let parent = p.parent().unwrap_or(p);
     let parent_str = parent.to_string_lossy();
     parent_str.contains("/T/")
+        || parent_str.contains("\\T\\")
         || parent_str.contains("/TemporaryItems")
+        || parent_str.contains("\\TemporaryItems")
         || parent_str.starts_with("/tmp")
         || parent_str.starts_with("/var/folders")
         || parent_str.starts_with("/private/var/folders")
@@ -3185,15 +3187,39 @@ pub(super) fn normalise_dropped_token(raw: &str) -> Option<PathBuf> {
         // screen and open the wrong thing.
         let decoded = crate::shell_integration::percent_decode(rest.as_bytes());
         s = String::from_utf8(decoded).ok()?;
-    }
-    let mut unescaped = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\'
-            && let Some(next) = chars.next()
+        let bytes = s.as_bytes();
+        if bytes.len() >= 4
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b':'
+            && matches!(bytes[3], b'/' | b'\\')
         {
-            unescaped.push(next);
-            continue;
+            s.remove(0);
+        }
+    }
+    let bytes = s.as_bytes();
+    let is_windows_path = (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/'))
+        || s.starts_with("\\\\");
+    let mut unescaped = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if is_windows_path {
+                if chars.peek() == Some(&' ') {
+                    unescaped.push(' ');
+                    chars.next();
+                    continue;
+                }
+                unescaped.push('\\');
+                continue;
+            }
+            if let Some(next) = chars.next() {
+                unescaped.push(next);
+                continue;
+            }
         }
         unescaped.push(c);
     }

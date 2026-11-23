@@ -335,16 +335,22 @@ mod tests {
         let loaded = SessionState::load(&path).expect("load");
         assert_eq!(state, loaded);
         // It carries unsaved text: owner-only.
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn handoff_path_is_pid_scoped_under_cache_croft() {
         let p = handoff_path();
-        assert!(p.to_string_lossy().contains(".cache/croft"));
+        assert!(
+            p.parent()
+                .is_some_and(|d| d.ends_with(Path::new(".cache").join("croft")))
+        );
         assert!(
             p.file_name()
                 .unwrap()

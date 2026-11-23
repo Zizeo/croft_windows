@@ -88,6 +88,7 @@ pub(super) fn new_file_in_existing_dir(
 ) -> Option<(PathBuf, std::ffi::OsString)> {
     if err.kind() != std::io::ErrorKind::NotFound
         || path.as_os_str().as_encoded_bytes().ends_with(b"/")
+        || (cfg!(windows) && path.as_os_str().as_encoded_bytes().ends_with(b"\\"))
     {
         return None;
     }

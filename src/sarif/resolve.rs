@@ -166,7 +166,13 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
         if parsed.scheme() != "file" {
             return None;
         }
-        return parsed.to_file_path().ok();
+        if let Ok(path) = parsed.to_file_path() {
+            return Some(path);
+        }
+        if matches!(parsed.host_str(), None | Some("") | Some("localhost")) {
+            return Some(PathBuf::from(percent_decode(parsed.path())));
+        }
+        return None;
     }
     Some(PathBuf::from(percent_decode(uri)))
 }
@@ -268,7 +274,7 @@ impl Resolver {
         // 2. The log's own bases.
         let expanded = expand(run, loc)?;
         if let Some(p) = uri_to_path(&expanded.uri) {
-            if p.is_absolute() {
+            if p.is_absolute() || p.has_root() {
                 if let Some(p) = found(p) {
                     return Some(p);
                 }

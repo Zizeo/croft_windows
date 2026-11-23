@@ -1409,7 +1409,10 @@ fn seeding_search_cannot_leave_a_stale_field_selection() {
 fn search_honours_the_vscode_exclude_settings() {
     let (mut app, t) = app_with_vscode_excludes();
     assert_eq!(
-        search_hit_paths(&mut app, t.path(), "parse_order"),
+        search_hit_paths(&mut app, t.path(), "parse_order")
+            .into_iter()
+            .map(|s| s.replace('\\', "/"))
+            .collect::<Vec<_>>(),
         vec![String::from("src/orders.py")]
     );
 }

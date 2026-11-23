@@ -1836,8 +1836,11 @@ mod tests {
     #[test]
     fn argument_lists_name_the_database_query_and_output() {
         let (q, db) = (Path::new("/w/q.ql"), Path::new("/dbs/app"));
+        let norm = |v: Vec<String>| -> Vec<String> {
+            v.into_iter().map(|s| s.replace('\\', "/")).collect()
+        };
         assert_eq!(
-            analyze_args(q, db, Path::new("/out/r.sarif")),
+            norm(analyze_args(q, db, Path::new("/out/r.sarif"))),
             vec![
                 "database",
                 "analyze",
@@ -1851,7 +1854,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            run_args(q, db, Path::new("/out/r.bqrs")),
+            norm(run_args(q, db, Path::new("/out/r.bqrs"))),
             vec![
                 "query",
                 "run",
@@ -1863,10 +1866,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            log_summary_args(
+            norm(log_summary_args(
                 &evaluator_log(Path::new("/out/results.csv")),
                 &evaluator_log_summary(Path::new("/out/results.csv"))
-            ),
+            )),
             vec![
                 "generate",
                 "log-summary",
@@ -1876,10 +1879,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            log_predicates_args(
+            norm(log_predicates_args(
                 &evaluator_log(Path::new("/out/results.csv")),
                 &evaluator_log_predicates(Path::new("/out/results.csv"))
-            ),
+            )),
             vec![
                 "generate",
                 "log-summary",
@@ -2002,7 +2005,13 @@ mod tests {
                     p.language.as_deref(),
                     p.queries
                         .iter()
-                        .map(|q| q.strip_prefix(&p.dir).unwrap().display().to_string())
+                        .map(|q| {
+                            q.strip_prefix(&p.dir)
+                                .unwrap()
+                                .display()
+                                .to_string()
+                                .replace('\\', "/")
+                        })
                         .collect(),
                 )
             })

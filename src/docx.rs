@@ -669,7 +669,7 @@ mod tests {
         // Pad past the cap without building a real many-member archive:
         // the gate reads the file's length, which is what a crafted
         // central directory inflates.
-        let f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
         f.set_len(MAX_DOC_LISTING_BYTES + 1).unwrap();
         // Both bounds, so the refusal can only be the NEW cap. Past the
         // listing cap says the gate under test should fire; still under
@@ -710,7 +710,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("big.docx");
         docx_fixture(&p);
-        let f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
         f.set_len(MAX_DOC_LISTING_BYTES + 1).unwrap();
 
         assert!(

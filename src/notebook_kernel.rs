@@ -777,13 +777,20 @@ mod tests {
         std::fs::create_dir_all(py.parent().unwrap()).unwrap();
         std::fs::write(&py, "").unwrap();
         let c = python_candidates(dir.path(), None);
-        assert_eq!(c, vec![py, PathBuf::from("python3")]);
+        assert_eq!(
+            c,
+            vec![
+                py,
+                PathBuf::from(if cfg!(windows) { "python" } else { "python3" })
+            ]
+        );
     }
 
     /// Runs a real kernel. Set `CROFT_TEST_JUPYTER_PYTHON` to the `python`
     /// of a venv with ipykernel; the test links that whole venv in as the
     /// workspace's `.venv` (a venv's python moved out of its venv is the
     /// bare base interpreter).
+    #[cfg(unix)]
     #[test]
     #[ignore = "needs a Python with ipykernel; set CROFT_TEST_JUPYTER_PYTHON"]
     fn a_real_kernel_runs_prints_and_survives_an_interrupt() {

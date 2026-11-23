@@ -1892,9 +1892,23 @@ mod tests {
     }
 
     fn fake_output(success: bool, stderr: &str) -> std::process::Output {
+        #[cfg(unix)]
         use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
         std::process::Output {
-            status: std::process::ExitStatus::from_raw(if success { 0 } else { 256 }),
+            status: std::process::ExitStatus::from_raw(if success {
+                0
+            } else {
+                #[cfg(unix)]
+                {
+                    256
+                }
+                #[cfg(windows)]
+                {
+                    1
+                }
+            }),
             stdout: Vec::new(),
             stderr: stderr.as_bytes().to_vec(),
         }
@@ -2052,9 +2066,12 @@ mod tests {
             script,
             "the payload is written unaltered"
         );
-        let out = Command::new(&target).output().expect("run the raw binary");
-        assert!(out.status.success(), "the raw binary is executable");
-        assert!(String::from_utf8_lossy(&out.stdout).contains("marksman-ok"));
+        #[cfg(unix)]
+        {
+            let out = Command::new(&target).output().expect("run the raw binary");
+            assert!(out.status.success(), "the raw binary is executable");
+            assert!(String::from_utf8_lossy(&out.stdout).contains("marksman-ok"));
+        }
     }
 
     /// End-to-end exercise of the raw path against marksman's real release,
@@ -2125,12 +2142,15 @@ mod tests {
             target.is_file(),
             "the binary lands at <dir>/<bin>: {target:?}"
         );
-        let out = Command::new(&target)
-            .output()
-            .expect("run the extracted binary");
+        #[cfg(unix)]
+        {
+            let out = Command::new(&target)
+                .output()
+                .expect("run the extracted binary");
+            assert!(out.status.success(), "the extracted binary is executable");
+            assert!(String::from_utf8_lossy(&out.stdout).contains("csvlens-ok"));
+        }
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(out.status.success(), "the extracted binary is executable");
-        assert!(String::from_utf8_lossy(&out.stdout).contains("csvlens-ok"));
     }
 
     /// A valid archive that expands past the ceiling must not land: the
@@ -2480,6 +2500,7 @@ mod tests {
     }
 
     /// An executable at `dir/name`.
+    #[cfg(unix)]
     fn put_exe(dir: &Path, name: &str, exec: bool) {
         use std::os::unix::fs::PermissionsExt;
         let p = dir.join(name);
@@ -2491,6 +2512,7 @@ mod tests {
     /// Ubuntu's `apt install clangd-18` leaves only `/usr/bin/clangd-18`; the
     /// newest such executable on PATH is the toolchain copy croft uses
     /// (#1211).
+    #[cfg(unix)]
     #[test]
     fn a_versioned_binary_on_path_is_found_newest_first() {
         let a = tempfile::tempdir().unwrap();
@@ -2513,6 +2535,7 @@ mod tests {
 
     /// A relative PATH entry still yields an absolute path, so the server
     /// launches from the workspace root, not croft's cwd.
+    #[cfg(unix)]
     #[test]
     fn a_versioned_binary_on_a_relative_path_entry_is_returned_absolute() {
         let a = tempfile::tempdir().unwrap();
@@ -2532,6 +2555,7 @@ mod tests {
     /// Negative: a different tool that shares the prefix (`clangd-tidy`,
     /// `clangd-indexer`), a bare `clangd-`, a fused `clangd18` and a
     /// non-executable `clangd-20` are never taken for clangd.
+    #[cfg(unix)]
     #[test]
     fn only_a_numbered_executable_counts_as_a_versioned_binary() {
         let a = tempfile::tempdir().unwrap();

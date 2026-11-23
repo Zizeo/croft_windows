@@ -499,7 +499,9 @@ fn clicking_a_related_location_row_opens_that_place() {
     app.lsp_diagnostics.insert(main, by_server);
     app.rebuild_problems();
     assert_eq!(
-        app.problems.groups()[0].items[0].related[0].rel_path,
+        app.problems.groups()[0].items[0].related[0]
+            .rel_path
+            .replace('\\', "/"),
         "src/lib.rs"
     );
     app.bottom_panel_tab = BottomPanelTab::Problems;

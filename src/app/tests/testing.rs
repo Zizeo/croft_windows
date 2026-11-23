@@ -1189,6 +1189,7 @@ fn a_coverage_report_marks_the_gutter_and_dims_after_an_edit() {
 /// branch-free lines red, and reports a percentage. Set
 /// `CROFT_TEST_PYTEST_COV_PYTHON` to a venv python with pytest and
 /// pytest-cov; the test links that venv in as the project's `.venv`.
+#[cfg(unix)]
 #[test]
 #[ignore = "needs pytest and pytest-cov; set CROFT_TEST_PYTEST_COV_PYTHON"]
 fn a_real_pytest_cov_run_marks_the_covered_file() {
@@ -1639,6 +1640,7 @@ fn show_coverage_report_opens_the_last_run_as_a_tab() {
 /// #263 against real pytest-cov: "Run Test at Cursor with Coverage" runs
 /// only the caret's test, so code that only another test reaches stays
 /// uncovered. Set `CROFT_TEST_PYTEST_COV_PYTHON` as for the whole-run test.
+#[cfg(unix)]
 #[test]
 #[ignore = "needs pytest and pytest-cov; set CROFT_TEST_PYTEST_COV_PYTHON"]
 fn a_real_scoped_coverage_run_covers_only_the_test_at_the_cursor() {

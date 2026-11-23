@@ -170,6 +170,7 @@ mod tests {
         assert_eq!(any_host_signed_in(&stale), Ok(false));
     }
 
+    #[cfg(unix)]
     #[test]
     fn gh_exit_code_4_means_signed_out() {
         let status = |code: &str| {

@@ -5,7 +5,7 @@ use super::*;
 
 /// Why a local static build for `triple` can't run, or `None` when it can.
 /// Shared by the remote installer and dev containers (#617).
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 pub(crate) fn cross_build_unavailable(triple: &str) -> Option<String> {
     if let Some(reason) = cross_compile_unavailable_reason() {
         return Some(reason);
@@ -170,7 +170,7 @@ pub(super) fn find_executable_in_dirs(tool: &str, dirs: &[PathBuf]) -> Option<Pa
     crate::platform::env::find_executable_in(tool, dirs)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn is_executable_file(path: &Path) -> bool {
     crate::platform::env::is_executable_file(path)
 }

@@ -342,3 +342,28 @@ jobs:
           echo "Using NDK at $ANDROID_NDK_HOME"
           test -d "$ANDROID_NDK_HOME"
           cargo ndk --target arm64-v8a --platform 24 build --locked --bin croft
+
+  windows:
+    name: windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: windows
+      - name: Check library, binary, and test targets
+        run: |
+          cargo check --locked --bin croft --tests
+          cargo check --locked --tests
+      - name: Build binary
+        run: cargo build --locked --bin croft
+      - name: Run platform tests
+        run: cargo test --locked --test platform
+      - name: Run unit tests
+        env:
+          RUST_TEST_THREADS: 4
+        run: cargo test --locked --bin croft
+      - name: Run CLI integration tests
+        run: cargo test --locked --test cli

@@ -84,9 +84,9 @@ fn fs_watcher_does_not_deliver_events_from_target_or_node_modules_subtrees() {
     std::fs::create_dir(&src_raw).unwrap();
     std::fs::create_dir(&target_raw).unwrap();
     std::fs::create_dir(&node_modules_raw).unwrap();
-    let src = src_raw.canonicalize().unwrap();
-    let target = target_raw.canonicalize().unwrap();
-    let node_modules = node_modules_raw.canonicalize().unwrap();
+    let src = crate::platform::fs::canonicalize(&src_raw).unwrap();
+    let target = crate::platform::fs::canonicalize(&target_raw).unwrap();
+    let node_modules = crate::platform::fs::canonicalize(&node_modules_raw).unwrap();
 
     let (_debouncer, rx) = super::fs_watch::FsWatch::spawn_watcher(tmp.path())
         .expect("watcher must start cleanly with noise dirs present");
@@ -106,7 +106,16 @@ fn fs_watcher_does_not_deliver_events_from_target_or_node_modules_subtrees() {
     while let Ok(batch) = rx.try_recv() {
         for ev in batch.unwrap_or_default() {
             for path in &ev.event.paths {
-                if path.starts_with(&target) || path.starts_with(&node_modules) {
+                // On Windows, ReadDirectoryChangesW on `root` reports parent-dir
+                // metadata ticks on the child folder name itself (`root\target`),
+                // which `FsWatch::drain` filters; verify nothing inside the
+                // noise subtree escaped into the debouncer.
+                #[cfg(windows)]
+                let is_noise_hit = (path != &target && path.starts_with(&target))
+                    || (path != &node_modules && path.starts_with(&node_modules));
+                #[cfg(not(windows))]
+                let is_noise_hit = path.starts_with(&target) || path.starts_with(&node_modules);
+                if is_noise_hit {
                     noise_events.push(path.clone());
                 }
             }
@@ -152,8 +161,8 @@ fn fs_watcher_prunes_a_go_module_cache_below_the_workspace_root() {
     let src_raw = tmp.path().join("go/cmd");
     std::fs::create_dir_all(&cache_raw).unwrap();
     std::fs::create_dir_all(&src_raw).unwrap();
-    let cache = cache_raw.canonicalize().unwrap();
-    let src = src_raw.canonicalize().unwrap();
+    let cache = crate::platform::fs::canonicalize(&cache_raw).unwrap();
+    let src = crate::platform::fs::canonicalize(&src_raw).unwrap();
 
     let (_debouncer, rx) = super::fs_watch::FsWatch::spawn_watcher(tmp.path())
         .expect("watcher must start cleanly with a go module cache present");
@@ -219,8 +228,8 @@ fn fs_watcher_still_watches_a_workspace_whose_own_path_is_noise_named() {
     let root_raw = tmp.path().join("build/myapp");
     let src_raw = root_raw.join("src");
     std::fs::create_dir_all(&src_raw).unwrap();
-    let root = root_raw.canonicalize().unwrap();
-    let src = src_raw.canonicalize().unwrap();
+    let root = crate::platform::fs::canonicalize(&root_raw).unwrap();
+    let src = crate::platform::fs::canonicalize(&src_raw).unwrap();
 
     let (_debouncer, rx) = super::fs_watch::FsWatch::spawn_watcher(&root)
         .expect("watcher must start for a root under a noise-named ancestor");
@@ -368,9 +377,9 @@ fn fs_watcher_prunes_noise_dirs_nested_below_the_workspace_root() {
     std::fs::create_dir_all(&src_raw).unwrap();
     std::fs::create_dir_all(&node_modules_raw).unwrap();
     std::fs::create_dir_all(&git_raw).unwrap();
-    let src = src_raw.canonicalize().unwrap();
-    let node_modules = node_modules_raw.canonicalize().unwrap();
-    let git = git_raw.canonicalize().unwrap();
+    let src = crate::platform::fs::canonicalize(&src_raw).unwrap();
+    let node_modules = crate::platform::fs::canonicalize(&node_modules_raw).unwrap();
+    let git = crate::platform::fs::canonicalize(&git_raw).unwrap();
 
     let (_debouncer, rx) = super::fs_watch::FsWatch::spawn_watcher(tmp.path())
         .expect("watcher must start cleanly with nested noise dirs present");
@@ -390,7 +399,15 @@ fn fs_watcher_prunes_noise_dirs_nested_below_the_workspace_root() {
     while let Ok(batch) = rx.try_recv() {
         for ev in batch.unwrap_or_default() {
             for path in &ev.event.paths {
-                if path.starts_with(&node_modules) || path.starts_with(&git) {
+                // On Windows, ReadDirectoryChangesW emits parent-dir mtime ticks on
+                // child folder names themselves (`repo\node_modules`, `repo\.git`);
+                // verify nothing inside those subtrees enters the debouncer.
+                #[cfg(windows)]
+                let is_noise_hit = (path != &node_modules && path.starts_with(&node_modules))
+                    || (path != &git && path.starts_with(&git));
+                #[cfg(not(windows))]
+                let is_noise_hit = path.starts_with(&node_modules) || path.starts_with(&git);
+                if is_noise_hit {
                     noise_events.push(path.clone());
                 }
             }
@@ -890,7 +907,23 @@ fn watched_file_events_cover_a_moved_directory_and_an_atomic_save() {
     let mut app = App::new(root.to_path_buf()).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     app.fs_watch.set_test_events(rx);
+    #[cfg(not(windows))]
     std::fs::rename(root.join("old"), root.join("new")).unwrap();
+    #[cfg(windows)]
+    {
+        let mut res = std::fs::rename(root.join("old"), root.join("new"));
+        for _ in 0..40 {
+            if !res
+                .as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            res = std::fs::rename(root.join("old"), root.join("new"));
+        }
+        res.unwrap();
+    }
     std::fs::write(root.join("fresh.rs"), "y").unwrap();
     let rename = |mode, paths: &[&str]| {
         let mut ev = NotifyEvent::new(EventKind::Modify(ModifyKind::Name(mode)));
@@ -2166,6 +2199,7 @@ fn auto_save_never_writes_a_write_protected_file() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_save_refused_for_permission_offers_sudo_and_the_next_press_stages_it() {
     // Root may write anything, so the kernel's refusal is handed in as the
@@ -2217,6 +2251,7 @@ fn a_save_refused_for_permission_offers_sudo_and_the_next_press_stages_it() {
     assert_eq!(app.status, "Saved hosts with sudo");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_sudo_save_waits_while_the_file_holds_anything_else() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2231,6 +2266,7 @@ fn a_sudo_save_waits_while_the_file_holds_anything_else() {
     assert_eq!(app.pending_sudo_saves.len(), 1, "still waiting on tee");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_sudo_save_over_an_external_change_asks_first() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2257,6 +2293,7 @@ fn a_sudo_save_over_an_external_change_asks_first() {
     assert_eq!(app.pending_sudo_saves.len(), 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_second_sudo_save_waits_for_the_first_ones_terminal() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2285,6 +2322,7 @@ fn a_second_sudo_save_waits_for_the_first_ones_terminal() {
     assert_eq!(app.pending_sudo_saves[0].1, b"bca\n".to_vec());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_finished_sudo_save_runs_the_usual_save_follow_ups() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2579,6 +2617,7 @@ fn write_private_refuses_a_symlinked_dir_and_tightens_a_loose_one() {
 /// owner-side open would follow the link — disclosing (and editing) files
 /// beyond the share. Symlinked keys must resolve inside the workspace or be
 /// declined; intra-workspace symlinks keep working.
+#[cfg(unix)]
 #[test]
 fn a_symlinked_wire_file_key_cannot_escape_the_workspace() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2614,6 +2653,7 @@ fn a_symlinked_wire_file_key_cannot_escape_the_workspace() {
 /// box; here no owner serves the file (the host was seated by hand, no
 /// self-appointment), so the words fall back to the Navigator OUTPUT
 /// channel rather than being lost.
+#[cfg(unix)]
 #[test]
 fn cmd_k_y_yields_the_active_file_and_commentary_reaches_output() {
     use std::time::{Duration, Instant};
@@ -3400,6 +3440,7 @@ fn a_view_request_for_a_directory_is_refused_with_a_reason_the_client_prints() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn the_socket_sweep_removes_a_dead_crofts_file_and_spares_a_live_one() {
     // Sockets are not auto-unlinked, so a crashed croft leaves its file for
@@ -3544,7 +3585,7 @@ fn one_drain_answers_every_client_already_waiting() {
 
     let mut clients = Vec::new();
     for target in [&first, &second] {
-        let mut c = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let mut c = crate::platform::ipc::LocalStream::connect(&sock).unwrap();
         // A read timeout, so losing FAILS rather than hangs: a drain that
         // serves only client 0 still passes the assert below, because
         // something opened, and an untimed `read_line` on client 1 would then
@@ -3681,7 +3722,7 @@ fn a_client_that_never_sends_a_newline_is_refused_by_the_deadline() {
     let served = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let dribbling = std::sync::Arc::clone(&served);
     let dribbler = std::thread::spawn(move || {
-        let Ok(mut c) = std::os::unix::net::UnixStream::connect(&sock2) else {
+        let Ok(mut c) = crate::platform::ipc::LocalStream::connect(&sock2) else {
             return;
         };
         // Continuously, and INSIDE the budget. Writing once and going quiet
@@ -3750,7 +3791,7 @@ fn a_non_blocking_accepted_stream_is_still_answered() {
     let sock2 = sock.clone();
     let target2 = target.clone();
     let client = std::thread::spawn(move || {
-        let mut c = std::os::unix::net::UnixStream::connect(&sock2).unwrap();
+        let mut c = crate::platform::ipc::LocalStream::connect(&sock2).unwrap();
         // Connect, PAUSE, then write. The pause is what makes the blocking
         // mode observable at all: a client that writes before the server
         // accepts leaves the bytes sitting in the socket buffer, so the first
@@ -3776,6 +3817,7 @@ fn a_non_blocking_accepted_stream_is_still_answered() {
     let stream = accept_when_ready(listener);
     // The state macOS hands production, forced here so Linux exercises it too.
     stream.set_nonblocking(true).unwrap();
+    #[cfg(unix)]
     let probe = stream.try_clone().expect("a dup of the accepted stream");
 
     // The client thread sleeps before it writes, so this deadline is racing a
@@ -3786,19 +3828,22 @@ fn a_non_blocking_accepted_stream_is_still_answered() {
     let (reply, opened) = app.answer_view_client(stream, deadline);
     let _ = client.join();
 
-    let flags = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&probe), libc::F_GETFL) };
-    assert!(
-        flags >= 0,
-        "F_GETFL on the dup failed: {}",
-        std::io::Error::last_os_error()
-    );
-    assert_eq!(
-        flags & libc::O_NONBLOCK,
-        0,
-        "production must clear O_NONBLOCK on an accepted stream: macOS inherits \
-         the listener's flags across accept, and a non-blocking read there \
-         returns before the client has written"
-    );
+    #[cfg(unix)]
+    {
+        let flags = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&probe), libc::F_GETFL) };
+        assert!(
+            flags >= 0,
+            "F_GETFL on the dup failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "production must clear O_NONBLOCK on an accepted stream: macOS inherits \
+             the listener's flags across accept, and a non-blocking read there \
+             returns before the client has written"
+        );
+    }
 
     assert_eq!(
         reply,
@@ -3943,7 +3988,7 @@ fn the_view_socket_is_bound_before_the_first_pane_is_spawned() {
     let files = app_source_files();
     let src = files
         .iter()
-        .map(|(_, text)| text.as_str())
+        .map(|(_, text)| text.replace("\r\n", "\n"))
         .find(|text| text.contains("pub fn new(root: PathBuf)"))
         .expect("App::new must exist for this guard to mean anything");
     let ctor = src.find("pub fn new(root: PathBuf)").unwrap();
@@ -3986,6 +4031,7 @@ fn the_view_socket_is_bound_before_the_first_pane_is_spawned() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_view_request_for_a_fifo_is_refused_rather_than_opened() {
     // `apply_view_request` refused only directories, so a FIFO passed the
@@ -4260,6 +4306,7 @@ fn a_missing_file_asks_to_locate_it_and_the_mapping_is_learned_and_kept() {
 /// #365: a viewed-state read that began while a write was in flight may
 /// have seen GitHub before the write landed. Its answer must not undo the
 /// mark, even after the write finished and a refresh replaced the view.
+#[cfg(unix)]
 #[test]
 fn a_read_that_began_before_a_write_settled_does_not_undo_it() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -4818,7 +4865,7 @@ fn serve_view_request_1606(
     path: &std::path::Path,
     at: Option<(usize, usize)>,
 ) -> crate::view_ipc::ViewReply {
-    let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (mut client, server) = crate::platform::ipc::LocalStream::pair().unwrap();
     let mut line = serde_json::to_vec(&crate::view_ipc::ViewRequest::at(path, at)).unwrap();
     line.push(b'\n');
     std::io::Write::write_all(&mut client, &line).unwrap();

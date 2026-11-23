@@ -253,6 +253,17 @@ mod win {
             Ok(Self { inner })
         }
 
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub fn pair() -> io::Result<(Self, Self)> {
+            let listener = TcpListener::bind(("127.0.0.1", 0))?;
+            let addr = listener.local_addr()?;
+            let a = TcpStream::connect(addr)?;
+            let (b, _) = listener.accept()?;
+            let _ = a.set_nodelay(true);
+            let _ = b.set_nodelay(true);
+            Ok((Self { inner: a }, Self { inner: b }))
+        }
+
         pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
             self.inner.set_nonblocking(nonblocking)
         }

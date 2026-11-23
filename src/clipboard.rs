@@ -717,8 +717,10 @@ pub(crate) mod macos {
 #[cfg(test)]
 pub(crate) mod test_clip {
     use std::cell::{Cell, RefCell};
+    #[cfg(unix)]
     use std::sync::{Mutex, MutexGuard};
 
+    #[cfg(unix)]
     pub(crate) static CLIP_LOCK: Mutex<()> = Mutex::new(());
 
     thread_local! {
@@ -824,6 +826,7 @@ pub(crate) mod test_clip {
     /// on the developer's real clipboard for the next paste to surface.
     /// (On a headless box with no clipboard backend the snapshot is `None`
     /// and restore is a harmless no-op.)
+    #[cfg(unix)]
     pub(crate) struct ClipboardTestGuard {
         _mutex: MutexGuard<'static, ()>,
         /// Cross-process exclusion: a process-per-test runner
@@ -845,6 +848,7 @@ pub(crate) mod test_clip {
         snapshot: Option<String>,
     }
 
+    #[cfg(unix)]
     impl ClipboardTestGuard {
         pub(crate) fn acquire() -> Self {
             let mutex = CLIP_LOCK
@@ -880,6 +884,7 @@ pub(crate) mod test_clip {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for ClipboardTestGuard {
         fn drop(&mut self) {
             #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -889,7 +894,7 @@ pub(crate) mod test_clip {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn lock_clipboard_for_test() -> test_clip::ClipboardTestGuard {
     test_clip::ClipboardTestGuard::acquire()
 }
@@ -1039,7 +1044,10 @@ mod linux_backend_tests {
 /// fail soft — `false` / `None`, never a panic — so the caller's OSC-52
 /// fallback can take over. Mirrors the macOS and Linux coverage above for the
 /// "no native backend" arm of the cfg cascade.
-#[cfg(all(test, not(any(target_os = "macos", target_os = "linux"))))]
+#[cfg(all(
+    test,
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
+))]
 mod other_os_backend_tests {
     use super::*;
 

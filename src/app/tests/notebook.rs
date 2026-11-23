@@ -481,6 +481,7 @@ fn select_kernel_lists_the_installed_kernels_and_switches_the_notebook() {
 /// Acceptance for #355 against a real kernel: `print(1+1)` shows `2`, and
 /// after Save the file holds the output in the standard format. Set
 /// `CROFT_TEST_JUPYTER_PYTHON` to a venv python with ipykernel.
+#[cfg(unix)]
 #[test]
 #[ignore = "needs a Python with ipykernel; set CROFT_TEST_JUPYTER_PYTHON"]
 fn a_real_kernel_runs_a_cell_and_save_persists_the_output() {
@@ -516,6 +517,7 @@ fn a_real_kernel_runs_a_cell_and_save_persists_the_output() {
 /// matplotlib plot arrives as an `image/png` display, is saved in the file,
 /// and the preview places it as an image block, the path Kitty and iTerm2
 /// hosts draw. Needs matplotlib next to ipykernel.
+#[cfg(unix)]
 #[test]
 #[ignore = "needs a Python with ipykernel and matplotlib; set CROFT_TEST_JUPYTER_PYTHON"]
 fn a_real_kernel_matplotlib_figure_becomes_an_inline_image() {

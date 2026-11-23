@@ -339,9 +339,12 @@ mod tests {
         let path = own_path(dir.path(), root.path());
         backup(root.path()).save(&path).unwrap();
         assert_eq!(Backup::load(&path).unwrap(), backup(root.path()));
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 
     #[test]
@@ -355,8 +358,10 @@ mod tests {
 
     /// A process this test starts and owns, so its start time is readable
     /// wherever the test runs; killed when dropped.
+    #[cfg(unix)]
     struct Running(std::process::Child);
 
+    #[cfg(unix)]
     impl Running {
         fn start() -> Self {
             Self(
@@ -371,6 +376,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for Running {
         fn drop(&mut self) {
             let _ = self.0.kill();
@@ -378,6 +384,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn only_the_backups_of_gone_crofts_are_orphaned() {
         let root = tempfile::tempdir().unwrap();
@@ -577,6 +584,7 @@ mod tests {
     /// writes to the cache, and on a clean exit removes only that copy)
     /// stays in the cache; moving it would leave a copy behind that the next
     /// launch restores as a crash. A gone croft's backup moves.
+    #[cfg(unix)]
     #[test]
     fn move_tree_leaves_a_running_crofts_backup_in_the_cache() {
         let cache = tempfile::tempdir().unwrap();

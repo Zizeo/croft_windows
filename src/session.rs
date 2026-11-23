@@ -640,7 +640,11 @@ mod tests {
         let b = socket_path(Path::new("/work/other"));
         assert_eq!(a1, a2);
         assert_ne!(a1, b);
-        assert!(a1.to_string_lossy().contains(".cache/croft/sessions"));
+        assert!(
+            a1.to_string_lossy()
+                .replace('\\', "/")
+                .contains(".cache/croft/sessions")
+        );
         assert_eq!(a1.extension().and_then(|e| e.to_str()), Some("sock"));
     }
 

@@ -181,7 +181,7 @@ pub(super) fn handle_claude_event(
 /// 0:0 on EVERY turn;
 /// "linger" refuses to exit on stdin EOF. Crate-visible so the App's
 /// navigator tests drive the same fake.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) const FAKE_CLAUDE: &str = r#"
 import json, sys
 

@@ -3772,7 +3772,7 @@ fn repositories_overview_lists_every_folder_and_a_pin_overrides_the_follow() {
 
     let mut app = App::new(a.clone()).unwrap();
     app.add_workspace_folder(b.clone());
-    let b_canon = b.canonicalize().unwrap();
+    let b_canon = crate::platform::fs::canonicalize(&b).unwrap();
 
     // Both workers report their repos; the per-frame sync builds the rows.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -3865,7 +3865,7 @@ fn clicking_a_repositories_overview_row_switches_the_panel() {
     let b = mk_repo("repb", "trunk");
     let mut app = App::new(a.clone()).unwrap();
     app.add_workspace_folder(b.clone());
-    let b_canon = b.canonicalize().unwrap();
+    let b_canon = crate::platform::fs::canonicalize(&b).unwrap();
     app.set_sidebar_view(SidebarView::SourceControl);
 
     let backend = ratatui::backend::TestBackend::new(120, 40);
@@ -5031,6 +5031,7 @@ fn a_rebuild_that_changes_the_rows_drops_the_hunk_anchor() {
 ///
 /// Both files here are twice the retention age, so age cannot be what
 /// separates them: only the holder's liveness can.
+#[cfg(unix)]
 #[test]
 fn the_staging_sweep_spares_a_pipe_a_live_croft_still_holds() {
     let tmp = tempfile::tempdir().unwrap();
@@ -6273,6 +6274,7 @@ fn configure_858(dir: &std::path::Path, pull_rebase: &str) {
 /// `mine`, the clone the app opens (#858).
 struct Remote858 {
     _dir: tempfile::TempDir,
+    #[cfg_attr(not(unix), allow(dead_code))]
     bare: std::path::PathBuf,
     theirs: std::path::PathBuf,
     mine: std::path::PathBuf,
@@ -6458,6 +6460,7 @@ fn a_sync_with_nothing_to_move_still_reports_both_halves() {
 /// #858: a sync whose push the remote refuses reported "pull ok; push
 /// failed: " and git push's whole stderr (`remote:` lines, `To <url>`,
 /// the rejected ref, `error:`). It now names the rejected ref.
+#[cfg(unix)]
 #[test]
 fn a_sync_whose_push_is_refused_names_the_rejected_ref() {
     use std::os::unix::fs::PermissionsExt;
@@ -6790,7 +6793,9 @@ fn a_failed_clone_names_git_s_fatal_line() {
     let not_a_repo = tmp.path().join("elsewhere").join("notrepo");
     std::fs::create_dir(&ws).unwrap();
     std::fs::create_dir_all(&not_a_repo).unwrap();
-    let url = format!("file://{}", not_a_repo.display());
+    let url = lsp_types::Url::from_file_path(&not_a_repo)
+        .unwrap()
+        .to_string();
     let mut app = App::new(ws).unwrap();
     let err = crate::git::clone_into(tmp.path(), &url)
         .map(|_| ())
@@ -6799,10 +6804,10 @@ fn a_failed_clone_names_git_s_fatal_line() {
     app.finish_clone(Err(err), tmp.path());
     assert!(app.source_control.commit_feedback_is_error);
     assert_eq!(
-        app.status,
+        app.status.replace('\\', "/"),
         format!(
             "Clone failed: fatal: '{}' does not appear to be a git repository",
-            not_a_repo.display()
+            not_a_repo.display().to_string().replace('\\', "/")
         )
     );
     assert_one_line_858(&app);
@@ -7103,7 +7108,7 @@ fn source_control_lists_the_repo_found_one_folder_down() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.sidebar_view = SidebarView::SourceControl;
     let _ = draw_buffer(&mut app, 140, 50);
-    let sub = tmp.path().join("sub").canonicalize().unwrap();
+    let sub = crate::platform::fs::canonicalize(&tmp.path().join("sub")).unwrap();
     assert_eq!(
         app.source_control.nested_repos,
         vec![(String::from("sub/"), sub.clone())],

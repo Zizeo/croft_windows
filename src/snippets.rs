@@ -1041,7 +1041,12 @@ mod tests {
         std::fs::create_dir_all(root.join(".vscode/dir.code-snippets")).unwrap();
         let names: Vec<_> = project_files(root)
             .iter()
-            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .map(|p| {
+                p.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
             .collect();
         assert_eq!(
             names,

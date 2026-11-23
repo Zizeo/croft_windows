@@ -171,6 +171,20 @@ impl FsWatch {
         self.init_rx = None;
     }
 
+    /// Returns whether this watcher targets `root` (literal or canonicalized).
+    #[cfg(windows)]
+    pub(super) fn watches_root(&self, root: &Path) -> bool {
+        self.watch_root == root || self.canon_watch_root == root
+    }
+
+    /// Drop the underlying watcher synchronously so Windows directory handles close immediately.
+    #[cfg(windows)]
+    pub(super) fn disable_sync(&mut self) {
+        drop(self._watcher.take());
+        self.rx = None;
+        self.init_rx = None;
+    }
+
     pub fn try_install_watcher(&mut self) -> bool {
         let Some(rx) = self.init_rx.as_ref() else {
             return false;

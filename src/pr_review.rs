@@ -755,6 +755,7 @@ mod tests {
         assert_eq!(take_startup_pr(), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn gh_runs_bounded_and_reports_stdout_or_stderr() {
         let dir = std::env::temp_dir();

@@ -67,6 +67,7 @@ fn block_selection_highlights_and_extracts_a_rectangle() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn annotations_anchor_to_content_and_ride_the_scrollback() {
     let tmp = tempfile::tempdir().unwrap();
@@ -145,6 +146,7 @@ fn annotations_anchor_to_content_and_ride_the_scrollback() {
     assert_eq!(cur[0].3, "this is where it broke");
 }
 
+#[cfg(unix)]
 #[test]
 fn prompt_click_arrows_map_a_click_to_cursor_motion() {
     let tmp = tempfile::tempdir().unwrap();
@@ -224,6 +226,7 @@ fn row_times_record_when_each_line_arrived() {
     assert_eq!(tb, 1400, "second row gets the later chunk's arrival time");
 }
 
+#[cfg(unix)]
 #[test]
 fn reader_thread_stamps_arriving_rows() {
     // End-to-end: the real reader loop must feed stamp_chunk. Only
@@ -523,6 +526,7 @@ fn dsr_cursor_position_query_round_trips_into_the_pty_response_channel() {
 /// answers the probe. It sends a device-attributes query right behind
 /// it, which every terminal answers, so the probe's answer must reach
 /// the program FIRST: the first ten bytes it reads back are the answer.
+#[cfg(unix)]
 #[test]
 fn the_osc_7501_probe_is_answered_ahead_of_the_device_attributes_reply() {
     let tmp = tempfile::tempdir().unwrap();
@@ -657,6 +661,7 @@ fn interactive_shell_invocation_handles_powershell_and_windows_paths() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_large_write_to_a_child_not_reading_never_blocks_the_caller() {
     let tmp = tempfile::tempdir().unwrap();
@@ -831,6 +836,7 @@ fn write_input_marks_dirty() {
 /// but not that the production path uses it — deleting the reader's
 /// `rb.push` leaves it green, which was measured, not assumed. This
 /// spawns a real shell and reads what the reader thread actually stored.
+#[cfg(unix)]
 #[test]
 fn the_reader_thread_records_shell_output_for_rewind() {
     let tmp = tempfile::tempdir().unwrap();
@@ -860,6 +866,7 @@ fn the_reader_thread_records_shell_output_for_rewind() {
 ///
 /// Asserted on a clone of the handle, standing in for the reader thread's
 /// copy: that clone is exactly what kept a closed pane's buffer alive.
+#[cfg(unix)]
 #[test]
 fn closing_a_pane_frees_its_rewind_buffer() {
     let tmp = tempfile::tempdir().unwrap();
@@ -896,6 +903,7 @@ fn closing_a_pane_frees_its_rewind_buffer() {
 /// its script emits no marks, so `done` stays 0 and the tail happens to
 /// BE the whole chunk. The fixture agrees with the implementation. This
 /// test puts a mark between two needles so the two differ.
+#[cfg(unix)]
 #[test]
 fn output_before_an_osc_mark_is_recorded_not_just_the_tail() {
     let tmp = tempfile::tempdir().unwrap();
@@ -943,6 +951,7 @@ fn output_before_an_osc_mark_is_recorded_not_just_the_tail() {
 /// only when the shell dies inside its SIGHUP grace loop; a shell that
 /// ignores HUP gets the SIGKILL escalation, which never waits — so every
 /// such closed pane left a zombie for the life of the process.
+#[cfg(unix)]
 #[test]
 fn dropping_a_terminal_reaps_a_hup_ignoring_shell() {
     let tmp = tempfile::tempdir().unwrap();
@@ -968,6 +977,7 @@ fn dropping_a_terminal_reaps_a_hup_ignoring_shell() {
 /// #912: a hosted shell that exits while croft attaches can have its
 /// exit arrive in the same read as the greeting. Its code is kept, and
 /// the output before it still reaches the pane.
+#[cfg(unix)]
 #[test]
 fn an_exit_in_the_pane_hosts_greeting_keeps_its_code() {
     use crate::session_host::{Control, encode_bytes_frame, encode_control_frame};
@@ -995,6 +1005,7 @@ fn an_exit_in_the_pane_hosts_greeting_keeps_its_code() {
 /// #912: a shell that exits while its pane lives is reaped then, not
 /// left a zombie until the pane is dropped, and its exit code goes
 /// under its output.
+#[cfg(unix)]
 #[test]
 fn a_shell_that_exits_is_reaped_and_its_exit_code_shown() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1106,6 +1117,7 @@ fn foreground_is_shell_flips_false_while_a_foreground_command_runs() {
 /// group with a job-control child — the rc-startup state the #94 flake
 /// caught `change_workspace_root` in. Returns the pane after the child
 /// has taken the foreground (bounded wait, asserted).
+#[cfg(unix)]
 fn startup_owned_pane(tmp: &tempfile::TempDir) -> PtyTerminal {
     let script = tmp.path().join("slow-startup.sh");
     std::fs::write(&script, "#!/bin/bash\nset -m\nsleep 30\n").unwrap();
@@ -1127,6 +1139,7 @@ fn startup_owned_pane(tmp: &tempfile::TempDir) -> PtyTerminal {
     term
 }
 
+#[cfg(unix)]
 #[test]
 fn cwd_seed_stays_safe_through_startup_until_a_prompt_mark_arrives() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1144,6 +1157,7 @@ fn cwd_seed_stays_safe_through_startup_until_a_prompt_mark_arrives() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn cwd_seed_turns_unsafe_once_the_pane_has_received_input() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1162,6 +1176,7 @@ fn cwd_seed_turns_unsafe_once_the_pane_has_received_input() {
 /// impersonating this machine's own hostname. The self-reported host
 /// is no proof of locality then: `local_shell_cwd` must refuse while
 /// the shell is not the foreground group, whatever the claim says.
+#[cfg(unix)]
 #[test]
 fn a_foreground_process_cannot_impersonate_a_local_cwd_report() {
     let out = std::process::Command::new("hostname").output().unwrap();
@@ -1342,6 +1357,7 @@ fn a_stale_claim_from_a_dead_foreground_job_stays_untrusted() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn clear_screen_and_scrollback_wipes_the_grid() {
     fn dump(term: &PtyTerminal) -> String {
@@ -1392,6 +1408,7 @@ fn change_cwd_writes_cd_command_to_pty() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn new_running_spawns_program_directly_and_produces_output() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1435,6 +1452,7 @@ fn new_running_spawns_program_directly_and_produces_output() {
 /// whole `resize`. If the ioctl goes out before the grid is resized,
 /// the child reports the new size WHILE the lock is held, which the
 /// correct order makes impossible however long the wait.
+#[cfg(unix)]
 #[test]
 fn the_grid_takes_the_new_size_before_the_child_hears_the_winch() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1497,6 +1515,7 @@ fn the_grid_takes_the_new_size_before_the_child_hears_the_winch() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn pristine_covers_only_an_untouched_interactive_shell() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1613,6 +1632,7 @@ fn a_hosted_pane_outlives_a_croft_that_never_closed_it() {
 }
 
 /// Poll `grid_lines` until a predicate matches or 4s elapse.
+#[cfg(unix)]
 fn wait_for_grid<F: Fn(&[String]) -> bool>(term: &PtyTerminal, pred: F) -> Vec<String> {
     let mut waited_ms = 0u32;
     loop {
@@ -1632,6 +1652,7 @@ fn wait_for_grid<F: Fn(&[String]) -> bool>(term: &PtyTerminal, pred: F) -> Vec<S
 /// The terminal's find highlight follows the editor's: Croft Loch tints
 /// each matched cell's own background amber and keeps an ink that reads
 /// on it, where a boxed theme stamps its black-on-gold block.
+#[cfg(unix)]
 #[test]
 fn terminal_find_matches_are_an_amber_tint_on_croft_loch_and_gold_when_boxed() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1696,6 +1717,7 @@ fn terminal_find_matches_are_an_amber_tint_on_croft_loch_and_gold_when_boxed() {
 /// croft reported that bell over the "Running …" status of the task it
 /// had just typed into an idle pane. What croft types ahead of a command
 /// never rings, and still clears a half-typed line.
+#[cfg(unix)]
 #[test]
 fn clearing_the_line_ahead_of_a_command_never_rings_the_bell() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1726,6 +1748,7 @@ fn clearing_the_line_ahead_of_a_command_never_rings_the_bell() {
     assert!(!term.take_bell(), "clearing the line rang the bell");
 }
 
+#[cfg(unix)]
 #[test]
 fn ansi_named_colors_render_through_the_theme_palette() {
     // SGR 31 red must come out as the theme palette's red (VS Code's
@@ -1781,6 +1804,7 @@ fn ansi_named_colors_render_through_the_theme_palette() {
 /// same width while the grid keeps the real text, so a click on the
 /// mask can still recover it; the count feeds the status chip; a
 /// reveal window paints the text as typed.
+#[cfg(unix)]
 #[test]
 fn redacted_spans_paint_as_masks_and_the_real_text_stays_recoverable() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1881,6 +1905,7 @@ fn redacted_spans_paint_as_masks_and_the_real_text_stays_recoverable() {
     assert_eq!(term.redacted_on_screen, 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn faint_cells_render_with_the_dim_modifier() {
     // Claude Code paints its inline ghost suggestion as default-foreground
@@ -1920,6 +1945,7 @@ fn faint_cells_render_with_the_dim_modifier() {
 
 /// A quiet pane fed the issue's bytes (#1288): two struck-through todo
 /// items, a concealed password and a plain word.
+#[cfg(unix)]
 fn strike_and_conceal_pane() -> (PtyTerminal, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let term = PtyTerminal::new_running(
@@ -1932,6 +1958,7 @@ fn strike_and_conceal_pane() -> (PtyTerminal, tempfile::TempDir) {
     (term, tmp)
 }
 
+#[cfg(unix)]
 #[test]
 fn struck_through_cells_paint_crossed_out_and_concealed_cells_paint_blank() {
     let (mut term, _tmp) = strike_and_conceal_pane();
@@ -1966,6 +1993,7 @@ fn struck_through_cells_paint_crossed_out_and_concealed_cells_paint_blank() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn concealed_text_still_copies_and_exports_with_its_sgr() {
     // Negative: hiding is paint-only, as in xterm. The grid, and so a
@@ -1986,6 +2014,7 @@ fn concealed_text_still_copies_and_exports_with_its_sgr() {
     assert!(raw.contains("\x1b[8mhunter2"), "{raw:?}");
 }
 
+#[cfg(unix)]
 #[test]
 fn imgcat_style_inline_images_are_captured_with_a_grid_anchor() {
     use base64::Engine;
@@ -2033,6 +2062,7 @@ fn imgcat_style_inline_images_are_captured_with_a_grid_anchor() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn wide_chars_read_back_without_phantom_spacer_spaces() {
     // A CJK char occupies two grid columns: the WIDE_CHAR cell plus a
@@ -2049,6 +2079,7 @@ fn wide_chars_read_back_without_phantom_spacer_spaces() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn wide_chars_render_the_glyph_once_with_a_blank_spacer_cell() {
     // The render loop writes the double-width glyph into its WIDE_CHAR
@@ -2083,6 +2114,7 @@ fn wide_chars_render_the_glyph_once_with_a_blank_spacer_cell() {
     assert!(found, "the wide glyph must appear in the rendered buffer");
 }
 
+#[cfg(unix)]
 #[test]
 fn hyperlink_at_returns_the_osc8_uri_under_the_cell() {
     // OSC 8 hyperlinks live in the cell, invisible in the text. The app's
@@ -2112,6 +2144,7 @@ fn hyperlink_at_returns_the_osc8_uri_under_the_cell() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn osc133_marks_record_kind_exit_code_and_grid_line() {
     // Emit a prompt mark before "PROMPT", a command-start mark, and a
@@ -2148,6 +2181,7 @@ fn osc133_marks_record_kind_exit_code_and_grid_line() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn marks_follow_their_content_into_scrollback() {
     // A mark recorded on the live screen must keep pointing at the same
@@ -2197,6 +2231,7 @@ fn marks_follow_their_content_into_scrollback() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn osc7_updates_the_shell_cwd() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2218,6 +2253,7 @@ fn osc7_updates_the_shell_cwd() {
 /// path on the REMOTE machine: consumers that act on the local
 /// filesystem (split-in-cwd, session restore) must not trust it just
 /// because the same path happens to exist locally.
+#[cfg(unix)]
 #[test]
 fn a_remote_reported_cwd_is_not_trusted_for_local_use() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2258,6 +2294,7 @@ fn a_remote_reported_cwd_is_not_trusted_for_local_use() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn osc9_notifications_drain_once() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2275,6 +2312,7 @@ fn osc9_notifications_drain_once() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn osc777_and_osc99_notifications_drain_like_osc9() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2295,6 +2333,7 @@ fn osc777_and_osc99_notifications_drain_like_osc9() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn notify_triggers_fire_on_completed_output_lines() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2331,6 +2370,7 @@ fn notify_triggers_fire_on_completed_output_lines() {
 /// chunk that merely ENDED on the primary screen fire on alt content).
 /// The scanner tracks the boundary positionally, so the reader must
 /// feed it every chunk unconditionally.
+#[cfg(unix)]
 #[test]
 fn a_trigger_fires_for_primary_text_that_shares_a_chunk_with_alt_entry() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2504,6 +2544,7 @@ fn pair_decorations_matches_prompts_with_exits() {
     assert!(pair_decorations(&views(&running)).is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn command_output_and_input_extract_and_select() {
     // Copy Output / Re-run Command need the exact spans back out of the
@@ -2548,6 +2589,7 @@ fn human_duration_formats_ms_seconds_minutes() {
     assert_eq!(human_duration(d(125_000)), "2m 05s");
 }
 
+#[cfg(unix)]
 #[test]
 fn osc133_decorations_carry_exit_and_duration_end_to_end() {
     // A real PTY run emitting the mark protocol: the finished command
@@ -2592,6 +2634,7 @@ fn osc133_decorations_carry_exit_and_duration_end_to_end() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn decoration_dot_paints_on_the_left_border_and_hit_tests() {
     // The finished command's prompt row gets a VS Code-style dot on the
@@ -2651,6 +2694,7 @@ fn decoration_dot_paints_on_the_left_border_and_hit_tests() {
 /// the accent eased into the canvas, not VS Code's blue. An unfocused
 /// pane's top edge is the hairline, so its seam with the tab strip is
 /// drawn even without the focus lip.
+#[cfg(unix)]
 #[test]
 fn croft_loch_paints_a_quiet_accent_dot_and_a_hairline_top_edge() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3241,12 +3285,11 @@ fn fish_integration_restores_xdg_dirs_and_yields_single_native_marks() {
 #[test]
 fn the_pane_bin_goes_first_on_the_pane_path() {
     let mut cmd = CommandBuilder::new("/bin/sh");
-    cmd.env("PATH", "/opt/homebrew/bin:/pane-bin:/usr/bin");
+    let initial = std::env::join_paths(["/opt/homebrew/bin", "/pane-bin", "/usr/bin"]).unwrap();
+    let expected = std::env::join_paths(["/pane-bin", "/opt/homebrew/bin", "/usr/bin"]).unwrap();
+    cmd.env("PATH", &initial);
     apply_pane_bin(&mut cmd, Some(std::path::Path::new("/pane-bin")));
-    assert_eq!(
-        cmd.get_env("PATH"),
-        Some(std::ffi::OsStr::new("/pane-bin:/opt/homebrew/bin:/usr/bin"))
-    );
+    assert_eq!(cmd.get_env("PATH"), Some(expected.as_os_str()));
     assert_eq!(
         cmd.get_env(crate::shell_integration::PANE_BIN_ENV),
         Some(std::ffi::OsStr::new("/pane-bin"))
@@ -3259,7 +3302,8 @@ fn a_pane_with_no_bin_of_its_own_drops_an_inherited_one() {
     // names the OUTER croft. Passing it on would hand this croft's panes
     // a different croft than the window they run in.
     let mut cmd = CommandBuilder::new("/bin/sh");
-    cmd.env("PATH", "/outer-pane-bin:/usr/bin");
+    let initial = std::env::join_paths(["/outer-pane-bin", "/usr/bin"]).unwrap();
+    cmd.env("PATH", &initial);
     cmd.env(crate::shell_integration::PANE_BIN_ENV, "/outer-pane-bin");
     apply_pane_bin(&mut cmd, None);
     assert_eq!(cmd.get_env(crate::shell_integration::PANE_BIN_ENV), None);
@@ -3282,12 +3326,14 @@ fn an_unset_path_is_left_for_the_shell_to_default() {
 /// A pane bin linking to a stand-in for the running croft, and another
 /// dir whose `croft` a user rc puts first on PATH (#1854). Each prints
 /// which one it is.
+#[cfg(unix)]
 struct TwoCrofts {
     _tmp: tempfile::TempDir,
     pane_bin: std::path::PathBuf,
     other_dir: std::path::PathBuf,
 }
 
+#[cfg(unix)]
 fn two_crofts() -> TwoCrofts {
     use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
@@ -3310,6 +3356,7 @@ fn two_crofts() -> TwoCrofts {
 }
 
 /// Type `input`; the rest of the first line on screen starting `prefix`.
+#[cfg(unix)]
 fn pane_answer(term: &mut PtyTerminal, input: &[u8], prefix: &str) -> String {
     term.write_input(input);
     let answer = || {
@@ -3327,6 +3374,7 @@ fn pane_answer(term: &mut PtyTerminal, input: &[u8], prefix: &str) -> String {
 }
 
 /// Type `croft` at the pane's first prompt; the name of the croft that ran.
+#[cfg(unix)]
 fn croft_that_answers(term: &mut PtyTerminal) -> String {
     // Text on screen, not a prompt mark, so a shell croft does not
     // integrate is waited for too.
@@ -3340,6 +3388,7 @@ fn croft_that_answers(term: &mut PtyTerminal) -> String {
 
 /// A zsh login pane whose user `file` prepends the dir holding the other
 /// croft, with the pane bin when `pane_bin`.
+#[cfg(unix)]
 fn zsh_login_pane(
     crofts: &TwoCrofts,
     home: &std::path::Path,
@@ -3365,6 +3414,7 @@ fn zsh_login_pane(
     Some(PtyTerminal::spawn_with(cmd, None).unwrap())
 }
 
+#[cfg(unix)]
 #[test]
 fn a_zsh_pane_runs_its_own_croft_when_the_user_profile_prepends_another() {
     // #1854: the window was cargo's croft 0.2.32 while `croft --version`
@@ -3380,6 +3430,7 @@ fn a_zsh_pane_runs_its_own_croft_when_the_user_profile_prepends_another() {
     assert_eq!(croft_that_answers(&mut term), "running");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_zsh_pane_runs_its_own_croft_when_the_user_login_file_prepends_another() {
     // A login zsh reads `.zlogin` after `.zshrc`, so a prepend there
@@ -3393,6 +3444,7 @@ fn a_zsh_pane_runs_its_own_croft_when_the_user_login_file_prepends_another() {
     assert_eq!(croft_that_answers(&mut term), "running");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_zsh_pane_without_a_pane_bin_keeps_the_user_path() {
     // With no pane bin the shims must leave PATH as the user's files
@@ -3415,6 +3467,7 @@ fn a_zsh_pane_without_a_pane_bin_keeps_the_user_path() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_bash_login_pane_runs_its_own_croft_when_the_profile_prepends_another() {
     // The production argv, so macOS's bash 3.2, which cannot take the
@@ -3497,6 +3550,7 @@ fn a_non_login_bash_without_env_injection_replays_no_login_files() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_bash_pane_runs_its_own_croft_when_the_user_rc_prepends_another() {
     // The shim is read through `--rcfile` here, which every bash honours,
@@ -3526,6 +3580,7 @@ fn a_bash_pane_runs_its_own_croft_when_the_user_rc_prepends_another() {
     assert_eq!(croft_that_answers(&mut term), "running");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_fish_pane_runs_its_own_croft_when_the_user_config_prepends_another() {
     let Some(fish) = find_fish() else {
@@ -3571,6 +3626,7 @@ fn prompt_jump_targets_walk_previous_and_next() {
     assert_eq!(pick_prompt_jump(&prompts, 0, true), None);
 }
 
+#[cfg(unix)]
 #[test]
 fn bell_sets_a_flag_the_app_can_drain() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3597,6 +3653,7 @@ fn bell_sets_a_flag_the_app_can_drain() {
 /// #678: a program in the pane copying through OSC 52 (Claude Code over
 /// SSH has no other way) must reach the app, once, and only for the
 /// clipboard: a primary-selection store is not a copy the user made.
+#[cfg(unix)]
 #[test]
 fn osc52_clipboard_store_is_latched_for_the_app_and_selection_is_not() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3626,6 +3683,7 @@ fn osc52_clipboard_store_is_latched_for_the_app_and_selection_is_not() {
 /// #257: the colour export round-trips through the log parser: the
 /// text is what the pane showed and the coloured run keeps its colour
 /// and weight, as the 16 symbolic slots the theme resolves.
+#[cfg(unix)]
 #[test]
 fn grid_lines_ansi_carries_the_pane_colours_as_sgr() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3680,6 +3738,7 @@ fn grid_lines_ansi_carries_the_pane_colours_as_sgr() {
 /// #356: the recorder's screen read is the visible screen in colour,
 /// with the cursor where the program put it, and no cursor once the
 /// program hides it.
+#[cfg(unix)]
 #[test]
 fn screen_ansi_wrapped_carries_colour_and_the_cursor() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3723,6 +3782,7 @@ fn screen_ansi_wrapped_carries_colour_and_the_cursor() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn grid_lines_exposes_output_for_terminal_find() {
     // The find bar searches the grid text this returns. Spawn a program
@@ -3756,6 +3816,7 @@ fn grid_lines_exposes_output_for_terminal_find() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn pending_bytes_counts_advanced_output_and_resets_on_take_dirty() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3789,6 +3850,7 @@ fn pending_bytes_counts_advanced_output_and_resets_on_take_dirty() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn new_running_renders_running_header_in_term_immediately() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3809,6 +3871,7 @@ fn new_running_renders_running_header_in_term_immediately() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn new_running_appends_exit_footer_when_child_finishes() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4079,6 +4142,7 @@ fn extract_selection_text_addresses_absolute_grid_lines() {
 /// is far taller than the 3-row viewport. Before the absolute-
 /// coordinate model the selection was capped at the visible pane
 /// height and the off-screen lines were simply unreachable.
+#[cfg(unix)]
 #[test]
 fn selection_stays_glued_to_its_content_while_output_streams() {
     // A selection made while a program keeps printing (Claude Code, any
@@ -4131,6 +4195,7 @@ fn selection_stays_glued_to_its_content_while_output_streams() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn selection_survives_streaming_past_a_saturated_scrollback() {
     // Once a pane has scrolled more than SCROLLBACK_LINES, history_size
@@ -4292,7 +4357,18 @@ fn feed_pty(t: &PtyTerminal, bytes: &[u8]) {
 
 fn quiet_pty() -> (tempfile::TempDir, PtyTerminal) {
     let tmp = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
     let t = PtyTerminal::new_running("/bin/sleep", &[String::from("30")], tmp.path()).unwrap();
+    #[cfg(windows)]
+    let t = PtyTerminal::new_running(
+        "cmd.exe",
+        &[
+            String::from("/C"),
+            String::from("ping -n 31 127.0.0.1 >nul"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
     (tmp, t)
 }
 
@@ -4477,6 +4553,7 @@ fn an_inline_image_rides_scrollback_past_saturation() {
 /// thread (modern terminfo wipes scrollback), never through the pane's
 /// own Clear method: the reader must drop captured images too, or the
 /// picture floats over the fresh prompt.
+#[cfg(unix)]
 #[test]
 fn a_program_emitted_scrollback_wipe_drops_captured_images() {
     use base64::Engine;
@@ -4514,6 +4591,7 @@ fn a_program_emitted_scrollback_wipe_drops_captured_images() {
 /// A wipe with EMPTY scrollback (picture captured on the first screen,
 /// nothing scrolled into history yet) must drop the image too: the
 /// history-shrink heuristic saw 0 → 0 and kept the stale overlay.
+#[cfg(unix)]
 #[test]
 fn a_zero_history_screen_wipe_drops_captured_images() {
     use base64::Engine;
@@ -4607,6 +4685,7 @@ fn the_wipe_sniffer_reports_where_each_wipe_ends() {
 /// chunk. Judging the wipe by the chunk's FINAL mode attributed it to
 /// the alt screen and kept the invalidated primary images, which then
 /// reappeared over unrelated content when the app exited.
+#[cfg(unix)]
 #[test]
 fn a_wipe_followed_by_alt_entry_in_one_chunk_still_drops_images() {
     use base64::Engine;
@@ -5379,6 +5458,7 @@ fn alt_screen_bottom_up_drag_from_a_blank_row_selects_and_survives_release() {
     assert_eq!(t.selection_text(), "bravo two\ncharlie three\n");
 }
 
+#[cfg(unix)]
 #[test]
 fn alt_screen_edge_autoscroll_forwards_wheel_to_the_tracking_app() {
     // On the alternate screen a drag held past the pane edge cannot
@@ -5549,6 +5629,7 @@ fn discover_windows_shells_finds_installed_shells() {
         "expected built-in Windows shell in {shells:?}"
     );
 }
+#[cfg(unix)]
 #[test]
 fn finished_command_carries_its_output_block() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5577,6 +5658,7 @@ fn finished_command_carries_its_output_block() {
 
 /// Run `script` under `/bin/sh` in a pane and return the first `n`
 /// commands its marks finish.
+#[cfg(unix)]
 fn finished_commands(script: &str, n: usize) -> Vec<FinishedCommand> {
     let tmp = tempfile::tempdir().unwrap();
     let term =
@@ -5599,6 +5681,7 @@ fn finished_commands(script: &str, n: usize) -> Vec<FinishedCommand> {
 /// the run notices all got an empty command. A full reset (`reset`,
 /// RIS) erases them in place, without scrolling, so the output start
 /// has to move to the top of the screen.
+#[cfg(unix)]
 #[test]
 fn a_command_that_clears_the_screen_keeps_its_text_and_output() {
     let script = "printf '\\033]133;A\\007$ \\033]133;B\\007clear; echo hi\\n\\033]133;C\\007\\033[H\\033[2J\\033[3Jhi\\n\\033]133;D;0\\007\\033]133;A\\007$ \\033]133;B\\007echo bye; clear\\n\\033]133;C\\007bye\\n\\033[H\\033[2J\\033[3J\\033]133;D;0\\007\\033]133;A\\007$ \\033]133;B\\007reset; echo again\\n\\033]133;C\\007\\033cagain\\n\\033]133;D;0\\007'";
@@ -5614,6 +5697,7 @@ fn a_command_that_clears_the_screen_keeps_its_text_and_output() {
 /// #876: a clear in its own read, after an earlier command whose marks
 /// survive in the scrollback (ED 2 alone pushes the screen there), must
 /// not hand the earlier command's text or output to this one.
+#[cfg(unix)]
 #[test]
 fn a_clear_in_its_own_read_does_not_pick_up_the_previous_command() {
     let script = "printf '\\033]133;A\\007$ \\033]133;B\\007echo one\\n\\033]133;C\\007one\\n\\033]133;D;0\\007\\033]133;A\\007$ \\033]133;B\\007clear; echo two\\n\\033]133;C\\007'; sleep 0.3; printf '\\033[H\\033[2J'; sleep 0.3; printf 'two\\n\\033]133;D;0\\007'";
@@ -5630,6 +5714,7 @@ fn a_clear_in_its_own_read_does_not_pick_up_the_previous_command() {
 
 /// #876: output that scrolls past the screen right after a clear, in
 /// the same read, is captured from its first line.
+#[cfg(unix)]
 #[test]
 fn output_scrolling_after_a_clear_is_captured_whole() {
     let script = "printf '\\033]133;A\\007$ \\033]133;B\\007clear; seq 60\\n\\033]133;C\\007\\033[H\\033[2J\\033[3J%s\\n\\033]133;D;0\\007' \"$(seq 60)\"";
@@ -5641,6 +5726,7 @@ fn output_scrolling_after_a_clear_is_captured_whole() {
 
 /// Run `typed` as the input between a `133;B` and `133;C` mark, and
 /// return what the finished command recorded and what Re-run reads.
+#[cfg(unix)]
 fn recorded_command(typed: &str) -> (String, String) {
     let tmp = tempfile::tempdir().unwrap();
     let script = format!(
@@ -5666,6 +5752,7 @@ fn recorded_command(typed: &str) -> (String, String) {
 
 /// The `printf` formats fish runs in `func` of croft's fish hooks, in
 /// order, rewritten for `/bin/sh`'s printf (which spells ESC `\033`).
+#[cfg(unix)]
 fn fish_hook_printfs(script: &str, func: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut lines = script.lines();
@@ -5694,6 +5781,7 @@ fn fish_hook_printfs(script: &str, func: &str) -> Vec<String> {
 /// the typed line, preexec, postexec) through a real pane, and the
 /// command is recorded with its text. Without an end-of-prompt mark it
 /// was recorded empty, so the history never got it.
+#[cfg(unix)]
 #[test]
 fn a_fish_3_pane_records_the_typed_command() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5785,6 +5873,7 @@ fn saving_the_fish_prompt_saves_the_users_prompt_not_the_wrapper() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_multi_line_command_is_recorded_without_its_continuation_prompt() {
     // #1250: bash's PS2 `> ` was stored as typed input, and recalling
@@ -5796,6 +5885,7 @@ fn a_multi_line_command_is_recorded_without_its_continuation_prompt() {
     assert_eq!(cmd, "ls \\\n-la");
 }
 
+#[cfg(unix)]
 #[test]
 fn zsh_continuation_prompts_are_dropped_too() {
     let (cmd, _) = recorded_command("for f in a b\\nfor> do echo $f\\nfor> done");
@@ -5804,6 +5894,7 @@ fn zsh_continuation_prompts_are_dropped_too() {
     assert_eq!(cmd, "echo \"a\nb\"");
 }
 
+#[cfg(unix)]
 #[test]
 fn redirects_typed_by_the_user_stay_in_the_command() {
     // Negative: only the prompt goes. A `>` the user typed, on the first
@@ -5826,6 +5917,7 @@ fn an_empty_continuation_line_keeps_no_prompt() {
     assert_eq!(without_continuation_prompts("a\n>> log"), "a\n>> log");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_soft_wrapped_line_is_not_a_continuation() {
     // Negative: a long line wraps with no newline and no PS2, so text
@@ -5835,6 +5927,7 @@ fn a_soft_wrapped_line_is_not_a_continuation() {
     assert_eq!(cmd, long);
 }
 
+#[cfg(unix)]
 #[test]
 fn finished_output_keeps_a_final_line_without_trailing_newline() {
     // `133;D` moves no cursor: a diagnostic printed WITHOUT a trailing

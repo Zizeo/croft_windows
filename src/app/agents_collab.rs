@@ -2312,6 +2312,39 @@ impl App {
         // then refused, measured. Dropping the folder first would leave the
         // user with the lane gone from their workspace and the directory
         // still on disk, which is the worst of both.
+        // On Windows, a live ConPTY shell or `FsWatch` (`ReadDirectoryChangesW`)
+        // holding an open handle to `lane` causes `git worktree remove` to fail
+        // with Permission denied. Release those handles when the worktree is not
+        // locked, and restore watchers if removal still fails.
+        #[cfg(windows)]
+        let released_watchers = if !crate::git::worktree_is_locked(&lane) {
+            let mut stopped = false;
+            for w in &mut self.fs_watch_extra {
+                if w.watches_root(&lane) {
+                    w.disable_sync();
+                    stopped = true;
+                }
+            }
+            for t in &mut self.terminals {
+                let is_lane_pane = self
+                    .lane_panes
+                    .get(&t.uid())
+                    .is_some_and(|l| Path::new(&l.path) == lane)
+                    || t.shell_cwd().is_some_and(|c| c.starts_with(&lane));
+                if is_lane_pane {
+                    t.end_child();
+                }
+            }
+            for c in &mut self.closed_terminals {
+                if c.term.shell_cwd().is_some_and(|p| p.starts_with(&lane)) {
+                    c.term.end_child();
+                }
+            }
+            stopped
+        } else {
+            false
+        };
+
         match crate::git::remove_worktree_lane(&lane) {
             Ok(()) => {
                 self.remove_workspace_folder(lane.clone());
@@ -2342,7 +2375,13 @@ impl App {
                     self.status = format!("Removed lane {}", lane.display());
                 }
             }
-            Err(why) => self.status = format!("Keeping the lane: {why}"),
+            Err(why) => {
+                #[cfg(windows)]
+                if released_watchers {
+                    self.rebind_workspace_watchers();
+                }
+                self.status = format!("Keeping the lane: {why}");
+            }
         }
     }
 

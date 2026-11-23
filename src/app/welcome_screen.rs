@@ -1119,8 +1119,61 @@ impl App {
         for path in sample {
             self.close_tabs_with_path_everywhere(&path);
         }
+        #[cfg(windows)]
+        {
+            self.fs_watch.disable_sync();
+            for w in &mut self.fs_watch_extra {
+                w.disable_sync();
+            }
+        }
+        #[cfg(windows)]
+        let previous_root = run.previous_root.clone();
         self.change_workspace_root(run.previous_root);
-        self.status = match crate::tour::remove_scratch(&run.scratch) {
+        let remove_res = {
+            let mut res = crate::tour::remove_scratch(&run.scratch);
+            #[cfg(windows)]
+            if res.is_err() && run.scratch.exists() {
+                for _ in 0..10 {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    res = crate::tour::remove_scratch(&run.scratch);
+                    if res.is_ok() || !run.scratch.exists() {
+                        break;
+                    }
+                }
+            }
+            #[cfg(windows)]
+            if res.is_err() && run.scratch.exists() {
+                // `A::Run` sets `input_seen`, so `change_workspace_root` may skip
+                // `change_cwd`, leaving a shell child with CWD inside `scratch`.
+                for c in &mut self.closed_terminals {
+                    if c.term
+                        .shell_cwd()
+                        .is_none_or(|p| p.starts_with(&run.scratch))
+                    {
+                        c.term.end_child();
+                    }
+                }
+                for t in &mut self.terminals {
+                    if t.shell_cwd().is_none_or(|p| p.starts_with(&run.scratch)) {
+                        t.end_child();
+                        if let Ok(fresh) =
+                            crate::widgets::terminal::PtyTerminal::new(&previous_root)
+                        {
+                            *t = fresh;
+                        }
+                    }
+                }
+                for _ in 0..240 {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    res = crate::tour::remove_scratch(&run.scratch);
+                    if res.is_ok() || !run.scratch.exists() {
+                        break;
+                    }
+                }
+            }
+            res
+        };
+        self.status = match remove_res {
             Ok(()) => String::from("Tour finished"),
             Err(e) => format!("Tour finished, but its sample project was not removed: {e}"),
         };

@@ -2426,6 +2426,7 @@ fn lldb_dap_session_launches_via_shared_machinery() {
 /// would make debugpy report the canonical path and break that match.
 /// (macOS `/tmp` is itself a symlink to `/private/tmp`, exercising the
 /// `/var`-style case too.)
+#[cfg(unix)]
 #[test]
 #[ignore = "requires ~/.croft/debug-venv (uv + debugpy on CPython 3.14)"]
 fn binds_breakpoint_set_via_symlinked_path() {
@@ -2495,7 +2496,11 @@ fn a_delve_launch_builds_outside_the_workspace() {
         assert!(delve_builds(&request), "{request}");
         let out = with_build_output(request, dir);
         let bin = out["arguments"]["output"].as_str().unwrap();
-        assert!(bin.starts_with("/tmp/croft-dlv-x/__debug_bin"), "{bin}");
+        assert!(
+            bin.replace('\\', "/")
+                .starts_with("/tmp/croft-dlv-x/__debug_bin"),
+            "{bin}"
+        );
     }
 }
 

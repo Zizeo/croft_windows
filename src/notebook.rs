@@ -377,7 +377,12 @@ fn with_attachments(
             continue;
         };
         let target = resolved.entry(name.to_string()).or_insert_with(|| {
-            picture_for(name).map(|p| p.display().to_string().replace(' ', "%20"))
+            picture_for(name).map(|p| {
+                p.display()
+                    .to_string()
+                    .replace('\\', "/")
+                    .replace(' ', "%20")
+            })
         });
         if let Some(target) = target {
             let start = range.start + at + 1;

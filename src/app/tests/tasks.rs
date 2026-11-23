@@ -2,6 +2,7 @@
 
 use super::*;
 
+#[cfg(unix)]
 #[test]
 fn run_spec_for_runs_an_executable_binary_directly() {
     use std::os::unix::fs::PermissionsExt;
@@ -48,6 +49,7 @@ fn cmd_shift_b_runs_the_projects_build_task_in_a_named_pane() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn rerunning_a_task_reuses_its_pane_instead_of_stacking_new_ones() {
     let tmp = tempfile::tempdir().unwrap();
@@ -99,6 +101,7 @@ fn rerunning_a_task_reuses_its_pane_instead_of_stacking_new_ones() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_reused_task_pane_clears_a_half_typed_prompt_line_first() {
     // A shell sitting at its prompt can hold unsubmitted text in the line
@@ -129,6 +132,7 @@ fn a_reused_task_pane_clears_a_half_typed_prompt_line_first() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_task_pane_from_the_old_workspace_is_not_reused_after_a_re_root() {
     // The pane's shell still sits in workspace A; running B's build task
@@ -416,7 +420,9 @@ fn run_spec_walks_up_from_file_dir_to_find_venv_in_an_ancestor() {
     std::fs::write(&f, b"").unwrap();
     let spec = App::run_spec_for(&f, tmp.path()).unwrap();
     assert!(
-        spec.program.ends_with(".venv/bin/python"),
+        spec.program
+            .replace('\\', "/")
+            .ends_with(".venv/bin/python"),
         "expected venv python program, got: {}",
         spec.program
     );
@@ -431,7 +437,7 @@ fn run_spec_also_picks_a_plain_venv_directory() {
     std::fs::write(&f, b"").unwrap();
     let spec = App::run_spec_for(&f, tmp.path()).unwrap();
     assert!(
-        spec.program.ends_with("venv/bin/python"),
+        spec.program.replace('\\', "/").ends_with("venv/bin/python"),
         "expected plain-venv python program, got: {}",
         spec.program
     );
@@ -639,7 +645,7 @@ fn clicking_a_fence_play_glyph_runs_it_in_a_named_pane() {
         .pending_run_block
         .as_ref()
         .expect("every block confirms");
-    assert_eq!(pending.pane_name, "docs/README.md:2");
+    assert_eq!(pending.pane_name.replace('\\', "/"), "docs/README.md:2");
     assert_eq!(pending.cwd, sub, "the document's directory is the cwd");
     assert!(!pending.destructive);
     assert_eq!(app.terminals.len(), panes_before, "nothing ran yet");
@@ -648,10 +654,16 @@ fn clicking_a_fence_play_glyph_runs_it_in_a_named_pane() {
     assert!(app.pending_run_block.is_none());
     assert_eq!(app.terminals.len(), panes_before + 1, "Y opens the pane");
     assert_eq!(
-        app.terminals[app.active_terminal].label(),
+        app.terminals[app.active_terminal]
+            .label()
+            .replace('\\', "/"),
         "docs/README.md:2"
     );
-    assert!(app.status.contains("docs/README.md:2"), "{}", app.status);
+    assert!(
+        app.status.replace('\\', "/").contains("docs/README.md:2"),
+        "{}",
+        app.status
+    );
 
     // The third block pipes the network into a shell: the popup is red.
     let (gx, gy) = glyph_row(&app, 2);
@@ -661,7 +673,7 @@ fn clicking_a_fence_play_glyph_runs_it_in_a_named_pane() {
         .pending_run_block
         .as_ref()
         .expect("the confirm popup is up");
-    assert_eq!(pending.pane_name, "docs/README.md:3");
+    assert_eq!(pending.pane_name.replace('\\', "/"), "docs/README.md:3");
     assert!(pending.destructive, "curl | sh turns the popup red");
     term.draw(|f| app.render(f)).unwrap();
     let painted: String = (0..40)
@@ -693,7 +705,7 @@ fn clicking_a_fence_play_glyph_runs_it_in_a_named_pane() {
         .pending_run_block
         .as_ref()
         .expect("Cmd+Enter confirms too");
-    assert_eq!(pending.pane_name, "docs/README.md:1");
+    assert_eq!(pending.pane_name.replace('\\', "/"), "docs/README.md:1");
     app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
         .unwrap();
     app.focus_pane(super::Pane::Editor);
@@ -705,7 +717,8 @@ fn clicking_a_fence_play_glyph_runs_it_in_a_named_pane() {
         .as_ref()
         .expect("the caret is in the fourth fence");
     assert_eq!(
-        pending.pane_name, "docs/README.md:4",
+        pending.pane_name.replace('\\', "/"),
+        "docs/README.md:4",
         "identical blocks keep their own numbers"
     );
     app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
@@ -838,10 +851,13 @@ fn fence_command_shapes_the_typed_block() {
     let file = staged_block_path(&cmd);
     assert!(file.starts_with(&scripts));
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "print(1)\n");
-    use std::os::unix::fs::PermissionsExt;
-    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode(&file), 0o600, "only the user reads the block");
-    assert_eq!(mode(&scripts), 0o700);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600, "only the user reads the block");
+        assert_eq!(mode(&scripts), 0o700);
+    }
     // Two runs of one block never share a file.
     let again = super::fence_command("python3", "print(1)\n", &scripts, "/bin/sh");
     assert_ne!(staged_block_path(&again), file);
@@ -855,6 +871,7 @@ fn fence_command_shapes_the_typed_block() {
 /// #1630: the issue's block prints its output when the typed line runs, and
 /// the line holds nothing but a command, a redirect and a quoted path, which
 /// bash, zsh and fish all read the same way.
+#[cfg(unix)]
 #[test]
 fn a_python_block_runs_from_its_file_and_prints() {
     if !(crate::markdown::runnable_interpreter("python") == Some("python3")) {
@@ -880,6 +897,7 @@ fn fence_blocks_with_tabs_or_bangs_run_exactly_as_shown() {
         std::fs::read_to_string(staged_block_path(&cmd)).unwrap(),
         code
     );
+    #[cfg(unix)]
     if crate::markdown::runnable_interpreter("python") == Some("python3") {
         assert_eq!(run_typed_line(&cmd, tmp.path()), "hi!\n");
     }
@@ -892,8 +910,11 @@ fn fence_blocks_with_tabs_or_bangs_run_exactly_as_shown() {
         "/bin/sh",
     );
     assert!(sh.starts_with("eval \"$(printf '%b' "), "{sh}");
-    let probe = format!("{}; pwd", sh.trim_end_matches('\r'));
-    assert_eq!(run_typed_line(&probe, tmp.path()), "hi!\n/\n");
+    #[cfg(unix)]
+    {
+        let probe = format!("{}; pwd", sh.trim_end_matches('\r'));
+        assert_eq!(run_typed_line(&probe, tmp.path()), "hi!\n/\n");
+    }
 }
 
 /// #1367: zsh at its prompt reads `#` as a word unless `interactive_comments`
@@ -901,6 +922,7 @@ fn fence_blocks_with_tabs_or_bangs_run_exactly_as_shown() {
 /// or failed with exit 127. Typed into an interactive zsh with no startup
 /// files, as a pane's prompt reads it, the block's comment is a comment, and
 /// a `#` inside a word or quotes is kept.
+#[cfg(unix)]
 #[test]
 fn a_shell_block_with_a_comment_runs_in_an_interactive_zsh() {
     let tmp = tempfile::tempdir().unwrap();
@@ -949,6 +971,7 @@ fn a_shell_block_with_a_comment_runs_in_an_interactive_zsh() {
 /// #920: a shell block of several lines reaches the shell as ONE command
 /// line, so the shell reports one outcome for it: every line's output and
 /// the status the block ends with, as `sh` running it as a script would.
+#[cfg(unix)]
 #[test]
 fn a_multi_line_shell_block_is_typed_as_one_command() {
     let tmp = tempfile::tempdir().unwrap();
@@ -972,6 +995,7 @@ fn a_multi_line_shell_block_is_typed_as_one_command() {
 /// `source`s the block from a `psub` file, which runs it in the pane's own
 /// shell (a `cd` persists) on every fish, and leaves the block's stdin the
 /// pane's: a `read` in it still gets what the user types.
+#[cfg(unix)]
 #[test]
 fn a_multi_line_shell_block_in_a_fish_pane_is_sourced() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1006,6 +1030,7 @@ fn a_multi_line_shell_block_in_a_fish_pane_is_sourced() {
 /// line between OSC 133 marks. Typed line by line, the block finished three
 /// times, and its box and `{persist}` fence held only the first command's
 /// output and exit.
+#[cfg(unix)]
 #[test]
 fn a_multi_line_blocks_capture_holds_every_line_and_the_blocks_exit() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1289,6 +1314,7 @@ fn a_task_problem_matcher_owns_its_pane_and_watch_publishes_win() {
 /// DESCENDANT, so a shell that had `cd`'d into a subdirectory was reused
 /// and the task ran there. The two callers now share `pane_is_idle_at`,
 /// so a correction cannot land on one and miss the other.
+#[cfg(unix)]
 #[test]
 fn a_task_pane_whose_shell_left_the_directory_is_not_reused() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1349,6 +1375,7 @@ fn a_task_pane_whose_shell_left_the_directory_is_not_reused() {
 }
 
 /// #250: a config's `postDebugTask` runs when the user stops the session.
+#[cfg(unix)]
 #[test]
 fn stopping_a_session_runs_its_post_debug_task_once() {
     let (_tmp, mut app) = app_with_cleanup_task();
@@ -1370,6 +1397,7 @@ fn stopping_with_no_session_runs_no_post_debug_task() {
 }
 
 /// #250: a session that ends by itself runs the task too.
+#[cfg(unix)]
 #[test]
 fn a_session_ending_on_its_own_runs_its_post_debug_task() {
     let (_tmp, mut app) = app_with_cleanup_task();
@@ -1382,6 +1410,7 @@ fn a_session_ending_on_its_own_runs_its_post_debug_task() {
 
 /// #867 guard: a postDebugTask reports after the end, so its message is
 /// the one left on the status line, not the end message.
+#[cfg(unix)]
 #[test]
 fn a_post_debug_task_message_outlives_the_end_message() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1510,6 +1539,7 @@ fn a_finished_fenced_block_replaces_its_running_status_with_the_outcome() {
 /// boom; exit 3`) kept "Running fail" for good: a shell that exits sends
 /// no command-finished mark. Its exit code is now the task's outcome, and
 /// the pane stays so the output can be read.
+#[cfg(unix)]
 #[test]
 fn a_task_that_exits_its_shell_reports_the_exit_code() {
     let tmp = tempfile::tempdir().unwrap();

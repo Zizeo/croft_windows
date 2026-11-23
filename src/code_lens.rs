@@ -166,18 +166,26 @@ mod tests {
 
     #[test]
     fn a_references_lens_shows_its_locations() {
+        let tp = |p: &str| {
+            if cfg!(windows) {
+                PathBuf::from(format!("C:{p}"))
+            } else {
+                PathBuf::from(p)
+            }
+        };
+        let tu = |p: &str| -> String { lsp_types::Url::from_file_path(tp(p)).unwrap().into() };
         let l = lens(
             "rust-analyzer.showReferences",
             vec![
-                json!("file:///p/a.rs"),
+                json!(tu("/p/a.rs")),
                 json!({"line": 0, "character": 3}),
-                json!([{"uri": "file:///p/b.rs", "range": {"start": {"line": 7, "character": 2}, "end": {"line": 7, "character": 5}}}]),
+                json!([{"uri": tu("/p/b.rs"), "range": {"start": {"line": 7, "character": 2}, "end": {"line": 7, "character": 5}}}]),
             ],
             false,
         );
         assert_eq!(
             action_for(&l),
-            LensAction::ShowLocations(vec![(PathBuf::from("/p/b.rs"), 7, 2)])
+            LensAction::ShowLocations(vec![(tp("/p/b.rs"), 7, 2)])
         );
     }
 

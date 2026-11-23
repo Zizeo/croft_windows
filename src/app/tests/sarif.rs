@@ -152,11 +152,14 @@ fn a_sarif_result_whose_file_is_only_in_the_log_opens_the_logs_copy() {
         assert_eq!(app.editor.lines[2], "int bad;");
         assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 4));
         assert!(app.status.contains("read-only"), "{}", app.status);
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(&opened).unwrap().permissions().mode() & 0o222,
-            0
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&opened).unwrap().permissions().mode() & 0o222,
+                0
+            );
+        }
 
         app.editor.open_preview(&log).unwrap();
         select(&mut app, "R2");
@@ -1378,6 +1381,7 @@ fn sarif_export_writes_the_visible_results_as_sarif_or_csv() {
     assert!(csv.starts_with("rule,level,file"), "{csv}");
 }
 
+#[cfg(unix)]
 #[test]
 fn code_scanning_follows_the_branch_when_on_and_only_says_so_when_prompting() {
     // #577: `code_scanning = on` loads the branch's newest analysis per

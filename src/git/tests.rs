@@ -290,7 +290,7 @@ fn result_line_keeps_a_lone_result_and_is_empty_for_pure_noise() {
     assert_eq!(result_line(""), "");
 }
 use super::*;
-use crate::test_git::test_git_command;
+use crate::test_git::{git_init_with_identity, git_ok, test_git, test_git_command};
 use tempfile::TempDir;
 
 #[test]
@@ -389,6 +389,7 @@ fn commit_graph_of_a_real_merge_lays_out_the_diamond() {
         assert!(ok, "git {args:?} failed");
     };
     run(&["init", "-q", "-b", "main"]);
+    run(&["config", "core.autocrlf", "false"]);
     run(&["config", "user.email", "t@t"]);
     run(&["config", "user.name", "t"]);
     std::fs::write(root.join("a.txt"), "1\n").unwrap();
@@ -442,6 +443,7 @@ fn repo_with_two_hunks(root: &Path) {
         assert!(ok, "git {args:?} failed");
     };
     run(&["init", "-q", "-b", "main"]);
+    run(&["config", "core.autocrlf", "false"]);
     run(&["config", "user.email", "t@t"]);
     run(&["config", "user.name", "t"]);
     let original: String = (1..=20).map(|i| format!("line{i}\n")).collect();
@@ -1532,21 +1534,7 @@ fn the_pull_request_remote_is_the_one_naming_the_repository() {
 }
 
 fn init_repo_with_commit(p: &Path) {
-    let _ = test_git_command()
-        .args(["-C"])
-        .arg(p)
-        .args(["init", "-q", "-b", "main"])
-        .output();
-    let _ = test_git_command()
-        .args(["-C"])
-        .arg(p)
-        .args(["config", "user.email", "a@b"])
-        .status();
-    let _ = test_git_command()
-        .args(["-C"])
-        .arg(p)
-        .args(["config", "user.name", "a"])
-        .status();
+    crate::test_git::git_init_with_identity(p);
     std::fs::write(p.join("seed.txt"), "one\ntwo\n").unwrap();
     let _ = test_git_command()
         .args(["-C"])
@@ -2624,6 +2612,7 @@ fn git_diff_views_ignore_a_color_always_config() {
 
 /// #1447: a `diff.external` tool (difftastic's recommended setup) does
 /// not replace the patch with its own output.
+#[cfg(unix)]
 #[test]
 fn git_diff_views_ignore_an_external_diff_tool() {
     let (tmp, _) = repo_with_a_staged_edit();
@@ -3620,22 +3609,34 @@ fn pull_on_an_up_to_date_clone_succeeds() {
 /// #989: the issue's repro, a merge stopped on a conflict in README.md.
 fn repo_in_a_conflicted_merge() -> TempDir {
     let tmp = TempDir::new().unwrap();
-    let script = r#"set -e
-git init -q -b main && git config user.email a@b && git config user.name a
-printf '# Orders\n\nRun `python pricing.py`.\n' > README.md && git add . && git commit -qm init
-git checkout -qb hotfix && sed 's/python pricing.py/python -m pricing/' README.md > README.tmp && mv README.tmp README.md && git commit -qam fix
-git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md > README.tmp && mv README.tmp README.md && git commit -qam uv
-! git merge -q hotfix >/dev/null 2>&1"#;
-    let out = Command::new("sh")
-        .args(["-c", script])
-        .current_dir(tmp.path())
+    let p = tmp.path();
+    git_init_with_identity(p);
+    std::fs::write(
+        p.join("README.md"),
+        "# Orders\n\nRun `python pricing.py`.\n",
+    )
+    .unwrap();
+    git_ok(p, &["add", "."]);
+    git_ok(p, &["commit", "-qm", "init"]);
+    git_ok(p, &["checkout", "-qb", "hotfix"]);
+    std::fs::write(
+        p.join("README.md"),
+        "# Orders\n\nRun `python -m pricing`.\n",
+    )
+    .unwrap();
+    git_ok(p, &["commit", "-qam", "fix"]);
+    git_ok(p, &["checkout", "-q", "main"]);
+    std::fs::write(
+        p.join("README.md"),
+        "# Orders\n\nRun `uv run pricing.py`.\n",
+    )
+    .unwrap();
+    git_ok(p, &["commit", "-qam", "uv"]);
+    let merge = test_git(p)
+        .args(["merge", "-q", "hotfix"])
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(!merge.status.success(), "expected merge conflict");
     tmp
 }
 
@@ -3779,24 +3780,39 @@ fn a_resolved_file_that_shows_a_marker_example_both_sides_had_stages() {
     // block after its real conflict is resolved; it must not block
     // staging forever.
     let tmp = TempDir::new().unwrap();
-    let script = r#"set -e
-git init -q -b main && git config user.email a@b && git config user.name a
-printf 'Example:\n<<<<<<< HEAD\nmine\n=======\nyours\n>>>>>>> br\n\nRun `python pricing.py`.\n' > GUIDE.md && git add . && git commit -qm init
-git checkout -qb hotfix && sed 's/python pricing.py/python -m pricing/' GUIDE.md > g.tmp && mv g.tmp GUIDE.md && git commit -qam fix
-git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' GUIDE.md > g.tmp && mv g.tmp GUIDE.md && git commit -qam uv
-! git merge -q hotfix >/dev/null 2>&1
-sed -n '1,7p' GUIDE.md > g.tmp && echo 'Run `uv run -m pricing`.' >> g.tmp && mv g.tmp GUIDE.md"#;
-    let out = Command::new("sh")
-        .args(["-c", script])
-        .current_dir(tmp.path())
+    let p = tmp.path();
+    git_init_with_identity(p);
+    std::fs::write(
+        p.join("GUIDE.md"),
+        "Example:\n<<<<<<< HEAD\nmine\n=======\nyours\n>>>>>>> br\n\nRun `python pricing.py`.\n",
+    )
+    .unwrap();
+    git_ok(p, &["add", "."]);
+    git_ok(p, &["commit", "-qm", "init"]);
+    git_ok(p, &["checkout", "-qb", "hotfix"]);
+    std::fs::write(
+        p.join("GUIDE.md"),
+        "Example:\n<<<<<<< HEAD\nmine\n=======\nyours\n>>>>>>> br\n\nRun `python -m pricing`.\n",
+    )
+    .unwrap();
+    git_ok(p, &["commit", "-qam", "fix"]);
+    git_ok(p, &["checkout", "-q", "main"]);
+    std::fs::write(
+        p.join("GUIDE.md"),
+        "Example:\n<<<<<<< HEAD\nmine\n=======\nyours\n>>>>>>> br\n\nRun `uv run pricing.py`.\n",
+    )
+    .unwrap();
+    git_ok(p, &["commit", "-qam", "uv"]);
+    let merge = test_git(p)
+        .args(["merge", "-q", "hotfix"])
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let p = tmp.path();
+    assert!(!merge.status.success(), "expected merge conflict");
+    std::fs::write(
+        p.join("GUIDE.md"),
+        "Example:\n<<<<<<< HEAD\nmine\n=======\nyours\n>>>>>>> br\n\nRun `uv run -m pricing`.\n",
+    )
+    .unwrap();
     assert_eq!(unmerged_paths(p), vec![String::from("GUIDE.md")]);
     stage_all(p).expect("the example both sides had is not a conflict");
     assert!(unmerged_paths(p).is_empty());
@@ -3865,6 +3881,7 @@ fn filtered_repo_with(root: &Path, name: &str) {
         )
     };
     run(&["init", "-q", "-b", "main"]);
+    run(&["config", "core.autocrlf", "false"]);
     run(&["config", "user.email", "t@t"]);
     run(&["config", "user.name", "t"]);
     let rot13 = "tr A-Za-z N-ZA-Mn-za-m";

@@ -105,7 +105,7 @@ impl LspManager {
 
     /// Test hook: replace the servers registered for `lang`, as a disabled
     /// or added extension would.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn set_registered_servers_for_test(&mut self, lang: Language, names: &[&'static str]) {
         self.registered_servers.insert(lang, names.to_vec());
     }

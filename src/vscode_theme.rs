@@ -229,6 +229,7 @@ fn load_chain(path: &Path, depth: usize, out: &mut Vec<RawTheme>) -> Result<()> 
 fn beside(theme: &Path, rel: &str, field: &str) -> Result<PathBuf> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute()
+        || rel_path.has_root()
         || rel_path
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))

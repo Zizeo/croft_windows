@@ -37,7 +37,7 @@ pub use add_configuration::ConfigDraft;
 pub use add_configuration::DRAFT_TYPES;
 pub use add_configuration::DraftField;
 pub use add_configuration::add_to_croft_launch_json;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use add_configuration::*;
 pub use compounds::Compound;
 pub use compounds::resolve_compound;

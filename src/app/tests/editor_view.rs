@@ -1570,6 +1570,7 @@ fn minimap_edit_rebakes_in_place_but_a_moved_strip_arms_the_clear() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn timestamps_gutter_toggles_on_and_shows_arrival_times() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1642,6 +1643,7 @@ fn timestamps_gutter_toggles_on_and_shows_arrival_times() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn sticky_command_header_pins_the_command_while_scrolled_into_its_output() {
     let tmp = tempfile::tempdir().unwrap();

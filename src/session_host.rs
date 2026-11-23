@@ -84,11 +84,11 @@ use outbox::*;
 pub use protocol::Control;
 #[cfg(any(unix, test))]
 pub use protocol::Frame;
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 pub use protocol::FrameReader;
 pub use protocol::Participant;
 pub use protocol::encode_bytes_frame;
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 pub use protocol::encode_control_frame;
 #[cfg(all(unix, test))]
 use protocol::*;

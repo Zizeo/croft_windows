@@ -187,7 +187,7 @@ fn hit_paths(root: &Path, query: &str) -> Vec<String> {
                 .strip_prefix(root)
                 .unwrap()
                 .to_string_lossy()
-                .into_owned()
+                .replace('\\', "/")
         })
         .collect();
     paths.sort();
@@ -2080,6 +2080,7 @@ fn replace_in_text_never_matches_across_a_line_break() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn replace_in_file_keeps_the_mode_and_reports_a_non_utf8_file() {
     use std::os::unix::fs::PermissionsExt;
@@ -2109,6 +2110,7 @@ fn replace_in_file_keeps_the_mode_and_reports_a_non_utf8_file() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_symlink_planted_at_the_temp_name_is_not_written_through() {
     let dir = tempfile::tempdir().unwrap();
@@ -2169,6 +2171,7 @@ fn captures_keep_the_context_around_the_match() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn replace_in_file_keeps_hard_links_linked() {
     let dir = tempfile::tempdir().unwrap();

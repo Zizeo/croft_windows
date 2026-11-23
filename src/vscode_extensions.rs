@@ -892,6 +892,7 @@ mod tests {
 
     /// The listing is bounded: a child that never answers is given up on
     /// within the timeout, and a normal one is read in full.
+    #[cfg(unix)]
     #[test]
     fn listing_installed_extensions_gives_up_on_a_hung_child() {
         let mut fast = std::process::Command::new("/bin/sh");

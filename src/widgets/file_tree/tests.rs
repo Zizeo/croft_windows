@@ -1595,15 +1595,15 @@ fn affected_dir_for_event_returns_parent() {
     std::fs::create_dir(&sub).unwrap();
     let f = sub.join("a.txt");
     std::fs::write(&f, "").unwrap();
-    let canon = tmp.path().canonicalize().unwrap();
+    let canon = crate::platform::fs::canonicalize(tmp.path()).unwrap();
     let res = affected_dir_for_event(&f, tmp.path(), &canon).unwrap();
-    assert_eq!(res, sub.canonicalize().unwrap());
+    assert_eq!(res, crate::platform::fs::canonicalize(&sub).unwrap());
 }
 
 #[test]
 fn affected_dir_for_event_returns_none_for_root_itself() {
     let tmp = TempDir::new().unwrap();
-    let canon = tmp.path().canonicalize().unwrap();
+    let canon = crate::platform::fs::canonicalize(tmp.path()).unwrap();
     assert!(affected_dir_for_event(tmp.path(), tmp.path(), &canon).is_none());
 }
 
@@ -1613,7 +1613,7 @@ fn affected_dir_for_event_returns_none_when_outside_root() {
     let other = TempDir::new().unwrap();
     let f = other.path().join("x.txt");
     std::fs::write(&f, "").unwrap();
-    let canon = tmp.path().canonicalize().unwrap();
+    let canon = crate::platform::fs::canonicalize(tmp.path()).unwrap();
     assert!(affected_dir_for_event(&f, tmp.path(), &canon).is_none());
 }
 
@@ -1622,9 +1622,9 @@ fn affected_dir_for_top_level_file_returns_root() {
     let tmp = TempDir::new().unwrap();
     let f = tmp.path().join("top.txt");
     std::fs::write(&f, "").unwrap();
-    let canon = tmp.path().canonicalize().unwrap();
+    let canon = crate::platform::fs::canonicalize(tmp.path()).unwrap();
     let res = affected_dir_for_event(&f, tmp.path(), &canon).unwrap();
-    assert_eq!(res, tmp.path().canonicalize().unwrap());
+    assert_eq!(res, crate::platform::fs::canonicalize(tmp.path()).unwrap());
 }
 
 #[test]
@@ -1637,7 +1637,7 @@ fn affected_dir_for_event_resolves_correctly_for_external_creation() {
     std::fs::create_dir(&sub).unwrap();
     let f = sub.join("x.txt");
     std::fs::write(&f, "external write").unwrap();
-    let canon = tmp.path().canonicalize().unwrap();
+    let canon = crate::platform::fs::canonicalize(tmp.path()).unwrap();
     let dir = affected_dir_for_event(&f, tmp.path(), &canon).expect("inside root");
     // Reload the tree's children of `sub` and verify x.txt is found.
     let mut tree = FileTree::new(tmp.path().to_path_buf());
@@ -1919,6 +1919,7 @@ fn rename_in_errors_when_target_already_exists() {
     assert!(b.exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_hard_link_under_the_new_name_is_still_a_clash() {
     // A second directory entry for the same file is a separate name:

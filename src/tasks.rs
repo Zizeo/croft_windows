@@ -1655,6 +1655,7 @@ mod tests {
     /// The words a shell line splits into, and the cwd/env it sets up, as a
     /// real `sh` sees them: the program is swapped for a printer, so each
     /// argument comes back bracketed.
+    #[cfg(unix)]
     fn shell_words(line: &str, program: &str) -> String {
         let probe = line.replacen(program, "printf '[%s]'", 1);
         let out = std::process::Command::new("sh")
@@ -1664,6 +1665,7 @@ mod tests {
         String::from_utf8(out.stdout).unwrap()
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_tasks_json_line_expands_variables_quotes_args_and_applies_options() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1748,11 +1750,12 @@ mod tests {
             std::fs::create_dir(tmp.path().join(dir)).unwrap();
         }
         std::fs::write(tmp.path().join(".vscode/tasks.json"), json).unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = crate::platform::fs::canonicalize(tmp.path()).unwrap();
         (tmp, root)
     }
 
     /// What `label`'s command line prints when `sh` runs it in `root`.
+    #[cfg(unix)]
     fn run_task(root: &Path, label: &str) -> String {
         let tasks = discover_tasks(root);
         let task = tasks
@@ -1771,6 +1774,7 @@ mod tests {
 
     /// #1441: the top-level `options` apply to every task; a task's own
     /// `cwd` wins, and its `env` merges over the shared one key by key.
+    #[cfg(unix)]
     #[test]
     fn top_level_options_apply_to_every_task_and_a_tasks_own_win() {
         let (_tmp, root) = tasks_workspace(
@@ -1794,6 +1798,7 @@ mod tests {
 
     /// #1441: `{ "value", "quoting" }` arguments and commands are kept, each
     /// one shell word quoted the way it asks.
+    #[cfg(unix)]
     #[test]
     fn quoted_arguments_and_commands_are_kept_as_one_word() {
         let (_tmp, root) = tasks_workspace(
@@ -1837,6 +1842,7 @@ mod tests {
     /// #1441: a task with no command of its own runs the top-level one, with
     /// the top-level `args` and then its own; a `dependsOn` task stays
     /// compound.
+    #[cfg(unix)]
     #[test]
     fn a_task_without_a_command_runs_the_top_level_one() {
         let (_tmp, root) = tasks_workspace(
@@ -1870,6 +1876,7 @@ mod tests {
     /// #1441, negative: a file with no top level runs each task as written,
     /// in the workspace root, and words that are neither a string nor an
     /// object with a string `value` are still dropped.
+    #[cfg(unix)]
     #[test]
     fn without_a_top_level_tasks_run_as_written_and_odd_words_are_dropped() {
         let (_tmp, root) = tasks_workspace(
@@ -2135,6 +2142,7 @@ mod tests {
 
     /// #1361: the folder `compile_commands.json` already points into is
     /// the build folder.
+    #[cfg(unix)]
     #[test]
     fn a_cmake_project_keeps_the_build_folder_clangd_uses() {
         let tmp = tempfile::tempdir().unwrap();

@@ -704,7 +704,10 @@ mod tests {
         let build = build_args(&dc, root).unwrap();
         let tag = image_tag(root);
         assert_eq!(build[..3], ["build".to_string(), "-t".into(), tag.clone()]);
-        assert_eq!(build.last().unwrap(), "/home/me/proj/.devcontainer/.");
+        assert_eq!(
+            build.last().unwrap().replace('\\', "/"),
+            "/home/me/proj/.devcontainer/."
+        );
 
         let run = run_args(&dc, root, "abc");
         let joined = run.join(" ");

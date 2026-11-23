@@ -594,8 +594,11 @@ fn cmd_click_on_a_file_line_reference_in_the_terminal_opens_the_file_there() {
     term.draw(|f| app.render(f)).unwrap();
 
     let reference = "src/probe.rs:3:2";
-    app.terminal_mut()
-        .write_input(format!("printf 'ref {reference}\\n'\r").as_bytes());
+    #[cfg(unix)]
+    let cmd = format!("printf 'ref {reference}\\n'\r");
+    #[cfg(not(unix))]
+    let cmd = format!("Write-Output 'ref {reference}'\r");
+    app.terminal_mut().write_input(cmd.as_bytes());
     // The echoed command line also contains the reference; wait for the
     // OUTPUT line (the one starting with "ref "), then click that one.
     let is_output_line = |l: &str| l.trim_start().starts_with("ref src/probe.rs");
@@ -635,13 +638,11 @@ fn cmd_click_on_a_file_line_reference_in_the_terminal_opens_the_file_there() {
         .editor
         .path
         .as_deref()
-        .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
+        .map(|p| crate::platform::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
     assert_eq!(
         opened,
         Some(
-            tmp.path()
-                .join("src/probe.rs")
-                .canonicalize()
+            crate::platform::fs::canonicalize(&tmp.path().join("src/probe.rs"))
                 .expect("probe file exists")
         ),
         "Cmd+click on path:line:col must open the file (status: {})",

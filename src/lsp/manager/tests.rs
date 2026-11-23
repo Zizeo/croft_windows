@@ -231,9 +231,21 @@ fn normalise_inlay_hint_flattens_parts_and_folds_padding() {
     );
 }
 
+fn test_path(p: &str) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(format!("C:{p}"))
+    } else {
+        PathBuf::from(p)
+    }
+}
+
+fn test_url(p: &str) -> Url {
+    Url::from_file_path(test_path(p)).unwrap()
+}
+
 #[test]
 fn workspace_symbol_items_maps_the_flat_response() {
-    use lsp_types::{SymbolInformation, SymbolKind, Url, WorkspaceSymbolResponse};
+    use lsp_types::{SymbolInformation, SymbolKind, WorkspaceSymbolResponse};
     #[allow(deprecated)]
     let resp = WorkspaceSymbolResponse::Flat(vec![SymbolInformation {
         name: "main".into(),
@@ -241,7 +253,7 @@ fn workspace_symbol_items_maps_the_flat_response() {
         tags: None,
         deprecated: None,
         location: Location {
-            uri: Url::from_file_path("/w/src/main.rs").unwrap(),
+            uri: test_url("/w/src/main.rs"),
             range: lsp_types::Range {
                 start: Position {
                     line: 4,
@@ -261,7 +273,7 @@ fn workspace_symbol_items_maps_the_flat_response() {
         vec![WorkspaceSymbolItem {
             name: "main".into(),
             kind: OutlineKind::Function,
-            path: PathBuf::from("/w/src/main.rs"),
+            path: test_path("/w/src/main.rs"),
             line: 4,
             character: 3,
             container: Some("app".into()),
@@ -271,7 +283,7 @@ fn workspace_symbol_items_maps_the_flat_response() {
 
 #[test]
 fn workspace_symbol_items_maps_the_nested_response_and_bare_uris() {
-    use lsp_types::{SymbolKind, Url, WorkspaceLocation, WorkspaceSymbol, WorkspaceSymbolResponse};
+    use lsp_types::{SymbolKind, WorkspaceLocation, WorkspaceSymbol, WorkspaceSymbolResponse};
     let resp = WorkspaceSymbolResponse::Nested(vec![
         WorkspaceSymbol {
             name: "Config".into(),
@@ -279,7 +291,7 @@ fn workspace_symbol_items_maps_the_nested_response_and_bare_uris() {
             tags: None,
             container_name: None,
             location: OneOf::Left(Location {
-                uri: Url::from_file_path("/w/src/config.rs").unwrap(),
+                uri: test_url("/w/src/config.rs"),
                 range: lsp_types::Range {
                     start: Position {
                         line: 9,
@@ -299,7 +311,7 @@ fn workspace_symbol_items_maps_the_nested_response_and_bare_uris() {
             tags: None,
             container_name: None,
             location: OneOf::Right(WorkspaceLocation {
-                uri: Url::from_file_path("/w/src/lib.rs").unwrap(),
+                uri: test_url("/w/src/lib.rs"),
             }),
             data: None,
         },
@@ -310,7 +322,7 @@ fn workspace_symbol_items_maps_the_nested_response_and_bare_uris() {
     assert_eq!(items[0].line, 9);
     assert_eq!(
         items[1].path,
-        PathBuf::from("/w/src/lib.rs"),
+        test_path("/w/src/lib.rs"),
         "a range-less nested location still yields a jump target"
     );
     assert_eq!(items[1].line, 0, "bare-URI locations land on line 0");
@@ -434,14 +446,14 @@ fn client_capabilities_ask_for_location_links_on_every_goto() {
 /// its name lands on the name, not the declaration.
 #[test]
 fn a_plain_location_still_jumps_to_its_start_and_a_link_to_its_name() {
-    let uri = Url::from_file_path("/tmp/config.ts").unwrap();
+    let uri = test_url("/tmp/config.ts");
     let plain = GotoDefinitionResponse::Array(vec![Location {
         uri: uri.clone(),
         range: lsp_types::Range::new(Position::new(7, 0), Position::new(11, 10)),
     }]);
     assert_eq!(
         def_location(&plain),
-        Some((PathBuf::from("/tmp/config.ts"), 7, 0))
+        Some((test_path("/tmp/config.ts"), 7, 0))
     );
     let link = GotoDefinitionResponse::Link(vec![LocationLink {
         origin_selection_range: None,
@@ -451,11 +463,11 @@ fn a_plain_location_still_jumps_to_its_start_and_a_link_to_its_name() {
     }]);
     assert_eq!(
         def_location(&link),
-        Some((PathBuf::from("/tmp/config.ts"), 10, 2))
+        Some((test_path("/tmp/config.ts"), 10, 2))
     );
     assert_eq!(
         def_locations(&link),
-        vec![(PathBuf::from("/tmp/config.ts"), 10, 2)]
+        vec![(test_path("/tmp/config.ts"), 10, 2)]
     );
 }
 
@@ -1301,7 +1313,7 @@ fn a_workspace_pull_forwards_full_reports_and_leaves_unchanged_files_alone() {
     // send back an id the server never issued for this content.
     let (tx, rx) = std_mpsc::channel();
     let mut ids = DiagnosticResultIds::default();
-    let uri = |p: &str| Url::from_file_path(p).expect("an absolute path");
+    let uri = test_url;
     let wire = |message: &str| lsp_types::Diagnostic {
         range: def_range(3, 1),
         message: message.to_string(),
@@ -1346,9 +1358,11 @@ fn a_workspace_pull_forwards_full_reports_and_leaves_unchanged_files_alone() {
 
     let sent: Vec<DiagnosticsUpdate> = rx.try_iter().collect();
     let paths: Vec<&Path> = sent.iter().map(|u| u.path.as_path()).collect();
+    let broken_path = test_path("/ws/broken.toml");
+    let fixed_path = test_path("/ws/fixed.toml");
     assert_eq!(
         paths,
-        vec![Path::new("/ws/broken.toml"), Path::new("/ws/fixed.toml")],
+        vec![broken_path.as_path(), fixed_path.as_path()],
         "the Unchanged file must not be re-processed, and the CLEARED file must be: \
              an empty batch is how the app drops a fixed file's rows"
     );
@@ -1365,14 +1379,8 @@ fn a_workspace_pull_forwards_full_reports_and_leaves_unchanged_files_alone() {
     assert_eq!(
         previous,
         vec![
-            (
-                "file:///ws/broken.toml".to_string(),
-                "id-broken".to_string()
-            ),
-            (
-                "file:///ws/steady.toml".to_string(),
-                "id-steady".to_string()
-            ),
+            (uri("/ws/broken.toml").to_string(), "id-broken".to_string()),
+            (uri("/ws/steady.toml").to_string(), "id-steady".to_string()),
         ],
         "the id-less report must leave nothing behind for /ws/fixed.toml"
     );
@@ -1539,7 +1547,7 @@ fn resolve_config_skips_a_server_not_on_path_and_keeps_one_that_is() {
     );
     let present = ServerConfig {
         name: "shell",
-        command: "sh".into(),
+        command: if cfg!(windows) { "cmd" } else { "sh" }.into(),
         args: vec![],
         language: Language::BASH,
         initialization_options: None,
@@ -1866,7 +1874,7 @@ fn a_rustup_proxy_without_the_component_is_not_the_server_croft_starts() {
 
 #[test]
 fn workspace_edits_reads_changes_map() {
-    let uri = Url::from_file_path("/tmp/foo.rs").unwrap();
+    let uri = test_url("/tmp/foo.rs");
     let mut changes = HashMap::new();
     changes.insert(
         uri,
@@ -1882,7 +1890,7 @@ fn workspace_edits_reads_changes_map() {
     };
     let out = workspace_edits(&we);
     assert_eq!(out.len(), 1);
-    assert_eq!(out[0].0, PathBuf::from("/tmp/foo.rs"));
+    assert_eq!(out[0].0, test_path("/tmp/foo.rs"));
     assert_eq!(out[0].1.len(), 1);
     assert_eq!(out[0].1[0].new_text, "renamed");
     assert_eq!(out[0].1[0].start, (2, 4));
@@ -1891,7 +1899,7 @@ fn workspace_edits_reads_changes_map() {
 #[test]
 fn code_action_items_skips_disabled_and_normalises_edits() {
     use lsp_types::{CodeAction, CodeActionDisabled, CodeActionOrCommand, Command};
-    let uri = Url::from_file_path("/tmp/foo.rs").unwrap();
+    let uri = test_url("/tmp/foo.rs");
     let mut changes = HashMap::new();
     changes.insert(
         uri,
@@ -2232,24 +2240,24 @@ fn reference_locations_maps_every_location() {
     // one must survive the mapping, in order.
     let locs = vec![
         Location {
-            uri: Url::from_file_path("/tmp/a.rs").unwrap(),
+            uri: test_url("/tmp/a.rs"),
             range: def_range(2, 4),
         },
         Location {
-            uri: Url::from_file_path("/tmp/b.rs").unwrap(),
+            uri: test_url("/tmp/b.rs"),
             range: def_range(7, 1),
         },
         Location {
-            uri: Url::from_file_path("/tmp/a.rs").unwrap(),
+            uri: test_url("/tmp/a.rs"),
             range: def_range(11, 0),
         },
     ];
     assert_eq!(
         reference_locations(&locs),
         vec![
-            (PathBuf::from("/tmp/a.rs"), 2, 4),
-            (PathBuf::from("/tmp/b.rs"), 7, 1),
-            (PathBuf::from("/tmp/a.rs"), 11, 0),
+            (test_path("/tmp/a.rs"), 2, 4),
+            (test_path("/tmp/b.rs"), 7, 1),
+            (test_path("/tmp/a.rs"), 11, 0),
         ]
     );
 }
@@ -2261,47 +2269,38 @@ fn reference_locations_empty_is_empty() {
 
 #[test]
 fn def_location_reads_scalar() {
-    let uri = Url::from_file_path("/tmp/foo.rs").unwrap();
+    let uri = test_url("/tmp/foo.rs");
     let resp = GotoDefinitionResponse::Scalar(Location {
         uri,
         range: def_range(3, 5),
     });
-    assert_eq!(
-        def_location(&resp),
-        Some((PathBuf::from("/tmp/foo.rs"), 3, 5))
-    );
+    assert_eq!(def_location(&resp), Some((test_path("/tmp/foo.rs"), 3, 5)));
 }
 
 #[test]
 fn def_location_reads_first_of_array() {
     let resp = GotoDefinitionResponse::Array(vec![
         Location {
-            uri: Url::from_file_path("/tmp/a.rs").unwrap(),
+            uri: test_url("/tmp/a.rs"),
             range: def_range(1, 0),
         },
         Location {
-            uri: Url::from_file_path("/tmp/b.rs").unwrap(),
+            uri: test_url("/tmp/b.rs"),
             range: def_range(9, 9),
         },
     ]);
-    assert_eq!(
-        def_location(&resp),
-        Some((PathBuf::from("/tmp/a.rs"), 1, 0))
-    );
+    assert_eq!(def_location(&resp), Some((test_path("/tmp/a.rs"), 1, 0)));
 }
 
 #[test]
 fn def_location_reads_link_target_selection_range() {
     let resp = GotoDefinitionResponse::Link(vec![LocationLink {
         origin_selection_range: None,
-        target_uri: Url::from_file_path("/tmp/c.rs").unwrap(),
+        target_uri: test_url("/tmp/c.rs"),
         target_range: def_range(10, 0),
         target_selection_range: def_range(12, 4),
     }]);
-    assert_eq!(
-        def_location(&resp),
-        Some((PathBuf::from("/tmp/c.rs"), 12, 4))
-    );
+    assert_eq!(def_location(&resp), Some((test_path("/tmp/c.rs"), 12, 4)));
 }
 
 #[test]
@@ -2317,19 +2316,19 @@ fn def_locations_reads_every_entry_of_array() {
     // `def_location` keeps only the first).
     let resp = GotoDefinitionResponse::Array(vec![
         Location {
-            uri: Url::from_file_path("/tmp/a.rs").unwrap(),
+            uri: test_url("/tmp/a.rs"),
             range: def_range(1, 0),
         },
         Location {
-            uri: Url::from_file_path("/tmp/b.rs").unwrap(),
+            uri: test_url("/tmp/b.rs"),
             range: def_range(9, 9),
         },
     ]);
     assert_eq!(
         def_locations(&resp),
         vec![
-            (PathBuf::from("/tmp/a.rs"), 1, 0),
-            (PathBuf::from("/tmp/b.rs"), 9, 9),
+            (test_path("/tmp/a.rs"), 1, 0),
+            (test_path("/tmp/b.rs"), 9, 9),
         ]
     );
 }
@@ -2337,13 +2336,10 @@ fn def_locations_reads_every_entry_of_array() {
 #[test]
 fn def_locations_collapses_scalar_to_one_entry() {
     let resp = GotoDefinitionResponse::Scalar(Location {
-        uri: Url::from_file_path("/tmp/foo.rs").unwrap(),
+        uri: test_url("/tmp/foo.rs"),
         range: def_range(3, 5),
     });
-    assert_eq!(
-        def_locations(&resp),
-        vec![(PathBuf::from("/tmp/foo.rs"), 3, 5)]
-    );
+    assert_eq!(def_locations(&resp), vec![(test_path("/tmp/foo.rs"), 3, 5)]);
 }
 
 #[test]
@@ -2351,13 +2347,13 @@ fn def_locations_reads_all_links() {
     let resp = GotoDefinitionResponse::Link(vec![
         LocationLink {
             origin_selection_range: None,
-            target_uri: Url::from_file_path("/tmp/c.rs").unwrap(),
+            target_uri: test_url("/tmp/c.rs"),
             target_range: def_range(10, 0),
             target_selection_range: def_range(12, 4),
         },
         LocationLink {
             origin_selection_range: None,
-            target_uri: Url::from_file_path("/tmp/d.rs").unwrap(),
+            target_uri: test_url("/tmp/d.rs"),
             target_range: def_range(20, 0),
             target_selection_range: def_range(22, 2),
         },
@@ -2365,8 +2361,8 @@ fn def_locations_reads_all_links() {
     assert_eq!(
         def_locations(&resp),
         vec![
-            (PathBuf::from("/tmp/c.rs"), 12, 4),
-            (PathBuf::from("/tmp/d.rs"), 22, 2),
+            (test_path("/tmp/c.rs"), 12, 4),
+            (test_path("/tmp/d.rs"), 22, 2),
         ]
     );
 }
@@ -2436,12 +2432,13 @@ fn drain_completion_blocking(manager: &LspManager, timeout: Duration) -> Option<
     }
 }
 
-/// The `python3` the stub server runs under, if there is one.
+/// The `python3` / `python` the stub server runs under, if there is one.
 fn python_for_stub_server() -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|entry| entry.join("python3"))
-        .find(|candidate| is_executable_file(candidate))
+    std::env::split_paths(&path).find_map(|entry| {
+        crate::platform::env::executable_in_dir(&entry, "python3")
+            .or_else(|| crate::platform::env::executable_in_dir(&entry, "python"))
+    })
 }
 
 fn any_python_completion_server_on_path() -> bool {
@@ -3537,6 +3534,7 @@ fn server_restarts_are_budgeted_per_window() {
 
 /// A stub rust-analyzer (#1626): answers `initialize`, logs each
 /// method, and answers `rust-analyzer/expandMacro` with an expansion.
+#[cfg(unix)]
 const FAKE_RUST_ANALYZER: &str = r#"
 import json, sys
 
@@ -3584,6 +3582,7 @@ while True:
 
 /// A worker for `root` whose only Rust server is `name`, run as the
 /// stub rust-analyzer logging to `log`.
+#[cfg(unix)]
 fn worker_with_rust_server(
     python: &Path,
     root: &Path,
@@ -3594,6 +3593,7 @@ fn worker_with_rust_server(
 }
 
 /// [`worker_with_rust_server`] with the stub `source` as the server.
+#[cfg(unix)]
 fn worker_with_rust_stub(
     python: &Path,
     root: &Path,
@@ -3730,6 +3730,7 @@ fn a_rust_analyzer_request_never_goes_to_another_server() {
 /// A stub server that, once initialized, registers a `**/*.rs` watcher
 /// (#908). It logs each method with its params, and each reply croft
 /// sends it as `reply <error>`.
+#[cfg(unix)]
 const FAKE_LSP_WATCHING: &str = r#"
 import json, sys
 
@@ -3819,6 +3820,7 @@ fn disk_changes_reach_the_servers_watching_them() {
 
 /// A worker whose python and go servers are fake recorders that log
 /// their pid to `<root>/<lang>.pids` (#1621).
+#[cfg(unix)]
 fn two_language_worker(root: &Path, python: &Path) -> (WorkerState, Arc<AtomicBool>) {
     let script = root.join("fake_lsp.py");
     std::fs::write(
@@ -3871,6 +3873,7 @@ fn two_language_worker(root: &Path, python: &Path) -> (WorkerState, Arc<AtomicBo
 
 /// The pids a fake server of `tag` has logged under `root`, waiting up to
 /// ten seconds for `n` of them.
+#[cfg(unix)]
 fn logged_pids(root: &Path, tag: &str, n: usize) -> Vec<i32> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -3887,6 +3890,7 @@ fn logged_pids(root: &Path, tag: &str, n: usize) -> Vec<i32> {
 }
 
 /// Whether process `pid` is gone, waiting up to ten seconds for it.
+#[cfg(unix)]
 fn process_exits(pid: i32) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -5522,7 +5526,7 @@ fn incoming_call_sites_prefer_the_call_range_over_the_definition() {
         kind: SymbolKind::FUNCTION,
         tags: None,
         detail: None,
-        uri: Url::from_file_path("/proj/src/lib.rs").unwrap(),
+        uri: test_url("/proj/src/lib.rs"),
         range: Range {
             start: Position { line, character: 0 },
             end: Position {
@@ -5578,7 +5582,7 @@ fn outgoing_call_sites_target_the_callee_definition() {
         kind: SymbolKind::FUNCTION,
         tags: None,
         detail: None,
-        uri: Url::from_file_path("/proj/src/util.rs").unwrap(),
+        uri: test_url("/proj/src/util.rs"),
         range: Range {
             start: Position {
                 line: 4,

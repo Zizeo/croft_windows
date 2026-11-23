@@ -152,9 +152,14 @@ mod tests {
     #[test]
     fn user_data_lives_in_the_xdg_state_directory() {
         use std::path::PathBuf;
+        let abs = if cfg!(windows) {
+            r"C:\x\state"
+        } else {
+            "/x/state"
+        };
         assert_eq!(
-            super::state_dir_from(Some("/x/state".into()), Some("/home/u".into())),
-            PathBuf::from("/x/state/croft")
+            super::state_dir_from(Some(abs.into()), Some("/home/u".into())),
+            PathBuf::from(abs).join("croft")
         );
         assert_eq!(
             super::state_dir_from(None, Some("/home/u".into())),

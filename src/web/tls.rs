@@ -8,23 +8,17 @@
 //! No certificate is generated in the binary: bring one from `mkcert`, or
 //! front `croft web` with Tailscale Serve or Caddy (docs/WEB.md).
 
-#[cfg(unix)]
 use std::io::{Read, Write};
-#[cfg(unix)]
 use std::net::TcpStream;
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::Arc;
-#[cfg(unix)]
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use rustls::ServerConfig;
-#[cfg(unix)]
-use rustls::ServerConnection;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{ServerConfig, ServerConnection};
+
+use crate::platform::ipc::LocalStream;
 
 /// The server config for a PEM certificate chain and its private key.
 pub fn load(cert: &Path, key: &Path) -> Result<Arc<ServerConfig>> {
@@ -52,11 +46,11 @@ pub fn load(cert: &Path, key: &Path) -> Result<Arc<ServerConfig>> {
 /// carry sequence numbers, so handshake output from one thread and
 /// application data from the other must reach the wire in the order rustls
 /// produced them.
-#[cfg(unix)]
-pub fn terminate(tcp: TcpStream, config: Arc<ServerConfig>) -> std::io::Result<UnixStream> {
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn terminate(tcp: TcpStream, config: Arc<ServerConfig>) -> std::io::Result<LocalStream> {
     let tls = ServerConnection::new(config).map_err(std::io::Error::other)?;
     let tls = Arc::new(Mutex::new(tls));
-    let (ours, theirs) = UnixStream::pair()?;
+    let (ours, theirs) = LocalStream::pair()?;
 
     // Network to plaintext.
     {
@@ -133,7 +127,7 @@ pub fn terminate(tcp: TcpStream, config: Arc<ServerConfig>) -> std::io::Result<U
 }
 
 /// Write every pending TLS record to the network.
-#[cfg(unix)]
+#[cfg_attr(not(unix), allow(dead_code))]
 fn flush(tls: &mut ServerConnection, mut net: &TcpStream) -> std::io::Result<()> {
     while tls.wants_write() {
         tls.write_tls(&mut net)?;
@@ -147,7 +141,6 @@ mod tests {
 
     /// A write far larger than one TLS record (a big paste, a burst of
     /// screen output) arrives whole in both directions.
-    #[cfg(unix)]
     #[test]
     fn a_large_write_passes_through_whole() {
         use rustls::pki_types::pem::PemObject;

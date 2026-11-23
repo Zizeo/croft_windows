@@ -65,6 +65,7 @@ fn setup_terminal_help_works() {
 /// the GUI-PATH repair ran before the probe early-out, every attach would
 /// stall on a login-shell probe — against the "remote attach never waits"
 /// invariant. The probe subcommands must answer without consulting a shell.
+#[cfg(unix)]
 #[test]
 fn probe_subcommands_answer_instantly_even_with_a_stripped_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -108,6 +109,7 @@ fn nonexistent_path_fails_cleanly() {
 /// #917: `croft pr` without a usable GitHub CLI says so in the shell, in
 /// one line naming the fix, instead of opening an editor whose review tab
 /// can never load.
+#[cfg(unix)]
 #[test]
 fn pr_without_a_usable_gh_says_how_to_fix_it_before_starting() {
     use std::os::unix::fs::PermissionsExt;
@@ -257,6 +259,7 @@ fn devcontainer_rebuild_waits_for_the_croft_running_in_it() {
 /// re-activation must both keep a custom ollama endpoint. Resolving bare
 /// flags in isolation used to clobber the custom URL with the default and
 /// silently converted a disabled ollama record into a cloud claude seat.
+#[cfg(unix)]
 #[test]
 fn pair_off_and_reactivation_keep_the_recorded_backend() {
     // A SHORT home: the activation path binds a relay socket under
@@ -327,6 +330,7 @@ fn pair_off_and_reactivation_keep_the_recorded_backend() {
 
 /// Activation detaches a relay for the workspace; reap the ones under
 /// `home` so test runs do not accumulate idle processes.
+#[cfg(unix)]
 fn reap_pair_relays(home: &std::path::Path) {
     let sessions = home.join(".cache/croft/sessions");
     if let Ok(entries) = std::fs::read_dir(&sessions) {
@@ -344,6 +348,7 @@ fn reap_pair_relays(home: &std::path::Path) {
 /// #1907: the navigator's name persists like its model. A plain `croft pair`
 /// or `croft pair --off` keeps the recorded name instead of renaming the
 /// seat back to `claude`; only an explicit `--name` changes it.
+#[cfg(unix)]
 #[test]
 fn pair_rerun_without_name_keeps_the_recorded_name() {
     // A SHORT home, for the relay socket's AF_UNIX path limit (see above).
@@ -469,6 +474,7 @@ fn view_against_a_vanished_croft_says_the_croft_is_gone() {
 /// The unit tests drive the client and server halves in one process, where
 /// they can agree with each other. This stands up a socket the binary knows
 /// nothing about and makes the shipped `croft view` talk to it.
+#[cfg(unix)]
 #[test]
 fn view_sends_the_resolved_path_to_the_socket_and_exits_zero() {
     use std::io::{BufRead, BufReader, Write};
@@ -524,6 +530,7 @@ fn view_sends_the_resolved_path_to_the_socket_and_exits_zero() {
 /// A file that does not exist is refused by the client, before any croft is
 /// asked to open it: the message can then name the path as the user typed it,
 /// resolved against the cwd they typed it in.
+#[cfg(unix)]
 #[test]
 fn view_refuses_a_missing_file_without_bothering_the_socket() {
     let tmp = tempfile::tempdir().unwrap();
@@ -604,6 +611,7 @@ fn view_transmits_a_non_utf8_filename_byte_for_byte() {
 /// An `--as` value that cannot become a filename is refused, not ignored:
 /// falling back to the sniff would stage the bytes under a name the user did
 /// not ask for and still report success.
+#[cfg(unix)]
 #[test]
 fn view_refuses_an_as_flag_that_cannot_be_a_file_extension() {
     let tmp = tempfile::tempdir().unwrap();
@@ -642,6 +650,7 @@ fn view_refuses_an_as_flag_that_cannot_be_a_file_extension() {
 /// under a sniffed extension the editor routes on, at 0600, with THAT path
 /// being what the server is told to open. HOME is redirected so the staging
 /// lands in a tempdir rather than the developer's own cache.
+#[cfg(unix)]
 #[test]
 fn view_from_a_pipe_stages_an_owner_only_file_and_sends_its_path() {
     use std::io::{BufRead, BufReader, Write};
@@ -716,6 +725,7 @@ fn view_from_a_pipe_stages_an_owner_only_file_and_sends_its_path() {
 /// user was trying to override, which is precisely the reasoning the module
 /// already gives for refusing an unusable `--as` value rather than sniffing
 /// past it.
+#[cfg(unix)]
 #[test]
 fn view_refuses_an_as_flag_on_a_named_file_rather_than_ignoring_it() {
     let tmp = tempfile::tempdir().unwrap();
@@ -745,6 +755,7 @@ fn view_refuses_an_as_flag_on_a_named_file_rather_than_ignoring_it() {
 }
 
 /// An empty pipe is refused by name, and stages nothing (#362).
+#[cfg(unix)]
 #[test]
 fn view_from_an_empty_pipe_says_nothing_arrived() {
     let tmp = tempfile::tempdir().unwrap();
@@ -777,6 +788,7 @@ fn view_from_an_empty_pipe_says_nothing_arrived() {
 /// creates it empty, asks the croft to open it, and returns once a probe
 /// says its tab closed. That is what `EDITOR="croft edit --wait"` needs from
 /// a tool that names a file it has not written, and it used to be refused.
+#[cfg(unix)]
 #[test]
 fn edit_wait_creates_a_new_file_opens_it_and_returns_once_it_closes() {
     use std::io::{BufRead, BufReader, Write};
@@ -849,6 +861,7 @@ fn edit_outside_croft_names_itself_and_creates_nothing() {
 /// #848 guard: a new file's folder must exist. `croft edit` into a missing
 /// one is refused before any croft is asked to open it, and creates neither
 /// the file nor the folders above it.
+#[cfg(unix)]
 #[test]
 fn edit_refuses_a_missing_folder_without_bothering_the_socket() {
     let tmp = tempfile::tempdir().unwrap();
@@ -900,6 +913,7 @@ fn edit_against_a_vanished_croft_leaves_no_new_file_behind() {
 
 /// #848: a croft that answers but refuses to open the new file leaves
 /// nothing behind either.
+#[cfg(unix)]
 #[test]
 fn edit_refused_by_the_croft_leaves_no_new_file_behind() {
     use std::io::{BufRead, BufReader, Write};
@@ -1442,7 +1456,10 @@ fn locale_template_write_keeps_the_translations_already_in_the_file() {
     assert_eq!(map["File: Save"], "Enregistrer");
     assert_eq!(map["View: Toggle Terminal"], "Afficher le terminal");
     assert!(map.len() > 2, "the missing strings are added");
-    assert!(stderr.contains("locales/fr.json"), "{stderr}");
+    assert!(
+        stderr.replace('\\', "/").contains("locales/fr.json"),
+        "{stderr}"
+    );
 }
 
 /// #1148: the printed template carries the user's own translations too, so
@@ -2092,6 +2109,7 @@ fn a_plain_edit_against_a_gone_croft_still_fails() {
 
 /// #1452 negative: a croft that is running but refuses the file is not a
 /// gone croft. Its refusal stands, and git's editor does not run.
+#[cfg(unix)]
 #[test]
 fn a_croft_that_refuses_the_plan_is_not_replaced_by_gits_editor() {
     use std::io::{BufRead, BufReader, Write};
@@ -2127,6 +2145,7 @@ fn a_croft_that_refuses_the_plan_is_not_replaced_by_gits_editor() {
 
 /// #1452 negative: a croft that took the plan and closed without a reply may
 /// have opened it, so git's editor must not open the same plan a second time.
+#[cfg(unix)]
 #[test]
 fn a_croft_that_closes_without_replying_is_not_replaced_by_gits_editor() {
     use std::io::{BufRead, BufReader};
@@ -2184,6 +2203,7 @@ fn the_sequence_editor_fails_when_git_names_no_editor() {
 
 /// #1452 negative: with its croft alive the plan opens there, exactly as
 /// before, and git's editor never runs.
+#[cfg(unix)]
 #[test]
 fn a_live_croft_still_gets_the_plan() {
     use std::io::{BufRead, BufReader, Write};

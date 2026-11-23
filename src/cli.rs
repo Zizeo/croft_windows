@@ -20,7 +20,7 @@ mod version;
 mod vscode_import;
 mod workspace;
 use commands::*;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use cross::CROSS_TARGETS;
 use cross::*;
 use git_editor::*;

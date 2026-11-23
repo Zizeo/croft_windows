@@ -569,6 +569,7 @@ fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() 
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn terminal_decoration_dot_click_is_not_hijacked_by_the_sidebar_splitter() {
     use crossterm::event::{MouseButton, MouseEventKind};
@@ -786,6 +787,7 @@ fn run_selected_text_sends_nothing_for_a_blank_line() {
     assert_eq!(unbracketed(&run_selected_text(&mut app)), "");
 }
 
+#[cfg(unix)]
 #[test]
 fn cmd_opt_up_parks_the_previous_prompt_mark_at_the_viewport_top() {
     let tmp = tempfile::tempdir().unwrap();
@@ -836,6 +838,7 @@ fn cmd_opt_up_parks_the_previous_prompt_mark_at_the_viewport_top() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn ctrl_shift_space_quick_select_labels_matches_and_a_label_commits() {
     let tmp = tempfile::tempdir().unwrap();
@@ -931,6 +934,7 @@ fn ctrl_shift_space_quick_select_labels_matches_and_a_label_commits() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn shift_pageup_pages_the_scrollback_and_shift_end_snaps_back() {
     let tmp = tempfile::tempdir().unwrap();
@@ -978,6 +982,7 @@ fn shift_pageup_pages_the_scrollback_and_shift_end_snaps_back() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn copy_on_select_puts_a_finished_terminal_selection_on_the_clipboard() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1014,6 +1019,7 @@ fn copy_on_select_puts_a_finished_terminal_selection_on_the_clipboard() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn pane_inline_image_overlay_anchors_hides_when_scrolled_off_and_returns() {
     use base64::Engine;
@@ -1096,6 +1102,7 @@ fn pane_inline_image_overlay_anchors_hides_when_scrolled_off_and_returns() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn quick_select_paints_gold_labels_and_broadcast_paints_modal_and_pills() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1175,6 +1182,7 @@ fn quick_select_paints_gold_labels_and_broadcast_paints_modal_and_pills() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn cmd_k_i_broadcasts_input_to_every_pane_with_confirm_and_auto_off() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1236,6 +1244,7 @@ fn cmd_k_i_broadcasts_input_to_every_pane_with_confirm_and_auto_off() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn trigger_hits_surface_in_the_status_bar_via_the_drain_tick() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2400,6 +2409,7 @@ fn restoring_terminal_from_maximize_rearms_welcome_overlay_dirty() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn dtach_reattach_mode_reassert_reenables_mouse_tracking() {
     // dtach `-r winch` delivers only a SIGWINCH on reattach: the newly
@@ -2456,6 +2466,7 @@ fn change_workspace_root_writes_cd_into_active_terminal_pty() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn change_workspace_root_skips_cd_when_terminal_runs_a_foreground_app() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2543,6 +2554,7 @@ fn change_workspace_root_skips_cd_when_terminal_runs_a_foreground_app() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn change_workspace_root_seeds_cd_while_shell_startup_owns_the_tty() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2841,6 +2853,7 @@ fn cmd_c_inside_a_mouse_tracking_program_says_why_nothing_was_copied() {
 
 /// A pane whose script emits one OSC 133 command printing `out-1667`, and
 /// that command's decoration.
+#[cfg(unix)]
 fn app_with_one_finished_command(
     tmp: &std::path::Path,
 ) -> (App, crate::widgets::terminal::CommandDecoration) {
@@ -2865,6 +2878,7 @@ fn app_with_one_finished_command(
 /// clipboard the user pastes from, like a selection copy does (#538). It
 /// wrote the remote box's clipboard, which nothing on the user's machine can
 /// paste from.
+#[cfg(unix)]
 #[test]
 fn copy_output_on_a_relay_session_reaches_the_local_clipboard() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -2880,6 +2894,7 @@ fn copy_output_on_a_relay_session_reaches_the_local_clipboard() {
 
 /// #1667: copy mode, quick select and copy on select go home on a relay
 /// session too, so no terminal copy is left writing the remote box.
+#[cfg(unix)]
 #[test]
 fn every_terminal_copy_on_a_relay_session_reaches_the_local_clipboard() {
     use crossterm::event::{MouseButton, MouseEventKind};
@@ -2994,6 +3009,7 @@ fn every_terminal_copy_on_a_relay_session_reaches_the_local_clipboard() {
 
 /// #1667 negative: off a relay session Copy Output still writes this
 /// machine's clipboard and queues nothing for a relay.
+#[cfg(unix)]
 #[test]
 fn copy_output_off_a_relay_session_writes_this_machines_clipboard() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -3201,6 +3217,7 @@ fn bare_f9_in_a_focused_terminal_is_the_shells_even_with_an_update_ready() {
 
 /// Negative (#1630): the block still runs from the pane's directory, so a
 /// module beside the document imports as it did through the heredoc.
+#[cfg(unix)]
 #[test]
 fn a_python_block_still_imports_from_the_pane_s_directory() {
     if !(crate::markdown::runnable_interpreter("python") == Some("python3")) {
@@ -3255,6 +3272,7 @@ fn quick_select_skips_hints_inside_masked_spans() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn undo_close_restores_a_closed_terminal_pane_with_its_process_alive() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3318,6 +3336,7 @@ fn undo_close_restores_a_closed_terminal_pane_with_its_process_alive() {
     assert_eq!(app.terminals.len(), 1, "nothing to restore after expiry");
 }
 
+#[cfg(unix)]
 #[test]
 fn copy_mode_navigates_scrollback_with_vi_keys_and_copies_char_line_and_block() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3430,6 +3449,7 @@ fn copy_mode_navigates_scrollback_with_vi_keys_and_copies_char_line_and_block() 
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn capture_triggers_collect_into_the_captures_panel_and_jump_to_the_line() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3499,14 +3519,17 @@ fn capture_triggers_collect_into_the_captures_panel_and_jump_to_the_line() {
 /// `err-N` capture trigger, once `want` lines have been captured. Read-gated
 /// and assembled at runtime like the test above, so the trigger set reaches
 /// the pane first and the `▶ …` header never fires it.
+#[cfg(unix)]
 fn app_with_captures(script: &str, want: usize) -> (tempfile::TempDir, App) {
     app_with_triggers(ERR_CAPTURE, script, want)
 }
 
+#[cfg(unix)]
 const ERR_CAPTURE: &str =
     r#"[ { "regex": "err-(\\d+)", "action": "capture", "message": "boom \\1" } ]"#;
 
 /// [`app_with_captures`] with the pane's triggers given as JSON.
+#[cfg(unix)]
 fn app_with_triggers(triggers: &str, script: &str, want: usize) -> (tempfile::TempDir, App) {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -3527,6 +3550,7 @@ fn app_with_triggers(triggers: &str, script: &str, want: usize) -> (tempfile::Te
 }
 
 /// Drain the pane until the CAPTURES panel holds `want` entries.
+#[cfg(unix)]
 fn await_captures(app: &mut App, want: usize) {
     crate::test_budget::await_spawned(
         crate::test_budget::tests::SHELL_PAINT_BASE,
@@ -3538,6 +3562,7 @@ fn await_captures(app: &mut App, want: usize) {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn each_capture_of_a_repeated_line_jumps_to_its_own_copy() {
     // #1450: a test that fails on every run prints the same line every run,
@@ -3566,6 +3591,7 @@ fn each_capture_of_a_repeated_line_jumps_to_its_own_copy() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_capture_that_left_the_scrollback_is_not_stood_in_for_by_its_repeat() {
     // 6000 filler rows push the first copy past the 5000-row scrollback.
@@ -3598,6 +3624,7 @@ fn a_capture_that_left_the_scrollback_is_not_stood_in_for_by_its_repeat() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_resize_that_rewraps_the_output_keeps_each_capture_on_its_own_copy() {
     // A resize re-wraps the 200-column lines by a different number of rows
@@ -3632,6 +3659,7 @@ fn a_resize_that_rewraps_the_output_keeps_each_capture_on_its_own_copy() {
 
 /// Run `before`, then a full-screen program that the pane is resized to 40
 /// columns under, then `after` once it exits (#1450).
+#[cfg(unix)]
 fn app_resized_under_a_full_screen_program(
     before: &str,
     want: usize,
@@ -3641,6 +3669,7 @@ fn app_resized_under_a_full_screen_program(
 }
 
 /// [`app_resized_under_a_full_screen_program`] with the triggers as JSON.
+#[cfg(unix)]
 fn app_resized_under_a_full_screen_program_with(
     triggers: &str,
     before: &str,
@@ -3680,6 +3709,7 @@ fn app_resized_under_a_full_screen_program_with(
     (tmp, app)
 }
 
+#[cfg(unix)]
 #[test]
 fn a_resize_under_a_full_screen_program_keeps_each_capture_on_its_own_copy() {
     // A full-screen program hides the primary grid, but a resize re-wraps
@@ -3712,6 +3742,7 @@ fn a_resize_under_a_full_screen_program_keeps_each_capture_on_its_own_copy() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn two_triggers_on_one_line_still_find_it_after_a_full_screen_resize() {
     // Two `capture` triggers catch each copy, so each printed line has two
@@ -3747,6 +3778,7 @@ fn two_triggers_on_one_line_still_find_it_after_a_full_screen_resize() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_reset_after_a_full_screen_resize_drops_the_capture() {
     // A reset (RIS) erases the screen and the scrollback. An entry whose row
@@ -3768,6 +3800,7 @@ fn a_reset_after_a_full_screen_resize_drops_the_capture() {
     assert!(app.terminals[0].selection().is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_copy_gone_after_a_full_screen_resize_is_not_stood_in_for_by_its_repeat() {
     // The first copy rotates off the 5000-row scrollback after the resize
@@ -3800,6 +3833,7 @@ fn a_copy_gone_after_a_full_screen_resize_is_not_stood_in_for_by_its_repeat() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_capture_erased_by_a_clear_is_not_stood_in_for_by_a_later_copy() {
     // The program's own `clear` erases the first copy and the pane's Clear
@@ -3833,6 +3867,7 @@ fn a_capture_erased_by_a_clear_is_not_stood_in_for_by_a_later_copy() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_capture_whose_pane_closed_takes_the_newest_match_in_the_active_pane() {
     // The anchor names a row in the pane that recorded it; in the pane the
@@ -3977,6 +4012,7 @@ fn restoring_a_workspaces_layout_drops_pane_bound_state_from_the_outgoing_panel(
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4093,6 +4129,7 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn cmd_k_d_dumps_the_pane_scrollback_into_a_rendered_log_tab() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4171,6 +4208,7 @@ fn cmd_k_d_dumps_the_pane_scrollback_into_a_rendered_log_tab() {
 /// #257: Cmd+K D lands the pane's scrollback in the rendered log view, so
 /// the colours the pane showed survive into the tab, written to a real file
 /// under the scrollback dir because the log view indexes from disk.
+#[cfg(unix)]
 #[test]
 fn cmd_k_d_opens_the_scrollback_as_a_rendered_log_with_its_colours() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4242,6 +4280,7 @@ fn cmd_k_d_opens_the_scrollback_as_a_rendered_log_with_its_colours() {
 /// The dump file is one per pane and overwritten on each Cmd+K D, so the
 /// second dump must show the pane's NEW output, not the first dump's rows
 /// through a stale index, and must not claim a fresh open it did not make.
+#[cfg(unix)]
 #[test]
 fn a_second_dump_of_the_same_pane_shows_its_new_output() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4336,6 +4375,7 @@ fn colour_beyond_the_sniff_prefix_keeps_the_dump_plain() {
 /// A dump is a pinned tab of its own, as the scratch buffer was: a later
 /// single-click file peek must not replace it, and two panes' dumps must
 /// not share one preview slot.
+#[cfg(unix)]
 #[test]
 fn a_scrollback_dump_is_a_pinned_tab() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4377,6 +4417,7 @@ fn a_scrollback_dump_is_a_pinned_tab() {
 /// Two panes may carry the same label (two unnamed shells both read
 /// `terminal`), so the dump file is keyed on the pane's stable uid too: the
 /// second pane's dump must not overwrite and close the first pane's.
+#[cfg(unix)]
 #[test]
 fn two_panes_with_one_label_dump_to_separate_files() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4473,6 +4514,7 @@ fn a_scrollback_dump_is_owner_only_on_disk() {
 /// A dump file must not be shared across croft processes: the pane uid is
 /// a per-process counter that restarts at 1, so the file name carries the
 /// pid too, as the session handoff file does.
+#[cfg(unix)]
 #[test]
 fn a_scrollback_dump_file_is_scoped_to_this_process() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4515,6 +4557,7 @@ fn a_scrollback_dump_file_is_scoped_to_this_process() {
 /// The prune after a close is scoped to the group the close emptied: a
 /// group the user left blank on purpose (a split with one side cleared) is
 /// not this command's to fold away.
+#[cfg(unix)]
 #[test]
 fn a_scrollback_dump_leaves_a_blank_group_it_did_not_empty_alone() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4574,6 +4617,7 @@ fn a_scrollback_dump_leaves_a_blank_group_it_did_not_empty_alone() {
 /// With two inactive groups, one emptied by the close and one the user
 /// blanked, only the emptied one is pruned: the sweep must be scoped to the
 /// group the close emptied, not to blankness.
+#[cfg(unix)]
 #[test]
 fn a_scrollback_dump_prunes_only_the_group_it_emptied() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4641,6 +4685,7 @@ fn a_scrollback_dump_prunes_only_the_group_it_emptied() {
 
 /// A dump that cannot reach the disk still leaves the user the text: the
 /// plain rows land in the scratch buffer and the status says why.
+#[cfg(unix)]
 #[test]
 fn a_scrollback_dump_that_cannot_be_written_falls_back_to_the_plain_buffer() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4743,6 +4788,7 @@ fn a_scrollback_dump_reaps_the_dumps_of_dead_processes() {
 /// The dump is a new on-disk copy of pane output, so the redact rules must
 /// hold on disk too: the matching row is written masked (and gives up its
 /// colour), while a neighbouring row keeps its colour.
+#[cfg(unix)]
 #[test]
 fn a_scrollback_dump_is_redacted_on_disk_and_only_the_masked_row_loses_colour() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4849,6 +4895,7 @@ fn copy_mode_keys_follow_content_that_streamed_between_presses() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_plain_click_on_the_prompt_row_moves_the_shell_cursor() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4906,6 +4953,7 @@ fn a_plain_click_on_the_prompt_row_moves_the_shell_cursor() {
 /// REPL binds arrows from terminfo's application-mode entries — must receive
 /// arrows and Home/End as SS3 (`\eOA`…), not the normal-mode CSI form the
 /// REPL does not recognize (vitali87/croft#1).
+#[cfg(unix)]
 #[test]
 fn arrow_keys_reach_an_app_cursor_mode_child_as_ss3() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4965,6 +5013,7 @@ fn arrow_keys_reach_an_app_cursor_mode_child_as_ss3() {
 /// (bash's readline leaves DECCKM off while zsh turns it on, so mixed panes
 /// are the normal case): pane 0 stays in normal mode and must get CSI, pane
 /// 1 turns application cursor keys on and must get SS3.
+#[cfg(unix)]
 #[test]
 fn broadcast_arrows_encode_per_pane_cursor_mode() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5027,6 +5076,7 @@ fn broadcast_arrows_encode_per_pane_cursor_mode() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn host_accent_rules_dress_matching_panes() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5194,6 +5244,7 @@ fn alt_screen_upward_drag_through_the_real_mouse_pipeline_selects_upward() {
 /// be silently wiped when the attach pass seeded the pane one tick later.
 /// The bootstrap input gate must cover this window too: refuse the key
 /// with a hint instead of losing it.
+#[cfg(unix)]
 #[test]
 fn typing_into_an_unattached_pane_of_a_live_file_is_gated_not_wiped() {
     use std::time::{Duration, Instant};
@@ -5457,12 +5508,20 @@ fn a_wrapped_prompt_does_not_push_the_url_off_a_maximized_pane() {
     // The pane's child writes nothing, so the grid holds only the bytes fed
     // below: a real shell's startup prompt landing between them adds rows
     // the geometry does not count (#641).
-    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
-        "sleep",
-        &[String::from("30")],
-        tmp.path(),
-    )
-    .unwrap();
+    #[cfg(unix)]
+    let (prog, args) = ("sleep", &[String::from("30")][..]);
+    #[cfg(windows)]
+    let (prog, args) = (
+        "cmd.exe",
+        &[
+            String::from("/C"),
+            String::from("ping -n 31 127.0.0.1 >nul"),
+        ][..],
+    );
+    app.terminals[0] =
+        crate::widgets::terminal::PtyTerminal::new_running(prog, args, tmp.path()).unwrap();
+    #[cfg(windows)]
+    app.terminals[0].end_child();
     app.focus_pane(Pane::Terminal);
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
     app.toggle_terminal_maximize();
@@ -5512,6 +5571,7 @@ fn a_wrapped_prompt_does_not_push_the_url_off_a_maximized_pane() {
 /// output streaming under an open label set used to leave the gold labels
 /// at fixed viewport rows while their matches scrolled away, so the user
 /// typed the label next to one thing and copied another.
+#[cfg(unix)]
 #[test]
 fn quick_select_labels_follow_content_that_streams_below_them() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5703,14 +5763,18 @@ fn quick_select_closes_instead_of_hijacking_another_pane() {
         .chars()
         .next()
         .unwrap();
-    app.terminals.push(
-        crate::widgets::terminal::PtyTerminal::new_running(
-            "/bin/sleep",
-            &[String::from("30")],
-            tmp.path(),
-        )
-        .unwrap(),
+    #[cfg(unix)]
+    let (prog, args) = ("/bin/sleep", &[String::from("30")][..]);
+    #[cfg(windows)]
+    let (prog, args) = (
+        "cmd.exe",
+        &[
+            String::from("/C"),
+            String::from("ping -n 31 127.0.0.1 >nul"),
+        ][..],
     );
+    app.terminals
+        .push(crate::widgets::terminal::PtyTerminal::new_running(prog, args, tmp.path()).unwrap());
     app.active_terminal = 1;
     app.handle_terminal_quick_select_key(key(KeyCode::Char(prefix), KeyModifiers::NONE));
     assert!(
@@ -5819,14 +5883,18 @@ fn terminal_find_closes_instead_of_straying_to_another_pane() {
         app.terminals[0].has_search_for_test(),
         "staging: the owning pane is highlighted"
     );
-    app.terminals.push(
-        crate::widgets::terminal::PtyTerminal::new_running(
-            "/bin/sleep",
-            &[String::from("30")],
-            tmp.path(),
-        )
-        .unwrap(),
+    #[cfg(unix)]
+    let (prog, args) = ("/bin/sleep", &[String::from("30")][..]);
+    #[cfg(windows)]
+    let (prog, args) = (
+        "cmd.exe",
+        &[
+            String::from("/C"),
+            String::from("ping -n 31 127.0.0.1 >nul"),
+        ][..],
     );
+    app.terminals
+        .push(crate::widgets::terminal::PtyTerminal::new_running(prog, args, tmp.path()).unwrap());
     app.active_terminal = 1;
     app.sync_focus_flags();
     assert!(
@@ -5850,14 +5918,18 @@ fn copy_mode_closes_instead_of_hijacking_another_pane() {
     app.focus_pane(Pane::Terminal);
     app.open_terminal_copy_mode();
     assert!(app.terminal_copy_mode.is_some());
-    app.terminals.push(
-        crate::widgets::terminal::PtyTerminal::new_running(
-            "/bin/sleep",
-            &[String::from("30")],
-            tmp.path(),
-        )
-        .unwrap(),
+    #[cfg(unix)]
+    let (prog, args) = ("/bin/sleep", &[String::from("30")][..]);
+    #[cfg(windows)]
+    let (prog, args) = (
+        "cmd.exe",
+        &[
+            String::from("/C"),
+            String::from("ping -n 31 127.0.0.1 >nul"),
+        ][..],
     );
+    app.terminals
+        .push(crate::widgets::terminal::PtyTerminal::new_running(prog, args, tmp.path()).unwrap());
     app.active_terminal = 1;
     app.handle_terminal_copy_mode_key(key(KeyCode::Char('j'), KeyModifiers::NONE));
     assert!(
@@ -7985,6 +8057,7 @@ fn right_does_not_accept_a_terminal_suggestion_the_typing_outran() {
 /// #678: Claude Code (or tmux, nvim) copying a selection through OSC 52 in
 /// a croft pane must land where croft's own copy lands. Dropping it broke
 /// copy on a remote box, where OSC 52 is the program's only clipboard.
+#[cfg(unix)]
 #[test]
 fn a_pane_program_osc52_copy_reaches_the_clipboard_on_the_drain_tick() {
     let tmp = tempfile::tempdir().unwrap();
@@ -8079,6 +8152,7 @@ fn recorded_frames(app: &App) -> Vec<String> {
 /// #356: a recorded frame keeps the colours the pane showed, as SGR per
 /// run, and ends by putting the player's cursor where the pane's was, or
 /// hiding it, so each frame sets the cursor state rather than inheriting it.
+#[cfg(unix)]
 #[test]
 fn a_recorded_frame_keeps_the_panes_colours_and_cursor() {
     let tmp = tempfile::tempdir().unwrap();
@@ -8242,6 +8316,7 @@ fn ctrl_n_leaves_terminals_vim_and_shifted_chords_alone() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_multiline_paste_into_a_plain_shell_waits_for_confirmation() {
     let (mut app, _tmp) = plain_paste_app();
@@ -8254,6 +8329,7 @@ fn a_multiline_paste_into_a_plain_shell_waits_for_confirmation() {
     assert!(app.pending_terminal_paste.is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_click_while_asking_cannot_move_the_paste_to_another_pane() {
     // The paste was checked against the active pane; a click on another
@@ -8275,12 +8351,18 @@ fn wrapped_find_app(text: &str) -> (tempfile::TempDir, App) {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.apply_theme(crate::theme::Theme::BLACK);
-    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
-        "/bin/sleep",
-        &[String::from("60")],
-        tmp.path(),
-    )
-    .unwrap();
+    #[cfg(unix)]
+    let (prog, args) = ("/bin/sleep", &[String::from("60")][..]);
+    #[cfg(windows)]
+    let (prog, args) = (
+        "cmd.exe",
+        &[
+            String::from("/C"),
+            String::from("ping -n 61 127.0.0.1 >nul"),
+        ][..],
+    );
+    app.terminals[0] =
+        crate::widgets::terminal::PtyTerminal::new_running(prog, args, tmp.path()).unwrap();
     app.terminals[0].resize(30, 10);
     app.terminals[0].feed_bytes_for_test(format!("\x1b[2J\x1b[H{text}").as_bytes());
     app.focus_pane(Pane::Terminal);

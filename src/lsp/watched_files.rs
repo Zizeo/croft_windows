@@ -137,14 +137,28 @@ mod tests {
             .expect("registration")
     }
 
+    fn test_path(p: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:{p}"))
+        } else {
+            PathBuf::from(p)
+        }
+    }
+
     /// The paths among `changes` that `w` reports.
     fn reported(w: &WatchedFiles, changes: &[(&str, FileChangeType)]) -> Vec<String> {
-        let changes: Vec<_> = changes
-            .iter()
-            .map(|(p, t)| (PathBuf::from(p), *t))
-            .collect();
+        let changes: Vec<_> = changes.iter().map(|(p, t)| (test_path(p), *t)).collect();
         let events = w.events_for(&changes).into_iter();
-        events.map(|e| e.uri.path().to_string()).collect()
+        events
+            .map(|e| {
+                let p = e.uri.path();
+                if cfg!(windows) && p.as_bytes().get(2) == Some(&b':') {
+                    p[3..].to_string()
+                } else {
+                    p.to_string()
+                }
+            })
+            .collect()
     }
 
     #[test]
@@ -154,12 +168,13 @@ mod tests {
             FileChangeType::CHANGED,
             FileChangeType::DELETED,
         );
+        let base_a = Url::from_file_path(test_path("/p/a")).unwrap().to_string();
         let mut w = WatchedFiles::default();
         assert!(w.register(&[registration(
             "a",
             json!([
                 { "globPattern": "**/*.py" },
-                { "globPattern": { "baseUri": "file:///p/a", "pattern": "**/*.rs" } },
+                { "globPattern": { "baseUri": base_a, "pattern": "**/*.rs" } },
                 // 5 = Create | Delete: no Change events.
                 { "globPattern": "**/*.go", "kind": 5 },
             ])

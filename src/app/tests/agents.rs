@@ -384,6 +384,7 @@ fn cmd_k_x_cancels_the_ai_stream_and_the_stop_row_follows_the_pilot_caret() {
 /// throttled tick, a plain-launch croft self-appoints the collab OWNER seat
 /// (nobody else would answer the pilot's snapshot requests), and a disabled
 /// record unseats it.
+#[cfg(unix)]
 #[test]
 fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
     use std::time::{Duration, Instant};
@@ -696,6 +697,7 @@ fn toggling_the_navigator_preserves_its_provider() {
 /// Only one croft self-appoints the navigator owner per workspace: a second
 /// plain croft is refused the single-host lock and must NOT seat (two owners
 /// would both claim collab site id 1 and corrupt the shared buffer).
+#[cfg(unix)]
 #[test]
 fn only_one_croft_self_appoints_the_navigator_owner() {
     use std::time::{Duration, Instant};
@@ -778,6 +780,7 @@ fn only_one_croft_self_appoints_the_navigator_owner() {
 /// Unseating the navigator mid-turn must reset the turn's note counters:
 /// they survived into the NEXT seat's first TurnDone, which then reported
 /// a dead seat's notes (inflated count, wrong file).
+#[cfg(unix)]
 #[test]
 fn unseating_the_navigator_resets_the_turn_note_counters() {
     use std::time::{Duration, Instant};
@@ -837,6 +840,7 @@ fn unseating_the_navigator_resets_the_turn_note_counters() {
 /// "a running croft seats it within a second", but an enabled→enabled
 /// rewrite has no transition for the death latch to observe. The record's
 /// mtime is the signal.
+#[cfg(unix)]
 #[test]
 fn a_record_rewrite_re_arms_a_downed_navigator() {
     use std::time::{Duration, Instant};
@@ -915,6 +919,7 @@ fn a_record_rewrite_re_arms_a_downed_navigator() {
 /// (or the selection), right-click menus carry the entries, and submitting
 /// sends the composed ask turn (instruction, 0-based range, numbered
 /// buffer) to the pilot's claude stdin.
+#[cfg(unix)]
 #[test]
 fn ask_box_opens_from_chord_and_menus_and_sends_the_ask_turn() {
     use crate::widgets::input_prompt::InputPurpose;
@@ -1080,6 +1085,7 @@ fn reroot_rebinds_the_navigator_activation_watch() {
 /// newly COMPLETED construct plus a typing pause makes it take a
 /// comment-only look on its own. A pause alone never fires, the pref kills
 /// the behavior, and one buffer state never fires twice.
+#[cfg(unix)]
 #[test]
 fn a_completed_construct_plus_pause_triggers_a_proactive_look() {
     use std::time::{Duration, Instant};
@@ -1177,6 +1183,7 @@ fn a_completed_construct_plus_pause_triggers_a_proactive_look() {
     assert!(!app.tick_proactive_navigator());
 }
 
+#[cfg(unix)]
 fn set_stream(owner: &mut App, pilot: &mut crate::collab::CollabSession, active: bool) {
     use std::time::{Duration, Instant};
     pilot.send_stream_state("f.txt", active);
@@ -1188,11 +1195,13 @@ fn set_stream(owner: &mut App, pilot: &mut crate::collab::CollabSession, active:
     }
 }
 
+#[cfg(unix)]
 const ADD: &str = "def add(a, b):\n    return a - b";
 
 /// #1207: a navigator edit streamed over many ticks undoes in one Ctrl+Z,
 /// back to the text from before the stream, instead of one fragment at a
 /// time through broken code.
+#[cfg(unix)]
 #[test]
 fn a_navigator_stream_undoes_in_one_step() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1221,6 +1230,7 @@ fn a_navigator_stream_undoes_in_one_step() {
 
 /// #1207 (comment): after a cancelled stream's revert, the text is back and
 /// there is nothing left to undo, never a hybrid of the two texts.
+#[cfg(unix)]
 #[test]
 fn a_cancelled_navigator_stream_leaves_nothing_to_undo() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1309,6 +1319,7 @@ fn a_replayed_transcript_cannot_execute_control_sequences() {
 /// transition fires exactly once per prompt. The fake agent is a shell that
 /// prints a permission question and then sits; the sample names it `claude`
 /// the way the label sampler would.
+#[cfg(unix)]
 #[test]
 fn an_agent_pane_is_badged_and_a_prompt_fires_waiting_once() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1436,6 +1447,7 @@ fn an_agent_pane_is_badged_and_a_prompt_fires_waiting_once() {
 /// reports count: not a departed agent's, not those of a program that is no
 /// agent, and when one agent replaces another between two samples, a probe
 /// between them is what keeps the second's.
+#[cfg(unix)]
 #[test]
 fn a_reporting_agent_is_read_by_its_report_not_its_screen() {
     use crate::agents::AgentStatus;
@@ -2023,16 +2035,20 @@ fn a_new_lane_opens_a_named_pane_in_the_worktree_running_the_agent_command() {
     init_lane_repo(&repo);
     let mut app = App::new(repo.clone()).unwrap();
     app.terminal_session_path = tmp.path().join("sessions.json");
-    app.agents = crate::agents::AgentTable::from_json(
-        r#"[{ "name": "probe", "launch": "printf '%s%s\\n' 'croft-lane' '-seated-1'" }]"#,
-    );
+    #[cfg(unix)]
+    let launch = r#"[{ "name": "probe", "launch": "printf '%s%s\\n' 'croft-lane' '-seated-1'" }]"#;
+    #[cfg(not(unix))]
+    let launch = r#"[{ "name": "probe", "launch": "Write-Output ('croft-lane' + '-seated-1')" }]"#;
+    app.agents = crate::agents::AgentTable::from_json(launch);
     app.lane_agent = Some(String::from("Probe"));
     let before = app.terminals.len();
     app.create_worktree_lane("fix login");
     let lane = tmp.path().join("repo-fix-login");
     assert!(lane.is_dir(), "the worktree exists: {}", app.status);
     assert!(
-        app.roots.iter().any(|r| r == lane.canonicalize().unwrap()),
+        app.roots
+            .iter()
+            .any(|r| r == crate::platform::fs::canonicalize(&lane).unwrap()),
         "and is a workspace root"
     );
     assert_eq!(app.terminals.len(), before + 1, "one new pane");
@@ -2075,7 +2091,7 @@ fn a_new_lane_opens_a_named_pane_in_the_worktree_running_the_agent_command() {
     assert_eq!(lanes[0].agent.as_deref(), Some("probe"));
     assert_eq!(
         std::path::Path::new(&lanes[0].path),
-        lane.canonicalize().unwrap(),
+        crate::platform::fs::canonicalize(&lane).unwrap(),
         "recorded canonical, like the roots"
     );
 }
@@ -2164,9 +2180,11 @@ fn a_restored_lane_pane_is_a_lane_again_with_its_agent_seated() {
     crate::terminal_session::save_for_root(&session, &root_key, rec).unwrap();
     let mut app = App::new(repo.clone()).unwrap();
     app.terminal_session_path = session;
-    app.agents = crate::agents::AgentTable::from_json(
-        r#"[{ "name": "probe", "launch": "printf '%s%s\\n' 'croft-lane' '-back-2'" }]"#,
-    );
+    #[cfg(unix)]
+    let launch = r#"[{ "name": "probe", "launch": "printf '%s%s\\n' 'croft-lane' '-back-2'" }]"#;
+    #[cfg(not(unix))]
+    let launch = r#"[{ "name": "probe", "launch": "Write-Output ('croft-lane' + '-back-2')" }]"#;
+    app.agents = crate::agents::AgentTable::from_json(launch);
     app.restore_terminal_session_with(true);
     assert_eq!(app.terminals.len(), 3);
     let uid = app.terminals[1].uid();
@@ -2247,15 +2265,23 @@ fn a_restored_lane_pane_spawns_in_its_worktree_not_where_the_shell_had_wandered(
     crate::terminal_session::save_for_root(&session, &root_key, rec).unwrap();
     let mut app = App::new(repo.clone()).unwrap();
     app.terminal_session_path = session;
-    app.agents = crate::agents::AgentTable::from_json(
-        r#"[
+    #[cfg(unix)]
+    let launch = r#"[
           { "name": "probe-a", "launch": "printf '%s%s\\n' 'croft-seat' \"-a:$(pwd)\"" },
           { "name": "probe-b", "launch": "printf '%s%s\\n' 'croft-seat' \"-b:$(pwd)\"" }
-        ]"#,
-    );
+        ]"#;
+    #[cfg(not(unix))]
+    let launch = r#"[
+          { "name": "probe-a", "launch": "Write-Output ('croft-seat' + '-a:' + (Get-Location).Path)" },
+          { "name": "probe-b", "launch": "Write-Output ('croft-seat' + '-b:' + (Get-Location).Path)" }
+        ]"#;
+    app.agents = crate::agents::AgentTable::from_json(launch);
     app.restore_terminal_session_with(true);
     assert_eq!(app.terminals.len(), 2);
-    let lane_canon = lane_dir.canonicalize().unwrap().display().to_string();
+    let lane_canon = crate::platform::fs::canonicalize(&lane_dir)
+        .unwrap()
+        .display()
+        .to_string();
     let budget = crate::test_budget::spawn_budget(crate::test_budget::tests::TERMINAL_PROBE_BASE);
     let started = std::time::Instant::now();
     let seated = |app: &App, tag: &str| {
@@ -2335,7 +2361,7 @@ fn closing_a_lane_whose_pane_is_the_last_one_replaces_it_with_a_shell_in_the_pri
     assert_eq!(app.terminals.len(), 1);
     let lane_uid = app.terminals[0].uid();
     assert_eq!(app.terminals[0].manual_name(), Some("Lane: solo"));
-    let lane = tmp.path().join("repo-solo").canonicalize().unwrap();
+    let lane = crate::platform::fs::canonicalize(&tmp.path().join("repo-solo")).unwrap();
     app.active_scm_root = lane.clone();
     app.close_worktree_lane();
     assert!(!lane.exists(), "{}", app.status);
@@ -2352,7 +2378,10 @@ fn closing_a_lane_whose_pane_is_the_last_one_replaces_it_with_a_shell_in_the_pri
     assert!(app.status.contains("closed its pane"), "{}", app.status);
     // The replacement is a live shell in the primary root, not in the
     // removed directory: it can print its cwd.
+    #[cfg(unix)]
     app.terminals[0].write_input(b"printf '%s%s\\n' 'croft-repl' \"-at:$(pwd)\"\r");
+    #[cfg(not(unix))]
+    app.terminals[0].write_input(b"Write-Output ('croft-repl' + '-at:' + (Get-Location).Path)\r");
     let budget = crate::test_budget::spawn_budget(crate::test_budget::tests::TERMINAL_PROBE_BASE);
     let started = std::time::Instant::now();
     while started.elapsed() < budget && !app.terminals[0].visible_text().contains("croft-repl-at:")
@@ -2364,7 +2393,10 @@ fn closing_a_lane_whose_pane_is_the_last_one_replaces_it_with_a_shell_in_the_pri
         .lines()
         .find(|l| l.contains("croft-repl-at:"))
         .unwrap_or_else(|| panic!("the replacement shell never answered; screen:\n{screen}"));
-    let repo_canon = repo.canonicalize().unwrap().display().to_string();
+    let repo_canon = crate::platform::fs::canonicalize(&repo)
+        .unwrap()
+        .display()
+        .to_string();
     assert!(
         line.trim_end().ends_with(&repo_canon)
             || line.trim_end().ends_with(&repo.display().to_string()),
@@ -2381,7 +2413,7 @@ fn closing_a_lane_closes_its_pane_through_the_undoable_path() {
     app.terminal_session_path = tmp.path().join("sessions.json");
     app.lane_agent = None;
     app.create_worktree_lane("fix login");
-    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+    let lane = crate::platform::fs::canonicalize(&tmp.path().join("repo-fix-login")).unwrap();
     assert_eq!(app.terminals.len(), 2);
     let lane_uid = app.terminals[app.active_terminal].uid();
     // Close targets the ACTIVE root; the lane is what the user is in.
@@ -2418,7 +2450,7 @@ fn closing_a_lane_refuses_while_a_tab_in_it_has_unsaved_edits_in_any_group() {
     app.terminal_session_path = tmp.path().join("sessions.json");
     app.lane_agent = None;
     app.create_worktree_lane("fix login");
-    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+    let lane = crate::platform::fs::canonicalize(&tmp.path().join("repo-fix-login")).unwrap();
     let lane_file = lane.join("seed.txt");
     app.editor.open_pinned(&lane_file).unwrap();
     app.editor.insert_str("edited ");
@@ -2460,7 +2492,7 @@ fn closing_a_lane_refuses_while_a_sheet_cell_in_it_is_being_typed_into() {
     app.terminal_session_path = tmp.path().join("sessions.json");
     app.lane_agent = None;
     app.create_worktree_lane("fix login");
-    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+    let lane = crate::platform::fs::canonicalize(&tmp.path().join("repo-fix-login")).unwrap();
     let csv = lane.join("stock.csv");
     app.editor.open_pinned(&csv).unwrap();
     app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
@@ -2487,7 +2519,7 @@ fn closing_a_lane_closes_its_saved_tabs_in_every_group() {
     app.terminal_session_path = tmp.path().join("sessions.json");
     app.lane_agent = None;
     app.create_worktree_lane("fix login");
-    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+    let lane = crate::platform::fs::canonicalize(&tmp.path().join("repo-fix-login")).unwrap();
     let main_file = repo.canonicalize().unwrap().join("seed.txt");
     // The unfocused group holds only the lane's file; the focused one
     // holds it beside the main repo's.
@@ -2564,7 +2596,7 @@ fn a_lanes_root_row_wears_its_branch_and_its_agent() {
     app.lane_agent = None;
     app.create_worktree_lane("docs");
     app.sync_lane_root_badges();
-    let lane = tmp.path().join("repo-docs").canonicalize().unwrap();
+    let lane = crate::platform::fs::canonicalize(&tmp.path().join("repo-docs")).unwrap();
     assert_eq!(
         app.tree.root_badges.get(&lane).map(String::as_str),
         Some("agent/docs"),
@@ -2603,7 +2635,7 @@ fn a_lanes_badge_follows_the_seat_and_a_seated_pane_outranks_a_plain_one() {
         crate::agents::AgentTable::from_json(r#"[{ "name": "claude", "launch": "true" }]"#);
     app.lane_agent = Some(String::from("claude"));
     app.create_worktree_lane("fix login");
-    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+    let lane = crate::platform::fs::canonicalize(&tmp.path().join("repo-fix-login")).unwrap();
     let idx = app.active_terminal;
     app.sync_lane_root_badges();
     assert_eq!(
@@ -2681,7 +2713,10 @@ fn two_lanes_sharing_a_branch_are_named_by_their_folders_instead() {
         std::fs::create_dir_all(dir).unwrap();
         app.add_workspace_folder(dir.clone());
     }
-    let (one, two) = (one.canonicalize().unwrap(), two.canonicalize().unwrap());
+    let (one, two) = (
+        crate::platform::fs::canonicalize(&one).unwrap(),
+        crate::platform::fs::canonicalize(&two).unwrap(),
+    );
     // Two panes, two lanes, one branch name between them.
     for (i, dir) in [(0u64, &one), (1, &two)] {
         app.lane_panes.insert(
@@ -3333,13 +3368,13 @@ fn an_agent_edit_proposal_opens_the_popup_and_enter_answers_the_hook() {
     std::fs::write(&file, "let x = 1;\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let sock = tmp.path().join("hook.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let listener = crate::platform::ipc::LocalListener::bind(&sock).unwrap();
     listener.set_nonblocking(true).unwrap();
     app.hook_listener = Some(listener);
     assert!(!app.drain_hook_requests());
     assert!(app.approval_ui.is_none());
 
-    let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    let mut hook = crate::platform::ipc::LocalStream::connect(&sock).unwrap();
     let req = crate::agent_hook::EditRequest {
         agent: "claude-code".into(),
         tool: "Edit".into(),
@@ -3353,7 +3388,7 @@ fn an_agent_edit_proposal_opens_the_popup_and_enter_answers_the_hook() {
     app.approvals[0].arrived -= crate::agent_hook::ANSWER_WINDOW;
     assert!(app.drain_hook_requests());
     assert!(app.approval_ui.is_none() && app.approvals.is_empty());
-    let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    let mut hook = crate::platform::ipc::LocalStream::connect(&sock).unwrap();
     writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
     assert!(app.drain_hook_requests());
 
@@ -3424,7 +3459,7 @@ fn agent_lane_rows_list_each_agent_then_its_files_unreviewed_first() {
         .map(|r| match r {
             LaneRow::File {
                 label, unreviewed, ..
-            } => (label.clone(), *unreviewed),
+            } => (label.replace('\\', "/"), *unreviewed),
             other => panic!("expected a file row, got {other:?}"),
         })
         .collect();
@@ -3466,6 +3501,7 @@ fn agents_open_agent_lane_shows_the_section_open() {
 /// notification whose Approve link carries the proposal's token, and that
 /// token, sent back the way `croft decide` sends it, answers the hook and
 /// closes the popup without a key pressed.
+#[cfg(unix)]
 #[test]
 fn an_approval_notifies_once_and_its_approve_token_answers_the_hook() {
     use std::io::{BufRead, Write};
@@ -3487,11 +3523,11 @@ fn an_approval_notifies_once_and_its_approve_token_answers_the_hook() {
         ..Default::default()
     }]);
     let sock = tmp.path().join("hook.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let listener = crate::platform::ipc::LocalListener::bind(&sock).unwrap();
     listener.set_nonblocking(true).unwrap();
     app.hook_listener = Some(listener);
 
-    let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    let mut hook = crate::platform::ipc::LocalStream::connect(&sock).unwrap();
     let req = crate::agent_hook::EditRequest {
         agent: "claude-code".into(),
         tool: "Edit".into(),
@@ -3690,11 +3726,11 @@ fn approve_all_lets_one_agent_through_until_stopped() {
     std::fs::write(tmp.path().join("a.rs"), "let x = 1;\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let sock = tmp.path().join("hook.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let listener = crate::platform::ipc::LocalListener::bind(&sock).unwrap();
     listener.set_nonblocking(true).unwrap();
     app.hook_listener = Some(listener);
     let propose = |app: &mut App, agent: &str| {
-        let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let mut hook = crate::platform::ipc::LocalStream::connect(&sock).unwrap();
         let req = crate::agent_hook::EditRequest {
             agent: agent.into(),
             tool: "Edit".into(),
@@ -3705,7 +3741,7 @@ fn approve_all_lets_one_agent_through_until_stopped() {
         app.drain_hook_requests();
         hook
     };
-    let answer = |hook: std::os::unix::net::UnixStream| {
+    let answer = |hook: crate::platform::ipc::LocalStream| {
         hook.set_read_timeout(Some(std::time::Duration::from_millis(200)))
             .unwrap();
         let mut line = String::new();
@@ -3839,10 +3875,10 @@ fn edit_then_approve_sends_the_saved_text_as_the_tools_input() {
         std::fs::write(&target, "let x = 1;\n").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         let sock = tmp.path().join("hook.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let listener = crate::platform::ipc::LocalListener::bind(&sock).unwrap();
         listener.set_nonblocking(true).unwrap();
         app.hook_listener = Some(listener);
-        let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let mut hook = crate::platform::ipc::LocalStream::connect(&sock).unwrap();
         let input = serde_json::json!({"file_path": target, "old_string": "1", "new_string": "2"});
         let req = crate::agent_hook::EditRequest {
             agent: "claude-code".into(),
@@ -3931,11 +3967,11 @@ fn an_agent_edit_to_a_dirty_tab_goes_through_a_three_way_merge() {
         app.editor.dirty = true;
         app.editor.pin_active(); // as any real edit does
         let sock = tmp.path().join("hook.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let listener = crate::platform::ipc::LocalListener::bind(&sock).unwrap();
         listener.set_nonblocking(true).unwrap();
         app.hook_listener = Some(listener);
         // The agent's: lines 3 and 5 (Write, so the whole text).
-        let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let mut hook = crate::platform::ipc::LocalStream::connect(&sock).unwrap();
         let req = crate::agent_hook::EditRequest {
             agent: "claude-code".into(),
             tool: "Write".into(),
@@ -4021,10 +4057,10 @@ fn completing_an_approval_merge_approves_it_and_stages_nothing() {
         app.editor.dirty = true;
         app.editor.pin_active();
         let sock = tmp.path().join("hook.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let listener = crate::platform::ipc::LocalListener::bind(&sock).unwrap();
         listener.set_nonblocking(true).unwrap();
         app.hook_listener = Some(listener);
-        let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let mut hook = crate::platform::ipc::LocalStream::connect(&sock).unwrap();
         let req = crate::agent_hook::EditRequest {
             agent: "claude-code".into(),
             tool: "Write".into(),

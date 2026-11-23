@@ -1725,14 +1725,14 @@ pub(crate) fn display_file(uri: &str, roots: &[PathBuf]) -> String {
     let Some(path) = uri_to_path(uri) else {
         return uri.to_string();
     };
-    if path.is_absolute() {
+    if path.is_absolute() || path.has_root() {
         for root in roots {
             if let Ok(rel) = path.strip_prefix(root) {
-                return rel.to_string_lossy().into_owned();
+                return rel.to_string_lossy().replace('\\', "/");
             }
         }
     }
-    path.to_string_lossy().into_owned()
+    path.to_string_lossy().replace('\\', "/")
 }
 
 #[cfg(test)]

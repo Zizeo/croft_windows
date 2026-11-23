@@ -543,22 +543,25 @@ mod tests {
         assert_eq!(got.get("snippets.json"), Some(&h));
         assert!(!got.contains_key("config.json"));
         // The script itself, run by a real shell against a config dir.
-        let home = tempfile::tempdir().unwrap();
-        let dir = home.path().join(".config/croft");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("keybindings.json"), "{}\n").unwrap();
-        std::fs::write(dir.join("config.json"), "{}\n").unwrap();
-        let out = std::process::Command::new("sh")
-            .args(["-c", &remote_hash_script()])
-            .env("HOME", home.path())
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        let got = parse_remote_listing(&String::from_utf8_lossy(&out.stdout)).unwrap();
-        assert_eq!(
-            got.into_iter().collect::<Vec<_>>(),
-            [(String::from("keybindings.json"), content_hash(b"{}\n"))]
-        );
+        #[cfg(unix)]
+        {
+            let home = tempfile::tempdir().unwrap();
+            let dir = home.path().join(".config/croft");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("keybindings.json"), "{}\n").unwrap();
+            std::fs::write(dir.join("config.json"), "{}\n").unwrap();
+            let out = std::process::Command::new("sh")
+                .args(["-c", &remote_hash_script()])
+                .env("HOME", home.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            let got = parse_remote_listing(&String::from_utf8_lossy(&out.stdout)).unwrap();
+            assert_eq!(
+                got.into_iter().collect::<Vec<_>>(),
+                [(String::from("keybindings.json"), content_hash(b"{}\n"))]
+            );
+        }
         assert_eq!(content_hash(b"").len(), 64);
     }
 
@@ -571,16 +574,19 @@ mod tests {
         let got = parse_remote_listing(&format!("{HASHES_HEADER}\n{h}  snippets.json\n")).unwrap();
         assert_eq!(got.get("snippets.json"), Some(&h));
         // A remote with no config dir answers with the header alone.
-        let home = tempfile::tempdir().unwrap();
-        let out = std::process::Command::new("sh")
-            .args(["-c", &remote_hash_script()])
-            .env("HOME", home.path())
-            .output()
-            .unwrap();
-        assert_eq!(
-            parse_remote_listing(&String::from_utf8_lossy(&out.stdout)),
-            Some(Default::default())
-        );
+        #[cfg(unix)]
+        {
+            let home = tempfile::tempdir().unwrap();
+            let out = std::process::Command::new("sh")
+                .args(["-c", &remote_hash_script()])
+                .env("HOME", home.path())
+                .output()
+                .unwrap();
+            assert_eq!(
+                parse_remote_listing(&String::from_utf8_lossy(&out.stdout)),
+                Some(Default::default())
+            );
+        }
     }
 
     #[test]

@@ -984,7 +984,11 @@ fn write_aside(target: &Path, meta: &std::fs::Metadata, bytes: &[u8]) -> Result<
     };
     #[cfg(test)]
     if test_hooks::ASIDE_OUT_OF_SPACE.get() {
-        return Err(fail(&tmp, std::io::Error::from_raw_os_error(libc::ENOSPC)));
+        #[cfg(unix)]
+        let err = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        #[cfg(windows)]
+        let err = std::io::Error::from_raw_os_error(112); // ERROR_DISK_FULL
+        return Err(fail(&tmp, err));
     }
     if let Err(e) = file.write_all(bytes).and_then(|()| file.flush()) {
         return Err(fail(&tmp, e));

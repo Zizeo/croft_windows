@@ -174,9 +174,17 @@ pub fn remove_worktree_lane(lane: &Path) -> Result<(), String> {
     let Some(path) = lane.to_str() else {
         return Err(String::from("lane path is not valid UTF-8"));
     };
-    // Run from the lane itself: git resolves the main worktree from there,
-    // so the caller does not have to remember which repo it was cut from.
-    run_git_mut(lane, &["worktree", "remove", path])
+    // Run from the main repo root when possible: on Windows, spawning git with
+    // CWD inside the worktree being removed holds an open directory handle and
+    // causes `Permission denied`.
+    let repo = run_git(
+        lane,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()
+    .and_then(|out| Path::new(out.trim()).parent().map(Path::to_path_buf));
+    let cwd = repo.as_deref().unwrap_or(lane);
+    run_git_mut(cwd, &["worktree", "remove", path])
 }
 
 /// Where review mode checks pull request `number` out (#365): a sibling of
@@ -192,7 +200,7 @@ pub fn pr_worktree_path(repo: &Path, number: u64) -> Option<PathBuf> {
 pub fn remote_for_slug(repo: &Path, slug: &str) -> String {
     let slug = slug.to_ascii_lowercase();
     let names = |url: &str| {
-        let url = url.trim().to_ascii_lowercase();
+        let url = url.trim().to_ascii_lowercase().replace('\\', "/");
         let url = url.strip_suffix(".git").unwrap_or(&url).to_string();
         url.ends_with(&format!("/{slug}")) || url.ends_with(&format!(":{slug}"))
     };
@@ -321,4 +329,14 @@ pub fn pr_worktree_keep_reason(path: &Path, checked_out: &str) -> Option<String>
         )),
         None => Some(String::from("git cannot read its HEAD")),
     }
+}
+
+/// Returns whether Git marks the worktree at `path` as locked (`<git-dir>/locked`).
+#[cfg(windows)]
+pub fn worktree_is_locked(path: &Path) -> bool {
+    let Ok(dir) = run_git(path, &["rev-parse", "--path-format=absolute", "--git-dir"]) else {
+        return false;
+    };
+    let dir = dir.trim();
+    !dir.is_empty() && Path::new(dir).join("locked").exists()
 }

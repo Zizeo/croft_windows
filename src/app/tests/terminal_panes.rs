@@ -342,6 +342,7 @@ fn close_active_terminal_refuses_to_drop_the_last_one() {
 /// #912: `exit` in a pane left it open, dead and swallowing input. It now
 /// closes, as VS Code closes a terminal whose shell exits, and is not
 /// parked for undo-close: there is no shell to bring back.
+#[cfg(unix)]
 #[test]
 fn a_pane_whose_shell_exits_closes() {
     let tmp = tempfile::tempdir().unwrap();
@@ -366,6 +367,7 @@ fn a_pane_whose_shell_exits_closes() {
 /// #912: the last pane cannot close, so when its shell exits it stays,
 /// takes no input, and is not counted active; a key starts a new shell in
 /// its place.
+#[cfg(unix)]
 #[test]
 fn the_last_pane_whose_shell_exits_waits_for_a_key_to_start_a_new_shell() {
     let tmp = tempfile::tempdir().unwrap();
@@ -396,6 +398,7 @@ fn the_last_pane_whose_shell_exits_waits_for_a_key_to_start_a_new_shell() {
 /// #912: a paste is input like a key, so into the last pane after its shell
 /// exited it starts a new shell, as a typed key does, instead of going to
 /// the shell that is gone.
+#[cfg(unix)]
 #[test]
 fn a_paste_into_the_last_exited_pane_starts_a_new_shell() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1623,6 +1626,7 @@ fn dragging_a_pane_label_and_a_rail_row_reorders_terminals_end_to_end() {
     assert_eq!(order, ["three", "one", "two"], "rail drag moves the row");
 }
 
+#[cfg(unix)]
 #[test]
 fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2716,6 +2720,7 @@ fn a_folded_strips_menu_offers_nothing_that_acts_on_the_active_pane() {
 /// the pane has a selection - the menu model has no disabled state, so an
 /// entry that would copy nothing is worse than no entry - and both entries
 /// go through the same routes the Cmd+C / Cmd+V chords already use.
+#[cfg(unix)]
 #[test]
 fn the_pane_menu_copies_a_selection_and_pastes_the_clipboard() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2813,6 +2818,7 @@ fn the_pane_menu_copies_a_selection_and_pastes_the_clipboard() {
 /// #933: with no host clipboard to read and no relay to fetch one over,
 /// the pane menu's Paste sends what croft itself last copied, as every
 /// other paste inside croft does.
+#[cfg(unix)]
 #[test]
 fn the_pane_menu_pastes_croft_s_own_copy_where_the_clipboard_cant_be_read() {
     let tmp = tempfile::tempdir().unwrap();

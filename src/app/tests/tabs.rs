@@ -1537,6 +1537,7 @@ fn tab_strip_renders_disambiguated_titles_for_colliding_names() {
 /// the focused one, and every copy must go before the file is rewritten:
 /// a tab left in another group would read the new bytes through its old
 /// index and paint garbage, with nothing to heal it.
+#[cfg(unix)]
 #[test]
 fn a_second_dump_closes_the_stale_tab_in_every_editor_group() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2529,7 +2530,9 @@ fn status_bar_go_to_line_drops_the_selection_it_leaves_behind() {
 /// the cooldown a flick froze the UI for one render per queued event.
 #[test]
 fn a_wheel_burst_over_a_background_split_pdf_steps_one_page() {
-    require_pdf_backend();
+    if !require_pdf_backend() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("doc.pdf");
     write_three_page_pdf(&path);

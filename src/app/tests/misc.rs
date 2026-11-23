@@ -218,6 +218,7 @@ fn build_title_uses_basename_and_app_name() {
     assert_eq!(build_title(p), "croft  /");
 }
 
+#[cfg(unix)]
 #[test]
 fn bounded_output_gives_up_on_a_command_that_hangs() {
     let started = std::time::Instant::now();
@@ -248,6 +249,7 @@ fn bounded_output_gives_up_on_a_command_that_hangs() {
 
 /// Open `path` for writing as a hanging script and hold it open for `hold`,
 /// so starting it fails with "Text file busy" until then.
+#[cfg(unix)]
 fn busy_script(path: &std::path::Path, hold: std::time::Duration) -> std::thread::JoinHandle<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt;
@@ -269,6 +271,7 @@ fn busy_script(path: &std::path::Path, hold: std::time::Duration) -> std::thread
 /// A program busy past the budget is given up on at the budget, not after
 /// the retries run out, and one that comes free late gets only what is left
 /// of the budget to answer, not the whole budget again.
+#[cfg(unix)]
 #[test]
 fn bounded_output_counts_a_busy_program_against_its_budget() {
     use std::time::{Duration, Instant};
@@ -355,6 +358,7 @@ fn a_relative_block_directory_is_made_absolute() {
 /// latched by KIND: when the reason changes (the directory appears but a
 /// second window now holds the flock) the new reason is announced, and
 /// when the lock frees this window hosts.
+#[cfg(unix)]
 #[test]
 fn an_unopenable_host_lock_is_reported_as_such_and_re_announced_when_the_reason_changes() {
     use std::time::{Duration, Instant};
@@ -647,15 +651,18 @@ fn draining_an_idle_listener_reports_no_change_and_does_not_block() {
     // so the test would HANG instead of failing and read as a CI timeout
     // rather than as this defect. Reading O_NONBLOCK turns that into a
     // one-line failure that names the cause.
-    let flags = {
-        use std::os::unix::io::AsRawFd;
-        let listener = app.view_listener.as_ref().unwrap();
-        unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFL) }
-    };
-    assert!(
-        flags != -1 && flags & libc::O_NONBLOCK != 0,
-        "the frame loop polls this listener, so it must be non-blocking"
-    );
+    #[cfg(unix)]
+    {
+        let flags = {
+            use std::os::unix::io::AsRawFd;
+            let listener = app.view_listener.as_ref().unwrap();
+            unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFL) }
+        };
+        assert!(
+            flags != -1 && flags & libc::O_NONBLOCK != 0,
+            "the frame loop polls this listener, so it must be non-blocking"
+        );
+    }
     let started = std::time::Instant::now();
     assert!(!app.drain_view_requests(), "nothing was sent");
     assert!(
@@ -677,7 +684,7 @@ fn a_terminated_request_over_the_cap_is_refused_like_an_unterminated_one() {
 
     let sock2 = sock.clone();
     let flood = std::thread::spawn(move || {
-        let Ok(mut c) = std::os::unix::net::UnixStream::connect(&sock2) else {
+        let Ok(mut c) = crate::platform::ipc::LocalStream::connect(&sock2) else {
             return;
         };
         // Just past the cap, and TERMINATED, so the newline lands INSIDE the

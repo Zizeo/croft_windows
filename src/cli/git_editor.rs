@@ -28,10 +28,40 @@ pub(super) fn git_editor() -> Option<String> {
         .filter(|editor| !editor.is_empty())
 }
 
+/// Locate Git for Windows's bundled POSIX `sh.exe` via `git --exec-path`,
+/// falling back to `"sh"` if unavailable.
+#[cfg(windows)]
+fn find_git_sh() -> std::ffi::OsString {
+    if let Ok(out) = std::process::Command::new("git")
+        .arg("--exec-path")
+        .stderr(std::process::Stdio::null())
+        .output()
+        && out.status.success()
+    {
+        let ep = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        for rel in [
+            "../../../usr/bin/sh.exe",
+            "../../../bin/sh.exe",
+            "../../usr/bin/sh.exe",
+            "../../bin/sh.exe",
+        ] {
+            let cand = ep.join(rel);
+            if cand.is_file() {
+                return cand.into_os_string();
+            }
+        }
+    }
+    std::ffi::OsString::from("sh")
+}
+
 /// Run the editor value `editor` on `path` exactly as git itself runs one,
 /// and return its exit code.
 pub(super) fn run_git_editor(editor: &str, path: &std::ffi::OsStr) -> i32 {
-    let status = std::process::Command::new("sh")
+    #[cfg(unix)]
+    let sh = std::ffi::OsString::from("sh");
+    #[cfg(windows)]
+    let sh = find_git_sh();
+    let status = std::process::Command::new(sh)
         .arg("-c")
         .arg(format!("{editor} \"$@\""))
         .arg(editor)

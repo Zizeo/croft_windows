@@ -1287,6 +1287,7 @@ mod tests {
     /// #923: a `config.json` croft cannot even stat is named too, not
     /// taken for a missing one. A symlink loop stands in for a parent
     /// without search permission, which a test run as root would pass.
+    #[cfg(unix)]
     #[test]
     fn a_user_config_that_cannot_be_statted_is_named() {
         let (_tmp, user, root) = setup();

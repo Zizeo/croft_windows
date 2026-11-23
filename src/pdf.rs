@@ -479,6 +479,7 @@ const STDERR_SETTLE_GRACE: std::time::Duration = std::time::Duration::from_milli
 /// Guessing between those two is what this exists to stop - and it earned its
 /// keep, since two plausible diagnoses were wrong before the numbers arrived.
 #[cfg(test)]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct SettleOutcome {
     waited: std::time::Duration,

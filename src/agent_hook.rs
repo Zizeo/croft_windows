@@ -802,10 +802,12 @@ mod tests {
     #[test]
     fn with_no_croft_open_the_hook_says_nothing_and_returns_fast() {
         let dir = tempfile::tempdir().unwrap();
-        let payload = format!(
-            "{{\"tool_name\":\"Edit\",\"tool_input\":{{}},\"cwd\":\"{}\"}}",
-            dir.path().display()
-        );
+        let payload = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": {},
+            "cwd": dir.path(),
+        })
+        .to_string();
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let t = std::time::Instant::now();
         run_claude_code(&mut payload.as_bytes(), &mut out, &mut err, ANSWER_WINDOW).unwrap();

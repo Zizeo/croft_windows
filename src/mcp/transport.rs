@@ -330,6 +330,7 @@ mod tests {
         assert!(d.next_message().is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_server_logging_heavily_to_stderr_still_answers() {
         let cwd = std::env::temp_dir();
@@ -348,6 +349,7 @@ mod tests {
     /// it into its own session. Assert the spawned child's session id differs
     /// from ours. (Spawns `sleep` as a stand-in server; the reader thread just
     /// hits EOF when it exits.)
+    #[cfg(unix)]
     #[test]
     fn spawned_server_is_detached_into_its_own_session() {
         let cwd = std::env::temp_dir();
@@ -370,6 +372,7 @@ mod tests {
     /// whose cleanup runs on EOF gets to run it. The stand-in answers one line,
     /// then records reaching EOF in a marker file. The old shutdown SIGKILLed
     /// it first, so the marker never appeared.
+    #[cfg(unix)]
     #[test]
     fn dropping_the_transport_closes_stdin_before_killing_the_server() {
         let dir = std::env::temp_dir().join(format!("croft-mcp-eof-{}", std::process::id()));
@@ -406,6 +409,7 @@ mod tests {
 
     /// #685 backstop: a server that ignores stdin EOF is still killed once the
     /// grace period runs out, so shutdown can never hang its caller.
+    #[cfg(unix)]
     #[test]
     fn a_server_that_ignores_stdin_eof_is_still_killed() {
         let t = McpTransport::spawn(

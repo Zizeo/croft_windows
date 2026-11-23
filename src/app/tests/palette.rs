@@ -1277,6 +1277,7 @@ fn zoxide_jump_popup_anchors_over_the_explorer_column_not_centered() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_zoxide_row_re_roots_under_the_same_key_as_the_add_branch() {
     // A zoxide row is a bare line from its database, so it can name a
@@ -1808,6 +1809,7 @@ fn typing_in_the_picker_without_a_language_server_reports_unsupported() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn finished_commands_land_in_durable_history_and_the_popup_types_them() {
     let tmp = tempfile::tempdir().unwrap();

@@ -186,6 +186,10 @@ mod tests {
         assert_eq!(find(r, &index, "util.h").as_deref(), Some("util.c"));
     }
 
+    fn find_norm(root: &Path, index: &[PathBuf], rel: &str) -> Option<String> {
+        find(root, index, rel).map(|s| s.replace('\\', "/"))
+    }
+
     #[test]
     fn src_and_include_trees_switch_both_ways() {
         let (tmp, index) = tree(&[
@@ -196,19 +200,19 @@ mod tests {
         ]);
         let r = tmp.path();
         assert_eq!(
-            find(r, &index, "src/geom.cpp").as_deref(),
+            find_norm(r, &index, "src/geom.cpp").as_deref(),
             Some("include/geom.hpp")
         );
         assert_eq!(
-            find(r, &index, "include/geom.hpp").as_deref(),
+            find_norm(r, &index, "include/geom.hpp").as_deref(),
             Some("src/geom.cpp")
         );
         assert_eq!(
-            find(r, &index, "lib/src/shape/circle.cc").as_deref(),
+            find_norm(r, &index, "lib/src/shape/circle.cc").as_deref(),
             Some("lib/include/shape/circle.hh")
         );
         assert_eq!(
-            find(r, &index, "lib/include/shape/circle.hh").as_deref(),
+            find_norm(r, &index, "lib/include/shape/circle.hh").as_deref(),
             Some("lib/src/shape/circle.cc")
         );
     }
@@ -225,11 +229,11 @@ mod tests {
         ]);
         let r = tmp.path();
         assert_eq!(
-            find(r, &index, "src/geom.cpp").as_deref(),
+            find_norm(r, &index, "src/geom.cpp").as_deref(),
             Some("include/mylib/geom.hpp")
         );
         assert_eq!(
-            find(r, &index, "include/mylib/geom.hpp").as_deref(),
+            find_norm(r, &index, "include/mylib/geom.hpp").as_deref(),
             Some("src/geom.cpp")
         );
     }

@@ -445,6 +445,7 @@ mod tests {
     /// in write() and never exits, so waiting for exit before reading
     /// deadlocks until the timeout and reports node as missing. Output must
     /// be drained while the child runs.
+    #[cfg(unix)]
     #[test]
     fn run_bounded_survives_output_larger_than_the_pipe_buffer() {
         let mut sh = Command::new("/bin/sh");
@@ -455,10 +456,17 @@ mod tests {
 
     #[test]
     fn node_bin_dir_is_the_parent_of_an_absolute_node_path() {
-        assert_eq!(
-            node_bin_dir("/Users/x/.nvm/versions/node/v23.7.0/bin/node"),
-            Some(PathBuf::from("/Users/x/.nvm/versions/node/v23.7.0/bin"))
-        );
+        if cfg!(windows) {
+            assert_eq!(
+                node_bin_dir(r"C:\Users\x\node\bin\node.exe"),
+                Some(PathBuf::from(r"C:\Users\x\node\bin"))
+            );
+        } else {
+            assert_eq!(
+                node_bin_dir("/Users/x/.nvm/versions/node/v23.7.0/bin/node"),
+                Some(PathBuf::from("/Users/x/.nvm/versions/node/v23.7.0/bin"))
+            );
+        }
     }
 
     #[test]

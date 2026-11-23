@@ -10,6 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 mod agents;
 mod codeql;
+#[cfg(unix)]
 mod collab;
 mod debug;
 mod diff_merge;
@@ -265,7 +266,14 @@ fn key_predicates() -> Vec<(&'static str, KeyPredicate)> {
 /// only the fragments, so nothing but the OUTPUT can ever match.
 fn probe_command(probe: &str) -> String {
     let (head, tail) = probe.split_at(1);
-    format!("printf '%s%s\\n' '{head}' '{tail}'\r")
+    #[cfg(unix)]
+    {
+        format!("printf '%s%s\\n' '{head}' '{tail}'\r")
+    }
+    #[cfg(not(unix))]
+    {
+        format!("Write-Output ('{head}' + '{tail}')\r")
+    }
 }
 
 /// Run the probe command in the app's embedded terminal and wait until the
@@ -1320,6 +1328,7 @@ fn diag(
 }
 
 /// Run a typed block line through a real `sh` in `cwd`, as a pane would.
+#[cfg(unix)]
 fn run_typed_line(line: &str, cwd: &std::path::Path) -> String {
     let out = std::process::Command::new("sh")
         .args(["-c", line.trim_end_matches('\r')])
@@ -1549,6 +1558,7 @@ fn quick_open_typing(app: &mut App, typed: &str) {
 
 /// A local-provider seat for tests: connects to the workspace relay but
 /// spawns no child process (the endpoint is never contacted until a turn).
+#[cfg(unix)]
 fn local_test_spawn(cfg: &crate::pair::PairConfig) -> anyhow::Result<crate::pair_host::PairHost> {
     crate::pair_host::PairHost::spawn(crate::pair::PairConfig {
         socket: cfg.socket.clone(),
@@ -1564,6 +1574,7 @@ fn local_test_spawn(cfg: &crate::pair::PairConfig) -> anyhow::Result<crate::pair
 
 /// An owner croft with `f.txt` open on a fresh relay, and a pilot
 /// stand-in seat with the file live (#1207).
+#[cfg(unix)]
 fn owner_and_pilot_on(tmp: &tempfile::TempDir, text: &str) -> (App, crate::collab::CollabSession) {
     use std::time::{Duration, Instant};
     let file = tmp.path().join("f.txt");
@@ -1614,6 +1625,7 @@ fn owner_and_pilot_on(tmp: &tempfile::TempDir, text: &str) -> (App, crate::colla
 
 /// Send the pilot's buffer as `text` and wait until the owner's tab shows
 /// it, so each call lands on its own owner tick.
+#[cfg(unix)]
 fn pilot_writes(owner: &mut App, pilot: &mut crate::collab::CollabSession, text: &str) {
     use std::time::{Duration, Instant};
     assert!(pilot.local_change("f.txt", text));
@@ -1706,11 +1718,14 @@ fn wheel(app: &mut App, kind: crossterm::event::MouseEventKind, col: u16, row: u
     app.handle_mouse(mouse(kind, col, row));
 }
 
-fn require_pdf_backend() {
-    assert!(
-        crate::pdf::detect_backend().is_some(),
-        "these tests need a PDF rasteriser (poppler's pdftoppm, or sips on macOS)"
-    );
+fn require_pdf_backend() -> bool {
+    if crate::pdf::detect_backend().is_some() {
+        return true;
+    }
+    #[cfg(unix)]
+    panic!("these tests need a PDF rasteriser (poppler's pdftoppm, or sips on macOS)");
+    #[cfg(not(unix))]
+    false
 }
 
 /// Click a file's row in the Explorer, the way a user opens a file with the
@@ -2131,13 +2146,13 @@ fn queue_edit_proposal(
     file: &Path,
     old: &str,
     new: &str,
-) -> std::os::unix::net::UnixStream {
+) -> crate::platform::ipc::LocalStream {
     use std::io::Write;
     let sock = dir.join("hook.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let listener = crate::platform::ipc::LocalListener::bind(&sock).unwrap();
     listener.set_nonblocking(true).unwrap();
     app.hook_listener = Some(listener);
-    let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    let mut hook = crate::platform::ipc::LocalStream::connect(&sock).unwrap();
     let req = crate::agent_hook::EditRequest {
         agent: "claude-code".into(),
         tool: "Edit".into(),
@@ -2174,8 +2189,8 @@ fn seat_view_listener(app: &mut App, dir: &std::path::Path) -> std::path::PathBu
 /// the code under test. When it loses, the panic names the client rather than
 /// the deadline, the blocking flag or the length cap the test is about.
 fn accept_when_ready(
-    listener: &std::os::unix::net::UnixListener,
-) -> std::os::unix::net::UnixStream {
+    listener: &crate::platform::ipc::LocalListener,
+) -> crate::platform::ipc::LocalStream {
     // Load-scaled rather than a fresh constant (CONTRIBUTING.md, "Waiting on
     // a spawned process in a test"). What blows a flat five seconds here is
     // not the accept: it is every other test in the suite spawning a shell at
@@ -2236,6 +2251,7 @@ fn drain_until_answered(
 /// A stand-in adapter that emits one DAP `terminated` event and then idles,
 /// or (with `ends: false`) never says anything. Real processes, so the test
 /// drives the same transport and `poll` the app does.
+#[cfg(unix)]
 fn stub_member(ends: bool) -> crate::dap::session::DapSession {
     let script = if ends {
         "printf 'Content-Length: %d\r\n\r\n%s' 45 '{\"seq\":1,\"type\":\"event\",\"event\":\"terminated\"}'; sleep 30"
@@ -2284,6 +2300,7 @@ fn app_with_breakpoints() -> (tempfile::TempDir, App, PathBuf, PathBuf) {
 }
 
 /// Poll until the set shrinks below `from` members or two seconds pass.
+#[cfg(unix)]
 fn poll_until_shrinks(app: &mut App, from: usize) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while app.debug_sessions.len() >= from && std::time::Instant::now() < deadline {
@@ -2374,6 +2391,7 @@ fn add_codeql_in(config_dir: &Path) {
 /// Add CodeQL in a scratch config dir and point `app` and its test worker at
 /// it, so CodeQL test packs find the runner that comes with CodeQL (#1842).
 /// The dir lives as long as the returned guard.
+#[cfg(unix)]
 fn add_codeql(app: &mut App) -> tempfile::TempDir {
     let config = tempfile::tempdir().unwrap();
     add_codeql_in(config.path());
@@ -2535,6 +2553,7 @@ fn screen_text(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Strin
 
 /// The rows of a frame the test already drew, one char per cell (the first
 /// of its symbol, a space for an empty one), so a char index is a column.
+#[cfg(unix)]
 fn screen_char_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
     let buf = term.backend().buffer();
     (0..buf.area.height)
@@ -2565,6 +2584,7 @@ fn fake_codeql(dir: &std::path::Path, body: &str, code: i32, err: &str) -> std::
 }
 
 /// Drain the query run until it lands, or fail after a few seconds.
+#[cfg(unix)]
 fn wait_for_codeql(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while app.codeql_run.is_some() {
@@ -2578,6 +2598,7 @@ fn wait_for_codeql(app: &mut App) {
 }
 
 /// A workspace with `q.ql` open and database "app" current.
+#[cfg(unix)]
 fn codeql_query_fixture(tmp: &std::path::Path, source: &str) -> App {
     let db = tmp.join("dbs/app");
     std::fs::create_dir_all(&db).unwrap();
@@ -2716,6 +2737,7 @@ fn status_row(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String
 /// A stub `gh` for the viewed-sync tests (#365): it logs its argv to
 /// `gh-args`, answers `pr view` with PR x/y#42 (a.rs, b.rs, c.rs), and
 /// runs `graphql` for everything else.
+#[cfg(unix)]
 fn viewed_sync_gh(
     dir: &std::path::Path,
     graphql: &str,
@@ -2742,6 +2764,7 @@ esac
 }
 
 /// Wait until every queued viewed mutation has run.
+#[cfg(unix)]
 fn settle_viewed_writes(app: &mut App) {
     crate::test_budget::await_spawned(
         std::time::Duration::from_secs(5),
@@ -2957,12 +2980,21 @@ fn tabs_snapshot_852(app: &App) -> TabsSnapshot852 {
 fn plain_paste_app() -> (App, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+    #[cfg(unix)]
+    let (prog, args) = (
         "/bin/sh",
-        &[String::from("-c"), String::from("sleep 30")],
-        tmp.path(),
-    )
-    .unwrap();
+        &[String::from("-c"), String::from("sleep 30")][..],
+    );
+    #[cfg(windows)]
+    let (prog, args) = (
+        "cmd.exe",
+        &[
+            String::from("/C"),
+            String::from("ping -n 31 127.0.0.1 >nul"),
+        ][..],
+    );
+    app.terminals[0] =
+        crate::widgets::terminal::PtyTerminal::new_running(prog, args, tmp.path()).unwrap();
     app.active_terminal = 0;
     app.focus_pane(Pane::Terminal);
     (app, tmp)

@@ -571,7 +571,10 @@ fn app_excluding_vscode_build() -> (App, tempfile::TempDir) {
 fn a_vscode_exclude_of_build_keeps_scripts_build_in_search() {
     let (mut app, t) = app_excluding_vscode_build();
     assert_eq!(
-        search_hit_paths(&mut app, t.path(), "release_step"),
+        search_hit_paths(&mut app, t.path(), "release_step")
+            .into_iter()
+            .map(|s| s.replace('\\', "/"))
+            .collect::<Vec<_>>(),
         vec![
             String::from("scripts/build/release.py"),
             String::from("src/main.py")
@@ -1276,7 +1279,7 @@ fn an_association_change_reopens_the_file_on_its_new_server() {
 fn associations_follow_workspace_folders_in_and_out() {
     let tmp = tempfile::tempdir().unwrap();
     let extra = tempfile::tempdir().unwrap();
-    let extra_root = extra.path().canonicalize().unwrap();
+    let extra_root = crate::platform::fs::canonicalize(extra.path()).unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.txt", "x\n");
     let mut prefs = crate::prefs::Prefs::default();
     prefs

@@ -522,6 +522,7 @@ fn click_on_run_debug_icon_switches_sidebar_to_run_debug() {
 
 /// A stand-in adapter that writes every request croft sends it to `log`
 /// and never answers, so a test reads exactly what a click asked for.
+#[cfg(unix)]
 fn recording_member(log: &std::path::Path) -> crate::dap::session::DapSession {
     crate::dap::session::DapSession::launch_with(
         "sh",
@@ -535,6 +536,7 @@ fn recording_member(log: &std::path::Path) -> crate::dap::session::DapSession {
 
 /// An app on the Run and Debug view with one session, paused (thread 1
 /// stopped) or running, its requests recorded to the returned log.
+#[cfg(unix)]
 fn debug_toolbar_app(
     paused: bool,
 ) -> (
@@ -575,6 +577,7 @@ fn debug_control_cell(
 }
 
 /// Wait for the adapter's log to hold a request for `command`.
+#[cfg(unix)]
 fn adapter_got(log: &std::path::Path, command: &str) -> bool {
     let needle = format!("\"command\":\"{command}\"");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -591,6 +594,7 @@ fn adapter_got(log: &std::path::Path, command: &str) -> bool {
 /// toolbar, and a click on each button sends the same DAP request as its
 /// key: Step Over `next`, Step Into `stepIn`, Step Out `stepOut`, Continue
 /// `continue`.
+#[cfg(unix)]
 #[test]
 fn the_debug_toolbar_steps_and_continues_a_paused_session() {
     use crate::widgets::run_debug::DebugControl;
@@ -615,6 +619,7 @@ fn the_debug_toolbar_steps_and_continues_a_paused_session() {
 
 /// #1545: while running the first button is Pause, which sends `pause`,
 /// and the steps are greyed out: a click on one sends nothing.
+#[cfg(unix)]
 #[test]
 fn a_running_sessions_toolbar_pauses_and_its_steps_do_nothing() {
     use crate::widgets::run_debug::DebugControl;
@@ -633,6 +638,7 @@ fn a_running_sessions_toolbar_pauses_and_its_steps_do_nothing() {
 
 /// #1545: Stop ends the session as Shift+F5 does, and each button names
 /// itself and its key in the pointer's tooltip.
+#[cfg(unix)]
 #[test]
 fn the_debug_toolbar_stops_and_names_its_keys() {
     use crate::widgets::run_debug::DebugControl;
@@ -656,6 +662,7 @@ fn the_debug_toolbar_stops_and_names_its_keys() {
 
 /// #1545: at the sidebar's minimum width the toolbar wraps instead of
 /// dropping its rightmost buttons, so every control stays clickable.
+#[cfg(unix)]
 #[test]
 fn the_debug_toolbar_wraps_at_the_minimum_sidebar_width() {
     use crate::widgets::run_debug::DebugControl;
@@ -713,7 +720,7 @@ fn a_debugged_script_runs_under_the_interpreter_run_uses() {
 
     let bare = super::project_python_for(&pkg, root);
     assert_eq!(
-        bare.file_name().and_then(|n| n.to_str()),
+        bare.file_stem().and_then(|n| n.to_str()),
         Some("python3"),
         "no venv: python3, got {}",
         bare.display()
@@ -766,7 +773,8 @@ fn a_launch_json_python_config_runs_under_the_project_venv_unless_it_names_one()
     let fallback = python_of(program);
     let fallback = fallback[0].as_str().unwrap();
     assert!(
-        fallback.ends_with("python3") && !fallback.contains("debug-venv"),
+        Path::new(fallback).file_stem().and_then(|n| n.to_str()) == Some("python3")
+            && !fallback.contains("debug-venv"),
         "no venv: python3, got {fallback}"
     );
 
@@ -1266,6 +1274,7 @@ fn f9_toggles_a_breakpoint_whatever_the_updater_is_doing() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn bare_f10_reaches_the_shell_when_terminal_is_focused_with_no_debug_session() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2163,6 +2172,7 @@ fn a_finished_compound_task_starts_its_member_and_chains_the_members_own_task() 
 /// banners around `build`'s lines and then keeps running, as `tsc --watch`
 /// does. The config debugs a program that is not there, so a launch that
 /// went ahead is told apart by its "does not exist" error.
+#[cfg(unix)]
 fn watch_task_workspace(background: bool, build: &str) -> (tempfile::TempDir, App) {
     let script = format!(
         "sleep 1; echo 'Starting compilation in watch mode...'; {build} echo 'Found 0 errors. Watching for file changes.'; sleep 30"
@@ -2171,6 +2181,7 @@ fn watch_task_workspace(background: bool, build: &str) -> (tempfile::TempDir, Ap
 }
 
 /// [`watch_task_workspace`] with the watcher's whole script and matcher.
+#[cfg(unix)]
 fn watch_task_workspace_with(
     background: bool,
     script: &str,
@@ -2210,6 +2221,7 @@ fn watch_task_workspace_with(
 /// #1541: the watch task's first build ended with no errors, so the launch
 /// goes ahead while the watcher keeps running. It waited for an exit that
 /// never comes.
+#[cfg(unix)]
 #[test]
 fn a_watch_pre_launch_task_launches_once_its_first_build_ends() {
     let (_tmp, mut app) = watch_task_workspace(true, "");
@@ -2240,6 +2252,7 @@ fn a_watch_pre_launch_task_launches_once_its_first_build_ends() {
 
 /// #1541: a first build with errors does not launch against them; it says
 /// so, and the watcher keeps running to rebuild once they are fixed.
+#[cfg(unix)]
 #[test]
 fn a_watch_pre_launch_task_with_build_errors_does_not_launch() {
     let (_tmp, mut app) = watch_task_workspace(
@@ -2266,6 +2279,7 @@ fn a_watch_pre_launch_task_with_build_errors_does_not_launch() {
 /// #1541: an `activeOnStart` watcher starts inside its first build, and
 /// may print only the end of it; that still settles the launch, which
 /// otherwise waited for a `beginsPattern` that never comes.
+#[cfg(unix)]
 #[test]
 fn an_active_on_start_watch_pre_launch_task_launches_on_its_first_end() {
     let (_tmp, mut app) = watch_task_workspace_with(
@@ -2302,6 +2316,7 @@ fn an_active_on_start_watch_pre_launch_task_launches_on_its_first_end() {
 
 /// #1541 negative: a task that is not `isBackground` still waits for its
 /// exit, whatever its output says.
+#[cfg(unix)]
 #[test]
 fn an_ordinary_pre_launch_task_still_waits_for_its_exit() {
     let (_tmp, mut app) = watch_task_workspace(
@@ -2856,8 +2871,8 @@ fn a_compound_member_from_another_folder_launches_from_that_folder() {
     };
     assert_eq!(rc.name, "Run web");
     assert_eq!(
-        rc.program.as_deref(),
-        Some(web.join("main.py").to_string_lossy().as_ref())
+        rc.program.as_deref().map(|s| s.replace('\\', "/")),
+        Some(web.join("main.py").to_string_lossy().replace('\\', "/"))
     );
 }
 
@@ -3176,6 +3191,7 @@ fn a_zero_config_launch_drops_an_older_parked_task() {
 
 /// A stand-in adapter that sends each JSON DAP message in `messages`, framed
 /// with its byte length, and then idles.
+#[cfg(unix)]
 fn stub_emitting(messages: &[&str]) -> crate::dap::session::DapSession {
     let mut script = String::new();
     for m in messages {
@@ -3197,6 +3213,7 @@ fn stub_emitting(messages: &[&str]) -> crate::dap::session::DapSession {
 }
 
 /// Poll until `done` holds or two seconds pass.
+#[cfg(unix)]
 fn poll_until(app: &mut App, done: impl Fn(&App) -> bool) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while !done(app) && std::time::Instant::now() < deadline {
@@ -3208,6 +3225,7 @@ fn poll_until(app: &mut App, done: impl Fn(&App) -> bool) {
 /// #1426: Alt+F9 sends js-debug's `all` filter and says it is on; with an
 /// adapter that offers no raised-exceptions filter it says so instead of
 /// claiming exceptions will break.
+#[cfg(unix)]
 #[test]
 fn the_raised_exceptions_toggle_follows_the_adapters_filters() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3258,6 +3276,7 @@ fn the_raised_exceptions_toggle_follows_the_adapters_filters() {
 /// #1426: Alt+F9 pressed before the adapter answers `initialize` is kept
 /// and translated into that adapter's own ids once it does, instead of
 /// sending debugpy's `raised`, which lldb-dap would then drop.
+#[cfg(unix)]
 #[test]
 fn the_raised_exceptions_toggle_before_initialize_uses_the_adapters_ids() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3284,6 +3303,7 @@ fn the_raised_exceptions_toggle_before_initialize_uses_the_adapters_ids() {
 /// #1421: an expensive scope (js-debug's Global) shows collapsed with a
 /// chevron and no variables; a click opens it and fetches it. A cheap
 /// scope stays open with no chevron.
+#[cfg(unix)]
 #[test]
 fn an_expensive_scope_shows_collapsed_and_opens_on_click() {
     use crate::widgets::run_debug::DebugRowKind;
@@ -3355,6 +3375,7 @@ fn an_expensive_scope_shows_collapsed_and_opens_on_click() {
 
 /// #1421: two expensive scopes sharing a name open separately; opening
 /// the second leaves the first collapsed.
+#[cfg(unix)]
 #[test]
 fn expensive_scopes_sharing_a_name_open_separately() {
     use crate::widgets::run_debug::DebugRowKind;
@@ -3740,6 +3761,7 @@ fn rows_without_an_expression_offer_less_or_nothing() {
 
 /// #567 item 1: a background member's program output used to be drained and
 /// dropped. It reaches the debug console, tagged with the member's name.
+#[cfg(unix)]
 #[test]
 fn a_background_members_output_reaches_the_console_with_its_name() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3775,6 +3797,7 @@ fn a_background_members_output_reaches_the_console_with_its_name() {
 /// #567 item 1: a background member hitting a breakpoint looked hung, its
 /// `stopped` drained and dropped. With the focused member still running, the
 /// view moves to the stopped one and says so.
+#[cfg(unix)]
 #[test]
 fn a_background_stop_moves_the_view_to_the_stopped_member() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3798,11 +3821,13 @@ fn a_background_stop_moves_the_view_to_the_stopped_member() {
     app.debug_stop();
 }
 
+#[cfg(unix)]
 const STOPPED_EVENT: &str =
     r#"{"seq":1,"type":"event","event":"stopped","body":{"reason":"breakpoint","threadId":1}}"#;
 
 /// A compound can list one configuration twice, so two members can share a
 /// name: the member that stopped is the one shown, not the first of that name.
+#[cfg(unix)]
 #[test]
 fn a_stop_shows_the_member_that_stopped_even_when_names_repeat() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3823,6 +3848,7 @@ fn a_stop_shows_the_member_that_stopped_even_when_names_repeat() {
 
 /// A member ending in the same poll shifts the stopped member's position; the
 /// view still lands on the member that stopped.
+#[cfg(unix)]
 #[test]
 fn a_stop_lands_on_the_right_member_when_an_earlier_one_ends_alongside() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3844,6 +3870,7 @@ fn a_stop_lands_on_the_right_member_when_an_earlier_one_ends_alongside() {
 }
 
 /// The switch command cycles the members, and says so when there is only one.
+#[cfg(unix)]
 #[test]
 fn switch_debug_session_cycles_the_members() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3875,6 +3902,7 @@ fn switch_debug_session_cycles_the_members() {
 
 /// What a member reported in the background replays when it is switched to:
 /// a queued `stopped` drives the same handler it would have when focused.
+#[cfg(unix)]
 #[test]
 fn a_switched_to_member_replays_its_queued_stop() {
     use crate::dap::session::DapEvent;
@@ -3910,6 +3938,7 @@ fn a_switched_to_member_replays_its_queued_stop() {
 /// Program output and REPL results are mirrored, whole, to OUTPUT's
 /// "Debug Console" channel, where they read at full width and can be
 /// searched and copied.
+#[cfg(unix)]
 #[test]
 fn the_debug_console_is_mirrored_to_an_output_channel() {
     use crate::dap::session::DapEvent;
@@ -3956,6 +3985,7 @@ fn the_debug_console_is_mirrored_to_an_output_channel() {
 /// #867 guard: the mirror carries what the console shows and nothing more.
 /// debugpy's `telemetry` banner, which the console drops, stays out of the
 /// channel too, and a printed line lands there once, not once per poll.
+#[cfg(unix)]
 #[test]
 fn the_debug_console_mirror_skips_telemetry_and_copies_each_line_once() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4083,10 +4113,10 @@ while True:
 #[test]
 fn an_exception_answer_after_continue_does_not_say_paused() {
     use crate::dap::session::SessionPhase;
-    if std::process::Command::new("python3")
+    if !std::process::Command::new("python3")
         .arg("--version")
         .output()
-        .is_err()
+        .is_ok_and(|o| o.status.success())
     {
         return;
     }
@@ -4149,6 +4179,7 @@ fn the_step_commands_are_in_the_palette_and_bindable() {
 /// #1543: with a session paused on thread 1, the palette's Step Into and
 /// Step Out send `stepIn` / `stepOut`, and Step Into Target's picker sends
 /// `stepIn` with the chosen call's `targetId`.
+#[cfg(unix)]
 #[test]
 fn step_into_target_steps_into_the_picked_call() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4203,6 +4234,7 @@ fn step_into_target_steps_into_the_picked_call() {
 
 /// #1543 negative: a line with one call steps straight into it and a line
 /// with none steps in plainly; neither opens a picker.
+#[cfg(unix)]
 #[test]
 fn one_or_no_step_in_target_needs_no_picker() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4251,10 +4283,10 @@ fn continue_with_no_session_starts_nothing() {
 /// names the exception, on the status line and in the panel.
 #[test]
 fn an_exception_answer_while_stopped_names_the_exception() {
-    if std::process::Command::new("python3")
+    if !std::process::Command::new("python3")
         .arg("--version")
         .output()
-        .is_err()
+        .is_ok_and(|o| o.status.success())
     {
         return;
     }
@@ -4474,6 +4506,7 @@ fn an_lldb_attach_needs_a_pid_a_program_or_attach_commands() {
 
 /// #250: an lldb attach whose `processId` is `${command:pickProcess}` opens
 /// a process picker instead of failing, and the chosen pid resumes it.
+#[cfg(unix)]
 #[test]
 fn a_pick_process_attach_opens_the_process_picker() {
     use crate::widgets::list_picker::ListPurpose;
@@ -4543,6 +4576,7 @@ fn pick_process_on_a_non_lldb_config_is_refused() {
 /// Replacing the set for a new launch is not the end of a debug run, so
 /// the internal stop leaves the task alone (VS Code runs it on stop and on
 /// termination, not on relaunch).
+#[cfg(unix)]
 #[test]
 fn the_internal_stop_before_a_relaunch_runs_no_post_debug_task() {
     let (_tmp, mut app) = app_with_cleanup_task();
@@ -4552,6 +4586,7 @@ fn the_internal_stop_before_a_relaunch_runs_no_post_debug_task() {
     assert_eq!(last_task_label(&app), None);
 }
 
+#[cfg(unix)]
 #[test]
 fn stop_all_true_stops_the_set_when_a_background_member_ends() {
     // #567 item 4: `stopAll: true` was refused; it is honoured now.
@@ -4575,6 +4610,7 @@ fn stop_all_true_stops_the_set_when_a_background_member_ends() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn stop_all_false_leaves_the_siblings_running() {
     // The control: without stopAll only the member that ended goes.
@@ -4593,6 +4629,7 @@ fn stop_all_false_leaves_the_siblings_running() {
 /// while the status bar still read "Debugging out.p… · F10 step over ·
 /// Shift+F5 stop". A session that ends on its own says so on the status
 /// line as well.
+#[cfg(unix)]
 #[test]
 fn a_session_ending_on_its_own_says_so_on_the_status_line() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4705,7 +4742,7 @@ fn has_python3() -> bool {
     std::process::Command::new("python3")
         .arg("--version")
         .output()
-        .is_ok()
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Poll the adapter until screen reader mode has a new event past `seen`,
@@ -4885,6 +4922,7 @@ fn a_run_with_a_status_outcome_adds_only_its_first_failure() {
 
 /// #867: the run that never reached its breakpoint says that on the
 /// status line too, as the panel does.
+#[cfg(unix)]
 #[test]
 fn a_run_that_never_hit_its_breakpoint_says_so_on_the_status_line() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4903,6 +4941,7 @@ fn a_run_that_never_hit_its_breakpoint_says_so_on_the_status_line() {
 
 /// #867 guard: the end message is written once, when the session ends. A
 /// status set after that (the user's next action) survives later polls.
+#[cfg(unix)]
 #[test]
 fn a_status_set_after_the_debug_session_ended_is_kept() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4920,6 +4959,7 @@ fn a_status_set_after_the_debug_session_ended_is_kept() {
 /// #867 guard: when the focused member of a `stopAll` compound ends, the
 /// status keeps saying why the rest stopped rather than the plain end
 /// message.
+#[cfg(unix)]
 #[test]
 fn stop_all_keeps_its_explanation_when_the_focused_member_ends() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4944,6 +4984,7 @@ fn stop_all_keeps_its_explanation_when_the_focused_member_ends() {
 /// A compound that is REFUSED (here, it names a configuration no
 /// launch.json declares) leaves the running set alone, so it must not leave
 /// its `stopAll` behind either: that set never asked for it.
+#[cfg(unix)]
 #[test]
 fn a_refused_compound_does_not_hand_its_stop_all_to_the_running_set() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4979,6 +5020,7 @@ fn a_refused_compound_does_not_hand_its_stop_all_to_the_running_set() {
     app.debug_stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_background_member_ending_rebuilds_the_report_from_the_live_set() {
     // #567 items 2 and 3: the status and panel line kept naming the ended
@@ -5006,6 +5048,7 @@ fn a_background_member_ending_rebuilds_the_report_from_the_live_set() {
     assert_eq!(app.debug_compound, None, "a full stop forgets the compound");
 }
 
+#[cfg(unix)]
 #[test]
 fn the_focused_member_ending_names_the_session_now_shown() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5066,6 +5109,7 @@ fn function_breakpoints_are_kept_for_the_next_session() {
 /// #939: a function breakpoint set before F5 goes with the session however it
 /// started (the active file, a test, a launch.json config or a compound
 /// member), not only from launch.json.
+#[cfg(unix)]
 #[test]
 fn every_new_debug_session_carries_the_function_breakpoints() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5098,12 +5142,15 @@ fn run_to_cursor_without_a_session_says_so() {
     assert_eq!(app.status, "Run to Cursor: no debug session");
 }
 
+#[cfg(unix)]
 const EXITED_EVENT: &str = r#"{"seq":1,"type":"event","event":"exited","body":{"exitCode":0}}"#;
+#[cfg(unix)]
 const TERMINATED_EVENT: &str = r#"{"seq":2,"type":"event","event":"terminated"}"#;
 
 /// Adapters send `exited` and then `terminated`, both of which end a member.
 /// Arriving in one poll they named the member twice, and the second removal
 /// took a live sibling with it.
+#[cfg(unix)]
 #[test]
 fn a_member_that_exits_and_terminates_in_one_poll_is_removed_once() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5128,6 +5175,7 @@ fn a_member_that_exits_and_terminates_in_one_poll_is_removed_once() {
 /// The focused member ending in the same poll a background member stops: the
 /// view used to move to the stopped member first, carrying the ending with it
 /// into the old member's backlog, so the ended member was never removed.
+#[cfg(unix)]
 #[test]
 fn a_focused_member_that_ends_as_another_stops_is_still_removed() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5219,6 +5267,7 @@ fn debugging_a_codeql_query_stops_at_its_first_breakpoint() {
 /// old for it) ends the debug session with its reason in the status and
 /// the Run and Debug feedback, not "Debug session ended", and not a
 /// session left Initializing.
+#[cfg(unix)]
 #[test]
 fn a_refused_debug_launch_says_why() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5670,7 +5719,11 @@ fn a_parked_js_launch_keeps_the_workspace_folder_it_was_resolved_against() {
     };
 
     // The user focuses a file in the other root while the task runs.
-    app.editor.path = Some(b.canonicalize().unwrap().join("other.js"));
+    app.editor.path = Some(
+        crate::platform::fs::canonicalize(&b)
+            .unwrap()
+            .join("other.js"),
+    );
     assert_ne!(
         app.active_workspace_root(),
         root,
@@ -5687,6 +5740,7 @@ fn a_parked_js_launch_keeps_the_workspace_folder_it_was_resolved_against() {
 
 /// Feed `events` (DAP `output` bodies' `output` strings, JSON-escaped) to a
 /// stub debug session and poll until `done` holds for the Debug Console.
+#[cfg(unix)]
 fn debug_console_after(outputs: &[&str], done: impl Fn(&App) -> bool) -> App {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -5714,6 +5768,7 @@ fn debug_console_after(outputs: &[&str], done: impl Fn(&App) -> bool) -> App {
     app
 }
 
+#[cfg(unix)]
 fn console_line<'a>(app: &'a App, text: &str) -> &'a crate::ansi_text::AnsiLine {
     app.debug_console
         .iter()
@@ -5722,6 +5777,7 @@ fn console_line<'a>(app: &'a App, text: &str) -> &'a crate::ansi_text::AnsiLine 
 }
 
 /// The colour at byte `at` of a console line.
+#[cfg(unix)]
 fn console_fg(line: &crate::ansi_text::AnsiLine, at: usize) -> Option<crate::ansi_text::AnsiColor> {
     line.spans
         .iter()
@@ -5732,6 +5788,7 @@ fn console_fg(line: &crate::ansi_text::AnsiLine, at: usize) -> Option<crate::ans
 /// #1501: pytest `--color=yes`, chalk and coloured logging printed their SGR
 /// sequences into the Debug Console as `[31mFAILED[0m`. The console keeps the
 /// colours as spans over the plain text, and OUTPUT's channel gets the text.
+#[cfg(unix)]
 #[test]
 fn the_debug_console_shows_colour_codes_as_colours() {
     let tag = format!("ansi-{}", std::process::id());
@@ -5767,6 +5824,7 @@ fn the_debug_console_shows_colour_codes_as_colours() {
 
 /// #1501: a colour set on one line stays on until reset, as in a terminal,
 /// and a sequence cut between two output events is joined, not printed.
+#[cfg(unix)]
 #[test]
 fn debug_console_colour_carries_across_lines_and_cut_events() {
     let tag = format!("carry-{}", std::process::id());
@@ -5795,6 +5853,7 @@ fn debug_console_colour_carries_across_lines_and_cut_events() {
 
 /// #1501 negative: text without escapes is untouched, brackets included, and
 /// croft's own console lines never inherit a colour the program left on.
+#[cfg(unix)]
 #[test]
 fn debug_console_plain_output_and_croft_lines_stay_plain() {
     use crate::dap::session::DapEvent;
@@ -5830,6 +5889,7 @@ fn debug_console_plain_output_and_croft_lines_stay_plain() {
 /// #1501: each debug session's output is its own ANSI stream. In a compound,
 /// session A ends an event mid-escape (`ESC[3`) with red left on; session B's
 /// next line must neither lose its first letter to A's escape nor turn red.
+#[cfg(unix)]
 #[test]
 fn debug_console_sessions_keep_their_own_colour_and_cut_escape() {
     let tag = format!("streams-{}", std::process::id());
@@ -5876,6 +5936,7 @@ fn debug_console_sessions_keep_their_own_colour_and_cut_escape() {
 }
 
 /// The Debug Console lines from the first one containing `tag` on.
+#[cfg(unix)]
 fn console_from<'a>(app: &'a App, tag: &str) -> Vec<&'a str> {
     let lines: Vec<&str> = app.debug_console.iter().map(|l| l.text.as_str()).collect();
     let start = lines
@@ -5885,6 +5946,7 @@ fn console_from<'a>(app: &'a App, tag: &str) -> Vec<&'a str> {
     lines[start..].to_vec()
 }
 
+#[cfg(unix)]
 fn mirrored(text: &str) -> usize {
     crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE)
         .unwrap_or_default()
@@ -5896,6 +5958,7 @@ fn mirrored(text: &str) -> usize {
 /// #932: an output event is a chunk, not a line. `print("print: i =", i)`
 /// came out as `print: i =` and ` 0` on two lines, and `print()` left no
 /// blank line. A line ends at its newline, and OUTPUT gets it whole.
+#[cfg(unix)]
 #[test]
 fn debug_console_joins_a_line_cut_across_events_and_keeps_blank_lines() {
     let tag = format!("chunks-{}", std::process::id());
@@ -5922,6 +5985,7 @@ fn debug_console_joins_a_line_cut_across_events_and_keeps_blank_lines() {
 /// #932: the line a program is still printing shows as it reads so far, a
 /// carriage return redraws it in place, and the line a run ends without a
 /// newline still reaches OUTPUT.
+#[cfg(unix)]
 #[test]
 fn debug_console_redraws_a_progress_line_in_place() {
     let tag = format!("progress-{}", std::process::id());
@@ -5952,6 +6016,7 @@ fn debug_console_redraws_a_progress_line_in_place() {
 /// #932: each output category is its own stream, so a `stderr` line does not
 /// land inside the `stdout` line being printed, and a background member's
 /// line is joined the same way under its name.
+#[cfg(unix)]
 #[test]
 fn debug_console_keeps_categories_apart_in_a_background_member() {
     let tag = format!("categories-{}", std::process::id());
@@ -5989,6 +6054,7 @@ fn debug_console_keeps_categories_apart_in_a_background_member() {
 
 /// #932: a REPL result with several lines, a traceback, is a console line
 /// each; as one entry only `Traceback (most recent call last):` showed.
+#[cfg(unix)]
 #[test]
 fn debug_console_shows_every_line_of_a_repl_result() {
     use crate::dap::session::DapEvent;
@@ -6067,6 +6133,7 @@ fn a_browser_runs_headless_only_where_there_is_no_display() {
 /// #1392: a CodeLLDB `cargo` launch with no `program` builds with cargo
 /// first instead of being refused; an lldb launch with neither is still
 /// refused.
+#[cfg(unix)]
 #[test]
 fn a_cargo_launch_builds_first_and_a_bare_one_is_refused() {
     let tmp = tempfile::tempdir().unwrap();

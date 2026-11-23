@@ -33,7 +33,8 @@ pub fn source_location_prefix(dir: &Path) -> Option<PathBuf> {
     yml.lines().find_map(|l| {
         let v = l.trim().strip_prefix("sourceLocationPrefix:")?.trim();
         let v = v.trim_matches(|c| c == '"' || c == '\'');
-        v.starts_with('/').then(|| PathBuf::from(v))
+        let p = Path::new(v);
+        (p.is_absolute() || p.has_root()).then(|| p.to_path_buf())
     })
 }
 
@@ -49,7 +50,7 @@ const ARCHIVED_SOURCE_LIMIT: u64 = 16 << 20;
 pub fn archived_source(dir: &Path, uri: &str) -> Option<String> {
     use std::io::Read;
     let path = crate::sarif::resolve::uri_to_path(uri)?;
-    let full = if path.is_absolute() {
+    let full = if path.is_absolute() || path.has_root() {
         path
     } else {
         source_location_prefix(dir)?.join(path)
@@ -76,7 +77,7 @@ pub fn archived_source(dir: &Path, uri: &str) -> Option<String> {
         DbSource::Zip(zip) => {
             let file = std::fs::File::open(zip).ok()?;
             let mut archive = zip::ZipArchive::new(file).ok()?;
-            let name = entry.to_str()?.to_string();
+            let name = entry.to_str()?.replace('\\', "/");
             archive
                 .by_name(&name)
                 .ok()?

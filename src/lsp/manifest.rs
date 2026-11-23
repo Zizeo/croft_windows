@@ -627,6 +627,7 @@ fn provisioned_path_stays_in_store(runs: &str) -> bool {
     let path = std::path::Path::new(runs);
     !runs.is_empty()
         && !path.is_absolute()
+        && !path.has_root()
         && !runs.starts_with('\\')
         && !path.components().any(|c| {
             matches!(

@@ -367,6 +367,7 @@ fn a_modified_click_that_drags_away_does_not_pair_with_the_click_it_returns_to()
 /// file:// or custom-scheme URI that `open`/`xdg-open` would hand to an
 /// arbitrary application. Only web links may open; anything else is
 /// refused with the REAL destination surfaced in the status line.
+#[cfg(unix)]
 #[test]
 fn cmd_clicking_a_non_web_hyperlink_refuses_instead_of_opening() {
     let tmp = tempfile::tempdir().unwrap();
@@ -912,12 +913,23 @@ fn clicking_an_annotated_span_still_clears_the_click_selection() {
     // assertion read as "annotation hover broke" on a merely busy host.
     // A child that prints nothing cannot move the grid, so the only bytes
     // on it are the ones this test feeds.
-    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+    #[cfg(unix)]
+    let (prog, args) = (
         "/bin/sh",
-        &[String::from("-c"), String::from("sleep 30")],
-        tmp.path(),
-    )
-    .unwrap();
+        &[String::from("-c"), String::from("sleep 30")][..],
+    );
+    #[cfg(windows)]
+    let (prog, args) = (
+        "cmd.exe",
+        &[
+            String::from("/C"),
+            String::from("ping -n 31 127.0.0.1 >nul"),
+        ][..],
+    );
+    app.terminals[0] =
+        crate::widgets::terminal::PtyTerminal::new_running(prog, args, tmp.path()).unwrap();
+    #[cfg(windows)]
+    app.terminals[0].end_child();
     app.focus_pane(Pane::Terminal);
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();

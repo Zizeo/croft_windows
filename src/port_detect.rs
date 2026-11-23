@@ -803,7 +803,7 @@ mod tests {
     /// inherited tty back.
     #[test]
     fn every_poll_helper_spawns_through_probe() {
-        let src = include_str!("port_detect.rs");
+        let src = include_str!("port_detect.rs").replace("\r\n", "\n");
         let body = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
         assert_eq!(
             body.matches("Command::new(").count(),

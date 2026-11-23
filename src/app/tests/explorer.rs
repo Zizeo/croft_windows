@@ -2126,7 +2126,7 @@ fn opening_a_workspace_file_installs_its_exact_folder_set() {
     let mut app = App::new(a.clone()).unwrap();
     // Poison the auto-store for primary B with a DIFFERENT folder: the
     // file must win, so alpha never joins.
-    let b_canon = b.canonicalize().unwrap();
+    let b_canon = crate::platform::fs::canonicalize(&b).unwrap();
     crate::workspace::save_folders_for_root(
         &app.workspace_folders_path.clone(),
         &b_canon.display().to_string(),
@@ -2143,11 +2143,11 @@ fn opening_a_workspace_file_installs_its_exact_folder_set() {
         "first folder becomes primary"
     );
     assert!(
-        roots.contains(&c.canonicalize().unwrap()),
+        roots.contains(&crate::platform::fs::canonicalize(&c).unwrap()),
         "the file's second folder joins: {roots:?}"
     );
     assert!(
-        !roots.contains(&a.canonicalize().unwrap()),
+        !roots.contains(&crate::platform::fs::canonicalize(&a).unwrap()),
         "the auto-store's folder does NOT merge in: {roots:?}"
     );
 
@@ -2243,7 +2243,9 @@ fn save_workspace_as_writes_a_relative_path_under_the_workspace() {
         "nothing under the launch directory"
     );
     assert!(
-        app.status.contains(&dest.display().to_string()),
+        app.status
+            .replace('\\', "/")
+            .contains(&dest.display().to_string().replace('\\', "/")),
         "{}",
         app.status
     );
@@ -2285,11 +2287,11 @@ fn save_workspace_as_keeps_the_suggested_path() {
 #[test]
 fn save_workspace_as_asks_before_changing_a_team_file_and_keeps_the_rest_of_it() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    let root = crate::platform::fs::canonicalize(tmp.path()).unwrap();
     for d in ["wsx", "wsx_lib", "extra"] {
         std::fs::create_dir(root.join(d)).unwrap();
     }
-    let file = root.join("wsx/wsx.code-workspace");
+    let file = root.join("wsx").join("wsx.code-workspace");
     let team = "{\n  \"folders\": [ { \"path\": \".\" }, { \"path\": \"../wsx_lib\", \"name\": \"shared lib\" } ],\n  // F5 runs the app\n  \"launch\": { \"configurations\": [ { \"name\": \"Run app\" } ] }\n}\n";
     std::fs::write(&file, team).unwrap();
     let mut app = App::new(root.join("wsx")).unwrap();
@@ -2358,8 +2360,8 @@ fn workspace_folder_set_persists_across_sessions_and_reroots() {
     let mut app2 = App::new(a.clone()).unwrap();
     app2.workspace_folders_path = store.clone();
     app2.restore_workspace_folders();
-    let b_canon = b.canonicalize().unwrap();
-    let c_canon = c.canonicalize().unwrap();
+    let b_canon = crate::platform::fs::canonicalize(&b).unwrap();
+    let c_canon = crate::platform::fs::canonicalize(&c).unwrap();
     let roots: Vec<PathBuf> = app2.roots.iter().map(Path::to_path_buf).collect();
     assert!(
         roots.contains(&b_canon) && roots.contains(&c_canon),
@@ -2397,7 +2399,7 @@ fn workspace_folder_set_persists_across_sessions_and_reroots() {
     app3.change_workspace_root(b_canon.clone());
     let roots: Vec<PathBuf> = app3.roots.iter().map(Path::to_path_buf).collect();
     assert!(
-        roots.contains(&a.canonicalize().unwrap()),
+        roots.contains(&crate::platform::fs::canonicalize(&a).unwrap()),
         "the new primary's saved folders come back with the re-root: {roots:?}"
     );
 }
@@ -2426,7 +2428,7 @@ fn focusing_a_secondary_roots_file_rebinds_the_test_runner_and_tasks() {
 
     let mut app = App::new(plain.clone()).unwrap();
     app.add_workspace_folder(proj.clone());
-    let proj_canon = proj.canonicalize().unwrap();
+    let proj_canon = crate::platform::fs::canonicalize(&proj).unwrap();
 
     // Primary focused: no runner, the gate refuses.
     app.status.clear();
@@ -2541,7 +2543,7 @@ fn focusing_a_secondary_roots_file_flips_source_control_to_its_repo() {
     // Primary is NOT a repo; the repo joins as a secondary folder.
     let mut app = App::new(plain.clone()).unwrap();
     app.add_workspace_folder(repo.clone());
-    let repo_canon = repo.canonicalize().unwrap();
+    let repo_canon = crate::platform::fs::canonicalize(&repo).unwrap();
 
     // Focus the secondary root's file: the SCM surfaces must follow.
     app.editor
@@ -2574,7 +2576,7 @@ fn focusing_a_secondary_roots_file_flips_source_control_to_its_repo() {
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        app.scm_root().canonicalize().unwrap(),
+        crate::platform::fs::canonicalize(&app.scm_root()).unwrap(),
         repo_canon,
         "panel operations address the active repo's toplevel"
     );
@@ -2606,7 +2608,7 @@ fn add_and_remove_workspace_folder_fan_out_across_tree_index_and_search() {
 
     app.add_workspace_folder(b.clone());
 
-    let b_canon = b.canonicalize().unwrap();
+    let b_canon = crate::platform::fs::canonicalize(&b).unwrap();
     assert!(app.roots.is_multi(), "the model grew");
     assert!(
         app.tree.root_paths().any(|r| r == b_canon),
@@ -2801,7 +2803,9 @@ fn right_arrow_in_the_explorer_previews_a_file_without_stealing_focus() {
 /// navigation keys are handled. Add a new preview type, add a row here.
 #[test]
 fn opening_any_file_type_from_the_explorer_lands_the_keyboard_in_the_editor() {
-    require_pdf_backend();
+    if !require_pdf_backend() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("plain.txt"), "alpha\nbeta\n").unwrap();
     std::fs::write(tmp.path().join("code.rs"), "fn main() {}\n").unwrap();
@@ -2833,7 +2837,9 @@ fn opening_any_file_type_from_the_explorer_lands_the_keyboard_in_the_editor() {
 
 #[test]
 fn clicking_any_file_type_in_the_explorer_lands_the_keyboard_in_the_editor() {
-    require_pdf_backend();
+    if !require_pdf_backend() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("plain.txt"), "alpha\nbeta\n").unwrap();
     std::fs::write(tmp.path().join("data.csv"), csv_body(5)).unwrap();
@@ -3089,7 +3095,7 @@ fn the_tree_breakpoint_section_follows_changes_without_duplicating() {
 #[test]
 fn renaming_a_file_in_the_explorer_keeps_its_local_history() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    let root = crate::platform::fs::canonicalize(tmp.path()).unwrap();
     std::fs::write(root.join("notes.txt"), "v3\n").unwrap();
     let (mut app, _hist) = app_with_history(&root);
     crate::history::record_in(&app.history_root, &root.join("notes.txt"), b"v1\n", 1_000).unwrap();
@@ -3110,7 +3116,7 @@ fn renaming_a_file_in_the_explorer_keeps_its_local_history() {
 #[test]
 fn cutting_a_folder_into_another_keeps_its_files_history() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    let root = crate::platform::fs::canonicalize(tmp.path()).unwrap();
     std::fs::create_dir_all(root.join("docs")).unwrap();
     std::fs::create_dir_all(root.join("archive")).unwrap();
     std::fs::write(root.join("docs").join("a.md"), "a\n").unwrap();
@@ -3130,7 +3136,7 @@ fn cutting_a_folder_into_another_keeps_its_files_history() {
 #[test]
 fn moving_files_and_folders_carries_every_open_tab_along() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    let root = crate::platform::fs::canonicalize(tmp.path()).unwrap();
     std::fs::create_dir_all(root.join("dir")).unwrap();
     std::fs::create_dir_all(root.join("dest")).unwrap();
     std::fs::write(root.join("a.txt"), "a").unwrap();

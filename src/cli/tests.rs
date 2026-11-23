@@ -288,7 +288,7 @@ fn a_missing_workspace_path_is_named_in_the_error() {
 #[test]
 fn a_file_not_written_yet_roots_at_its_folder_and_opens() {
     let dir = tempfile::tempdir().unwrap();
-    let canon = dir.path().canonicalize().unwrap();
+    let canon = crate::platform::fs::canonicalize(dir.path()).unwrap();
     let (root, open, folders) =
         resolve_workspace_from(Path::new("notes.md"), None, dir.path()).unwrap();
     assert_eq!(root, canon);
@@ -312,7 +312,12 @@ fn a_file_not_written_yet_roots_at_its_folder_and_opens() {
 #[test]
 fn a_new_file_needs_an_existing_folder_and_a_name() {
     let dir = tempfile::tempdir().unwrap();
-    for typed in ["no-such-dir/notes.md", "new-dir/", "no-such-dir/.."] {
+    #[allow(unused_mut)]
+    let mut cases = vec!["no-such-dir/notes.md", "new-dir/"];
+    // Windows resolves `<missing>/..` before opening on disk.
+    #[cfg(unix)]
+    cases.push("no-such-dir/..");
+    for typed in cases {
         let err = resolve_workspace_from(Path::new(typed), None, dir.path()).unwrap_err();
         assert!(
             format!("{err:#}").contains("resolving workspace path"),
@@ -327,15 +332,18 @@ fn file_path_roots_the_workspace_at_its_parent_and_opens_it() {
     let file = dir.path().join("pitch_deck.tex");
     std::fs::write(&file, "hi").unwrap();
     let (root, open, _) = resolve_workspace(&file, None).unwrap();
-    assert_eq!(root, dir.path().canonicalize().unwrap());
-    assert_eq!(open, Some(file.canonicalize().unwrap()));
+    assert_eq!(root, crate::platform::fs::canonicalize(dir.path()).unwrap());
+    assert_eq!(
+        open,
+        Some(crate::platform::fs::canonicalize(&file).unwrap())
+    );
 }
 
 #[test]
 fn directory_path_stays_the_workspace_root() {
     let dir = tempfile::tempdir().unwrap();
     let (root, open, _) = resolve_workspace(dir.path(), None).unwrap();
-    assert_eq!(root, dir.path().canonicalize().unwrap());
+    assert_eq!(root, crate::platform::fs::canonicalize(dir.path()).unwrap());
     assert_eq!(open, None);
 }
 
@@ -349,9 +357,16 @@ fn resolve_workspace_opens_a_code_workspace_file_as_a_folder_set() {
     let file = dir.path().join("p.code-workspace");
     crate::workspace::write_workspace_file(&file, &[a.clone(), b.clone()]).unwrap();
     let (root, open, folders) = resolve_workspace(&file, None).unwrap();
-    assert_eq!(root, a.canonicalize().unwrap(), "first folder is primary");
+    assert_eq!(
+        root,
+        crate::platform::fs::canonicalize(&a).unwrap(),
+        "first folder is primary"
+    );
     assert_eq!(open, None, "a workspace file is not an open-file");
-    assert_eq!(folders, vec![b.canonicalize().unwrap()]);
+    assert_eq!(
+        folders,
+        vec![crate::platform::fs::canonicalize(&b).unwrap()]
+    );
 
     // A malformed workspace file is a launch error, not a text open.
     let bad = dir.path().join("bad.code-workspace");
@@ -364,7 +379,7 @@ fn resolve_workspace_opens_a_code_workspace_file_as_a_folder_set() {
 #[test]
 fn a_file_line_launch_argument_opens_the_file_at_that_line() {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
+    let root = crate::platform::fs::canonicalize(dir.path()).unwrap();
     std::fs::write(root.join("big.txt"), "a\nb\n").unwrap();
     let (path, open_file, at) = split_launch_location(Path::new("big.txt:150"), None, &root);
     assert_eq!(at, Some((149, 0)));
@@ -399,7 +414,7 @@ fn an_open_file_location_is_found_under_the_workspace() {
 #[test]
 fn an_open_file_location_is_found_under_a_workspace_files_primary_folder() {
     let dir = tempfile::tempdir().unwrap();
-    let dir = dir.path().canonicalize().unwrap();
+    let dir = crate::platform::fs::canonicalize(dir.path()).unwrap();
     let primary = dir.join("alpha");
     std::fs::create_dir_all(primary.join("src")).unwrap();
     std::fs::write(primary.join("src/main.rs"), "fn main() {}\n").unwrap();
@@ -417,6 +432,7 @@ fn an_open_file_location_is_found_under_a_workspace_files_primary_folder() {
 /// over the PATH argument's location. A missing file keeps its suffix as
 /// part of its name, so it opens as a new file of that name (#1157), and
 /// a missing folder is still refused.
+#[cfg(unix)]
 #[test]
 fn an_existing_path_or_an_explicit_open_file_keeps_its_meaning() {
     let dir = tempfile::tempdir().unwrap();
@@ -450,7 +466,7 @@ fn explicit_open_file_wins_over_the_derived_one() {
     std::fs::write(&file, "hi").unwrap();
     let other = dir.path().join("b.rs");
     let (root, open, _) = resolve_workspace(&file, Some(other.clone())).unwrap();
-    assert_eq!(root, dir.path().canonicalize().unwrap());
+    assert_eq!(root, crate::platform::fs::canonicalize(dir.path()).unwrap());
     assert_eq!(open, Some(other));
 }
 
@@ -463,12 +479,12 @@ fn a_relative_open_file_is_made_absolute_under_the_cwd_or_the_workspace() {
     let ws = dir.path().join("rn");
     std::fs::create_dir_all(ws.join("pkg")).unwrap();
     std::fs::write(ws.join("pkg/util.py"), "x = 1\n").unwrap();
-    let util = ws.join("pkg/util.py").canonicalize().unwrap();
+    let util = crate::platform::fs::canonicalize(&ws.join("pkg/util.py")).unwrap();
     let rel = Some(PathBuf::from("pkg/util.py"));
     let (_, open, _) = resolve_workspace_from(Path::new("."), rel.clone(), &ws).unwrap();
     assert_eq!(open, Some(util.clone()), "from the workspace root");
     let (root, open, _) = resolve_workspace_from(Path::new("rn"), rel, dir.path()).unwrap();
-    assert_eq!(root, ws.canonicalize().unwrap());
+    assert_eq!(root, crate::platform::fs::canonicalize(&ws).unwrap());
     assert_eq!(open, Some(util), "from another directory");
 }
 
@@ -488,9 +504,9 @@ fn an_open_file_under_the_cwd_or_absolute_or_missing_keeps_its_meaning() {
             .unwrap();
     assert_eq!(
         open,
-        Some(dir.path().join("notes.md").canonicalize().unwrap())
+        Some(crate::platform::fs::canonicalize(&dir.path().join("notes.md")).unwrap())
     );
-    let abs = ws.join("notes.md").canonicalize().unwrap();
+    let abs = crate::platform::fs::canonicalize(&ws.join("notes.md")).unwrap();
     let (_, open, _) =
         resolve_workspace_from(Path::new("ws"), Some(abs.clone()), dir.path()).unwrap();
     assert_eq!(open, Some(abs));

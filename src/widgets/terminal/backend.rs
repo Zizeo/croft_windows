@@ -54,6 +54,21 @@ impl PtyTerminal {
             PaneBackend::Local { .. } => None,
         }
     }
+
+    /// Kill the child process and close its ConPTY master handle without dropping `self`.
+    #[cfg(windows)]
+    pub(crate) fn end_child(&mut self) {
+        self.backend.end();
+        if let Some(handle) = self.reader_thread.take() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
+    }
 }
 
 /// Where a pane's shell comes from.

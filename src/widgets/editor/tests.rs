@@ -39,7 +39,7 @@ fn an_over_cap_document_says_why_it_landed_in_hex() {
         z.finish().unwrap();
     }
     std::fs::OpenOptions::new()
-        .append(true)
+        .write(true)
         .open(&p)
         .unwrap()
         .set_len(crate::docx::MAX_DOC_LISTING_BYTES + 1)
@@ -81,7 +81,7 @@ fn an_over_cap_docx_named_doc_says_why_it_landed_in_hex() {
         z.finish().unwrap();
     }
     std::fs::OpenOptions::new()
-        .append(true)
+        .write(true)
         .open(&p)
         .unwrap()
         .set_len(crate::docx::MAX_DOC_LISTING_BYTES + 1)
@@ -2309,7 +2309,7 @@ fn oversized_binary_opens_in_hex_but_oversized_text_still_errors() {
     w.write_all(&vec![b'a'; 8192]).unwrap();
     drop(w);
     std::fs::OpenOptions::new()
-        .append(true)
+        .write(true)
         .open(&txt)
         .unwrap()
         .set_len(MAX_FILE_BYTES + 5)
@@ -2847,7 +2847,7 @@ fn a_huge_color_log_opens_rendered_instead_of_hitting_the_size_guard() {
     // Real colour bytes up front so the sniff fires, then a sparse tail
     // that pushes the file well past MAX_FILE_BYTES without writing it.
     std::fs::write(&p, "\u{1b}[31mERROR\u{1b}[0m first line\n").unwrap();
-    let f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
     f.set_len(MAX_FILE_BYTES + 4096).unwrap();
     drop(f);
 
@@ -4336,10 +4336,17 @@ fn diagnostics_at_adds_the_rule_code_and_its_link() {
 #[test]
 fn diagnostics_at_lists_the_related_locations_under_the_message() {
     let mut e = editor_with("let first = &v[0]; v.push(2);");
-    e.path = Some(PathBuf::from("/w/src/main.rs"));
+    let root = if cfg!(windows) {
+        PathBuf::from(r"C:\w")
+    } else {
+        PathBuf::from("/w")
+    };
+    let main_path = root.join("src").join("main.rs");
+    let main_url = lsp_types::Url::from_file_path(&main_path).unwrap();
+    e.path = Some(main_path.clone());
     let at = |line, character, message: &str| lsp_types::DiagnosticRelatedInformation {
         location: lsp_types::Location {
-            uri: lsp_types::Url::parse("file:///w/src/main.rs").unwrap(),
+            uri: main_url.clone(),
             range: lsp_types::Range::new(
                 lsp_types::Position::new(line, character),
                 lsp_types::Position::new(line, character + 1),
@@ -4360,9 +4367,9 @@ fn diagnostics_at_lists_the_related_locations_under_the_message() {
         ..Default::default()
     };
     let d = crate::lsp::client::convert_diagnostic("rust-analyzer", &wire);
-    e.apply_diagnostics(PathBuf::from("/w/src/main.rs"), vec![d]);
+    e.apply_diagnostics(main_path, vec![d]);
     assert_eq!(
-        e.diagnostics_at(0, 20, Path::new("/w"))[0].1,
+        e.diagnostics_at(0, 20, &root)[0].1.replace('\\', "/"),
         "cannot borrow `v` as mutable\n\
              src/main.rs(1, 14): immutable borrow occurs here\n\
              src/main.rs(5, 16): immutable borrow later used here"
@@ -10252,6 +10259,7 @@ fn child_saves_in_place_under_a_file_size_limit() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn saving_keeps_the_mode_and_writes_through_a_symlink() {
     // Negative: writing aside and renaming in must not change what a
@@ -10979,6 +10987,7 @@ fn a_failed_reload_is_retried_quietly_until_it_works() {
 /// #900: only a file that is not there is deleted. One that cannot be
 /// stat'd for another reason (here a parent turned into a file) is a
 /// failed reload: no `(deleted)` mark, and its save keeps the check.
+#[cfg(unix)]
 #[test]
 fn a_file_that_cannot_be_statd_is_not_reported_deleted() {
     let dir = tempfile::tempdir().unwrap();

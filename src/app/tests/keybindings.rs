@@ -325,6 +325,11 @@ fn a_bound_gesture_resolves_the_link_in_the_pane_it_clicked_not_the_active_one()
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     assert_eq!(app.terminals.len(), 2, "two panes are visible");
+    // On Windows ConPTY emits an async initial clear-screen shortly after spawn
+    // that can race with `feed_bytes_for_test` under load; stop pane 0's child
+    // first since this test drives the VT grid deterministically via fed bytes.
+    #[cfg(windows)]
+    app.terminals[0].end_child();
 
     // The URL is printed into pane 0 only, while pane 1 holds focus.
     // An OSC 8 hyperlink with a NON-WEB scheme, not a printed http(s) URL.
