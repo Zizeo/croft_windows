@@ -159,16 +159,18 @@ impl Drop for KernelSession {
 pub fn python_candidates(workspace: &Path, virtual_env: Option<&Path>) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = [".venv", "venv"]
         .iter()
-        .map(|d| workspace.join(d).join("bin").join("python"))
-        .filter(|p| p.exists())
+        .filter_map(|d| crate::platform::env::venv_python_in(&workspace.join(d)))
         .collect();
-    if let Some(v) = virtual_env {
-        let p = v.join("bin").join("python");
-        if p.exists() && !out.contains(&p) {
-            out.push(p);
-        }
+    if let Some(p) = virtual_env.and_then(crate::platform::env::venv_python_in)
+        && !out.contains(&p)
+    {
+        out.push(p);
     }
-    out.push(PathBuf::from("python3"));
+    out.push(PathBuf::from(if cfg!(windows) {
+        "python"
+    } else {
+        "python3"
+    }));
     out
 }
 

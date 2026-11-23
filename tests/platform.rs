@@ -504,3 +504,217 @@ fn terminal_probe_safe_on_non_console_handles() {
         assert!(cols > 0 && rows > 0, "invalid grid size: ({cols}, {rows})");
     }
 }
+
+#[test]
+fn toolchain_venv_python_dlv_lldb_and_node_modules_tsc_resolution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    // 1. Virtual-environment interpreter path & discovery.
+    let expected_debug_py = if cfg!(windows) {
+        root.join("debug-venv").join("Scripts").join("python.exe")
+    } else {
+        root.join("debug-venv").join("bin").join("python")
+    };
+    assert_eq!(
+        platform::env::venv_python_path(&root.join("debug-venv")),
+        expected_debug_py
+    );
+
+    let win_venv = root.join("win-venv");
+    let win_py = win_venv.join("Scripts").join("python.exe");
+    std::fs::create_dir_all(win_py.parent().unwrap()).unwrap();
+    std::fs::write(&win_py, "").unwrap();
+    assert_eq!(
+        platform::env::venv_python_in(&win_venv),
+        Some(win_py.clone())
+    );
+
+    let posix_venv = root.join("posix-venv");
+    let posix_py = posix_venv.join("bin").join("python");
+    std::fs::create_dir_all(posix_py.parent().unwrap()).unwrap();
+    std::fs::write(&posix_py, "").unwrap();
+    assert_eq!(
+        platform::env::venv_python_in(&posix_venv),
+        Some(posix_py.clone())
+    );
+
+    // 2. Delve resolution order & `.exe` handling.
+    let dlv_name = if cfg!(windows) { "dlv.exe" } else { "dlv" };
+    let mk_dlv = |rel: &str| {
+        let dir = root.join(rel);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(dlv_name), "").unwrap();
+        dir
+    };
+    let on_path = mk_dlv("dlv-path");
+    let gobin = mk_dlv("dlv-gobin");
+    let home = root.join("home");
+    let home_go_bin = mk_dlv("home/go/bin");
+    let gopath = root.join("gopath");
+    let gopath_bin = mk_dlv("gopath/bin");
+    let croft_go = mk_dlv("home/.croft/servers/go");
+    let path_env = std::env::join_paths([&on_path]).unwrap();
+
+    assert_eq!(
+        platform::env::find_dlv_in(Some(&path_env), Some(&gobin), Some(&gopath), Some(&home)),
+        Some(on_path.join(dlv_name))
+    );
+    assert_eq!(
+        platform::env::find_dlv_in(None, Some(&gobin), Some(&gopath), Some(&home)),
+        Some(gobin.join(dlv_name))
+    );
+    assert_eq!(
+        platform::env::find_dlv_in(None, None, Some(&gopath), Some(&home)),
+        Some(gopath_bin.join(dlv_name))
+    );
+    assert_eq!(
+        platform::env::find_dlv_in(None, None, None, Some(&home)),
+        Some(home_go_bin.join(dlv_name))
+    );
+    std::fs::remove_file(home_go_bin.join(dlv_name)).unwrap();
+    assert_eq!(
+        platform::env::find_dlv_in(None, None, None, Some(&home)),
+        Some(croft_go.join(dlv_name))
+    );
+
+    // 3. `node_modules/.bin/tsc` resolves `.cmd` ahead of POSIX shim on Windows.
+    let node_bin = root.join("node_modules").join(".bin");
+    std::fs::create_dir_all(&node_bin).unwrap();
+    let posix_tsc = node_bin.join("tsc");
+    std::fs::write(&posix_tsc, "#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&posix_tsc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let cmd_tsc = node_bin.join("tsc.cmd");
+    std::fs::write(&cmd_tsc, "@echo off\r\n").unwrap();
+    let expected_tsc = if cfg!(windows) { cmd_tsc } else { posix_tsc };
+    assert_eq!(
+        platform::env::executable_in_dir(&node_bin, "tsc"),
+        Some(expected_tsc)
+    );
+
+    // 4. `lldb-dap` ranking and PATH lookup.
+    assert!(
+        platform::env::lldb_dap_rank("lldb-dap.exe").unwrap()
+            > platform::env::lldb_dap_rank("lldb-vscode.exe").unwrap()
+    );
+    assert!(
+        platform::env::lldb_dap_rank("lldb-vscode.exe").unwrap()
+            > platform::env::lldb_dap_rank("lldb-dap-19.exe").unwrap()
+    );
+    assert!(
+        platform::env::lldb_dap_rank("lldb-dap-19.exe").unwrap()
+            > platform::env::lldb_dap_rank("lldb-dap-18.exe").unwrap()
+    );
+
+    let lldb_old = root.join("lldb-old");
+    let lldb_new = root.join("lldb-new");
+    std::fs::create_dir_all(&lldb_old).unwrap();
+    std::fs::create_dir_all(&lldb_new).unwrap();
+    let old_bin = lldb_old.join(if cfg!(windows) {
+        "lldb-dap-18.exe"
+    } else {
+        "lldb-dap-18"
+    });
+    let new_bin = lldb_new.join(if cfg!(windows) {
+        "lldb-dap.exe"
+    } else {
+        "lldb-dap"
+    });
+    std::fs::write(&old_bin, "").unwrap();
+    std::fs::write(&new_bin, "").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for p in [&old_bin, &new_bin] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let lldb_path = std::env::join_paths([&lldb_old, &lldb_new]).unwrap();
+    assert_eq!(
+        platform::env::find_lldb_dap_on_path(Some(&lldb_path)),
+        Some(new_bin)
+    );
+}
+
+#[test]
+fn fs_rename_and_write_retrying_recover_from_sharing_violation_and_refuse_readonly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("note.txt");
+    let staged = tmp.path().join("note.tmp");
+
+    platform::fs::write_retrying(&target, b"initial").unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"initial");
+
+    std::fs::write(&staged, b"renamed").unwrap();
+    platform::fs::rename_retrying(&staged, &target).unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"renamed");
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // Hold an exclusive (share_mode = 0) handle briefly; write_retrying recovers.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let lock_path = target.clone();
+        let holder = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(&lock_path)
+                .unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            drop(file);
+        });
+        rx.recv().unwrap();
+        platform::fs::write_retrying(&target, b"after-write-lock").unwrap();
+        holder.join().unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"after-write-lock");
+
+        // Hold an exclusive handle briefly; rename_retrying recovers.
+        std::fs::write(&staged, b"after-rename-lock").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let lock_path = target.clone();
+        let holder = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(&lock_path)
+                .unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            drop(file);
+        });
+        rx.recv().unwrap();
+        platform::fs::rename_retrying(&staged, &target).unwrap();
+        holder.join().unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"after-rename-lock");
+
+        // Read-only files fail immediately without burning the 305 ms retry budget.
+        let ro = tmp.path().join("readonly.txt");
+        std::fs::write(&ro, b"immutable").unwrap();
+        let mut perms = std::fs::metadata(&ro).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&ro, perms.clone()).unwrap();
+
+        std::fs::write(&staged, b"attempt").unwrap();
+        let t0 = std::time::Instant::now();
+        assert!(platform::fs::write_retrying(&ro, b"attempt").is_err());
+        assert!(platform::fs::rename_retrying(&staged, &ro).is_err());
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(120),
+            "read-only refusal unexpectedly slept: {:?}",
+            t0.elapsed()
+        );
+
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&ro, perms).unwrap();
+    }
+}

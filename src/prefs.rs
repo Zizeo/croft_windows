@@ -735,7 +735,7 @@ impl Prefs {
         ));
         write_keeping_mode(&tmp, path, json.as_bytes())
             .with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| {
+        crate::platform::fs::rename_retrying(&tmp, path).with_context(|| {
             let _ = std::fs::remove_file(&tmp);
             format!("replacing {}", path.display())
         })?;
@@ -887,7 +887,7 @@ pub(crate) fn replace_file_contents(path: &Path, bytes: &[u8]) -> Result<(), Rep
     };
     let target = crate::platform::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let Ok(meta) = std::fs::metadata(&target) else {
-        return std::fs::write(&target, bytes).map_err(|error| ReplaceError {
+        return crate::platform::fs::write_retrying(&target, bytes).map_err(|error| ReplaceError {
             error,
             touched: true,
         });
@@ -902,7 +902,7 @@ pub(crate) fn replace_file_contents(path: &Path, bytes: &[u8]) -> Result<(), Rep
     if !in_place {
         match write_aside(&target, &meta, bytes) {
             Ok(tmp) => {
-                return std::fs::rename(&tmp, &target).map_err(|e| {
+                return crate::platform::fs::rename_retrying(&tmp, &target).map_err(|e| {
                     let _ = std::fs::remove_file(&tmp);
                     untouched(e)
                 });
@@ -989,13 +989,14 @@ fn write_aside(target: &Path, meta: &std::fs::Metadata, bytes: &[u8]) -> Result<
     if let Err(e) = file.write_all(bytes).and_then(|()| file.flush()) {
         return Err(fail(&tmp, e));
     }
-    if let Err(e) = std::fs::set_permissions(&tmp, meta.permissions()) {
-        return Err(fail(&tmp, e));
-    }
     #[cfg(unix)]
     if !carry_owner_metadata(&file, target, meta) {
         let _ = std::fs::remove_file(&tmp);
         return Err(Aside::InPlace);
+    }
+    drop(file);
+    if let Err(e) = std::fs::set_permissions(&tmp, meta.permissions()) {
+        return Err(fail(&tmp, e));
     }
     Ok(tmp)
 }
@@ -1086,13 +1087,13 @@ fn write_in_place(target: &Path, bytes: &[u8], must_reserve: bool) -> Result<(),
     use std::io::{Seek as _, Write as _};
     #[cfg(not(target_os = "linux"))]
     let _ = must_reserve;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(target)
-        .map_err(|error| ReplaceError {
-            error,
-            touched: false,
-        })?;
+    let mut file = crate::platform::fs::retry_transient_io(target, || {
+        std::fs::OpenOptions::new().write(true).open(target)
+    })
+    .map_err(|error| ReplaceError {
+        error,
+        touched: false,
+    })?;
     let new_len = bytes.len() as u64;
     // The reservation is Linux-only, and so is everything it reads: built
     // anywhere else these were unused, and the release build warned (#1463).

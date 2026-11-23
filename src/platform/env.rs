@@ -280,3 +280,113 @@ pub fn resolve_on_path(cmd: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path).find_map(|dir| executable_in_dir(&dir, cmd))
 }
+
+/// Canonical virtual-environment Python interpreter location inside `venv_dir`
+/// (`Scripts\python.exe` on Windows, `bin/python` on Unix), whether or not
+/// the venv exists yet.
+pub fn venv_python_path(venv_dir: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        venv_dir.join("Scripts").join("python.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        venv_dir.join("bin").join("python")
+    }
+}
+
+/// Find an existing Python interpreter inside `venv_dir`, preferring native
+/// layout for the host OS while still accepting POSIX/Windows venv layouts.
+pub fn venv_python_in(venv_dir: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let candidates = [
+        venv_dir.join("Scripts").join("python.exe"),
+        venv_dir.join("bin").join("python"),
+        venv_dir.join("Scripts").join("python3.exe"),
+        venv_dir.join("bin").join("python3"),
+    ];
+    #[cfg(not(windows))]
+    let candidates = [
+        venv_dir.join("bin").join("python"),
+        venv_dir.join("Scripts").join("python.exe"),
+        venv_dir.join("bin").join("python3"),
+        venv_dir.join("Scripts").join("python3.exe"),
+    ];
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// Locate the Go Delve debugger binary (`dlv` / `dlv.exe`) in Delve's own
+/// resolution order: `PATH`, `GOBIN`, `GOPATH/bin` (default `~/go/bin`), then
+/// croft's `~/.croft/servers/go` directory.
+pub fn find_dlv_in(
+    path_env: Option<&std::ffi::OsStr>,
+    gobin: Option<&Path>,
+    gopath: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = path_env
+        .map(|p| std::env::split_paths(p).collect())
+        .unwrap_or_default();
+    dirs.extend(gobin.map(Path::to_path_buf));
+    match gopath {
+        Some(gp) => dirs.push(gp.join("bin")),
+        None => dirs.extend(home.map(|h| h.join("go").join("bin"))),
+    }
+    dirs.extend(home.map(|h| h.join(".croft").join("servers").join("go")));
+    dirs.into_iter().find_map(|d| {
+        executable_in_dir(&d, "dlv").or_else(|| {
+            let p = d.join("dlv");
+            p.is_file().then_some(p)
+        })
+    })
+}
+
+/// Rank an executable basename as an `lldb-dap` candidate, or `None` if it is
+/// not one. Strips a trailing `.exe`/`.EXE` suffix so Windows LLVM binaries rank
+/// identically to Unix ones: unversioned beats versioned, newer beats older,
+/// and `lldb-dap` beats legacy `lldb-vscode` at equal version.
+pub fn lldb_dap_rank(name: &str) -> Option<i64> {
+    let base = name
+        .strip_suffix(".exe")
+        .or_else(|| name.strip_suffix(".EXE"))
+        .unwrap_or(name);
+    if base == "lldb-dap" {
+        return Some(i64::MAX);
+    }
+    if base == "lldb-vscode" {
+        return Some(i64::MAX - 1);
+    }
+    // `family` breaks ties at equal version: lldb-dap (1) over lldb-vscode (0).
+    let (version, family) = base
+        .strip_prefix("lldb-dap-")
+        .map(|v| (v, 1))
+        .or_else(|| base.strip_prefix("lldb-vscode-").map(|v| (v, 0)))?;
+    let version: i64 = version.parse().ok()?;
+    Some(version * 2 + family)
+}
+
+/// Scan `path_var` entries for the highest-ranked executable matching
+/// `lldb-dap` / `lldb-dap-NN` / `lldb-vscode[-NN]`. Earlier `PATH` entries win
+/// ties.
+pub fn find_lldb_dap_on_path(path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let path_var = path_var?;
+    let mut best: Option<(i64, PathBuf)> = None;
+    for dir in std::env::split_paths(path_var) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(rank) = lldb_dap_rank(&name) else {
+                continue;
+            };
+            let full = entry.path();
+            if super::fs::is_executable(&full) && best.as_ref().is_none_or(|(r, _)| rank > *r) {
+                best = Some((rank, full));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}

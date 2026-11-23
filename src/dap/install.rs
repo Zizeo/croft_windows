@@ -46,7 +46,7 @@ pub fn debug_venv_dir() -> Option<PathBuf> {
 /// being debugged runs under the project's own interpreter (#864): debugpy
 /// injects itself there, so neither debugpy nor 3.14 is required of it.
 pub fn debug_venv_python() -> Option<PathBuf> {
-    Some(debug_venv_dir()?.join("bin").join("python"))
+    Some(crate::platform::env::venv_python_path(&debug_venv_dir()?))
 }
 
 /// Oldest CPython a launched program may run under: debugpy 1.8 declares
@@ -98,11 +98,13 @@ pub fn ensure_debug_venv() -> Result<PathBuf> {
         return Ok(py);
     }
     let dir = debug_venv_dir().context("$HOME unset")?;
+    let uv = crate::lsp::install::ensure_uv()
+        .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "uv.exe" } else { "uv" }));
 
     // .output(), never .status(): uv paints progress bars on stderr, and an
     // inherited TTY would spray them over the running TUI (same class as the
     // pdftoppm trailer-dictionary spray).
-    let venv = Command::new("uv")
+    let venv = Command::new(&uv)
         .args(["venv", "-p", PYTHON_VERSION])
         .arg(&dir)
         .output()
@@ -114,7 +116,7 @@ pub fn ensure_debug_venv() -> Result<PathBuf> {
         );
     }
 
-    let pip = Command::new("uv")
+    let pip = Command::new(&uv)
         .args(["pip", "install", "--python"])
         .arg(&py)
         .arg("debugpy")
@@ -217,9 +219,7 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<String> {
 /// Whether `bin` resolves on PATH (a `command -v` check via the shell-less
 /// `which`-style scan of PATH entries).
 fn which(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|p| p.join(bin).is_file()))
-        .unwrap_or(false)
+    crate::platform::env::resolve_on_path(bin).is_some()
 }
 
 /// Ensure the vscode-js-debug server is installed, downloading + extracting the
@@ -294,19 +294,16 @@ pub fn find_dlv(
     gopath: Option<&Path>,
     home: Option<&Path>,
 ) -> Option<PathBuf> {
-    let mut dirs: Vec<PathBuf> = path_env
-        .map(|p| std::env::split_paths(p).collect())
-        .unwrap_or_default();
-    dirs.extend(gobin.map(Path::to_path_buf));
-    match gopath {
-        Some(gp) => dirs.push(gp.join("bin")),
-        None => dirs.extend(home.map(|h| h.join("go").join("bin"))),
-    }
-    dirs.extend(home.map(|h| h.join(".croft").join("servers").join("go")));
-    dirs.into_iter()
-        .map(|d| d.join("dlv"))
-        .find(|p| p.is_file())
+    crate::platform::env::find_dlv_in(path_env, gobin, gopath, home)
 }
+
+/// Unix shell version of the delve install command.
+#[allow(dead_code)]
+pub const DLV_INSTALL_UNIX: &str = "sh -c 'case \"$(go env GOVERSION)\" in go1.[0-9]|go1.[0-9].*|go1.1[0-9]*|go1.2[0-4]*) v=v1.25.2 ;; *) v=latest ;; esac; GOBIN=\"$HOME/.croft/servers/go\" go install github.com/go-delve/delve/cmd/dlv@$v'";
+
+/// PowerShell version of the delve install command for Windows terminals.
+#[allow(dead_code)]
+pub const DLV_INSTALL_WINDOWS: &str = "powershell -NoProfile -Command \"$v = if ((go env GOVERSION) -match '^go1\\.([0-9]($|\\.)|1[0-9]|2[0-4])') { 'v1.25.2' } else { 'latest' }; $env:GOBIN = Join-Path $HOME '.croft\\servers\\go'; go install github.com/go-delve/delve/cmd/dlv@$v\"";
 
 /// The command "Debug: Install Go Debugger (delve)" runs, visibly, in a
 /// terminal pane (#264). `GOBIN` puts `dlv` in croft's servers directory,
@@ -316,9 +313,15 @@ pub fn find_dlv(
 /// The delve it installs is one that debugs with the Go on this machine:
 /// delve refuses a Go older than it supports (1.27 wants Go 1.25 or later),
 /// so Go 1.24 and older get delve 1.25.2, the last release that takes them,
-/// and anything newer gets `@latest`. Wrapped in `sh -c`, since it is typed
-/// into whatever shell the pane runs, fish included.
-pub const DLV_INSTALL: &str = "sh -c 'case \"$(go env GOVERSION)\" in go1.[0-9]|go1.[0-9].*|go1.1[0-9]*|go1.2[0-4]*) v=v1.25.2 ;; *) v=latest ;; esac; GOBIN=\"$HOME/.croft/servers/go\" go install github.com/go-delve/delve/cmd/dlv@$v'";
+/// and anything newer gets `@latest`. Wrapped in `sh -c` on Unix or
+/// `powershell` on Windows, since it is typed into whatever shell the pane runs.
+#[cfg(windows)]
+pub const DLV_INSTALL: &str = DLV_INSTALL_WINDOWS;
+
+/// The command "Debug: Install Go Debugger (delve)" runs, visibly, in a
+/// terminal pane (#264).
+#[cfg(not(windows))]
+pub const DLV_INSTALL: &str = DLV_INSTALL_UNIX;
 
 /// Whether the `go` toolchain is on PATH: installing delve needs it.
 pub fn go_on_path() -> bool {
@@ -473,7 +476,9 @@ mod tests {
         assert!(without.contains("installing delve needs Go"));
         assert!(without.contains("https://go.dev/dl"));
         // The install lands where find_dlv looks last.
-        assert!(DLV_INSTALL.contains("GOBIN=\"$HOME/.croft/servers/go\" go install "));
+        assert!(DLV_INSTALL_UNIX.contains("GOBIN=\"$HOME/.croft/servers/go\" go install "));
+        assert!(DLV_INSTALL_WINDOWS.contains("go install github.com/go-delve/delve/cmd/dlv@$v"));
+        assert!(!DLV_INSTALL.is_empty());
     }
 
     /// #264: delve's own resolution order, PATH first; `~/go/bin` stands in

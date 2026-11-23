@@ -11,58 +11,52 @@ use super::*;
 /// releases. Higher rank wins: an unversioned binary (tracks the system
 /// default) beats any versioned one, a newer LLVM release beats an older one,
 /// and at equal version the modern `lldb-dap` name beats legacy `lldb-vscode`.
+#[allow(dead_code)]
 pub(in crate::app) fn lldb_dap_rank(name: &str) -> Option<i64> {
-    if name == "lldb-dap" {
-        return Some(i64::MAX);
-    }
-    if name == "lldb-vscode" {
-        return Some(i64::MAX - 1);
-    }
-    // `family` breaks ties at equal version: lldb-dap (1) over lldb-vscode (0).
-    let (version, family) = name
-        .strip_prefix("lldb-dap-")
-        .map(|v| (v, 1))
-        .or_else(|| name.strip_prefix("lldb-vscode-").map(|v| (v, 0)))?;
-    let version: i64 = version.parse().ok()?;
-    Some(version * 2 + family)
+    crate::platform::env::lldb_dap_rank(name)
 }
 
 /// Resolve the `lldb-dap` adapter binary: the Xcode Command Line Tools copy
 /// first (always present on a dev Mac), then the best-ranked match found by
-/// scanning `PATH` for `lldb-dap`/`lldb-dap-NN`/`lldb-vscode[-NN]`. `None` if
+/// scanning `PATH` for `lldb-dap`/`lldb-dap-NN`/`lldb-vscode[-NN]`, and on
+/// Windows standard `Program Files\LLVM\bin\lldb-dap.exe` locations. `None` if
 /// none is installed.
 pub(in crate::app) fn lldb_dap_path() -> Option<String> {
     let xcode = "/Library/Developer/CommandLineTools/usr/bin/lldb-dap";
     if std::path::Path::new(xcode).is_file() {
         return Some(xcode.to_string());
     }
-    let path_var = std::env::var_os("PATH")?;
-    let mut best: Option<(i64, String)> = None;
-    for dir in std::env::split_paths(&path_var) {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            let Some(rank) = lldb_dap_rank(&name) else {
-                continue;
-            };
-            let full = entry.path();
-            if is_executable_file(&full) && best.as_ref().is_none_or(|(r, _)| rank > *r) {
-                best = Some((rank, full.to_string_lossy().into_owned()));
+    if let Some(found) =
+        crate::platform::env::find_lldb_dap_on_path(std::env::var_os("PATH").as_deref())
+    {
+        return Some(found.to_string_lossy().into_owned());
+    }
+    #[cfg(windows)]
+    {
+        let mut dirs = Vec::new();
+        for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(base) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+                dirs.push(std::path::PathBuf::from(base).join("LLVM").join("bin"));
+            }
+        }
+        dirs.push(std::path::PathBuf::from(r"C:\Program Files\LLVM\bin"));
+        for dir in dirs {
+            if let Some(found) = crate::platform::env::executable_in_dir(&dir, "lldb-dap") {
+                return Some(found.to_string_lossy().into_owned());
             }
         }
     }
-    best.map(|(_, p)| p)
+    None
 }
 
 /// The error shown when no lldb-dap adapter is installed, with a host-correct
-/// install hint: Xcode Command Line Tools on macOS, the LLVM package elsewhere.
+/// install hint: Xcode Command Line Tools on macOS, winget on Windows, or the
+/// LLVM package elsewhere.
 pub(in crate::app) fn lldb_dap_missing_message() -> String {
     let hint = if cfg!(target_os = "macos") {
         "install Xcode Command Line Tools"
+    } else if cfg!(windows) {
+        "install LLVM, e.g. winget install LLVM.LLVM"
     } else {
         "install LLVM, e.g. apt install lldb"
     };

@@ -30,8 +30,8 @@ pub fn is_executable(path: &Path) -> bool {
         let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
             return false;
         };
-        let pathext = std::env::var("PATHEXT")
-            .unwrap_or_else(|_| String::from(".COM;.EXE;.BAT;.CMD"));
+        let pathext =
+            std::env::var("PATHEXT").unwrap_or_else(|_| String::from(".COM;.EXE;.BAT;.CMD"));
         pathext.split(';').any(|entry| {
             entry
                 .trim()
@@ -112,4 +112,65 @@ pub fn create_file_link(target: &Path, link: &Path) -> io::Result<()> {
             Err(_) => std::fs::copy(target, link).map(|_| ()),
         }
     }
+}
+
+/// Bounded backoff schedule (total 305 ms) for transient NTFS sharing
+/// violations caused by Defender, Search Indexer, or background LSP scans.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const NTFS_RETRY_BACKOFF_MS: [u64; 6] = [5, 10, 20, 40, 80, 150];
+
+/// True when `err` looks like transient Windows NTFS lock/sharing contention
+/// (`ERROR_ACCESS_DENIED` = 5, `ERROR_SHARING_VIOLATION` = 32,
+/// `ERROR_LOCK_VIOLATION` = 33, or `ErrorKind::PermissionDenied`) AND `target`
+/// is not an intentionally read-only regular file or directory.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn is_transient_ntfs_contention(err: &io::Error, target: &Path) -> bool {
+    if std::fs::metadata(target)
+        .is_ok_and(|m| m.is_dir() || (m.is_file() && m.permissions().readonly()))
+    {
+        return false;
+    }
+    err.kind() == io::ErrorKind::PermissionDenied || matches!(err.raw_os_error(), Some(5 | 32 | 33))
+}
+
+/// Run `op`, retrying on transient NTFS sharing/access contention against
+/// `target` across [`NTFS_RETRY_BACKOFF_MS`] on Windows. On non-Windows hosts,
+/// runs `op()` once without sleeping.
+pub fn retry_transient_io<T>(
+    target: &Path,
+    mut op: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    #[cfg(not(windows))]
+    {
+        let _ = target;
+        op()
+    }
+    #[cfg(windows)]
+    {
+        let mut backoff = NTFS_RETRY_BACKOFF_MS.iter().copied();
+        loop {
+            match op() {
+                Ok(val) => return Ok(val),
+                Err(err) if is_transient_ntfs_contention(&err, target) => {
+                    let Some(ms) = backoff.next() else {
+                        return Err(err);
+                    };
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+}
+
+/// Rename `from` onto `to`, retrying transient NTFS sharing/access violations
+/// on Windows.
+pub fn rename_retrying(from: &Path, to: &Path) -> io::Result<()> {
+    retry_transient_io(to, || std::fs::rename(from, to))
+}
+
+/// Write `bytes` to `path`, retrying transient NTFS sharing/access violations
+/// on Windows.
+pub fn write_retrying(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    retry_transient_io(path, || std::fs::write(path, bytes))
 }

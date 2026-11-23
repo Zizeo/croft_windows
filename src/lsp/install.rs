@@ -1414,7 +1414,7 @@ fn uv_dist_dir() -> Option<PathBuf> {
 /// `~/.cargo/bin`) plus the common Homebrew/local prefixes — a non-login `exec`
 /// won't have those on PATH. `None` when uv isn't installed anywhere croft
 /// looks.
-fn uv_program() -> Option<PathBuf> {
+pub(crate) fn uv_program() -> Option<PathBuf> {
     if let Some(cmd) = crate::lsp::manager::resolve_command_on_path("uv") {
         return Some(PathBuf::from(cmd));
     }
@@ -1439,7 +1439,7 @@ fn uv_program() -> Option<PathBuf> {
 /// has none. Serialized by a process-global lock so `ty` and `ruff` opening at
 /// once don't both kick off a uv install — the second waits, then finds the uv
 /// the first just laid down.
-fn ensure_uv() -> Option<PathBuf> {
+pub(crate) fn ensure_uv() -> Option<PathBuf> {
     if let Some(uv) = uv_program() {
         return Some(uv);
     }

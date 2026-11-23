@@ -25,13 +25,17 @@ pub(super) fn pytest_launch_on(
 ) -> (PathBuf, &'static [&'static str]) {
     const MODULE: &[&str] = &["-m", "pytest"];
     for venv in [".venv", "venv"] {
-        let bin = root.join(venv).join("bin");
-        let python = bin.join("python");
-        // `-m pytest` needs the module: the console script says it is
-        // installed without a process, and without the script the venv's
-        // python is asked.
-        if python.is_file() && (bin.join("pytest").is_file() || python_has_pytest(root, &python)) {
-            return (python, MODULE);
+        if let Some(python) = crate::platform::env::venv_python_in(&root.join(venv)) {
+            let has_script = python.parent().is_some_and(|bin| {
+                crate::platform::env::executable_in_dir(bin, "pytest").is_some()
+                    || bin.join("pytest").is_file()
+            });
+            // `-m pytest` needs the module: the console script says it is
+            // installed without a process, and without the script the venv's
+            // python is asked.
+            if has_script || python_has_pytest(root, &python) {
+                return (python, MODULE);
+            }
         }
     }
     let python3 = python3_program(path_var);

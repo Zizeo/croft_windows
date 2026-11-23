@@ -497,8 +497,12 @@ impl App {
         if runs.is_empty() {
             return Some(ProjectCheck::Empty);
         }
-        let local = root.join("node_modules").join(".bin").join("tsc");
-        let (program, prefix): (std::ffi::OsString, &[&str]) = if local.is_file() {
+        let bin_dir = root.join("node_modules").join(".bin");
+        let local = crate::platform::env::executable_in_dir(&bin_dir, "tsc").or_else(|| {
+            let p = bin_dir.join("tsc");
+            p.is_file().then_some(p)
+        });
+        let (program, prefix): (std::ffi::OsString, &[&str]) = if let Some(local) = local {
             (local.into_os_string(), &[])
         } else {
             (std::ffi::OsString::from("npx"), &["--no-install", "tsc"])

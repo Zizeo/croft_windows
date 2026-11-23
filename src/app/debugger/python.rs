@@ -19,13 +19,21 @@ pub(in crate::app) fn project_python_on(
     root: &Path,
     path_var: Option<&std::ffi::OsStr>,
 ) -> Option<PathBuf> {
-    let venv = root.join(".venv").join("bin").join("python");
-    if venv.is_file() {
+    if let Some(venv) = crate::platform::env::venv_python_in(&root.join(".venv")) {
         return Some(venv);
     }
-    std::env::split_paths(path_var?)
-        .map(|dir| dir.join("python3"))
-        .find(|candidate| candidate.is_file())
+    std::env::split_paths(path_var?).find_map(|dir| {
+        #[cfg(windows)]
+        {
+            crate::platform::env::executable_in_dir(&dir, "python3")
+                .or_else(|| crate::platform::env::executable_in_dir(&dir, "python"))
+        }
+        #[cfg(not(windows))]
+        {
+            let candidate = dir.join("python3");
+            candidate.is_file().then_some(candidate)
+        }
+    })
 }
 
 /// Walk from `start` up to and including `workspace_root` looking for a
@@ -43,8 +51,7 @@ pub(in crate::app) fn find_python_venv(
     let mut probe = start.to_path_buf();
     loop {
         for venv_name in [".venv", "venv", ".env"] {
-            let py = probe.join(venv_name).join("bin").join("python");
-            if py.is_file() {
+            if let Some(py) = crate::platform::env::venv_python_in(&probe.join(venv_name)) {
                 return Some((py, probe));
             }
         }

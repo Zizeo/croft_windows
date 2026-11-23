@@ -1833,7 +1833,7 @@ impl Editor {
                     .is_some_and(|i| i > 0 && original[i - 1] == b'\r');
                 // Unchanged rows go back as the file had them (#1375).
                 let bytes = crate::sheet::serialize_delimited(data, delim, crlf, &original);
-                std::fs::write(&path, &bytes)
+                crate::platform::fs::write_retrying(&path, &bytes)
                     .map_err(|e| anyhow::anyhow!("Sheet save failed: {e}"))?;
                 view.dirty = false;
                 view.cell_edits.clear();
