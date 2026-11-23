@@ -264,6 +264,8 @@ impl PtyTerminal {
 
         let marks = Arc::new(std::sync::Mutex::new(Vec::<StoredMark>::new()));
         let marks_for_thread = marks.clone();
+        let osc133_state = Arc::new(std::sync::atomic::AtomicU8::new(OSC133_UNKNOWN));
+        let osc133_for_thread = osc133_state.clone();
         let images = Arc::new(std::sync::Mutex::new(Vec::<StoredImage>::new()));
         let images_for_thread = images.clone();
         let capture_rows = Arc::new(std::sync::Mutex::new(CaptureRows::default()));
@@ -677,6 +679,13 @@ impl PtyTerminal {
                             let clock_rec = clock_for_thread.lock().unwrap().tick(&mut t);
                             let col_rec = t.grid().cursor.point.column.0;
                             let started = matches!(kind, E::CommandStart);
+                            let next_osc133 = match &kind {
+                                E::CommandStart => OSC133_RUNNING,
+                                E::PromptStart | E::PromptEnd | E::CommandEnd(_) => OSC133_PROMPT,
+                                _ => OSC133_UNKNOWN,
+                            };
+                            osc133_for_thread
+                                .store(next_osc133, std::sync::atomic::Ordering::Relaxed);
                             let mut ms = marks_for_thread.lock().unwrap();
                             if ms.len() >= MARKS_MAX {
                                 let drop_n = ms.len() + 1 - MARKS_MAX;
@@ -857,6 +866,7 @@ impl PtyTerminal {
             bell,
             clipboard_store,
             marks,
+            osc133_state,
             osc7_cwd,
             osc7_host,
             accent: None,

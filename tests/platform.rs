@@ -2,6 +2,10 @@
 
 #[path = "../src/platform/mod.rs"]
 mod platform;
+#[path = "../src/program_status.rs"]
+mod program_status;
+#[path = "../src/shell_integration.rs"]
+mod shell_integration;
 
 #[test]
 fn env_home_and_dirs_resolve_non_empty() {
@@ -327,6 +331,100 @@ fn remote_and_sync_config_cli_subcommands_are_enabled() {
             !stdout.contains("not supported on native Windows"),
             "`croft {}` unexpectedly reports Windows unsupported",
             args.join(" ")
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn powershell_shim_emits_osc133_and_osc7_in_live_powershell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg_dir = tmp.path().join("cfg");
+    let pane_bin = tmp.path().join("pane_bin");
+    let work_dir = tmp.path().join("work dir");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::create_dir_all(&pane_bin).unwrap();
+    std::fs::create_dir_all(&work_dir).unwrap();
+
+    let shim = shell_integration::ensure_powershell_shim(&cfg_dir).unwrap();
+    assert!(shim.is_file());
+
+    let mut shells: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from("powershell.exe")];
+    if let Some(pwsh) = platform::env::resolve_on_path("pwsh.exe") {
+        shells.push(pwsh);
+    }
+
+    let script = format!(
+        ". '{}'; Write-Output \"PATH_FIRST=$($env:PATH.Split([IO.Path]::PathSeparator)[0])\"; prompt; $Global:__CroftCommandInFlight = $true; cmd /c 'exit 7'; prompt",
+        shim.display().to_string().replace('\'', "''")
+    );
+
+    for shell in shells {
+        let out = std::process::Command::new(&shell)
+            .args([
+                "-NoProfile",
+                "-NoLogo",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &script,
+            ])
+            .current_dir(&work_dir)
+            .env(shell_integration::PANE_BIN_ENV, &pane_bin)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {}: {e}", shell.display()));
+
+        assert!(
+            out.status.success(),
+            "{} exited with {:?}: stderr={}",
+            shell.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout_lossy = String::from_utf8_lossy(&out.stdout);
+        let expected_first = format!("PATH_FIRST={}", pane_bin.display());
+        assert!(
+            stdout_lossy.contains(&expected_first),
+            "{} did not prepend CROFT_PANE_BIN to PATH: stdout={stdout_lossy:?}",
+            shell.display()
+        );
+
+        let events: Vec<_> = shell_integration::OscSniffer::default()
+            .scan(&out.stdout)
+            .into_iter()
+            .map(|(_, ev)| ev)
+            .collect();
+        assert!(
+            events.contains(&shell_integration::OscEvent::PromptStart),
+            "{} missing OSC 133;A in {events:?}",
+            shell.display()
+        );
+        assert!(
+            events.contains(&shell_integration::OscEvent::PromptEnd),
+            "{} missing OSC 133;B in {events:?}",
+            shell.display()
+        );
+        assert!(
+            events.contains(&shell_integration::OscEvent::CommandEnd(Some(7))),
+            "{} missing OSC 133;D;7 in {events:?}",
+            shell.display()
+        );
+        let cwd_event = events.iter().find_map(|e| match e {
+            shell_integration::OscEvent::Cwd(p, Some(h)) if !h.is_empty() => Some(p),
+            _ => None,
+        });
+        let cwd_path = cwd_event.unwrap_or_else(|| {
+            panic!(
+                "{} missing OSC 7 CWD+host event in {events:?}",
+                shell.display()
+            )
+        });
+        assert!(
+            cwd_path.is_dir(),
+            "{} OSC 7 path {:?} is not an existing directory",
+            shell.display(),
+            cwd_path
         );
     }
 }

@@ -325,21 +325,39 @@ impl App {
     }
 
     /// Available terminal profiles as `(shell_path, label)`: the shells in
-    /// `/etc/shells`, with the user's current `$SHELL` ensured present
-    /// (prepended) so the default is always an option even on a box with no
-    /// `/etc/shells`.
+    /// `/etc/shells` (or Windows discovered shells when `/etc/shells` is
+    /// absent), with the user's current `$SHELL` / `default_shell()` ensured
+    /// present (prepended) so the default is always an option even on a box
+    /// with no `/etc/shells`.
     pub(super) fn terminal_profiles(&self) -> Vec<(String, String)> {
         let contents = std::fs::read_to_string("/etc/shells").unwrap_or_default();
         let mut shells = crate::widgets::terminal::parse_shells(&contents);
-        if let Ok(current) = std::env::var("SHELL")
-            && !current.is_empty()
-        {
+        #[cfg(windows)]
+        if shells.is_empty() {
+            shells = crate::widgets::terminal::discover_windows_shells();
+        }
+        let current = std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if cfg!(windows) {
+                    crate::platform::env::default_shell()
+                } else {
+                    String::new()
+                }
+            });
+        if !current.is_empty() {
             let base = std::path::Path::new(&current)
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or(&current)
                 .to_string();
-            if !shells.iter().any(|(_, b)| *b == base) {
+            let base_norm = base.strip_suffix(".exe").unwrap_or(&base);
+            if !shells.iter().any(|(p, b)| {
+                b.eq_ignore_ascii_case(&base)
+                    || b.eq_ignore_ascii_case(base_norm)
+                    || p.eq_ignore_ascii_case(&current)
+            }) {
                 shells.insert(0, (current, base));
             }
         }

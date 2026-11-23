@@ -223,6 +223,9 @@ impl PtyTerminal {
             return None;
         }
         let claim = self.shell_cwd()?;
+        if !cwd_is_observable() {
+            return claim.is_dir().then_some(claim);
+        }
         let real = cwd_of_pid(self.pid()?)?;
         // Symlink-tolerant equality (macOS reports /private/tmp for a
         // shell sitting in /tmp): equal canonical paths name the same
@@ -268,6 +271,29 @@ impl PtyTerminal {
         }
         match (self.backend.process_group_leader(), self.shell_pid) {
             (Some(fg), Some(pid)) => fg == pid,
+            (None, _) => {
+                if self.reader_thread.as_ref().is_some_and(|h| h.is_finished())
+                    || self
+                        .shell_pid
+                        .is_some_and(|p| p > 0 && !crate::platform::process::is_pid_alive(p as u32))
+                {
+                    return false;
+                }
+                match self.osc133_state.load(std::sync::atomic::Ordering::Relaxed) {
+                    OSC133_PROMPT => return true,
+                    OSC133_RUNNING => return false,
+                    _ => {}
+                }
+                if self.input_seen {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    match (self.backend.process_group_leader(), self.shell_pid) {
+                        (Some(fg), Some(pid)) => fg == pid,
+                        _ => false,
+                    }
+                } else {
+                    true
+                }
+            }
             _ if self.input_seen => {
                 // A pane that has received input CAN be running a launched
                 // app, so an UNRESOLVABLE sample (failed tcgetpgrp, or a

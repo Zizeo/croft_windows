@@ -1055,12 +1055,15 @@ impl App {
         task: &crate::tasks::Task,
         root: PathBuf,
     ) -> Result<String, String> {
-        task.command_line(&crate::dap::configs::SubstCtx {
-            workspace_folder: root,
-            file: self.editor.path.clone(),
-            inputs: Default::default(),
-            folders: self.workspace_folders(),
-        })
+        task.command_line_for(
+            &crate::dap::configs::SubstCtx {
+                workspace_folder: root,
+                file: self.editor.path.clone(),
+                inputs: Default::default(),
+                folders: self.workspace_folders(),
+            },
+            crate::tasks::ShellFlavor::host_default(),
+        )
     }
 
     /// Run `task` in its own named terminal pane. Rerunning a task whose
@@ -2754,9 +2757,15 @@ pub(super) fn pane_is_idle_at(
     pane_name: &str,
     root: &Path,
 ) -> bool {
+    let live_cwd = t.kernel_shell_cwd().or_else(|| {
+        (!cwd_is_observable())
+            .then(|| t.local_shell_cwd())
+            .flatten()
+            .and_then(|p| crate::platform::fs::canonicalize(&p).ok())
+    });
     t.label() == pane_name
         && t.foreground_is_shell()
-        && cwd_matches(t.kernel_shell_cwd().as_deref(), root, cwd_is_observable())
+        && cwd_matches(live_cwd.as_deref(), root, cwd_is_observable())
 }
 
 /// The cwd half of [`pane_is_idle_at`], as a pure function so both arms are

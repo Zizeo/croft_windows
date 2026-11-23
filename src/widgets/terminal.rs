@@ -70,6 +70,10 @@ pub use selection::Selection;
 pub use selection::is_terminal_word_char;
 use selection::*;
 pub(crate) use shell_env::apply_pane_env;
+#[cfg(any(windows, test))]
+pub use shell_env::discover_windows_shells;
+#[cfg(test)]
+pub use shell_env::interactive_shell_invocation;
 pub use shell_env::parse_shells;
 #[cfg(test)]
 pub(crate) use shell_env::sequence_editor_command;
@@ -82,6 +86,9 @@ pub(crate) use text::ansi_rows_from;
 use text::*;
 
 const SCROLLBACK_LINES: usize = 5000;
+pub(super) const OSC133_UNKNOWN: u8 = 0;
+pub(super) const OSC133_PROMPT: u8 = 1;
+pub(super) const OSC133_RUNNING: u8 = 2;
 
 /// What an alternate-screen selection remembers about its content so the
 /// highlight can follow text that the app moves by repainting (alt-screen
@@ -399,6 +406,9 @@ pub struct PtyTerminal {
     /// lines (content scrolls into history as output arrives, so a stored
     /// line drifts by exactly the history growth since recording).
     marks: Arc<std::sync::Mutex<Vec<StoredMark>>>,
+    /// Latest OSC 133 prompt/command lifecycle state (`OSC133_UNKNOWN`,
+    /// `OSC133_PROMPT`, `OSC133_RUNNING`) updated by the reader thread.
+    osc133_state: Arc<std::sync::atomic::AtomicU8>,
     /// Latest OSC 7 cwd report from the shell, when integration is active.
     osc7_cwd: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     /// Latest OSC 7 reporting host (SSH inside the pane moves it to the

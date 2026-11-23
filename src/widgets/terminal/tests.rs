@@ -615,6 +615,49 @@ fn interactive_shell_invocation_skips_login_flag_for_unknown_shells() {
 }
 
 #[test]
+fn interactive_shell_invocation_handles_powershell_and_windows_paths() {
+    for ps in [
+        "pwsh",
+        "pwsh.exe",
+        r"C:\Program Files\PowerShell\7\pwsh.exe",
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+    ] {
+        let (_, args) = interactive_shell_invocation(ps);
+        assert_eq!(args, vec!["-NoLogo".to_string()], "for {ps}");
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cmd = CommandBuilder::new("pwsh.exe");
+    let final_args = apply_shell_integration_env(
+        &mut cmd,
+        r"C:\Program Files\PowerShell\7\pwsh.exe",
+        tmp.path(),
+        vec!["-NoProfile".to_string(), "-NoLogo".to_string()],
+    );
+    let shim = tmp
+        .path()
+        .join("shell-integration")
+        .join("powershell")
+        .join("shellIntegration.ps1");
+    assert!(shim.is_file(), "PowerShell shim must be created");
+    assert_eq!(
+        cmd.get_env("CROFT_PS_NO_PROFILE").and_then(|v| v.to_str()),
+        Some("1")
+    );
+    assert_eq!(
+        final_args,
+        vec![
+            "-NoProfile".to_string(),
+            "-NoLogo".to_string(),
+            "-NoExit".to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-File".to_string(),
+            shim.display().to_string(),
+        ]
+    );
+}
+
+#[test]
 fn a_large_write_to_a_child_not_reading_never_blocks_the_caller() {
     let tmp = tempfile::tempdir().unwrap();
     let mut term = PtyTerminal::new_running(
@@ -5482,6 +5525,29 @@ fn parse_shells_skips_comments_and_dedupes_by_basename() {
         "comments/blanks/non-paths skipped, basenames deduped"
     );
     assert_eq!(p[0].0, "/bin/zsh", "full path retained");
+}
+
+#[cfg(windows)]
+#[test]
+fn discover_windows_shells_finds_installed_shells() {
+    let shells = discover_windows_shells();
+    assert!(
+        !shells.is_empty(),
+        "Windows host must discover at least cmd.exe / powershell.exe"
+    );
+    for (path, label) in &shells {
+        assert!(!label.is_empty());
+        assert!(
+            std::path::Path::new(path).is_file(),
+            "discovered shell {label} does not exist at {path}"
+        );
+    }
+    assert!(
+        shells
+            .iter()
+            .any(|(_, l)| l == "powershell" || l == "pwsh" || l == "cmd"),
+        "expected built-in Windows shell in {shells:?}"
+    );
 }
 #[test]
 fn finished_command_carries_its_output_block() {

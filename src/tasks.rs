@@ -81,14 +81,51 @@ pub struct TaskArg {
     pub quoting: Option<Quoting>,
 }
 
+/// Shell dialect a task command line targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellFlavor {
+    Posix,
+    PowerShell,
+    Cmd,
+}
+
+impl ShellFlavor {
+    /// Detect shell flavor from a shell executable name or full path.
+    pub fn from_shell_path(shell: &str) -> Self {
+        let base = shell
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(shell)
+            .to_ascii_lowercase();
+        match base.strip_suffix(".exe").unwrap_or(&base) {
+            "pwsh" | "powershell" => Self::PowerShell,
+            "cmd" => Self::Cmd,
+            _ => Self::Posix,
+        }
+    }
+
+    /// Default task shell flavor for the host OS (`Posix` on Unix;
+    /// derived from `crate::platform::env::default_shell()` on Windows).
+    pub fn host_default() -> Self {
+        #[cfg(windows)]
+        {
+            Self::from_shell_path(&crate::platform::env::default_shell())
+        }
+        #[cfg(not(windows))]
+        {
+            Self::Posix
+        }
+    }
+}
+
 /// VS Code's `ShellQuoting` for a `{ "value", "quoting" }` word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quoting {
-    /// Each character the shell would read as syntax gets a backslash.
+    /// Each character the shell would read as syntax gets an escape prefix.
     Escape,
     /// Single quotes: nothing inside is expanded.
     Strong,
-    /// Double quotes: `$VAR` still expands.
+    /// Double quotes: variable expansion remains enabled.
     Weak,
 }
 
@@ -103,25 +140,103 @@ impl Quoting {
         }
     }
 
-    /// `value` as one shell word, quoted this way.
-    fn apply(self, value: &str) -> String {
-        match self {
-            Quoting::Strong => quote_word(value),
-            Quoting::Weak => format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")),
-            // A backslash before a newline joins lines instead of keeping
-            // the newline, so such a value is quoted strongly instead.
-            Quoting::Escape if value.is_empty() || value.contains('\n') => quote_word(value),
-            Quoting::Escape => value
-                .chars()
-                .flat_map(|c| {
-                    let plain =
-                        c.is_ascii_alphanumeric() || "/._-+=:,@%".contains(c) || !c.is_ascii();
-                    (!plain)
-                        .then_some('\\')
-                        .into_iter()
-                        .chain(std::iter::once(c))
-                })
-                .collect(),
+    /// `value` as one POSIX shell word, quoted this way.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn apply(self, value: &str) -> String {
+        self.apply_for(value, ShellFlavor::Posix)
+    }
+
+    /// `value` as one shell word for `flavor`, quoted this way.
+    pub fn apply_for(self, value: &str, flavor: ShellFlavor) -> String {
+        match flavor {
+            ShellFlavor::Posix => match self {
+                Quoting::Strong => quote_word(value),
+                Quoting::Weak => {
+                    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+                }
+                // A backslash before a newline joins lines instead of keeping
+                // the newline, so such a value is quoted strongly instead.
+                Quoting::Escape if value.is_empty() || value.contains('\n') => quote_word(value),
+                Quoting::Escape => value
+                    .chars()
+                    .flat_map(|c| {
+                        let plain =
+                            c.is_ascii_alphanumeric() || "/._-+=:,@%".contains(c) || !c.is_ascii();
+                        (!plain)
+                            .then_some('\\')
+                            .into_iter()
+                            .chain(std::iter::once(c))
+                    })
+                    .collect(),
+            },
+            ShellFlavor::PowerShell => match self {
+                Quoting::Strong => format!("'{}'", value.replace('\'', "''")),
+                Quoting::Weak => {
+                    let mut out = String::with_capacity(value.len() + 2);
+                    out.push('"');
+                    for c in value.chars() {
+                        if matches!(c, '`' | '"' | '$') {
+                            out.push('`');
+                        }
+                        out.push(c);
+                    }
+                    out.push('"');
+                    out
+                }
+                Quoting::Escape if value.is_empty() || value.contains(['\n', '\r']) => {
+                    format!("'{}'", value.replace('\'', "''"))
+                }
+                Quoting::Escape => {
+                    let mut out = String::with_capacity(value.len());
+                    for c in value.chars() {
+                        if matches!(
+                            c,
+                            ' ' | '\t'
+                                | '"'
+                                | '\''
+                                | '`'
+                                | '$'
+                                | '&'
+                                | '|'
+                                | ';'
+                                | '<'
+                                | '>'
+                                | '('
+                                | ')'
+                                | '{'
+                                | '}'
+                                | '@'
+                                | '#'
+                                | ','
+                        ) {
+                            out.push('`');
+                        }
+                        out.push(c);
+                    }
+                    out
+                }
+            },
+            ShellFlavor::Cmd => match self {
+                Quoting::Strong | Quoting::Weak => {
+                    format!("\"{}\"", value.replace('"', "\"\""))
+                }
+                Quoting::Escape if value.is_empty() || value.contains(['\n', '\r']) => {
+                    format!("\"{}\"", value.replace('"', "\"\""))
+                }
+                Quoting::Escape => {
+                    let mut out = String::with_capacity(value.len());
+                    for c in value.chars() {
+                        if matches!(
+                            c,
+                            ' ' | '\t' | '"' | '^' | '&' | '|' | '<' | '>' | '(' | ')' | '%'
+                        ) {
+                            out.push('^');
+                        }
+                        out.push(c);
+                    }
+                    out
+                }
+            },
         }
     }
 }
@@ -168,14 +283,24 @@ impl Task {
         out
     }
 
-    /// The line to type into the task's shell. A tasks.json entry gets its
-    /// `${workspaceFolder}` / `${file}` variables expanded (the shell would
+    /// The line to type into a POSIX shell. See [`Self::command_line_for`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn command_line(&self, ctx: &crate::dap::configs::SubstCtx) -> Result<String, String> {
+        self.command_line_for(ctx, ShellFlavor::Posix)
+    }
+
+    /// The line to type into the task's shell of `flavor`. A tasks.json entry gets
+    /// its `${workspaceFolder}` / `${file}` variables expanded (the shell would
     /// otherwise expand them to nothing and run `/scripts/build.sh`), each
     /// argument with whitespace kept one word (`"fix bug"`), and
-    /// `options.cwd` / `options.env` applied in a subshell, so the pane's
-    /// own directory and environment are left alone. Err only when a
+    /// `options.cwd` / `options.env` applied in a subshell / scriptblock, so
+    /// the pane's own directory and environment are left alone. Err only when a
     /// `${file}`-family variable is used with no file open.
-    pub fn command_line(&self, ctx: &crate::dap::configs::SubstCtx) -> Result<String, String> {
+    pub fn command_line_for(
+        &self,
+        ctx: &crate::dap::configs::SubstCtx,
+        flavor: ShellFlavor,
+    ) -> Result<String, String> {
         let Some(v) = &self.vscode else {
             return Ok(self.command.clone());
         };
@@ -195,8 +320,8 @@ impl Task {
         // The command's literal text keeps its shell meaning (`&&`, globs);
         // an argument's is quoted only when it must stay one word.
         let mut line = match v.command_quoting {
-            Some(q) => q.apply(&expand_task_value(&v.command, ctx)?),
-            None => expand_task_text(&v.command, ctx, false)?,
+            Some(q) => q.apply_for(&expand_task_value(&v.command, ctx)?, flavor),
+            None => expand_task_text(&v.command, ctx, false, flavor)?,
         };
         for TaskArg {
             value: raw,
@@ -205,7 +330,7 @@ impl Task {
         {
             if let Some(q) = quoting {
                 line.push(' ');
-                line.push_str(&q.apply(&expand_task_value(raw, ctx)?));
+                line.push_str(&q.apply_for(&expand_task_value(raw, ctx)?, flavor));
                 continue;
             }
             let literal_space =
@@ -214,23 +339,78 @@ impl Task {
             // An argument that expands to nothing (an unset `${env:X}`) is
             // still an argument: left out, the next one took its place
             // (`--name  f` passed `f` as the name).
-            let arg = expand_task_text(raw, ctx, literal_space)?;
-            line.push_str(if arg.is_empty() { "''" } else { &arg });
+            let arg = expand_task_text(raw, ctx, literal_space, flavor)?;
+            if arg.is_empty() {
+                line.push_str(&Quoting::Strong.apply_for("", flavor));
+            } else {
+                line.push_str(&arg);
+            }
         }
-        let mut setup = Vec::new();
-        if let Some(cwd) = &v.cwd {
-            setup.push(format!("cd {}", expand_task_text(cwd, ctx, true)?));
+        match flavor {
+            ShellFlavor::Posix => {
+                let mut setup = Vec::new();
+                if let Some(cwd) = &v.cwd {
+                    setup.push(format!("cd {}", expand_task_text(cwd, ctx, true, flavor)?));
+                }
+                for (key, value) in &v.env {
+                    setup.push(format!(
+                        "export {key}={}",
+                        expand_task_text(value, ctx, true, flavor)?
+                    ));
+                }
+                if setup.is_empty() {
+                    return Ok(line);
+                }
+                Ok(format!("({} && {line})", setup.join(" && ")))
+            }
+            ShellFlavor::PowerShell => {
+                if v.cwd.is_none() && v.env.is_empty() {
+                    return Ok(line);
+                }
+                let mut env_stmts = String::new();
+                for (key, value) in &v.env {
+                    let val = Quoting::Strong
+                        .apply_for(&expand_task_value(value, ctx)?, ShellFlavor::PowerShell);
+                    env_stmts.push_str(&format!("$env:{key} = {val}; "));
+                }
+                if let Some(cwd) = &v.cwd {
+                    let quoted_cwd = Quoting::Strong
+                        .apply_for(&expand_task_value(cwd, ctx)?, ShellFlavor::PowerShell);
+                    Ok(format!(
+                        "& {{ Push-Location {quoted_cwd}; {env_stmts}try {{ {line} }} finally {{ Pop-Location }} }}"
+                    ))
+                } else {
+                    Ok(format!("& {{ {env_stmts}{line} }}"))
+                }
+            }
+            ShellFlavor::Cmd => {
+                if v.cwd.is_none() && v.env.is_empty() {
+                    return Ok(line);
+                }
+                let mut setup = Vec::new();
+                if let Some(cwd) = &v.cwd {
+                    setup.push(format!(
+                        "cd /d {}",
+                        expand_task_text(cwd, ctx, true, flavor)?
+                    ));
+                }
+                for (key, value) in &v.env {
+                    let val = expand_task_value(value, ctx)?.replace('"', "\"\"");
+                    setup.push(format!("set \"{key}={val}\""));
+                }
+                Ok(format!("({} && {line})", setup.join(" && ")))
+            }
         }
-        for (key, value) in &v.env {
-            setup.push(format!(
-                "export {key}={}",
-                expand_task_text(value, ctx, true)?
-            ));
-        }
-        if setup.is_empty() {
-            return Ok(line);
-        }
-        Ok(format!("({} && {line})", setup.join(" && ")))
+    }
+}
+
+/// Whether `s` holds anything the target `flavor` shell would read as more than plain text.
+fn needs_quote_for(s: &str, flavor: ShellFlavor) -> bool {
+    match flavor {
+        ShellFlavor::Posix => needs_quote(s),
+        ShellFlavor::PowerShell | ShellFlavor::Cmd => !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/\\._-+=:".contains(c)),
     }
 }
 
@@ -248,10 +428,11 @@ fn expand_task_text(
     raw: &str,
     ctx: &crate::dap::configs::SubstCtx,
     quote_literals: bool,
+    flavor: ShellFlavor,
 ) -> Result<String, String> {
     let literal = |out: &mut String, text: &str| {
         if quote_literals && !text.is_empty() {
-            out.push_str(&quote_word(text));
+            out.push_str(&Quoting::Strong.apply_for(text, flavor));
         } else {
             out.push_str(text);
         }
@@ -265,8 +446,10 @@ fn expand_task_text(
         literal(&mut out, &rest[..start]);
         let var = &rest[start + 2..start + 2 + len];
         match crate::dap::configs::substitute(&format!("${{{var}}}"), ctx) {
-            Ok(value) if needs_quote(&value) || (quote_literals && value.is_empty()) => {
-                out.push_str(&quote_word(&value));
+            Ok(value)
+                if needs_quote_for(&value, flavor) || (quote_literals && value.is_empty()) =>
+            {
+                out.push_str(&Quoting::Strong.apply_for(&value, flavor));
             }
             Ok(value) => out.push_str(&value),
             Err(e) if e.contains("no active file") => return Err(e),
@@ -287,7 +470,7 @@ fn expand_task_text(
     }
     literal(&mut out, rest);
     if quote_literals && out.is_empty() {
-        out.push_str("''");
+        out.push_str(&Quoting::Strong.apply_for("", flavor));
     }
     Ok(out)
 }
@@ -417,8 +600,12 @@ fn tsconfig_tasks(root: &Path) -> Vec<Task> {
         .filter(|n| !n.contains(char::is_whitespace))
         .collect();
     names.sort();
-    let tsc = if root.join("node_modules/.bin/tsc").is_file() {
+    let tsc = if cfg!(windows) && root.join("node_modules/.bin/tsc.cmd").is_file() {
+        "node_modules/.bin/tsc.cmd"
+    } else if root.join("node_modules/.bin/tsc").is_file() {
         "node_modules/.bin/tsc"
+    } else if root.join("node_modules/.bin/tsc.cmd").is_file() {
+        "node_modules/.bin/tsc.cmd"
     } else {
         "tsc"
     };
@@ -2946,5 +3133,94 @@ mod tests {
             "tasks.json",
             "a declared label wins"
         );
+    }
+
+    #[test]
+    fn powershell_flavor_quotes_and_wraps_cwd_and_env() {
+        assert_eq!(
+            ShellFlavor::from_shell_path(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            ShellFlavor::PowerShell
+        );
+        assert_eq!(
+            ShellFlavor::from_shell_path(
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+            ),
+            ShellFlavor::PowerShell
+        );
+        assert_eq!(
+            ShellFlavor::from_shell_path(r"C:\Windows\System32\cmd.exe"),
+            ShellFlavor::Cmd
+        );
+        assert_eq!(
+            ShellFlavor::from_shell_path("/bin/bash"),
+            ShellFlavor::Posix
+        );
+
+        assert_eq!(
+            Quoting::Strong.apply_for("it's work", ShellFlavor::PowerShell),
+            "'it''s work'"
+        );
+        assert_eq!(
+            Quoting::Weak.apply_for("say \"hi\" `$var $HOME", ShellFlavor::PowerShell),
+            "\"say `\"hi`\" ```$var `$HOME\""
+        );
+        assert_eq!(
+            Quoting::Escape.apply_for("a b;c&d", ShellFlavor::PowerShell),
+            "a` b`;c`&d"
+        );
+        assert_eq!(Quoting::Escape.apply_for("", ShellFlavor::PowerShell), "''");
+
+        let (_tmp, root) = tasks_workspace(
+            r#"{ "version": "2.0.0", "tasks": [
+                 { "label": "psbuild", "type": "shell",
+                   "command": { "value": "my tool", "quoting": "strong" },
+                   "args": [
+                     { "value": "it's arg", "quoting": "strong" },
+                     { "value": "a \"q\" $X", "quoting": "weak" },
+                     { "value": "${workspaceFolder}/sub" }
+                   ],
+                   "options": {
+                     "cwd": "${workspaceFolder}/it's sub",
+                     "env": { "MODE": "re'lease" }
+                   }
+                 }
+               ] }"#,
+        );
+        let tasks = discover_tasks(&root);
+        let ps = tasks.iter().find(|t| t.label == "psbuild").unwrap();
+        let line = ps
+            .command_line_for(&ctx_at(&root), ShellFlavor::PowerShell)
+            .unwrap();
+        let expected_cwd = Quoting::Strong.apply_for(
+            &format!("{}/it's sub", root.display()),
+            ShellFlavor::PowerShell,
+        );
+        assert!(
+            line.starts_with(&format!("& {{ Push-Location {expected_cwd}; ")),
+            "unexpected PowerShell wrapper: {line}"
+        );
+        assert!(
+            line.contains("$env:MODE = 're''lease'; "),
+            "missing PowerShell env assignment: {line}"
+        );
+        assert!(
+            line.contains("try { 'my tool' 'it''s arg' \"a `\"q`\" `$X\""),
+            "missing quoted command/args: {line}"
+        );
+        assert!(
+            line.ends_with("} finally { Pop-Location } }"),
+            "missing Pop-Location finally block: {line}"
+        );
+    }
+
+    #[test]
+    fn tsconfig_tasks_detects_local_tsc_cmd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        std::fs::write(p.join("tsconfig.json"), "{}").unwrap();
+        std::fs::create_dir_all(p.join("node_modules/.bin")).unwrap();
+        std::fs::write(p.join("node_modules/.bin/tsc.cmd"), "@echo off\r\n").unwrap();
+        let tsc = find_task(discover_tasks(p), "tsc: build - tsconfig.json").unwrap();
+        assert_eq!(tsc.command, "node_modules/.bin/tsc.cmd -p tsconfig.json");
     }
 }

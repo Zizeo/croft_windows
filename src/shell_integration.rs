@@ -308,8 +308,17 @@ fn parse_event(kind: OscKind, body: &[u8]) -> Option<OscEvent> {
                 return None;
             };
             let decoded = percent_decode(path);
+            let decoded_slice = if decoded.len() >= 3
+                && decoded[0] == b'/'
+                && decoded[1].is_ascii_alphabetic()
+                && decoded[2] == b':'
+            {
+                &decoded[1..]
+            } else {
+                &decoded[..]
+            };
             Some(OscEvent::Cwd(
-                PathBuf::from(String::from_utf8_lossy(&decoded).into_owned()),
+                PathBuf::from(String::from_utf8_lossy(decoded_slice).into_owned()),
                 host,
             ))
         }
@@ -928,6 +937,126 @@ pub fn ensure_zsh_shim(config_dir: &std::path::Path) -> std::io::Result<PathBuf>
     Ok(dir)
 }
 
+/// The PowerShell (Windows PowerShell 5.1 and PowerShell 7+) integration
+/// bootstrap, loaded via `-NoExit -ExecutionPolicy Bypass -File <shim>`.
+/// Replays the user's real `$PROFILE` files unless `CROFT_PS_NO_PROFILE=1`,
+/// restores `CROFT_PANE_BIN` at the front of `PATH`, binds `Ctrl+e` and
+/// `Ctrl+u` in `PSReadLine` so `CLEAR_TYPED_LINE` works in Windows edit
+/// mode, wraps `function global:prompt` to emit `OSC 133;D;<exit>`,
+/// `OSC 7;file://<host>/<path>`, `OSC 133;A`, the original prompt, and
+/// `OSC 133;B`, and hooks `PSReadLine` `Enter` (or `PSConsoleHostReadLine`)
+/// to emit `OSC 133;C`. Uses `[char]0x1b` and `[char]7` for PS 5.1
+/// compatibility.
+pub const POWERSHELL_INTEGRATION: &str = r#"# croft PowerShell integration (auto-generated; do not edit)
+if ($Global:__CroftShellIntegrationInstalled) { return }
+$Global:__CroftShellIntegrationInstalled = $true
+
+if ($env:CROFT_PS_NO_PROFILE -eq '1') {
+    Remove-Item Env:\CROFT_PS_NO_PROFILE -ErrorAction SilentlyContinue
+} else {
+    foreach ($__croftProfile in @($PROFILE.CurrentUserAllHosts, $PROFILE.CurrentUserCurrentHost)) {
+        if ($__croftProfile -and (Test-Path -LiteralPath $__croftProfile) -and ($__croftProfile -ne $PSCommandPath)) {
+            try { . $__croftProfile } catch {}
+        }
+    }
+    Remove-Variable __croftProfile -ErrorAction SilentlyContinue
+}
+
+if ($env:CROFT_PANE_BIN) {
+    $__croftSep = [IO.Path]::PathSeparator
+    $__croftParts = ($env:PATH -split [regex]::Escape([string]$__croftSep)) | Where-Object { $_ -and ($_ -ne $env:CROFT_PANE_BIN) }
+    $env:PATH = (@($env:CROFT_PANE_BIN) + $__croftParts) -join [string]$__croftSep
+    Remove-Variable __croftSep, __croftParts -ErrorAction SilentlyContinue
+}
+
+$Global:__CroftCommandInFlight = $false
+$Global:__CroftOriginalPrompt = if (Test-Path Function:\prompt) { $function:prompt } else { $null }
+
+function global:prompt {
+    $__croftSuccess = $global:?
+    $__croftLastExit = $global:LASTEXITCODE
+    $__croftEsc = [char]0x1b
+    $__croftBel = [char]7
+    $__croftOut = ""
+
+    if ($Global:__CroftCommandInFlight) {
+        $Global:__CroftCommandInFlight = $false
+        $__croftCode = if (-not $__croftSuccess) {
+            if ($null -ne $__croftLastExit -and $__croftLastExit -ne 0) { [int]$__croftLastExit } else { 1 }
+        } else {
+            0
+        }
+        $__croftOut += "$__croftEsc]133;D;$__croftCode$__croftBel"
+    }
+
+    $__croftCwd = try { $executionContext.SessionState.Path.CurrentLocation.ProviderPath } catch { $PWD.Path }
+    if ($__croftCwd) {
+        $__croftSlash = ($__croftCwd -replace '%', '%25') -replace '\\', '/'
+        if (-not $__croftSlash.StartsWith('/')) { $__croftSlash = '/' + $__croftSlash }
+        $__croftHost = try { [System.Net.Dns]::GetHostName() } catch { $env:COMPUTERNAME }
+        if (-not $__croftHost) { $__croftHost = 'localhost' }
+        $__croftOut += "$__croftEsc]7;file://$__croftHost$__croftSlash$__croftBel"
+    }
+
+    $__croftOut += "$__croftEsc]133;A$__croftBel"
+
+    $__croftUserPrompt = if ($null -ne $Global:__CroftOriginalPrompt) {
+        try { & $Global:__CroftOriginalPrompt } catch { "PS $($executionContext.SessionState.Path.CurrentLocation)> " }
+    } else {
+        "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
+    }
+    if ([string]::IsNullOrEmpty($__croftUserPrompt)) {
+        $__croftUserPrompt = "PS> "
+    }
+
+    $__croftOut += "$__croftUserPrompt$__croftEsc]133;B$__croftBel"
+    return $__croftOut
+}
+
+if (Get-Module -Name PSReadLine) {
+    try {
+        Set-PSReadLineKeyHandler -Chord 'Ctrl+e' -Function EndOfLine
+        Set-PSReadLineKeyHandler -Chord 'Ctrl+u' -Function BackwardDeleteLine
+        Set-PSReadLineKeyHandler -Key Enter -BriefDescription "CroftShellIntegrationEnter" -ScriptBlock {
+            param($key, $arg)
+            $line = $null
+            $cursor = $null
+            [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
+            [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+            $afterLine = $null
+            $afterCursor = $null
+            [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$afterLine, [ref]$afterCursor)
+            if ([string]::IsNullOrEmpty($afterLine) -and -not [string]::IsNullOrWhiteSpace($line)) {
+                $Global:__CroftCommandInFlight = $true
+                [Console]::Write("$([char]0x1b)]133;C$([char]7)")
+            }
+        }
+    } catch {}
+} elseif (Test-Path Function:\PSConsoleHostReadLine) {
+    $Global:__CroftOriginalReadLine = $function:PSConsoleHostReadLine
+    function global:PSConsoleHostReadLine {
+        $__croftLine = & $Global:__CroftOriginalReadLine
+        if (-not [string]::IsNullOrWhiteSpace($__croftLine)) {
+            $Global:__CroftCommandInFlight = $true
+            [Console]::Write("$([char]0x1b)]133;C$([char]7)")
+        }
+        return $__croftLine
+    }
+}
+"#;
+
+/// Write croft's PowerShell integration script (idempotently) and return the file path.
+pub fn ensure_powershell_shim(config_dir: &std::path::Path) -> std::io::Result<PathBuf> {
+    let dir = config_dir.join("shell-integration").join("powershell");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("shellIntegration.ps1");
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(POWERSHELL_INTEGRATION) {
+        let mut f = std::fs::File::create(&path)?;
+        f.write_all(POWERSHELL_INTEGRATION.as_bytes())?;
+    }
+    Ok(path)
+}
+
 /// Names the pane bin to the shell hooks, which put it back first on PATH
 /// after the user's startup files have run.
 pub const PANE_BIN_ENV: &str = "CROFT_PANE_BIN";
@@ -1512,18 +1641,25 @@ mod tests {
     fn the_pane_bin_holds_only_a_croft_linked_to_the_running_binary() {
         let cache = tempfile::tempdir().unwrap();
         let bins = tempfile::tempdir().unwrap();
+        let bin_name = if cfg!(windows) { "croft.exe" } else { "croft" };
         let exe = bins.path().join("croft");
-        std::fs::write(&exe, "").unwrap();
+        std::fs::write(&exe, b"croft-exe").unwrap();
         let dir = ensure_pane_bin(cache.path(), &exe).unwrap();
         assert!(dir.starts_with(cache.path()), "{}", dir.display());
-        assert_eq!(std::fs::read_link(dir.join("croft")).unwrap(), exe);
+        #[cfg(unix)]
+        assert_eq!(std::fs::read_link(dir.join(bin_name)).unwrap(), exe);
+        #[cfg(not(unix))]
+        assert_eq!(
+            std::fs::read_to_string(dir.join(bin_name)).unwrap(),
+            "croft-exe"
+        );
         // The dir goes FIRST on a pane's PATH, so anything else in it would
         // shadow one of the user's own tools.
         let names: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(names, vec![std::ffi::OsString::from("croft")]);
+        assert_eq!(names, vec![std::ffi::OsString::from(bin_name)]);
         assert_eq!(ensure_pane_bin(cache.path(), &exe).unwrap(), dir);
     }
 
@@ -1533,29 +1669,109 @@ mod tests {
         // each must hand its panes its own binary, not whichever wrote last.
         let cache = tempfile::tempdir().unwrap();
         let bins = tempfile::tempdir().unwrap();
+        let bin_name = if cfg!(windows) { "croft.exe" } else { "croft" };
         let cargo = bins.path().join("cargo-croft");
         let brew = bins.path().join("brew-croft");
-        std::fs::write(&cargo, "").unwrap();
-        std::fs::write(&brew, "").unwrap();
+        std::fs::write(&cargo, b"cargo-croft").unwrap();
+        std::fs::write(&brew, b"brew-croft").unwrap();
         let cargo_dir = ensure_pane_bin(cache.path(), &cargo).unwrap();
         let brew_dir = ensure_pane_bin(cache.path(), &brew).unwrap();
         assert_ne!(cargo_dir, brew_dir);
-        assert_eq!(std::fs::read_link(cargo_dir.join("croft")).unwrap(), cargo);
-        assert_eq!(std::fs::read_link(brew_dir.join("croft")).unwrap(), brew);
+        #[cfg(unix)]
+        {
+            assert_eq!(std::fs::read_link(cargo_dir.join(bin_name)).unwrap(), cargo);
+            assert_eq!(std::fs::read_link(brew_dir.join(bin_name)).unwrap(), brew);
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(
+                std::fs::read_to_string(cargo_dir.join(bin_name)).unwrap(),
+                "cargo-croft"
+            );
+            assert_eq!(
+                std::fs::read_to_string(brew_dir.join(bin_name)).unwrap(),
+                "brew-croft"
+            );
+        }
     }
 
     #[test]
     fn a_pane_bin_link_naming_another_binary_is_repointed() {
         let cache = tempfile::tempdir().unwrap();
         let bins = tempfile::tempdir().unwrap();
+        let bin_name = if cfg!(windows) { "croft.exe" } else { "croft" };
         let exe = bins.path().join("croft");
         let stranger = bins.path().join("stranger");
-        std::fs::write(&exe, "").unwrap();
-        std::fs::write(&stranger, "").unwrap();
+        std::fs::write(&exe, b"croft-exe").unwrap();
+        std::fs::write(&stranger, b"stranger-binary").unwrap();
         let dir = ensure_pane_bin(cache.path(), &exe).unwrap();
-        std::fs::remove_file(dir.join("croft")).unwrap();
-        std::os::unix::fs::symlink(&stranger, dir.join("croft")).unwrap();
+        std::fs::remove_file(dir.join(bin_name)).unwrap();
+        crate::platform::fs::create_file_link(&stranger, &dir.join(bin_name)).unwrap();
         ensure_pane_bin(cache.path(), &exe).unwrap();
-        assert_eq!(std::fs::read_link(dir.join("croft")).unwrap(), exe);
+        #[cfg(unix)]
+        assert_eq!(std::fs::read_link(dir.join(bin_name)).unwrap(), exe);
+        #[cfg(not(unix))]
+        assert_eq!(
+            std::fs::read_to_string(dir.join(bin_name)).unwrap(),
+            "croft-exe"
+        );
+    }
+
+    #[test]
+    fn osc7_strips_leading_slash_before_windows_drive_letter() {
+        let mut s = OscSniffer::default();
+        let events = scan_all(
+            &mut s,
+            &[
+                b"\x1b]7;file://DESKTOP/C:/Users/Elio%20Test\x07",
+                b"\x1b]7;file:///D:/work/croft\x07",
+            ],
+        );
+        assert_eq!(
+            events,
+            vec![
+                OscEvent::Cwd(
+                    PathBuf::from("C:/Users/Elio Test"),
+                    Some(String::from("DESKTOP"))
+                ),
+                OscEvent::Cwd(PathBuf::from("D:/work/croft"), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn powershell_shim_written_idempotently_and_contains_osc_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = ensure_powershell_shim(tmp.path()).expect("ps1 shim must be written");
+        assert!(file.is_file(), "shellIntegration.ps1 must exist");
+        assert!(
+            file.ends_with(
+                std::path::Path::new("shell-integration")
+                    .join("powershell")
+                    .join("shellIntegration.ps1")
+            ),
+            "unexpected path: {}",
+            file.display()
+        );
+        let s = std::fs::read_to_string(&file).unwrap();
+        for needle in [
+            "133;A",
+            "133;B",
+            "133;C",
+            "133;D",
+            "]7;file://",
+            "[char]0x1b",
+            "[char]7",
+            "EndOfLine",
+            "BackwardDeleteLine",
+            "CROFT_PS_NO_PROFILE",
+            "CROFT_PANE_BIN",
+        ] {
+            assert!(
+                s.contains(needle),
+                "PowerShell shim must contain {needle:?}"
+            );
+        }
+        assert_eq!(ensure_powershell_shim(tmp.path()).unwrap(), file);
     }
 }

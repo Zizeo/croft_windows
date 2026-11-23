@@ -17,7 +17,7 @@ use super::*;
 /// dotfiles unchanged and emits OSC 133 prompt marks + the OSC 7 cwd
 /// report. Opt out with `CROFT_SHELL_INTEGRATION=0`. Failures are
 /// non-fatal — the shell still spawns, just without marks.
-pub(super) fn apply_shell_integration_env(
+pub(crate) fn apply_shell_integration_env(
     cmd: &mut CommandBuilder,
     shell_path: &str,
     config_dir: &std::path::Path,
@@ -26,11 +26,8 @@ pub(super) fn apply_shell_integration_env(
     if std::env::var("CROFT_SHELL_INTEGRATION").as_deref() == Ok("0") {
         return args;
     }
-    let base = std::path::Path::new(shell_path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    match base {
+    let base = shell_base_normalized(shell_path);
+    match base.as_str() {
         "zsh" => {
             let Ok(shim) = crate::shell_integration::ensure_zsh_shim(config_dir) else {
                 return args;
@@ -94,6 +91,29 @@ pub(super) fn apply_shell_integration_env(
             cmd.env("CROFT_FISH_XDG_DATA_DIR", &dir);
             args
         }
+        "pwsh" | "powershell" => {
+            let Ok(shim) = crate::shell_integration::ensure_powershell_shim(config_dir) else {
+                return args;
+            };
+            if args.iter().any(|a| a.eq_ignore_ascii_case("-noprofile")) {
+                cmd.env("CROFT_PS_NO_PROFILE", "1");
+            }
+            let mut out: Vec<String> = args
+                .into_iter()
+                .filter(|a| {
+                    !a.eq_ignore_ascii_case("-nologo") && !a.eq_ignore_ascii_case("-noexit")
+                })
+                .collect();
+            out.extend([
+                "-NoLogo".to_string(),
+                "-NoExit".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                shim.display().to_string(),
+            ]);
+            out
+        }
         _ => args,
     }
 }
@@ -140,6 +160,17 @@ pub(super) fn parse_bash_version_supported(s: &str) -> bool {
     maj > 4 || (maj == 4 && min >= 4)
 }
 
+/// Normalize a shell executable path to its lowercase stem without `.exe`
+/// (e.g. `C:\Program Files\PowerShell\7\pwsh.exe` -> `"pwsh"`).
+pub fn shell_base_normalized(shell_path: &str) -> String {
+    let base = shell_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(shell_path)
+        .to_ascii_lowercase();
+    base.strip_suffix(".exe").unwrap_or(&base).to_string()
+}
+
 /// Pick the program + args to spawn the user's interactive shell so it
 /// behaves like the one iTerm2 / Terminal.app launches. Both run the
 /// shell as a *login* shell (`Login shell` is iTerm2's default Command
@@ -148,23 +179,86 @@ pub(super) fn parse_bash_version_supported(s: &str) -> bool {
 /// `.zprofile` — PATH munging, framework loaders, plugin managers like
 /// zinit/oh-my-zsh that install keybindings, vi-mode toggles — is
 /// silently absent inside croft. For mainstream POSIX shells we pass
-/// `-l`; for anything exotic we leave argv empty rather than risk
-/// breaking the spawn with an unknown flag.
+/// `-l`; for PowerShell we pass `-NoLogo`; for anything exotic we leave
+/// argv empty rather than risk breaking the spawn with an unknown flag.
 pub fn interactive_shell_invocation(shell_path: &str) -> (String, Vec<String>) {
-    let basename = std::path::Path::new(shell_path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(shell_path);
-    let supports_login_flag = matches!(
-        basename,
-        "zsh" | "bash" | "fish" | "ksh" | "mksh" | "dash" | "tcsh" | "sh"
-    );
-    let args = if supports_login_flag {
-        vec!["-l".to_string()]
-    } else {
-        Vec::new()
+    let base = shell_base_normalized(shell_path);
+    let args = match base.as_str() {
+        "zsh" | "bash" | "fish" | "ksh" | "mksh" | "dash" | "tcsh" | "sh" => {
+            vec!["-l".to_string()]
+        }
+        "pwsh" | "powershell" => vec!["-NoLogo".to_string()],
+        _ => Vec::new(),
     };
     (shell_path.to_string(), args)
+}
+
+/// Discover installed Windows shells for the terminal profile picker.
+/// Probes `PATH` (via `resolve_on_path`) and standard installation paths
+/// for PowerShell 7 (`pwsh`), Windows PowerShell (`powershell`), Command
+/// Prompt (`cmd`), Git Bash (`Git Bash`), and WSL (`wsl`).
+pub fn discover_windows_shells() -> Vec<(String, String)> {
+    let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| String::from(r"C:\Windows"));
+    let candidates: [(&str, &str, Vec<std::path::PathBuf>); 5] = [
+        (
+            "pwsh.exe",
+            "pwsh",
+            vec![std::path::PathBuf::from(
+                r"C:\Program Files\PowerShell\7\pwsh.exe",
+            )],
+        ),
+        (
+            "powershell.exe",
+            "powershell",
+            vec![
+                std::path::PathBuf::from(&sys_root)
+                    .join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+            ],
+        ),
+        (
+            "cmd.exe",
+            "cmd",
+            std::env::var("COMSPEC")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+                .into_iter()
+                .chain(std::iter::once(
+                    std::path::PathBuf::from(&sys_root).join(r"System32\cmd.exe"),
+                ))
+                .collect(),
+        ),
+        (
+            "",
+            "Git Bash",
+            vec![
+                std::path::PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
+                std::path::PathBuf::from(r"C:\Program Files (x86)\Git\bin\bash.exe"),
+            ],
+        ),
+        (
+            "wsl.exe",
+            "wsl",
+            vec![std::path::PathBuf::from(&sys_root).join(r"System32\wsl.exe")],
+        ),
+    ];
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (path_cmd, label, fallbacks) in candidates {
+        let resolved = (!path_cmd.is_empty())
+            .then(|| crate::platform::env::resolve_on_path(path_cmd))
+            .flatten()
+            .or_else(|| fallbacks.into_iter().find(|p| p.is_file()));
+        if let Some(path) = resolved {
+            let path_str = path.to_string_lossy().into_owned();
+            if !out
+                .iter()
+                .any(|(p, l)| p.eq_ignore_ascii_case(&path_str) || l.eq_ignore_ascii_case(label))
+            {
+                out.push((path_str, label.to_string()));
+            }
+        }
+    }
+    out
 }
 
 /// Parse `/etc/shells` into `(path, basename)` terminal profiles: skip comments
@@ -275,6 +369,8 @@ pub(super) const HOST_TERMINAL_VARS: &[&str] = &[
     "WEZTERM_PANE",
     "WEZTERM_EXECUTABLE",
     "VTE_VERSION",
+    "WT_SESSION",
+    "WT_PROFILE_ID",
 ];
 
 /// The locale variable to set so a Linux shell reads its text as UTF-8, or
