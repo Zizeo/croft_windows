@@ -593,27 +593,73 @@ pub fn ask_host() -> PendingHostProbe {
     }
 }
 
+/// Probe the host terminal on non-Unix platforms (Windows console / ConPTY)
+/// for Kitty keyboard, XTWINOPS pixel geometry, and DA1 Sixel support.
+#[cfg(not(unix))]
+pub fn ask_host() -> PendingHostProbe {
+    PendingHostProbe(crate::platform::terminal::ask_host_terminal())
+}
+
 /// The host probe, asked and not yet answered.
 #[cfg(unix)]
 pub struct PendingHostProbe {
     sent: bool,
 }
 
+/// The host probe, asked and not yet answered.
+#[cfg(not(unix))]
+pub struct PendingHostProbe(crate::platform::terminal::PendingWindowsProbe);
+
 #[cfg(unix)]
 impl PendingHostProbe {
-    /// Read the replies, waiting at most the probe's budget for them.
-    pub fn answer(self) -> HostProbe {
+    fn read_reply(self) -> Vec<u8> {
         use std::os::fd::AsRawFd;
         if !self.sent {
-            return HostProbe::default();
+            return Vec::new();
         }
         // ~250ms total budget: comfortably covers an SSH round-trip while staying
         // imperceptible. DA1 normally returns in a few ms regardless.
-        let reply = read_da1_reply(
+        read_da1_reply(
             std::io::stdin().as_raw_fd(),
             std::time::Duration::from_millis(250),
-        );
-        HostProbe::parse(&reply)
+        )
+    }
+
+    /// Read the replies, waiting at most the probe's budget for them.
+    pub fn answer(self) -> HostProbe {
+        HostProbe::parse(&self.read_reply())
+    }
+
+    /// Read the replies and return the cross-platform probe result including
+    /// any XTWINOPS pixel geometry.
+    pub fn answer_full(self) -> crate::platform::terminal::HostProbeResult {
+        let reply = self.read_reply();
+        let probe = HostProbe::parse(&reply);
+        let mut result = crate::platform::terminal::parse_host_probe_bytes(&reply);
+        result.sixel |= probe.sixel;
+        result.kitty_keyboard |= probe.kitty_keyboard;
+        result.answered |= probe.answered;
+        result
+    }
+}
+
+#[cfg(not(unix))]
+impl PendingHostProbe {
+    /// Read the replies, waiting at most the probe's budget for them.
+    #[allow(dead_code)]
+    pub fn answer(self) -> HostProbe {
+        let result = self.answer_full();
+        HostProbe {
+            sixel: result.sixel,
+            kitty_keyboard: result.kitty_keyboard,
+            answered: result.answered,
+        }
+    }
+
+    /// Read the replies and return the full cross-platform probe result
+    /// including XTWINOPS / console-font cell pixel geometry.
+    pub fn answer_full(self) -> crate::platform::terminal::HostProbeResult {
+        self.0.answer()
     }
 }
 

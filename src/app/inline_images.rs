@@ -290,14 +290,31 @@ impl App {
         if !self.inline_images_enabled() {
             return;
         }
-        let Ok(ws) = crossterm::terminal::window_size() else {
-            return;
+        let font_cell = || {
+            crate::platform::terminal::console_font_cell_pixel()
+                .map(|(w, h)| (u32::from(w), u32::from(h)))
         };
-        if ws.columns == 0 || ws.rows == 0 {
-            return;
-        }
-        let (cell_w, cell_h) =
-            cell_pixel_of(ws.columns, ws.rows, ws.width, ws.height).unwrap_or(FALLBACK_CELL_PIXEL);
+        let probed = match crossterm::terminal::window_size() {
+            Ok(ws) => {
+                if ws.columns == 0 || ws.rows == 0 {
+                    return;
+                }
+                cell_pixel_of(ws.columns, ws.rows, ws.width, ws.height)
+            }
+            Err(_) => {
+                let Ok((cols, rows)) = crossterm::terminal::size() else {
+                    return;
+                };
+                if cols == 0 || rows == 0 {
+                    return;
+                }
+                None
+            }
+        };
+        let (cell_w, cell_h) = probed
+            .or(self.cell_pixel)
+            .or_else(font_cell)
+            .unwrap_or(FALLBACK_CELL_PIXEL);
         self.cell_pixel = Some((cell_w, cell_h));
         // OSC-1337 hero will own the no-repo illustration cells; the
         // widget skips its ASCII fallback so resize doesn't flash old

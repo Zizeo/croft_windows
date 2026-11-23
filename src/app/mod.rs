@@ -6132,7 +6132,6 @@ pub fn run(
     // the editor is built: the answers travel while App::new runs instead of
     // after it, which over SSH is a network round trip off the first frame.
     enable_raw_mode().context("enable raw mode")?;
-    #[cfg(unix)]
     let host_probe = StartupProbe(Some(crate::iterm2_inline::ask_host()));
     let mut app = App::new(root.clone())?;
     crate::startup_trace::mark("editor built");
@@ -6244,7 +6243,6 @@ pub fn run(
     // from the environment and the reply lists it. tmux answers DA1 itself,
     // listing sixel when it was built with it whatever the terminal around
     // it can draw, so there the reply says nothing about the screen.
-    #[cfg(unix)]
     {
         let host = host_probe.answer();
         if app.inline_protocol == crate::iterm2_inline::InlineImageProtocol::None {
@@ -6253,6 +6251,9 @@ pub fn run(
                 .store(app.sixel_supported, std::sync::atomic::Ordering::Relaxed);
         }
         app.legacy_ctrl_punct = host.answered && !host.kitty_keyboard;
+        if let Some((w, h)) = host.cell_pixel_size {
+            app.cell_pixel = Some((u32::from(w), u32::from(h)));
+        }
     }
     crate::startup_trace::mark("host terminal answered");
     let mut out = stdout();
@@ -6468,24 +6469,21 @@ pub fn run(
 /// The host probe `run` sent before building the editor. Should building it
 /// fail, the replies are still read off the tty, so they never land at the
 /// shell's prompt, and raw mode is undone before the error prints.
-#[cfg(unix)]
 struct StartupProbe(Option<crate::iterm2_inline::PendingHostProbe>);
 
-#[cfg(unix)]
 impl StartupProbe {
-    fn answer(mut self) -> crate::iterm2_inline::HostProbe {
+    fn answer(mut self) -> crate::platform::terminal::HostProbeResult {
         self.0
             .take()
-            .map(crate::iterm2_inline::PendingHostProbe::answer)
+            .map(crate::iterm2_inline::PendingHostProbe::answer_full)
             .unwrap_or_default()
     }
 }
 
-#[cfg(unix)]
 impl Drop for StartupProbe {
     fn drop(&mut self) {
         if let Some(pending) = self.0.take() {
-            let _ = pending.answer();
+            let _ = pending.answer_full();
             disable_raw_mode().ok();
         }
     }

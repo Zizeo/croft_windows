@@ -45,7 +45,6 @@ pub use commands::CommandDecoration;
 pub use commands::human_duration;
 pub use commands::pick_prompt_jump;
 use commands::*;
-#[cfg(unix)]
 pub use images::SIXEL_HOST;
 use images::*;
 pub use input::osc52_copy_seq;

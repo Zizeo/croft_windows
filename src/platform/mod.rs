@@ -7,4 +7,5 @@ pub mod fs;
 pub mod ipc;
 pub mod os;
 pub mod process;
+pub mod terminal;
 pub mod time;

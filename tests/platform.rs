@@ -428,3 +428,79 @@ fn powershell_shim_emits_osc133_and_osc7_in_live_powershell() {
         );
     }
 }
+
+#[test]
+fn terminal_probe_parser_decodes_kitty_xtwinops_16t_14t_and_da1() {
+    use platform::terminal::{
+        HostProbeResult, has_complete_da1, parse_host_probe_bytes, parse_host_probe_bytes_with_grid,
+    };
+
+    let combined = b"\x1b[?0u\x1b[6;20;10t\x1b[4;600;1200t\x1b[?65;4;6;18;22;52c";
+    assert!(has_complete_da1(combined));
+    assert_eq!(
+        parse_host_probe_bytes(combined),
+        HostProbeResult {
+            sixel: true,
+            kitty_keyboard: true,
+            answered: true,
+            cell_pixel_size: Some((10, 20)),
+            window_pixel_size: Some((1200, 600)),
+        }
+    );
+
+    // Windows Terminal without Sixel advertises attributes like 14 and 42;
+    // make sure neither matches Sixel attribute 4 as a substring.
+    let wt_no_sixel = b"\x1b[?1u\x1b[?61;6;7;14;21;22;23;24;28;32;42c";
+    assert!(has_complete_da1(wt_no_sixel));
+    assert_eq!(
+        parse_host_probe_bytes(wt_no_sixel),
+        HostProbeResult {
+            sixel: false,
+            kitty_keyboard: true,
+            answered: true,
+            cell_pixel_size: None,
+            window_pixel_size: None,
+        }
+    );
+
+    // CSI 14 t fallback computes cell size from grid when CSI 16 t is absent.
+    let only_14t = b"\x1b[4;600;1200t\x1b[?61;4c";
+    assert_eq!(
+        parse_host_probe_bytes_with_grid(only_14t, Some((120, 30))),
+        HostProbeResult {
+            sixel: true,
+            kitty_keyboard: false,
+            answered: true,
+            cell_pixel_size: Some((10, 20)),
+            window_pixel_size: Some((1200, 600)),
+        }
+    );
+
+    // Partial / zero-valued sequences are ignored safely.
+    assert!(!has_complete_da1(b"\x1b[?62;4"));
+    assert_eq!(
+        parse_host_probe_bytes(b"\x1b[?62;4\x1b[6;0;10t"),
+        HostProbeResult::default()
+    );
+}
+
+#[test]
+fn terminal_probe_safe_on_non_console_handles() {
+    let t0 = std::time::Instant::now();
+    let res = platform::terminal::ask_host_terminal().answer();
+    assert!(
+        t0.elapsed() < std::time::Duration::from_millis(500),
+        "terminal probe blocked unexpectedly: {:?}",
+        t0.elapsed()
+    );
+    if let Some((w, h)) = res.cell_pixel_size {
+        assert!(w > 0 && h > 0, "invalid probed cell pixel size: ({w}, {h})");
+    }
+    if let Some((w, h)) = platform::terminal::console_font_cell_pixel() {
+        assert!(w > 0 && h > 0, "invalid font cell pixel size: ({w}, {h})");
+    }
+    #[cfg(windows)]
+    if let Some((cols, rows)) = platform::terminal::console_grid_size() {
+        assert!(cols > 0 && rows > 0, "invalid grid size: ({cols}, {rows})");
+    }
+}
