@@ -42,7 +42,7 @@ pub fn eligible(manifest_dir: &str) -> bool {
 
 /// [`eligible`], given whether `manifest_dir` exists on this machine.
 pub fn eligible_with(manifest_dir: &str, exists: bool) -> bool {
-    manifest_dir.contains("/registry/src/") || !exists
+    manifest_dir.contains("/registry/src/") || manifest_dir.contains("\\registry\\src\\") || !exists
 }
 
 /// The archive and checksum URLs for `version` (no `v`) and `triple`.
@@ -169,7 +169,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// business carrying one, and a link named like the binary could point
 /// anywhere.
 pub fn unpack_binary(archive: &[u8], triple: &str) -> Result<Vec<u8>> {
-    let want = format!("croft-{triple}/croft");
+    let bin = if triple.contains("-windows-") {
+        "croft.exe"
+    } else {
+        "croft"
+    };
+    let want = format!("croft-{triple}/{bin}");
     let mut found = None;
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
     for entry in tar.entries().context("reading the release archive")? {
@@ -585,5 +590,20 @@ mod tests {
             bundle_url("0.1.9"),
             format!("{RELEASES}/v0.1.9/SHA256SUMS.sigstore.json")
         );
+    }
+
+    #[test]
+    fn windows_archive_unpacks_croft_exe_and_eligible_recognises_windows_registry() {
+        let win_triple = "x86_64-pc-windows-msvc";
+        let archive = archive_with(&[(
+            &format!("croft-{win_triple}/croft.exe"),
+            b"MZ-fake-windows-exe",
+        )]);
+        let bytes = unpack_binary(&archive, win_triple).unwrap();
+        assert_eq!(bytes, b"MZ-fake-windows-exe");
+        assert!(eligible_with(
+            r"C:\Users\u\.cargo\registry\src\index.crates.io-1\croft-software-0.2.181",
+            true
+        ));
     }
 }

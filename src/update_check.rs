@@ -499,7 +499,10 @@ pub fn dismiss(cache_dir: &Path, version: &str) -> std::io::Result<()> {
 /// Where a staged build lands: cargo's `--root` layout puts the binary
 /// under `bin/`.
 pub fn staged_binary_path(cache_dir: &Path) -> PathBuf {
-    cache_dir.join(STAGE_DIR).join("bin").join("croft")
+    cache_dir
+        .join(STAGE_DIR)
+        .join("bin")
+        .join(format!("croft{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// `cargo install croft-software --version X --locked --root <stage>`: a
@@ -533,6 +536,10 @@ pub fn prebuilt_triple_for(os: &str, arch: &str) -> Option<&'static str> {
         "macos" => match arch {
             "aarch64" => Some("aarch64-apple-darwin"),
             "x86_64" => Some("x86_64-apple-darwin"),
+            _ => None,
+        },
+        "windows" => match arch {
+            "x86_64" => Some("x86_64-pc-windows-msvc"),
             _ => None,
         },
         _ => None,
@@ -828,6 +835,31 @@ fn temp_name(dir: &Path) -> PathBuf {
     dir.join(format!(".croft-update-{}-{nonce}", std::process::id()))
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn backup_name(target: &Path) -> PathBuf {
+    let mut os = target.as_os_str().to_os_string();
+    os.push(".old");
+    PathBuf::from(os)
+}
+
+/// Remove a `.old` backup left behind by a self-update of a running Windows `.exe`.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub fn cleanup_old_binary(target: &Path) {
+    let _ = std::fs::remove_file(backup_name(target));
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn replace_via_backup(tmp: &Path, target: &Path) -> std::io::Result<()> {
+    let backup = backup_name(target);
+    let _ = std::fs::remove_file(&backup);
+    crate::platform::fs::rename_retrying(target, &backup)?;
+    if let Err(err) = crate::platform::fs::rename_retrying(tmp, target) {
+        let _ = crate::platform::fs::rename_retrying(&backup, target);
+        return Err(err);
+    }
+    Ok(())
+}
+
 fn apply_staged_at(staged: &Path, target: &Path, tmp: &Path) -> std::io::Result<()> {
     let result = (|| {
         let mut src = std::fs::File::open(staged)?;
@@ -842,7 +874,18 @@ fn apply_staged_at(staged: &Path, target: &Path, tmp: &Path) -> std::io::Result<
         std::io::copy(&mut src, &mut dst)?;
         dst.sync_all()?;
         drop(dst);
-        std::fs::rename(tmp, target)
+        #[cfg(unix)]
+        {
+            std::fs::rename(tmp, target)
+        }
+        #[cfg(not(unix))]
+        {
+            match crate::platform::fs::rename_retrying(tmp, target) {
+                Ok(()) => Ok(()),
+                Err(_) if target.exists() => replace_via_backup(tmp, target),
+                Err(err) => Err(err),
+            }
+        }
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(tmp);
@@ -1049,8 +1092,25 @@ mod tests {
         );
         assert_eq!(
             staged_binary_path(Path::new("/c")),
-            PathBuf::from("/c/staged/bin/croft")
+            PathBuf::from(format!("/c/staged/bin/croft{}", std::env::consts::EXE_SUFFIX))
         );
+    }
+
+    #[test]
+    fn replace_via_backup_moves_target_to_old_and_cleanup_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("croft.exe");
+        let tmp = dir.path().join(".croft-update-tmp");
+        std::fs::write(&target, b"old-bin").unwrap();
+        std::fs::write(&tmp, b"new-bin").unwrap();
+
+        replace_via_backup(&tmp, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new-bin");
+        let backup = backup_name(&target);
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old-bin");
+
+        cleanup_old_binary(&target);
+        assert!(!backup.exists());
     }
 
     #[test]
@@ -1461,7 +1521,11 @@ mod tests {
             Some("aarch64-unknown-linux-musl")
         );
         assert_eq!(prebuilt_triple_for("macos", "powerpc"), None);
-        assert_eq!(prebuilt_triple_for("windows", "x86_64"), None);
+        assert_eq!(
+            prebuilt_triple_for("windows", "x86_64"),
+            Some("x86_64-pc-windows-msvc")
+        );
+        assert_eq!(prebuilt_triple_for("windows", "aarch64"), None);
         assert_eq!(prebuilt_triple_for("freebsd", "x86_64"), None);
     }
 

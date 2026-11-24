@@ -5996,6 +5996,10 @@ pub fn run(
     zen: bool,
     workspace_folders: Vec<PathBuf>,
 ) -> Result<()> {
+    #[cfg(windows)]
+    if let Ok(exe) = std::env::current_exe() {
+        crate::update_check::cleanup_old_binary(&exe);
+    }
     // What building the editor reads that takes real work to make: the
     // bundled extension manifests (one TOML parse each) and the built-in
     // secret and agent-prompt regexes. Together they were most of what a
