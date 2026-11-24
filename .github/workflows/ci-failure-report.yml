@@ -87,6 +87,13 @@ jobs:
         # waits on the failed jobs before calling this workflow. A log that
         # cannot be fetched is a warning, not a failure - the report still names
         # the job and its failing steps from the jobs API.
+        #
+        # The logs endpoint answers a redirect to a signed blob URL. Letting `gh api`
+        # follow it sends the Authorization header along, and the storage host
+        # rejects a token it did not issue - so EVERY job's log failed to download
+        # and the first real report (run 45498457151) was five job names with no
+        # error in it. `--include` stops gh at the Location header; curl then fetches
+        # the blob unauthenticated, which is what the signed URL is for.
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -103,10 +110,16 @@ jobs:
             | select(.conclusion | IN("failure", "timed_out", "cancelled", "startup_failure"))
             | "\(.id)\t\(.name)"' ci-jobs.json > ci-logs/failed.tsv
           while IFS=$'\t' read -r id name; do
-            gh api -H "Accept: application/vnd.github+json" \
-              "repos/$REPO/actions/jobs/$id/logs" > "ci-logs/$id.log" \
-              || { rm -f "ci-logs/$id.log"
-                   echo "::warning::no log downloaded for the failed job $name ($id)"; }
+          headers="$(mktemp)"
+          if gh api --include "repos/$REPO/actions/jobs/$id/logs" > "$headers"; then
+          location="$(awk 'BEGIN{IGNORECASE=1} /^location:/ { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }' "$headers" | tr -d '\r')"
+          if [ -n "$location" ] && curl -fsSL "$location" -o "ci-logs/$id.log"; then
+          rm -f "$headers"
+          continue
+          fi
+          fi
+          rm -f "$headers" "ci-logs/$id.log"
+          echo "::warning::no log downloaded for the failed job $name ($id)"
           done < ci-logs/failed.tsv
       - name: Write the report into the run summary
         # `tee` writes the file the artifact carries and the stdout the summary
