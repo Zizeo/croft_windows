@@ -64,6 +64,12 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -109,8 +115,16 @@ jobs:
         # false green as the missing arm below (#551).
         run: |
           set -euo pipefail
-          bin="target/${{ matrix.target }}/release/croft"
-          test -x "$bin" || { echo "::error::no artifact at $bin"; exit 1; }
+          ext=""
+          case "${{ matrix.target }}" in
+            *-windows-*) ext=".exe" ;;
+          esac
+          bin="target/${{ matrix.target }}/release/croft${ext}"
+          if [ -z "$ext" ]; then
+            test -x "$bin" || { echo "::error::no artifact at $bin"; exit 1; }
+          else
+            test -f "$bin" || { echo "::error::no artifact at $bin"; exit 1; }
+          fi
           file "$bin"
           # Exact triples, not suffixes: a typo in a matrix target then reaches
           # the catch-all rather than silently matching `*-linux-musl`.
@@ -119,6 +133,7 @@ jobs:
             aarch64-unknown-linux-musl) file "$bin" | grep -qE 'ELF 64-bit LSB.*aarch64' ;;
             x86_64-apple-darwin)        file "$bin" | grep -qE 'Mach-O 64-bit.*(x86_64|x86-64)' ;;
             aarch64-apple-darwin)       file "$bin" | grep -qE 'Mach-O 64-bit.*arm64e?' ;;
+            x86_64-pc-windows-msvc)     file "$bin" | grep -qE 'PE32\+ executable.*x86-64' ;;
             # A `case` with no match exits 0, so without this arm the whole
             # assertion becomes a silent no-op for any target the list does
             # not name - green step, unchecked artifact (#551). Adding a
@@ -127,14 +142,19 @@ jobs:
           esac
 
       - name: Package
-        # The archive layout binstall resolves against: a single `croft` at the
-        # root of a tar.gz named for the target. The crate is croft-software
-        # and the binary is croft, so the two names differ on purpose.
+        # The archive layout binstall resolves against: a single `croft` (or
+        # `croft.exe` on Windows) at the root of a tar.gz named for the target.
+        # The crate is croft-software and the binary is croft, so the two
+        # names differ on purpose.
         id: package
         run: |
           name="croft-${{ matrix.target }}"
+          ext=""
+          case "${{ matrix.target }}" in
+            *-windows-*) ext=".exe" ;;
+          esac
           mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/release/croft" "dist/$name/croft"
+          cp "target/${{ matrix.target }}/release/croft${ext}" "dist/$name/croft${ext}"
           cp README.md LICENSE "dist/$name/" 2>/dev/null || true
           tar -czf "dist/$name.tar.gz" -C dist "$name"
           echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
@@ -160,9 +180,9 @@ jobs:
           cd dist
           for f in "croft-${{ matrix.target }}.tar.gz" "croft-${{ matrix.target }}.cdx.json"; do
             if command -v sha256sum >/dev/null; then
-              sha256sum "$f" > "$f.sha256"
+              sha256sum "$f" | tr -d '\r' > "$f.sha256"
             else
-              shasum -a 256 "$f" > "$f.sha256"
+              shasum -a 256 "$f" | tr -d '\r' > "$f.sha256"
             fi
             cat "$f.sha256"
           done
@@ -208,12 +228,12 @@ jobs:
           mkdir -p dist
           find staged \( -name 'croft-*.tar.gz' -o -name 'croft-*.cdx.json' \) -exec cp {} dist/ \;
           cd dist
-          # Four archives, or the release is incomplete. Publishing three and
-          # a checksum file that says three is worse than failing: binstall
+          # Five archives, or the release is incomplete. Publishing fewer and
+          # a checksum file for fewer is worse than failing: binstall
           # would resolve for some users and 404 for others.
           count=$(ls -1 croft-*.tar.gz | wc -l | tr -d ' ')
-          if [ "$count" -ne 4 ]; then
-            echo "expected 4 archives, found $count:"
+          if [ "$count" -ne 5 ]; then
+            echo "expected 5 archives, found $count:"
             ls -1
             exit 1
           fi
@@ -231,7 +251,7 @@ jobs:
           # corrupted archive, which is the one thing it exists to catch.
           # The per-target .sha256 files are the only independent evidence,
           # so they are the input.
-          cat ../staged/*/croft-*.sha256 > SHA256SUMS
+          cat ../staged/*/croft-*.sha256 | tr -d '\r' > SHA256SUMS
           cat SHA256SUMS
           # `sha256sum -c` verifies the lines that ARE there; it cannot report
           # one that is missing. A leg whose .sha256 never arrived would ship

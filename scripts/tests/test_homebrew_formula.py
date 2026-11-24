@@ -70,9 +70,12 @@ class Render(unittest.TestCase):
 class MatchesTheRelease(unittest.TestCase):
     def test_targets_are_the_release_matrix(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
-        self.assertEqual(
-            set(TARGETS), check_binstall_contract.matrix_targets(workflow)
-        )
+        homebrew_targets = {
+            t
+            for t in check_binstall_contract.matrix_targets(workflow)
+            if "-windows-" not in t
+        }
+        self.assertEqual(set(TARGETS), homebrew_targets)
 
     def test_archive_names_match_the_package_step(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
