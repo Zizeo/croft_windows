@@ -1,30 +1,41 @@
-# croft Windows Tier 2 Port — Remaining Sub-projects Plan (Sub-projects 2–6)
+# croft Windows Tier 2 Port — Status & Sub-project 7 Plan
 
 > **Repository:** `C:\Users\Elio\prog\croft_windows` (`github.com:Zizeo/croft_windows`, branch `windows-port`)  
 > **Target Environment:** `x86_64-pc-windows-msvc`, Rust `1.97.1` (Edition `2024`), PowerShell 7+ (`pwsh.exe`), Windows PowerShell 5.1 (`powershell.exe`), `cmd.exe` fallback, hosted in Windows Terminal, WezTerm, or 3rd-party Windows terminal emulators.
 
 ---
 
-## 1. Current Baseline (Completed)
+## 1. Current Baseline (Completed through Sub-project 6 & Upstream `v2.181`)
 
-Before Sub-projects 2–6, the following foundations are already implemented on branch `windows-port` (HEAD `a66ba1f`):
+At `windows-port` HEAD `9dd26b40d`, **Sub-projects 1 through 6** and the **upstream `v0.2.160`–`v0.2.181` (`v2.181`) merge** are complete and verified (`cargo fmt --check`, `cargo check --locked --bin croft --tests` with 0 warnings, `cargo build --locked --bin croft`, `cargo test --locked --test platform` [59 passed], `cargo test --locked --test cli` [25 passed], and `RUST_TEST_THREADS=4 cargo test --locked --bin croft` [8405 passed, 0 failed, 31 ignored]):
 
 1. **Sub-project 1 — Compilable Core & Platform Layer:**
    - Relocated `libc = "0.2"` and `async-lsp`'s `"stdio"` feature to `[target.'cfg(unix)'.dependencies]`; added `dunce = "1"` and minimal `windows-sys = "0.59"`.
    - Replaced the `date` subprocess in `build.rs` with a pure-Rust UTC ISO-8601 formatter.
    - Built unified OS abstractions under `src/platform/` (`env`, `fs`, `process`, `time`, `clipboard`, `os`, `ipc`) with `unsafe` Win32 FFI confined strictly to `src/platform/`, plus `dunce::canonicalize` UNC stripping, Win32 Job Objects (`ManagedChild`, `TreeKiller`), and Win32 `CF_UNICODETEXT` clipboard support.
    - Added ConPTY channel-bridged PTY reading in `src/widgets/terminal/backend.rs` and `src/widgets/terminal/spawn.rs`.
-   - Kept full `#[cfg(unix)]` compatibility and verified `cargo test --test platform` (`tests/platform.rs`).
 2. **Windows LSP Discovery & Provisioning (`95018c0`):**
    - Added `.exe`/`.cmd`/`.bat` executable lookup (`src/platform/env.rs`, `src/lsp/manager/discovery.rs`), Windows `uv.exe` PowerShell bootstrap and Node/`npm.cmd` discovery (`src/lsp/install.rs`), and `windows-x86_64` binary targets/digests for `rust-analyzer`, `taplo`, `clangd`, `marksman`, and `csvlens`.
 3. **Windows SSH Workspaces (`a66ba1f`):**
-   - Ported `croft remote`, `croft sync-config`, and `SshAuth` (`src/remote/control.rs`, `src/remote_connect.rs`, `src/remote_bulk.rs`, `src/remote/*.rs`) to socket-free Windows OpenSSH (`ssh.exe`).
+   - Ported `croft remote`, `croft sync-config`, and `SshAuth` (`src/remote/control.rs`, `src/remote_connect.rs`, `src/remote_bulk.rs`, `src/remote/*.rs`) to socket-free Windows OpenSSH (`ssh.exe`) and tracked `ssh -N -L` port forwards (`src/remote/forward.rs`).
+4. **Sub-project 2 — PowerShell Integration & Task Runner (`45c422f`):**
+   - Implemented `shellIntegration.ps1` (`OSC 133` + `OSC 7` + Windows drive-letter URL normalization) and PowerShell/cmd/Git Bash/WSL profile discovery, plus `ShellFlavor`-aware quoting and location/env wrappers in `src/tasks.rs`.
+5. **Sub-project 3 — Host Terminal Capabilities (`9f6fdac`):**
+   - Implemented Win32 console capability probing (`src/platform/terminal.rs`) for DA1 Sixel, Kitty keyboard protocol, and `CSI 16 t`/`14 t` + `GetCurrentConsoleFontEx` cell pixel geometry in Windows Terminal and WezTerm.
+6. **Sub-project 4 — Windows Toolchains & NTFS Hardening (`c8f6ab4`):**
+   - Wired Windows DAP venvs (`Scripts\python.exe`), `dlv.exe`, `lldb-dap.exe`, `node_modules\.bin\tsc.cmd`, and `rename_retrying`/`write_retrying` for Defender/indexer sharing violations.
+7. **Sub-project 5 — Local Windows IPC & `croft://` Links (`ce7458c`):**
+   - Implemented capability-authenticated loopback TCP `LocalListener`/`LocalStream` (`src/platform/ipc.rs`) enabling `croft view`, `croft edit --wait`, and Claude Code approval hooks (`croft hook`), plus `HKCU\Software\Classes\croft` link registration (`src/cli/links.rs`).
+8. **Sub-project 6 — Full Unit/CLI Test Suites & Windows CI/Release (`616d850`, `7088d88`):**
+   - Enabled full `--test platform`, `--test cli`, and `--bin croft` CI checks on `windows-latest` (`.github/workflows/ci.yml`) and `x86_64-pc-windows-msvc` release artifacts (`.github/workflows/release.yml`).
+9. **Upstream `v0.2.160`–`v0.2.181` Merge (`0fd612d`, `9dd26b4`):**
+   - Merged all 22 upstream releases from `v2.181` while preserving `TreeKiller`/`ManagedChild` process-tree cancellation, added `is_pid_alive` sweeping for stale decompressed gzip temp copies (`src/widgets/editor/viewers.rs`), added `WT_SESSION` SGR 58 underline-color support (`src/color_depth.rs`), and adapted new popup/tick/git/testing-worker tests for Windows.
 
-*(Tier-3 Unix-daemon / OpenSSH-`ControlMaster`-dependent features — `attach`, `ls`, `record`, `web`, `pane-host`, `session-host`, `collab`, `pair`, `devcontainer`, and `lsof`/`ss` socket inspection — remain permanently out of native Windows scope and direct users to WSL2.)*
+*(Tier-3 Unix-daemon / OpenSSH-`ControlMaster`-dependent features — `attach`, `ls`, `record`, `web`, `pane-host`, `session-host`, `collab`, `pair`, `devcontainer` — remain out of native Windows scope and direct users to WSL2.)*
 
 ---
 
-## 2. Sub-project 2 — PowerShell Shell Integration (`OSC 133` / `OSC 7`) & Task Runner
+## 2. Sub-project 2 — PowerShell Shell Integration (`OSC 133` / `OSC 7`) & Task Runner (Completed)
 
 ### Problem Statement
 - On Windows ConPTY, `PaneBackend::process_group_leader()` (`src/widgets/terminal/backend.rs`) and `cwd_of_pid` / `foreground_group_of` (`src/widgets/terminal/processes.rs:165-168, 357-361`) return `None` because Windows has no POSIX `tcgetpgrp(master)` or `/proc/<pid>/cwd`.
@@ -70,7 +81,7 @@ Before Sub-projects 2–6, the following foundations are already implemented on 
 
 ---
 
-## 3. Sub-project 3 — Host Terminal Capabilities (Windows Terminal & WezTerm)
+## 3. Sub-project 3 — Host Terminal Capabilities (Windows Terminal & WezTerm) (Completed)
 
 ### Problem Statement
 - `StartupProbe` (`src/app/mod.rs:6135-6136, 6247-6256` and `src/app/host_integration.rs`) is gated to `#[cfg(unix)]` because it uses raw `STDIN_FILENO` + `libc::poll` to send and parse DA1 (`\x1b[c`) and Kitty keyboard (`\x1b[?u`) queries.
@@ -103,7 +114,7 @@ Before Sub-projects 2–6, the following foundations are already implemented on 
 
 ---
 
-## 4. Sub-project 4 — Windows Toolchains (DAP, Venvs, Task Binaries, & NTFS Save Hardening)
+## 4. Sub-project 4 — Windows Toolchains (DAP, Venvs, Task Binaries, & NTFS Save Hardening) (Completed)
 
 ### Problem Statement
 While Windows LSP binary discovery and provisioning (`src/lsp/manager/discovery.rs`, `src/lsp/install.rs`) landed in `95018c0`, several non-LSP toolchain and filesystem paths still assume POSIX conventions:
@@ -141,7 +152,7 @@ While Windows LSP binary discovery and provisioning (`src/lsp/manager/discovery.
 
 ---
 
-## 5. Sub-project 5 — Local Windows IPC (`croft view`, `croft edit`, `croft hook`) & `croft://` Links
+## 5. Sub-project 5 — Local Windows IPC (`croft view`, `croft edit`, `croft hook`) & `croft://` Links (Completed)
 
 ### Problem Statement
 - `src/platform/ipc.rs` currently provides inert stub structs `LocalListener` and `LocalStream` on Windows.
@@ -178,7 +189,7 @@ While Windows LSP binary discovery and provisioning (`src/lsp/manager/discovery.
 
 ---
 
-## 6. Sub-project 6 — Full Unit Test Suite & Windows CI
+## 6. Sub-project 6 — Full Unit Test Suite & Windows CI (Completed)
 
 ### Problem Statement
 - Currently `cargo test --test platform` passes on Windows, while `cargo test --bin croft` (covering all internal `#[cfg(test)]` unit tests across `src/`) fails to compile on `x86_64-pc-windows-msvc` due to Unix-only imports (`std::os::unix::*`, `libc::*`), `/tmp/...` paths, `#!/bin/sh` mock scripts, and an un-excluded fallback clipboard test (`src/clipboard.rs:1042-1058`).
@@ -212,10 +223,117 @@ While Windows LSP binary discovery and provisioning (`src/lsp/manager/discovery.
 
 ---
 
-## 7. Recommended Execution Order
+## 7. Sub-project 7 — Windows Feature Parity & Polish (Remaining Tier-2 Gaps)
 
-1. **Sub-project 2 (PowerShell Integration & Tasks)** — highest daily UX impact for the embedded PowerShell ConPTY pane and task runner.
-2. **Sub-project 3 (Host Terminal Capabilities)** — unlocks crisp Sixel/OSC 1337 graphics and full Kitty keyboard chords in Windows Terminal and WezTerm.
-3. **Sub-project 4 (Windows DAP, Venvs & NTFS Save Hardening)** — finishes Python/Node/LLVM/Go debugging setup and eliminates Defender/indexer save races.
-4. **Sub-project 5 (Local Windows IPC & `croft://` Links)** — enables `croft view`, `croft edit`, Claude Code approval hooks, and protocol links.
-5. **Sub-project 6 (Full Unit Test Suite & Windows CI)** — locks in regression coverage across every sub-project on GitHub Actions.
+A full audit of `croft` on `windows-port` (`9dd26b40d`) identified **8 Tier-2 user-facing features** that are either still macOS/Unix-gated, fall back to no-ops on Windows, or fail because of Windows executable/pipe/shell differences:
+
+### 1. Prebuilt Self-Update & Running `.exe` Replacement (`src/update_check.rs`, `src/remote_prebuilt.rs`)
+- **Problem Statement:**
+  - `prebuilt_triple_for("windows", "x86_64")` (`src/update_check.rs:530-540`) returns `None`, even though `.github/workflows/release.yml` publishes `croft-x86_64-pc-windows-msvc.tar.gz`. Help → Update falls back to compiling from source (`cargo install`) instead of downloading the signed prebuilt release binary.
+  - `unpack_binary(archive, triple)` (`src/remote_prebuilt.rs:171-173`) looks strictly for `croft-{triple}/croft`, missing `croft-{triple}/croft.exe` inside Windows release archives.
+  - `apply_staged_at(staged, target, tmp)` (`src/update_check.rs:831-846`) calls `std::fs::rename(tmp, target)`. On Windows, `MoveFileExW` cannot overwrite a currently executing `croft.exe` (it fails with `ERROR_ACCESS_DENIED`), even though Windows *does* allow renaming the running `.exe` to a sibling backup name (`croft.exe.old`).
+- **Architecture & Changes:**
+  - Map `("windows", "x86_64")` -> `Some("x86_64-pc-windows-msvc")` in `prebuilt_triple_for` (and update `src/update_check.rs:1464`).
+  - In `src/remote_prebuilt.rs:unpack_binary`, expect `croft-{triple}/croft.exe` when `triple.contains("-windows-")`.
+  - Under `#[cfg(windows)]` in `apply_staged_at`: rename an existing `target` to `<target>.old` (removing any stale `.old` first), move `tmp` into `target`, and sweep leftover `croft.exe.old` files on startup once the relaunched process is running.
+
+### 2. Enable "Reveal in File Explorer" in Explorer & Tab Menus (`src/app/explorer.rs`, `src/app/editor_tabs.rs`, `src/app/editor_input.rs`)
+- **Problem Statement:**
+  - `crate::platform::os::reveal_in_file_manager` (`src/platform/os.rs:23-39`) already implements `explorer.exe /select,<path>`, and `App::reveal_in_finder` (`src/app/editor_tabs.rs:1935`) delegates to it.
+  - However, all UI entry points remain gated to `cfg!(target_os = "macos")` and labeled `"Reveal in Finder"`:
+    - Explorer context menu (`src/app/explorer.rs:306-336`)
+    - Explorer keyboard shortcut (`src/app/explorer.rs:2405`)
+    - Editor tab context menu (`src/app/editor_tabs.rs:50-58`)
+    - Editor keyboard shortcut (`src/app/editor_input.rs:519-522`)
+- **Architecture & Changes:**
+  - Enable `reveal_enabled` on local Windows sessions (`!self.is_remote && cfg!(any(target_os = "macos", target_os = "windows"))`).
+  - Display `"Reveal in Finder"` on macOS and `"Reveal in File Explorer"` on Windows across both context menus and command labels.
+
+### 3. "Move / Copy Tab into New Window" (`src/app/editor_tabs.rs:1941-2118`)
+- **Problem Statement:**
+  - `spawn_new_window` (`src/app/editor_tabs.rs:2109-2118`) returns `Unsupported("opening a new window is only supported on macOS")`, disabling "Move into New Window" and "Copy into New Window" on Windows.
+- **Architecture & Changes:**
+  - Add a `#[cfg(windows)]` `spawn_new_window(root, file)` implementation selecting the host terminal:
+    - Windows Terminal (`WT_SESSION` set): `wt.exe -w new <exe> <root> --open-file <file> --zen`
+    - WezTerm (`TERM_PROGRAM=WezTerm`): `wezterm start -- <exe> <root> --open-file <file> --zen`
+    - Fallback (`conhost` / other): `cmd.exe /C start "" <exe> <root> --open-file <file> --zen`
+
+### 4. Native Port Detection & Auto-Retirement (`src/port_detect.rs:478-507`)
+- **Problem Statement:**
+  - `poll_listeners` returns `Vec::new()` and `poll_all_listening` returns `None` on `#[cfg(not(unix))]`.
+  - As a result, dev servers that bind a socket silently without printing a URL to stdout/stderr are never discovered in the Ports panel, and stopped servers are never auto-retired by socket polling.
+- **Architecture & Changes:**
+  - Add a Win32 IP Helper backend (`GetExtendedTcpTable` for `AF_INET` and `AF_INET6` `TCP_TABLE_OWNER_PID_LISTENER`, confined to `src/platform/` or `#[cfg(windows)]` helper) to enumerate listening loopback/wildcard TCP ports and their owning PIDs.
+  - Match owning PIDs against the terminal shell's descendant PID tree using `sysinfo` (`Process::parent()`) so `poll_listeners` and `poll_all_listening` work natively without `ss` or `lsof`.
+
+### 5. Live Terminal Pane Auto-Labels, Agent Detection & SSH Offer (`src/widgets/terminal/processes.rs`, `src/app/terminal_panes.rs:1865-1936`)
+- **Problem Statement:**
+  - `PaneBackend::process_group_leader()` (`src/widgets/terminal/backend.rs`) returns `None` on Windows because ConPTY does not expose POSIX `tcgetpgrp`.
+  - Consequently `refresh_terminal_labels` (`src/app/terminal_panes.rs:1865-1936`) never sees a foreground child PID, leaving pane tab labels stuck on the shell name instead of updating to running tools (`cargo`, `python`, `claude`, `ssh`), disabling active agent detection, and preventing the `#364` "Open SSH workspace" prompt when running `ssh host` inside a pane.
+- **Architecture & Changes:**
+  - When `process_group_leader()` is `None` on Windows and `shell_pid` is known, walk the live child-process tree rooted at `shell_pid` via `sysinfo` (skipping `conhost.exe` / `OpenConsole.exe` host shims) to resolve the deepest active foreground child PID for `process_name` and `process_cmdline`.
+
+### 6. Shell-Aware `format_cd_command` & Line-Clear Sequence (`src/widgets/terminal/processes.rs:412-435`)
+- **Problem Statement:**
+  - `CLEAR_TYPED_LINE` (`\x05x\x15`) uses Emacs/readline `Ctrl+E` + `Ctrl+U`, and `format_cd_command(path)` emits POSIX `cd '...'` with `'\''` apostrophe escaping.
+  - On PowerShell (where `Esc` clears the line in PSReadLine and `''` escapes single quotes) or `cmd.exe` (which requires `cd /d "..."`), paths containing apostrophes or spaces (or pre-typed text in PowerShell) can fail when croft retargets a pane's working directory.
+- **Architecture & Changes:**
+  - Parameterize `format_cd_command` by `ShellFlavor` (reusing the flavor logic from `src/tasks.rs`):
+    - `PowerShell`: `\x1bSet-Location '<escaped_with_doubled_quotes>'\r`
+    - `Cmd`: `\x1bcd /d "<path>"\r`
+    - `Posix`: keep `\x05x\x15cd '...'\n` unchanged.
+
+### 7. Zoxide Jump (`Ctrl+Z`) Windows Installer, Discovery & PowerShell Hook (`src/zoxide.rs`)
+- **Problem Statement:**
+  - `zoxide::query` works on Windows if `zoxide.exe` is already on `PATH`, but:
+    - `fallback_paths()` (`src/zoxide.rs:144-153`) checks only `~/.local/bin/zoxide`, `/opt/homebrew/bin/zoxide`, `/usr/local/bin/zoxide`, and `/usr/bin/zoxide` (missing `.exe`, `%USERPROFILE%\.cargo\bin\zoxide.exe`, and `%LOCALAPPDATA%\Microsoft\WinGet\Links\zoxide.exe`).
+    - `install_in_background()` (`src/zoxide.rs:472`) spawns `sh -c "curl ... | sh"`.
+    - `supported_shell()` / `ensure_shell_init()` (`src/zoxide.rs`) supports only `bash` and `zsh`, skipping PowerShell (`$PROFILE` with `Invoke-Expression (& { (zoxide init powershell --cmd j | Out-String) })`).
+- **Architecture & Changes:**
+  - Add Windows `.exe` fallback paths and `winget` / PowerShell install script support in `src/zoxide.rs`.
+  - Add PowerShell profile hook injection (`zoxide init powershell --cmd j`) guarded by the same managed sentinel markers (`# >>> croft zoxide (managed) >>>`).
+
+### 8. PDF Renderer Non-Blocking Pipe Reader (`src/pdf.rs:562-591`)
+- **Problem Statement:**
+  - `set_nonblocking(pipe: Option<&ChildStderr>)` returns `false` on `#[cfg(not(unix))]`, skipping incremental `stderr` draining during the render loop.
+  - If `pdftoppm.exe` or `mutool.exe` emits more than a Windows anonymous pipe buffer (~4 KB) on `stderr` before exiting, the child can stall until the render timeout kills it.
+- **Architecture & Changes:**
+  - Under `#[cfg(windows)]` in `src/pdf.rs`, spawn a small bounded reader thread to drain `ChildStderr` into an in-memory buffer (`Vec<u8>`) concurrently with `try_wait()`, preventing pipe-buffer deadlock while keeping the same bounded render timeout.
+
+### Verification
+- Unit tests for:
+  - `prebuilt_triple_for("windows", "x86_64")`, `unpack_binary` on `croft-x86_64-pc-windows-msvc`, and `apply_staged_at` `.old` rename-aside behavior on Windows.
+  - `spawn_new_window` argv generation for `wt.exe` and `wezterm`.
+  - `port_detect` Win32 TCP listener table parsing / descendant PID filtering.
+  - `format_cd_command` across `PowerShell`, `Cmd`, and `Posix`.
+  - `zoxide` Windows fallback paths and PowerShell `$PROFILE` hook injection.
+- Manual smoke test in Windows Terminal: verify Help → Update, Explorer/Tab "Reveal in File Explorer", "Move into New Window", live pane labels, and Ports panel auto-detection/retirement.
+
+---
+
+## 8. Intentionally Out-of-Scope (Tier-3 / WSL2) & Platform-Specific Features
+
+The following subsystems in upstream `croft` are **deliberately excluded** from native Windows (or inherently tied to another OS):
+
+1. **Tier-3 Unix-Daemon / Socket Features (directed to WSL2):**
+   - Persistent sessions (`croft attach`, `croft ls`, `session_host.rs`, `session_cli.rs`, `session.rs`) and `dtach` reattach
+   - Session recording (`croft record`, `session_record.rs`)
+   - Local pane daemon (`pane_host.rs`)
+   - Remote web UI (`croft web`, `src/web/`)
+   - Collaborative editing & pairing (`src/collab.rs`, `src/collab_agent.rs`, `src/pair/`, `src/pair_host.rs`)
+   - Devcontainers (`src/devcontainer.rs` — currently stubbed out on Windows; could optionally be revisited later on top of Docker Desktop)
+   - OpenSSH `ControlMaster` socket multiplexing (`ssh_control_dir`, `cross_build_unavailable` — Windows uses direct `ssh.exe` + tracked `ssh -N -L` forwards)
+2. **OS-Specific Integrations (non-Windows by design):**
+   - `croft setup-terminal` (Apple Terminal.app), `croft setup-iterm2` (iTerm2 plist), and `croft setup-ghostty` (macOS Ghostty Cmd-chord forwarding; a `croft setup-wt` helper for Windows Terminal is an optional future enhancement, not an upstream parity gap)
+   - `src/gui_path.rs` (macOS launchd PATH capture)
+   - `src/voice.rs` (Android Termux:API `termux-dialog speech` dictation)
+   - Bundled `lua-language-server` (`assets/extensions/lsp-lua/extension.toml` expects `lua-language-server` on `PATH` on all platforms, including Windows)
+
+---
+
+## 9. Recommended Execution Order for Sub-project 7
+
+1. **Item 2 ("Reveal in File Explorer") & Item 6 (`format_cd_command` for PowerShell/cmd)** — quick, self-contained UX wins with existing platform primitives.
+2. **Item 1 (Prebuilt Self-Update & `.exe.old` swap) & Item 3 ("Move/Copy into New Window" for Windows Terminal / WezTerm)** — completes desktop app lifecycle parity on Windows.
+3. **Item 4 (Win32 TCP Port Detection) & Item 5 (ConPTY Descendant Process Pane Labels / SSH Offer)** — restores live Ports panel and terminal pane intelligence.
+4. **Item 7 (Zoxide Windows + PowerShell Hook) & Item 8 (PDF `stderr` Reader Thread)** — eliminates the remaining tool-integration edge cases.
