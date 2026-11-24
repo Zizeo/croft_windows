@@ -8484,6 +8484,7 @@ fn a_bracketed_paste_into_the_terminal_find_bar_lands_at_the_caret() {
 /// every pop-up, so with the terminal focused it was written over Settings,
 /// a confirm or any pop-up covering the shell's line. It is part of that
 /// line, and is drawn with it, under the pop-ups.
+#[cfg(unix)]
 #[test]
 fn the_shell_suggestion_never_draws_over_a_popup() {
     use crate::app::popups::Popup;

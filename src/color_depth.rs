@@ -159,6 +159,9 @@ pub fn underline_colors_supported(env: impl Fn(&str) -> Option<String>) -> bool 
     if TERMS.iter().any(|t| term.contains(t)) {
         return true;
     }
+    if env("WT_SESSION").is_some_and(|s| !s.is_empty()) {
+        return true;
+    }
     var("VTE_VERSION").parse::<u32>().is_ok_and(|v| v >= 5200)
 }
 
@@ -176,11 +179,13 @@ pub fn drop_underline_colors(buffer: &mut Buffer) {
 /// is filtered per client. Only `ESC [ … m` sequences change; everything
 /// else, pictures and OSC strings included, passes through byte for byte.
 /// A sequence split across two writes is held until its end arrives.
+#[cfg(any(unix, test))]
 #[derive(Default)]
 pub struct UnderlineColorFilter {
     pending: Vec<u8>,
 }
 
+#[cfg(any(unix, test))]
 impl UnderlineColorFilter {
     /// A sequence longer than this without its final byte is not one croft
     /// writes; it is passed on as it came.
@@ -239,6 +244,7 @@ impl UnderlineColorFilter {
 /// when it holds none (or is not plain SGR parameters). `58;5;n` and
 /// `58;2;r;g;b` take their arguments with them; `38` and `48` keep theirs, so
 /// a `58` that is a colour index (`38;5;58`) stays.
+#[cfg(any(unix, test))]
 fn without_underline_color(params: &[u8]) -> Option<Vec<u8>> {
     if !params
         .iter()
@@ -507,6 +513,7 @@ mod tests {
             ("TERM", "alacritty"),
             ("TERM", "foot"),
             ("TERM", "tmux-256color"),
+            ("WT_SESSION", "abc"),
         ] {
             assert!(reads(env(&[(k, v)])), "{k}={v}");
         }

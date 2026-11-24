@@ -4406,7 +4406,7 @@ fn a_commit_in_a_linked_worktree_moves_its_git_state() {
         &["worktree", "add", "-q", "-b", "other", wt.to_str().unwrap()],
     );
     let dirs = git_dirs(&wt).expect("the worktree's git dirs");
-    let canon = |d: &Path| d.canonicalize().unwrap();
+    let canon = |d: &Path| crate::platform::fs::canonicalize(d).unwrap();
     assert_eq!(canon(&dirs.git_dir), canon(&p.join(".git/worktrees/wt")));
     assert_eq!(canon(&dirs.common_dir), canon(&p.join(".git")));
     let mut watch = settled_watch(&wt);

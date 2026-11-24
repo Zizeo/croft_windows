@@ -23,7 +23,7 @@ fn picture_app(root: &Path) -> App {
 /// catch-all, so a pop-up cannot join the list without a way to open it
 /// here. An agent's proposal is a real one, sent through the edit hook;
 /// the returned stream is the hook's end, kept open while the test runs.
-pub(super) fn open(app: &mut App, p: Popup) -> Option<std::os::unix::net::UnixStream> {
+pub(super) fn open(app: &mut App, p: Popup) -> Option<crate::platform::ipc::LocalStream> {
     match p {
         Popup::Prompt => {
             app.prompt = Some(Prompt {
@@ -163,10 +163,10 @@ pub(super) fn open(app: &mut App, p: Popup) -> Option<std::os::unix::net::UnixSt
             let file = root.join("a.rs");
             std::fs::write(&file, "let x = 1;\n").unwrap();
             let sock = root.join("hook.sock");
-            let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let listener = crate::platform::ipc::LocalListener::bind(&sock).unwrap();
             listener.set_nonblocking(true).unwrap();
             app.hook_listener = Some(listener);
-            let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+            let mut hook = crate::platform::ipc::LocalStream::connect(&sock).unwrap();
             let req = crate::agent_hook::EditRequest {
                 agent: "claude-code".into(),
                 tool: "Edit".into(),
@@ -639,12 +639,23 @@ fn paste_app(root: &Path, behind: Pane) -> App {
     let path = root.join("notes.txt");
     std::fs::write(&path, "keep\n").unwrap();
     let mut app = App::new(root.to_path_buf()).unwrap();
-    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+    #[cfg(unix)]
+    let (prog, args) = (
         "/bin/sh",
-        &[String::from("-c"), String::from("sleep 30")],
-        root,
-    )
-    .unwrap();
+        &[String::from("-c"), String::from("sleep 30")][..],
+    );
+    #[cfg(windows)]
+    let (prog, args) = (
+        "cmd.exe",
+        &[
+            String::from("/C"),
+            String::from("ping -n 31 127.0.0.1 >nul"),
+        ][..],
+    );
+    app.terminals[0] =
+        crate::widgets::terminal::PtyTerminal::new_running(prog, args, root).unwrap();
+    #[cfg(windows)]
+    app.terminals[0].end_child();
     app.active_terminal = 0;
     app.editor.open(&path).unwrap();
     app.focus_pane(behind);
@@ -994,7 +1005,7 @@ fn a_click_behind_a_popup_never_reaches_what_it_covers() {
         p: Popup,
     ) -> (
         App,
-        Option<std::os::unix::net::UnixStream>,
+        Option<crate::platform::ipc::LocalStream>,
         (u16, u16),
         (u16, u16),
     ) {

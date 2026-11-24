@@ -1487,6 +1487,7 @@ fn a_submit_in_flight_keeps_new_comments_and_refuses_a_second_submit() {
 /// #2578: a submission whose thread crashed no longer counts as in flight:
 /// its comments are still pending, and the next submit posts them instead
 /// of being refused as already running.
+#[cfg(unix)]
 #[test]
 fn a_review_submission_whose_thread_crashed_lets_the_next_one_run() {
     let (_tmp, root, f, _log, _stdin, gh) = review_fixture();

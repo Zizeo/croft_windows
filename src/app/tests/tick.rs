@@ -195,7 +195,8 @@ const BACKGROUND_PASS_CALLS: &[&str] = &[
 fn background_pass_calls() -> Vec<String> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app/tick.rs");
     let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+        .replace("\r\n", "\n");
     let mut calls = Vec::new();
     read_pass_calls(&text, "tick_background", &mut calls);
     calls

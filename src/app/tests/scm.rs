@@ -7802,7 +7802,7 @@ fn the_source_control_badge_counts_every_row_in_every_folder() {
 
     let mut app = App::new(a.clone()).unwrap();
     app.add_workspace_folder(b.clone());
-    let b_canon = b.canonicalize().unwrap();
+    let b_canon = crate::platform::fs::canonicalize(&b).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         let _ = app.drain_git_responses();

@@ -2645,7 +2645,11 @@ fn process_is_running(pid: u32) -> bool {
         let probe = unsafe { libc::kill(pid, 0) };
         probe == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        crate::platform::process::is_pid_alive(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true

@@ -78,7 +78,6 @@ fn running(pid: i32) -> bool {
     })
 }
 
-#[cfg(unix)]
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !done() {
@@ -278,7 +277,6 @@ fn a_run_whose_runner_crashed_ends_and_the_next_one_runs() {
 /// #2592: which runner listed each test outlives a thread that crashed, so
 /// a test listed by pytest in a folder Cargo also claims still goes to
 /// pytest; a new root forgets it, as its tests are another project's.
-#[cfg(unix)]
 #[test]
 fn a_restart_keeps_which_runner_listed_each_test() {
     let tmp = tempfile::tempdir().unwrap();
@@ -320,7 +318,6 @@ fn a_restart_keeps_which_runner_listed_each_test() {
 
 /// #2592: a test runner that crashes again soon after its restart stops,
 /// says so once, and the next run starts it again.
-#[cfg(unix)]
 #[test]
 fn a_test_runner_that_crashes_again_stops_until_the_next_run() {
     let tmp = tempfile::tempdir().unwrap();
