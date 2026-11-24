@@ -88,6 +88,12 @@ ERROR = re.compile(
 # and says nothing the step's output did not already say.
 RUNNER_NOISE = "Process completed with exit code"
 
+# A `run:` step is printed as a group whose body is the step's own script, then
+# the `shell:` it runs under and any `env:` under that. That is workflow source,
+# not output: a setup step whose script says `echo "::error::pdftoppm is
+# missing"` otherwise gets quoted as the reason the NEXT step failed.
+STEP_HEADER = re.compile(r"^(?:shell|with|env):")
+
 
 def clean(raw: str) -> str:
     """One log line without its timestamp, colour codes or carriage return."""
@@ -127,6 +133,30 @@ def read_log(path: Path):
     return read_text(path.read_text(errors="replace"))
 
 
+def command_block(lines):
+    """Indices of the lines that are GitHub echoing the step's own command.
+
+    A `Run ...` group is followed by the script and its `shell:`/`env:` trailer
+    before `##[endgroup]`, and the step's output only starts after that. A
+    `Run` group with no such trailer is a step that printed inside its group
+    (the fixtures here, and some composite steps), and is left alone.
+    """
+    skip = set()
+    index = 0
+    while index < len(lines):
+        group = GROUP.match(lines[index])
+        if group and group.group(1) == "group" and group.group(2).startswith("Run "):
+            end = index + 1
+            while end < len(lines) and not GROUP.match(lines[end]):
+                end += 1
+            body = lines[index + 1 : end]
+            if any(STEP_HEADER.match(line) for line in body):
+                skip.update(range(index + 1, end + 1))
+            index = end
+        index += 1
+    return skip
+
+
 def hits(lines):
     """(line number, text, step command) for each line that looks like a cause.
 
@@ -137,12 +167,15 @@ def hits(lines):
     found = []
     seen = set()
     command = ""
+    echo = command_block(lines)
     for number, line in enumerate(lines, start=1):
         group = GROUP.match(line)
         if group:
             kind, text = group.groups()
             if kind == "group" and text.startswith("Run "):
                 command = text[len("Run ") :].strip()
+            continue
+        if number - 1 in echo:
             continue
         if not looks_like_error(line):
             continue
@@ -162,19 +195,25 @@ def step_tail(lines, count=TAIL):
 
     The whole log's last lines are the runner's cleanup, which runs after the
     step that failed and says nothing about it; the failing step is the last
-    `Run ...` group before those.
+    `Run ...` group before those, and its output begins after that group's
+    echoed command.
     """
     starts = []
     for index, line in enumerate(lines):
         group = GROUP.match(line)
         if group and group.group(1) == "group":
             starts.append((index, group.group(2).startswith("Run ")))
+    echo = command_block(lines)
     for position in range(len(starts) - 1, -1, -1):
         start, is_run = starts[position]
         if not is_run:
             continue
         end = starts[position + 1][0] if position + 1 < len(starts) else len(lines)
-        body = [l for l in lines[start:end] if printable(l) and l.strip()]
+        body = [
+            line
+            for index, line in enumerate(lines[start:end], start=start)
+            if index not in echo and printable(line) and line.strip()
+        ]
         if body:
             return body[-count:]
     return [l for l in lines if printable(l) and l.strip()][-count:]

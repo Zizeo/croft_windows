@@ -98,6 +98,39 @@ class Causes(unittest.TestCase):
         found, _ = report.hits(lines)
         self.assertEqual(len(found), 1)
 
+    def test_the_steps_own_script_is_not_output(self):
+        """GitHub prints a `run:` step as the script, a `shell:` line and any
+        `env:` inside the group. A setup step that says `echo "::error::pdftoppm
+        is missing"` in that script would otherwise be quoted as the reason the
+        NEXT step failed."""
+        lines = report.read_text(log(
+            "##[group]Run set -euo pipefail",
+            '  || { echo "::error::pdftoppm is missing"; exit 1; }',
+            "shell: /usr/bin/bash -e {0}",
+            "env:",
+            "  CARGO_TERM_COLOR: always",
+            "##[endgroup]",
+            "##[group]Run cargo clippy --all-targets -- -D warnings",
+            "cargo clippy --all-targets -- -D warnings",
+            "shell: /usr/bin/bash -e {0}",
+            "##[endgroup]",
+            "error[E0308]: mismatched types",
+        ))
+        found, _ = report.hits(lines)
+        self.assertEqual([line for _, line, _ in found], ["error[E0308]: mismatched types"])
+        self.assertEqual(found[0][2], "cargo clippy --all-targets -- -D warnings")
+
+    def test_a_step_that_prints_inside_its_own_group_is_still_read(self):
+        """Only a group carrying the `shell:`/`env:` trailer is the echoed
+        command; anything else in a group is the step talking."""
+        lines = report.read_text(log(
+            "##[group]Run some composite step",
+            "error: this step printed its own complaint",
+            "##[endgroup]",
+        ))
+        found, _ = report.hits(lines)
+        self.assertEqual([line for _, line, _ in found], ["error: this step printed its own complaint"])
+
 
 class Rendering(unittest.TestCase):
     def render(self, jobs, logs, run=None, extra=()):
@@ -141,6 +174,25 @@ class Rendering(unittest.TestCase):
         self.assertIn("No line matched", out)
         self.assertIn("and then nothing", out)
         self.assertIn("cargo zigbuild", out)
+
+    def test_the_tail_does_not_quote_the_steps_own_script(self):
+        """When nothing matched, the tail is the fallback. If it is taken from
+        the echoed command, the reader gets the setup step's source instead of
+        what the failing step printed."""
+        text = log(
+            "##[group]Run set -euo pipefail",
+            '  || { echo "::error::the setup step is not the failure"; exit 1; }',
+            "shell: /usr/bin/bash -e {0}",
+            "##[endgroup]",
+            "only prose, no pattern matched",
+            "##[group]Post job cleanup.",
+            "Deleting the workspace directory",
+            "##[endgroup]",
+        )
+        status, out = self.render([job()], {42: text})
+        self.assertEqual(status, 0)
+        self.assertIn("only prose, no pattern matched", out)
+        self.assertNotIn("the setup step is not the failure", out)
 
     def test_the_tail_is_the_failing_steps_not_the_runners_cleanup(self):
         """The last lines of a job are the runner tearing it down. Printed as
