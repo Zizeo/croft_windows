@@ -1318,7 +1318,14 @@ fn a_task_problem_matcher_owns_its_pane_and_watch_publishes_win() {
 #[test]
 fn a_task_pane_whose_shell_left_the_directory_is_not_reused() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("Makefile"), "build:\n\ttrue\n").unwrap();
+    // Only the build's own shell works out the sum, so the pane shows
+    // `built_42` once the build has run and never before: the typed
+    // `make build` line cannot contain it.
+    std::fs::write(
+        tmp.path().join("Makefile"),
+        "build:\n\t@echo built_$$((40 + 2))\n",
+    )
+    .unwrap();
     std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let chord = key(
@@ -1327,15 +1334,21 @@ fn a_task_pane_whose_shell_left_the_directory_is_not_reused() {
     );
     app.handle_key(chord).unwrap();
 
-    // Wait for the pane's shell to reach its prompt, as the reuse path
-    // requires an idle pane.
+    // Wait for the build to finish and the pane's shell to come back to its
+    // prompt in the task's folder, as the reuse path requires an idle pane.
+    // The shell alone is not enough: a fresh pane's shell owns the
+    // foreground before it has even started the build, so under load the
+    // wait could pass at once and the check below meet `make` running
+    // (#2650; #2167 fixed the same race in the rerun test).
     let root = tmp.path().canonicalize().unwrap();
     crate::test_budget::await_spawned(
         std::time::Duration::from_secs(10),
-        "the task pane's shell",
+        "the build to run and the task pane's shell to return to its prompt",
         || {
             let t = &app.terminals[app.active_terminal];
-            t.foreground_is_shell() && t.kernel_shell_cwd() == Some(root.clone())
+            t.visible_text().contains("built_42")
+                && t.foreground_is_shell()
+                && t.kernel_shell_cwd() == Some(root.clone())
         },
     );
     let idx = app.active_terminal;
@@ -1487,6 +1500,82 @@ fn live_run_lands_a_real_run_on_the_tab() {
         Some("\u{25b8} 6")
     );
     assert!(app.status.starts_with("Live Run: ok"), "{}", app.status);
+}
+
+/// Tick Live Run until `done`, within a load-scaled five seconds.
+fn tick_live_run_until(app: &mut App, what: &str, mut done: impl FnMut(&App) -> bool) {
+    crate::test_budget::await_spawned(std::time::Duration::from_secs(5), what, || {
+        app.tick_live_run();
+        done(app)
+    });
+}
+
+/// #2597: Live Run's runner crashing on the armed file's run is started
+/// again, and the file is sent to the fresh one, so its values land
+/// instead of staying frozen for good.
+#[test]
+fn live_run_whose_runner_crashed_runs_the_file_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    app.live_run_runner = Some(crate::live_run::Runner::crashing(1));
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    tick_live_run_until(&mut app, "the run after the crash", |app| {
+        app.editor.live_run.is_some()
+    });
+    assert_eq!(app.status, "Live Run: ok (stand-in)");
+}
+
+/// #2597: a runner that crashes again soon after its restart stops and
+/// says so, and turning Live Run on for a file starts it again.
+#[test]
+fn live_run_whose_runner_crashed_twice_stops_until_turned_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    app.live_run_runner = Some(crate::live_run::Runner::crashing(2));
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    tick_live_run_until(&mut app, "the runner to stop", |app| {
+        app.status == LIVE_RUN_STOPPED
+    });
+    assert!(app.editor.live_run.is_none(), "no run landed");
+    app.status.clear();
+    app.tick_live_run();
+    assert_eq!(app.status, "", "it says so once");
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    tick_live_run_until(&mut app, "the run after turning it on", |app| {
+        app.editor.live_run.is_some()
+    });
+}
+
+/// Codex's finding on #2600: a runner whose second crash no tick has seen
+/// yet is started again when Live Run is turned on for a file, and the
+/// file runs, instead of the next tick finding it stopped with the file
+/// marked as sent.
+#[test]
+fn live_run_turned_on_after_a_crash_no_tick_saw_runs_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    app.live_run_runner = Some(crate::live_run::Runner::crashing(2));
+    let thread_ends = |app: &mut App| {
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(5),
+            "the runner's thread to end",
+            || app.live_run_runner.as_mut().unwrap().has_ended(),
+        );
+    };
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    app.tick_live_run();
+    thread_ends(&mut app);
+    // This tick sees the first crash, starts a fresh thread and sends the
+    // file again, which crashes it too, unseen.
+    app.tick_live_run();
+    thread_ends(&mut app);
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    tick_live_run_until(&mut app, "the run after turning it on", |app| {
+        app.editor.live_run.is_some()
+    });
+    assert_ne!(app.status, LIVE_RUN_STOPPED);
 }
 
 /// #856 (comment): a task set "Running <label>" and kept it after its pane

@@ -48,7 +48,6 @@ fn git_gutter_baselines_are_fetched_for_inactive_split_groups() {
     let inactive_baselines: Vec<Option<std::path::PathBuf>> = app
         .editor_layout
         .inactive_groups()
-        .into_iter()
         .flat_map(|g| g.editors.iter())
         .filter(|e| e.path.as_deref() == Some(f.as_path()))
         .map(|e| e.git_baseline_for.clone())
@@ -448,6 +447,7 @@ fn branch_status(dirty: bool) -> crate::git::GitStatus {
         prepared_message: None,
         operation: None,
         rebasing_branch: None,
+        upstream: None,
     }
 }
 
@@ -533,6 +533,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         prepared_message: None,
         operation: None,
         rebasing_branch: None,
+        upstream: None,
     };
     let spans = git_status_spans(&st, crate::theme::Theme::default());
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -556,6 +557,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         prepared_message: None,
         operation: None,
         rebasing_branch: None,
+        upstream: None,
     };
     let spans = git_status_spans(&st, crate::theme::Theme::default());
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -4187,6 +4189,126 @@ fn commit_graph_app(p: &std::path::Path) -> App {
     app
 }
 
+/// Whether COMMITS, drawn, shows the commit whose summary is `summary`.
+fn commits_show(app: &mut App, summary: &str) -> bool {
+    draw(app, 110, 44);
+    let area = app.commit_graph.last_area;
+    (area.y..area.y + area.height).any(|y| {
+        app.commit_graph
+            .commit_at(y)
+            .is_some_and(|c| c.summary == summary)
+    })
+}
+
+/// The ref labels COMMITS, drawn, shows on the commit whose summary is
+/// `summary`.
+fn commit_refs(app: &mut App, summary: &str) -> Vec<String> {
+    draw(app, 110, 44);
+    let area = app.commit_graph.last_area;
+    (area.y..area.y + area.height)
+        .find_map(|y| {
+            app.commit_graph
+                .commit_at(y)
+                .filter(|c| c.summary == summary)
+                .map(|c| c.refs.clone())
+        })
+        .unwrap_or_default()
+}
+
+/// One pass of the main loop's file, git and Explorer steps.
+fn run_git_ticks(app: &mut App) {
+    app.poll_filesystem_changes();
+    app.try_install_pending_init();
+    app.sync_explorer_panels();
+}
+
+/// #2577: a commit run in another terminal reaches COMMITS with nothing
+/// done in croft. It changes only git's own folder, which the file
+/// watcher skips, so before the fix COMMITS stayed stale until a file in
+/// the folder changed or Source Control was opened again.
+#[test]
+fn a_commit_made_outside_croft_reaches_commits() {
+    let tmp = commit_actions_repo();
+    let p = tmp.path();
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.show_tree = true;
+    app.set_sidebar_view(SidebarView::SourceControl);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "COMMITS to show the history",
+        || {
+            run_git_ticks(&mut app);
+            commits_show(&mut app, "update readme")
+        },
+    );
+    // Let the first status land and its git state be stamped, as the next
+    // poll would, so what follows is a change to it.
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "the first status",
+        || {
+            run_git_ticks(&mut app);
+            app.git.status().head_oid.is_some()
+        },
+    );
+    app.git.refresh_if_git_moved(true);
+    assert!(git_succeeds(
+        p,
+        &["commit", "-q", "--allow-empty", "-m", "made outside"]
+    ));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "COMMITS to show the outside commit",
+        || {
+            run_git_ticks(&mut app);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            commits_show(&mut app, "made outside")
+        },
+    );
+}
+
+/// #2577: a checkout made outside croft to a new branch at the same
+/// commit relabels HEAD in COMMITS, though HEAD's commit did not move.
+#[test]
+fn a_checkout_made_outside_croft_relabels_commits() {
+    let tmp = commit_actions_repo();
+    let p = tmp.path();
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.show_tree = true;
+    app.set_sidebar_view(SidebarView::SourceControl);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "COMMITS to label HEAD with main",
+        || {
+            run_git_ticks(&mut app);
+            commit_refs(&mut app, "update readme")
+                .iter()
+                .any(|r| r == "HEAD -> main")
+        },
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "the first status",
+        || {
+            run_git_ticks(&mut app);
+            app.git.status().head_oid.is_some()
+        },
+    );
+    app.git.refresh_if_git_moved(true);
+    assert!(git_succeeds(p, &["checkout", "-q", "-b", "fresh"]));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "COMMITS to label HEAD with the new branch",
+        || {
+            run_git_ticks(&mut app);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            commit_refs(&mut app, "update readme")
+                .iter()
+                .any(|r| r == "HEAD -> fresh")
+        },
+    );
+}
+
 /// Right-click the COMMITS row whose summary is `summary`.
 fn right_click_commit(app: &mut App, summary: &str) {
     use crossterm::event::{MouseButton, MouseEventKind};
@@ -7644,4 +7766,80 @@ fn copy_permalink_refuses_an_unpushed_commit() {
     let mut empty = App::new(tmp.path().to_path_buf()).unwrap();
     empty.run_command(Command::GitCopyPermalink);
     assert_eq!(empty.status, "Open a file to link to its lines");
+}
+
+/// #2629: the Source Control badge counts the same with and without
+/// pictures, as VS Code's does: every row of every folder's repository. A
+/// partly staged file is two rows (Staged Changes and Changes), and a change
+/// in another workspace folder counts too (#161: work pending in a
+/// background folder must never be invisible).
+#[test]
+fn the_source_control_badge_counts_every_row_in_every_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mk_repo = |name: &str| {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "a@b"],
+            vec!["config", "user.name", "a"],
+        ] {
+            git_ok(&dir, &args);
+        }
+        std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+        git_ok(&dir, &["add", "f.txt"]);
+        git_ok(&dir, &["commit", "-q", "-m", "first"]);
+        dir
+    };
+    // Folder A: f.txt partly staged (a staged edit and a later unstaged one).
+    let a = mk_repo("repa");
+    std::fs::write(a.join("f.txt"), "two\n").unwrap();
+    git_ok(&a, &["add", "f.txt"]);
+    std::fs::write(a.join("f.txt"), "three\n").unwrap();
+    // Folder B: one unstaged edit.
+    let b = mk_repo("repb");
+    std::fs::write(b.join("f.txt"), "changed\n").unwrap();
+
+    let mut app = App::new(a.clone()).unwrap();
+    app.add_workspace_folder(b.clone());
+    let b_canon = b.canonicalize().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let _ = app.drain_git_responses();
+        app.sync_focus_flags();
+        let a_dirty = app.git.status().dirty;
+        let b_dirty = app.git_worker_for_root(&b_canon).status().dirty;
+        if a_dirty && b_dirty {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "both repositories never reported their changes"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // With pictures: the count the badge picture is built for.
+    app.refresh_activity_badges();
+    assert_eq!(
+        app.activity_badges[ActivityIcon::SourceControl as usize].count(),
+        3,
+        "two rows for the partly staged file in A, one for B's edit"
+    );
+
+    // Without pictures: the count drawn at the icon's bottom-right corner.
+    assert!(!app.overlays.activity.has_images());
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let block = app.sidebar_areas.activity_icons[ActivityIcon::SourceControl];
+    let corner = (
+        block.x + block.width - 1,
+        block.y + block.height.saturating_sub(1),
+    );
+    assert_eq!(
+        term.backend().buffer()[corner].symbol(),
+        "3",
+        "the same count as with pictures"
+    );
 }

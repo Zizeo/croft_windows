@@ -3,6 +3,7 @@
 //! URLs on the local machine.
 
 use super::*;
+use crate::widgets::confirm_frame::{ConfirmFrame, Inset, draw_confirm};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RemotePullKind {
@@ -28,77 +29,42 @@ impl App {
         let Some(url) = &self.pending_local_open else {
             return;
         };
-        let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
-        let height: u16 = 8;
-        let x = (area.width.saturating_sub(width)) / 2 + area.x;
-        let y = (area.height.saturating_sub(height)) / 2 + area.y;
-        let rect = Rect {
-            x,
-            y,
-            width,
-            height,
+        let frame_spec = ConfirmFrame {
+            title: " OPEN ON LOCAL MAC? ",
+            accent: self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00)),
+            title_fg: Color::Black,
+            height: 8,
+            inset: Inset::Wide,
         };
-        let rect = rect.intersection(area);
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00))))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(ratatui::text::Span::styled(
-                " OPEN ON LOCAL MAC? ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00)))
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        frame.render_widget(block, rect);
-        let inner = Rect {
-            x: rect.x + 2,
-            y: rect.y + 1,
-            width: rect.width.saturating_sub(4),
-            height: rect.height.saturating_sub(2),
-        };
-        let body = ratatui::text::Text::from(vec![
-            ratatui::text::Line::from(ratatui::text::Span::styled(
-                "This URL will open in YOUR LOCAL MAC's browser via the croft relay.",
-                Style::default().fg(self.theme.ui(Color::White)),
-            )),
-            ratatui::text::Line::from(""),
-            ratatui::text::Line::from(ratatui::text::Span::styled(
-                truncate_for_display(url, inner.width as usize),
-                Style::default().fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))),
-            )),
-            ratatui::text::Line::from(""),
-            ratatui::text::Line::from(vec![
-                ratatui::text::Span::styled(
-                    "[Y]",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                ratatui::text::Span::raw("es once   "),
-                ratatui::text::Span::styled(
-                    "[A]",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                ratatui::text::Span::raw("lways for this session   "),
-                ratatui::text::Span::styled(
-                    "[N]",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-                ratatui::text::Span::raw("o / Esc"),
-            ]),
-        ]);
-        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
-            self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00)),
-        );
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let green = Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD);
+            let body = ratatui::text::Text::from(vec![
+                ratatui::text::Line::from(ratatui::text::Span::styled(
+                    "This URL will open in YOUR LOCAL MAC's browser via the croft relay.",
+                    Style::default().fg(self.theme.ui(Color::White)),
+                )),
+                ratatui::text::Line::from(""),
+                ratatui::text::Line::from(ratatui::text::Span::styled(
+                    truncate_for_display(url, inner.width as usize),
+                    Style::default().fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))),
+                )),
+                ratatui::text::Line::from(""),
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled("[Y]", green),
+                    ratatui::text::Span::raw("es once   "),
+                    ratatui::text::Span::styled("[A]", green),
+                    ratatui::text::Span::raw("lways for this session   "),
+                    ratatui::text::Span::styled(
+                        "[N]",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
+                    ratatui::text::Span::raw("o / Esc"),
+                ]),
+            ]);
+            frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        });
     }
 
     pub(super) fn handle_remote_key(&mut self, key: KeyEvent) {
@@ -448,11 +414,22 @@ impl App {
         {
             let adopted = auth.hand_off();
             let path = self.pending_remote_launch_path.take();
-            self.install_session = Some(crate::install_session::InstallSession::start(
-                adopted,
-                host.clone(),
-                path,
-            ));
+            let session =
+                match crate::install_session::InstallSession::start(adopted, host.clone(), path) {
+                    Ok(session) => session,
+                    // No thread could start: the connect ends here, failed,
+                    // as an install that failed at once would.
+                    Err(e) => {
+                        let detail = format!("croft could not start the install: {e}");
+                        if let Some(dialog) = self.connect_dialog.as_mut() {
+                            dialog.set_failed(detail.clone());
+                        }
+                        self.tear_down_connect_auth();
+                        self.status = format!("Remote install failed: {detail}");
+                        return true;
+                    }
+                };
+            self.install_session = Some(session);
             crate::output::push(
                 crate::output::CHANNEL_REMOTE,
                 crate::output::OutputLevel::Info,
@@ -535,8 +512,23 @@ impl App {
             if let Some(dialog) = self.connect_dialog.as_mut() {
                 dialog.set_failed(detail.clone());
             }
-            self.install_session = None;
-            self.status = format!("Remote install failed: {detail}");
+            // Nothing will run through the install's SSH connection now: close
+            // it, as an install that could not start does, instead of leaving
+            // it open until croft exits (#2610). An install that already let
+            // the user into the remote croft never gets here.
+            if let Some(adopted) = self
+                .install_session
+                .take()
+                .and_then(|mut session| session.take_adopted())
+            {
+                crate::remote::close_master(adopted);
+            }
+            // An install whose thread crashed leaves the status line to the
+            // crash notice, as every background job does (#2562); the dialog
+            // says what happened to the connect.
+            if detail != crate::install_session::CRASHED_DETAIL {
+                self.status = format!("Remote install failed: {detail}");
+            }
             changed = true;
         } else if done {
             if let Some(mut session) = self.install_session.take()

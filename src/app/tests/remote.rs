@@ -99,6 +99,83 @@ fn cancelling_the_remote_handoff_stays_here_with_the_edits() {
     assert!(app.status.contains("did not connect"), "{}", app.status);
 }
 
+/// A remote install whose thread crashed fails the connect and its dialog
+/// says so, reading as failed and closing like any failed connect, even
+/// while a helper of the install still holds its log (#2607 review). It used
+/// to show the install as under way for good.
+#[test]
+fn a_remote_install_whose_thread_crashed_fails_the_connect() {
+    // A failed install is remembered on disk: keep it off this machine's.
+    let _serial = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let _restore = override_cache_dir(tmp.path().join("cache"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.connect_dialog = Some(crate::widgets::connect_dialog::ConnectDialog::new(
+        String::from("devbox"),
+    ));
+    app.install_session = Some(crate::install_session::InstallSession::crashing("devbox"));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed install to end",
+        || {
+            app.poll_install_session();
+            app.install_session.is_none()
+        },
+    );
+    let dialog = app.connect_dialog.as_ref().expect("the dialog says why");
+    assert_eq!(
+        dialog.phase,
+        crate::widgets::connect_dialog::DialogPhase::Failed
+    );
+    assert_eq!(
+        dialog.error.as_deref(),
+        Some(crate::install_session::CRASHED_DETAIL)
+    );
+    assert!(
+        !app.status.contains("Remote install failed"),
+        "the status line is left to the crash notice: {}",
+        app.status
+    );
+    app.handle_connect_dialog_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.connect_dialog.is_none(), "Esc closes it");
+}
+
+/// #2610: a failed install closes the SSH connection it was handed, its
+/// socket's private directory included, instead of leaving it open until
+/// croft exits.
+#[test]
+fn a_failed_remote_install_closes_its_ssh_connection() {
+    // A failed install is remembered on disk: keep it off this machine's.
+    let _serial = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let _restore = override_cache_dir(tmp.path().join("cache"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let socket_dir = tmp.path().join("ctl");
+    std::fs::create_dir(&socket_dir).unwrap();
+    let adopted = crate::remote::AdoptedMaster {
+        host: String::from("devbox"),
+        socket_dir: socket_dir.clone(),
+        socket_path: socket_dir.join("ctl"),
+    };
+    app.connect_dialog = Some(crate::widgets::connect_dialog::ConnectDialog::new(
+        String::from("devbox"),
+    ));
+    app.install_session = Some(crate::install_session::InstallSession::with_events(
+        "devbox",
+        None,
+        Some(adopted),
+        vec![crate::install_session::InstallEvent::Done(Err(
+            String::from("no space left on device"),
+        ))],
+    ));
+    app.poll_install_session();
+    assert!(app.install_session.is_none());
+    assert!(
+        !socket_dir.exists(),
+        "the connection's socket directory is gone"
+    );
+}
+
 /// #862 negative: S at the handoff prompt whose save is refused (the file
 /// changed on disk) stays here, and drops the launch: left armed, the next
 /// ordinary Ctrl+Q would have connected instead of quitting.
@@ -124,7 +201,7 @@ fn ssh_empty_state_overlay_arms_image_clear_when_user_switches_off_remote_view()
     // Simulate the post-emit state without actually writing OSC bytes.
     app.overlays.ssh.set_displayed(true);
     app.set_sidebar_view(SidebarView::Explorer);
-    app.flush_ssh_empty_state_overlay();
+    app.flush_ssh_empty_state_overlay(&ratatui::buffer::Buffer::empty(app.last_frame_area));
     assert!(
         app.consume_ssh_empty_state_image_clear(),
         "leaving the Remote view after the illustration was painted must arm one terminal.clear() so iTerm2 evicts the cached image cells — otherwise the server-rack PNG ghosts onto the Explorer tree the user just clicked to"
@@ -140,7 +217,7 @@ fn ssh_empty_state_overlay_arms_image_clear_when_modal_opens_on_top() {
     app.overlays.ssh.set_displayed(true);
     app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
         .unwrap();
-    app.flush_ssh_empty_state_overlay();
+    app.flush_ssh_empty_state_overlay(&ratatui::buffer::Buffer::empty(app.last_frame_area));
     assert!(
         app.consume_ssh_empty_state_image_clear(),
         "F1 opening the shortcuts modal over the SSH empty state must arm an image-clear so the illustration doesn't bleed through the modal text"

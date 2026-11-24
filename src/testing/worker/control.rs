@@ -10,10 +10,28 @@ impl RunControl {
     /// starting.
     pub(super) fn cancel(&self, upto: u64) {
         self.cancelled_upto.fetch_max(upto, Ordering::SeqCst);
-        let killer = self.running.lock().unwrap().clone();
+        let killer = self.running().clone();
         if let Some(killer) = killer {
             killer.kill_tree();
         }
+    }
+
+    /// The worker thread ended (#2592): every request numbered up to
+    /// `upto` went with it, and the runner it was reading from is killed
+    /// and forgotten, so a later cancel never signals a group that is gone.
+    pub(super) fn abandon(&self, upto: u64) {
+        self.cancelled_upto.fetch_max(upto, Ordering::SeqCst);
+        if let Some(killer) = self.running().take() {
+            killer.kill_tree();
+        }
+    }
+
+    /// The running child, also after a thread that crashed holding it
+    /// (#2592): the handle it left is still the one to kill.
+    fn running(&self) -> std::sync::MutexGuard<'_, Option<crate::platform::process::TreeKiller>> {
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(super) fn is_cancelled(&self, request: u64) -> bool {
@@ -31,7 +49,7 @@ impl RunControl {
     pub(super) fn spawn(&self, request: u64, cmd: &mut Command) -> Option<std::io::Result<Child>> {
         crate::review_ops::retry_while_busy(
             || {
-                let mut running = self.running.lock().unwrap();
+                let mut running = self.running();
                 if self.is_cancelled(request) {
                     return None;
                 }
@@ -49,6 +67,43 @@ impl RunControl {
     }
 
     pub(super) fn finished(&self) {
-        *self.running.lock().unwrap() = None;
+        *self.running() = None;
+    }
+}
+
+impl Owners {
+    /// The map, also after a thread that crashed holding it: an insert
+    /// leaves it whole.
+    pub(super) fn map(&self) -> std::sync::MutexGuard<'_, OwnerMap> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `runner` listed or ran `test`.
+    pub(super) fn record(&self, test: String, runner: Runner) {
+        self.map().by_test.insert(test, runner);
+    }
+
+    /// The root is now the one of `epoch`: a new root's tests are another
+    /// project's, while the same root sent again to a fresh thread keeps
+    /// them.
+    pub(super) fn for_root(&self, epoch: u64) {
+        let mut map = self.map();
+        if map.epoch != epoch {
+            map.by_test.clear();
+            map.epoch = epoch;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn get(&self, test: &str) -> Option<Runner> {
+        self.map().by_test.get(test).copied()
+    }
+}
+
+impl OwnerMap {
+    pub(super) fn by_test(&self) -> &BTreeMap<String, Runner> {
+        &self.by_test
     }
 }

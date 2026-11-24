@@ -2005,6 +2005,91 @@ fn a_syntax_parse_landing_after_the_language_servers_outline_does_not_replace_it
     assert_eq!(names, vec!["FromServer"]);
 }
 
+/// The OUTLINE section as it draws.
+fn outline_text(app: &mut App) -> String {
+    app.outline.collapsed = false;
+    let area = ratatui::layout::Rect::new(0, 0, 40, 6);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    ratatui::widgets::Widget::render(&mut app.outline, area, &mut buf);
+    (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect()
+}
+
+/// #2586: going back to a large file that no language server handles, after
+/// a smaller one whose outline is read inline, parses its outline again
+/// instead of leaving OUTLINE on "Loading" for good.
+#[test]
+fn going_back_to_a_large_file_reads_its_outline_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "big.py", &python_module(20_000));
+    let big = app.editor.path.clone().unwrap();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(60),
+        "the large file's outline",
+        || {
+            app.sync_outline();
+            !app.outline.symbols().is_empty()
+        },
+    );
+    let small = tmp.path().join("small.py");
+    std::fs::write(&small, "def small(x):\n    return x\n").unwrap();
+    app.editor.open(&small).unwrap();
+    app.sync_outline();
+    assert_eq!(app.outline.symbols().len(), 1, "the small file's outline");
+    app.editor.open(&big).unwrap();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(60),
+        "the large file's outline again",
+        || {
+            app.sync_outline();
+            app.outline.symbols().len() > 1
+        },
+    );
+}
+
+/// #2587: a large file's outline parse whose thread crashed settles OUTLINE
+/// on saying so, instead of "Loading" for one that is not coming.
+#[test]
+fn a_large_outline_parse_whose_thread_crashed_says_it_could_not_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "big.py", &python_module(20_000));
+    app.sync_outline();
+    let key = app
+        .outline_parse
+        .as_ref()
+        .expect("the parse is running")
+        .0
+        .clone();
+    app.outline_parse = Some((
+        key,
+        crate::jobs::Job::spawn(
+            "outline-parse",
+            crate::jobs::Start::Now,
+            || -> Vec<crate::lsp::manager::OutlineSymbol> {
+                panic!("the parse crashed (on purpose, in a test)")
+            },
+        )
+        .unwrap(),
+    ));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed parse to settle",
+        || {
+            app.sync_outline();
+            app.outline_parse.is_none()
+        },
+    );
+    let text = outline_text(&mut app);
+    assert!(text.contains("Could not read the outline"), "got:\n{text}");
+    assert!(!text.contains("Loading"), "got:\n{text}");
+}
+
 fn app_outline_symbol_named(name: &str) -> crate::lsp::manager::OutlineSymbol {
     let tmp = tempfile::tempdir().unwrap();
     let mut probe = app_with_open_file(tmp.path(), "one.py", "def one(x):\n    return x\n");
@@ -2612,7 +2697,15 @@ fn a_prepare_rename_verdict_routes_to_the_prompt_status_or_fallback() {
         target,
     };
     let arm = |app: &mut App| {
-        app.prepare_rename_request = Some((4, path.clone(), 1, 9, app.editor.edit_seq));
+        app.prepare_rename_request = Some(CaretRequest {
+            id: 4,
+            at: CaretSpot {
+                path: path.clone(),
+                row: 1,
+                col: 9,
+                seq: app.editor.edit_seq,
+            },
+        });
         app.prompt = None;
         app.status = String::from("Preparing rename…");
     };
@@ -3011,7 +3104,11 @@ fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
     );
 
     // Armed and everything matches.
-    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    app.on_type_request = Some(FileRequest {
+        id: 7,
+        path: a.clone(),
+        seq: app.editor.edit_seq,
+    });
     assert_eq!(
         app.on_type_reply_disposition(&reply(7, &a)),
         OnTypeReply::Apply
@@ -3029,7 +3126,11 @@ fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
     );
 
     // Buffer moved since the request.
-    app.on_type_request = Some((7, app.editor.edit_seq.wrapping_sub(1), a.clone()));
+    app.on_type_request = Some(FileRequest {
+        id: 7,
+        path: a.clone(),
+        seq: app.editor.edit_seq.wrapping_sub(1),
+    });
     assert_eq!(
         app.on_type_reply_disposition(&reply(7, &a)),
         OnTypeReply::Stale,
@@ -3037,7 +3138,11 @@ fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
     );
 
     // Reply is for a different file than the one requested.
-    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    app.on_type_request = Some(FileRequest {
+        id: 7,
+        path: a.clone(),
+        seq: app.editor.edit_seq,
+    });
     assert_eq!(
         app.on_type_reply_disposition(&reply(7, &b)),
         OnTypeReply::Stale,
@@ -3047,7 +3152,11 @@ fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
     // The requested tab is no longer active: edit_seq is per-tab, so the
     // counter alone would compare two unrelated buffers.
     app.editor.open_pinned(&b).unwrap();
-    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    app.on_type_request = Some(FileRequest {
+        id: 7,
+        path: a.clone(),
+        seq: app.editor.edit_seq,
+    });
     assert_eq!(
         app.on_type_reply_disposition(&reply(7, &a)),
         OnTypeReply::Stale,
@@ -5619,4 +5728,77 @@ fn a_reask_reply_that_installs_no_popup_keeps_the_shown_items_request_point() {
     assert!(app.completion_popup.is_some(), "the older items stay open");
     app.handle_completion_popup_key(key(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(app.editor.lines[0], "f(PRESS) {", "the `)` stays");
+}
+
+/// #2062: `take_reply` keeps exactly what the five drains it replaced kept,
+/// for every sequence of up to four replies to three request ids, with no
+/// request, the first or the second still waited on. Each reply carries its
+/// place in the sequence, so keeping the wrong match shows.
+#[test]
+fn take_reply_keeps_what_the_old_drain_loops_kept() {
+    use crate::app::language_servers::take_reply;
+    // Declaration and type definition, verbatim but for names.
+    fn old_jump_loop(pending: &mut Option<u64>, replies: &[(u64, usize)]) -> Option<usize> {
+        let mut queue = replies.iter().copied();
+        let mut drain = move || queue.next();
+        let mut reply = None;
+        while let Some(result) = drain() {
+            if Some(result.0) == *pending {
+                reply = Some(result.1);
+            }
+        }
+        let place = reply?;
+        *pending = None;
+        Some(place)
+    }
+    // Rename, formatting and code actions, verbatim but for names.
+    fn old_arrived_loop(pending: &mut Option<u64>, replies: &[(u64, usize)]) -> Option<usize> {
+        let mut arrived = false;
+        let mut place = usize::MAX;
+        let mut queue = replies.iter().copied();
+        let mut drain = move || queue.next();
+        while let Some(result) = drain() {
+            if Some(result.0) != *pending {
+                continue;
+            }
+            arrived = true;
+            place = result.1;
+        }
+        if !arrived {
+            return None;
+        }
+        *pending = None;
+        Some(place)
+    }
+    let mut sequences: Vec<Vec<u64>> = vec![Vec::new()];
+    let mut shorter = sequences.clone();
+    for _ in 0..4 {
+        shorter = shorter
+            .iter()
+            .flat_map(|s| {
+                (1..=3).map(move |id| {
+                    let mut longer = s.clone();
+                    longer.push(id);
+                    longer
+                })
+            })
+            .collect();
+        sequences.extend(shorter.iter().cloned());
+    }
+    assert_eq!(sequences.len(), 1 + 3 + 9 + 27 + 81);
+    for waiting in [None, Some(1), Some(2)] {
+        for ids in &sequences {
+            let replies: Vec<(u64, usize)> = ids.iter().copied().zip(0..).collect();
+            let mut queue = replies.iter().copied();
+            let mut pending = waiting;
+            let got = take_reply(&mut pending, || queue.next(), |r| r.0).map(|r| r.1);
+            assert!(queue.next().is_none(), "every reply is drained: {ids:?}");
+            for old in [old_jump_loop, old_arrived_loop] {
+                let mut old_pending = waiting;
+                let kept = old(&mut old_pending, &replies);
+                assert_eq!(got, kept, "{ids:?} waiting on {waiting:?}");
+                assert_eq!(pending, old_pending, "{ids:?} waiting on {waiting:?}");
+            }
+        }
+    }
 }

@@ -2,6 +2,8 @@
 //! diffs and logs), Quick Open, and Switch Header/Source.
 
 use super::*;
+use crate::widgets::confirm_frame::{ConfirmFrame, Inset, confirm_width, draw_confirm};
+use crate::widgets::picker_rows::{PickerMouse, answer_mouse};
 
 /// A Search Editor tab's label (#615): not a file on disk, so it names the
 /// query rather than a path the save path could clobber.
@@ -23,6 +25,10 @@ pub(super) fn is_search_editor_tab(path: Option<&Path>) -> bool {
         p == "Search Editor" || p.starts_with("Search: ")
     })
 }
+
+/// The name of the thread that builds Go to File's index, which the crash
+/// notice names (#2618).
+pub(super) const FILE_INDEX_THREAD: &str = "file-index";
 
 /// A query as the status line quotes it, shortened.
 pub(super) fn header_query_for_status(query: &str) -> String {
@@ -51,7 +57,10 @@ impl App {
     /// Clears the live result list so streamed `Hits` events accumulate
     /// from zero rather than appending to leftover hits from the prior query.
     pub(super) fn submit_search_query(&mut self) {
-        self.search.complete = false;
+        // A new run: whatever an earlier one still sends is dropped, the same
+        // query's included (#2608).
+        self.search.run += 1;
+        self.search.progress = SearchProgress::Running;
         self.search.hits.clear();
         self.search.selected = 0;
         self.search.scroll = 0;
@@ -69,10 +78,11 @@ impl App {
             self.search.include.clone(),
             self.search.effective_exclude(),
         ));
-        let _ = self.search_query_tx.send(SearchRequest::Query(
-            self.search.query.clone(),
-            self.search.opts,
-        ));
+        let _ = self.search_query_tx.send(SearchRequest::Query {
+            run: self.search.run,
+            query: self.search.query.clone(),
+            opts: self.search.opts,
+        });
         let term = if crate::widgets::search::as_typed(&self.search.query).is_empty() {
             None
         } else {
@@ -81,11 +91,11 @@ impl App {
         self.editor.set_search_highlight(term, self.search.opts);
     }
 
-    /// Apply any pending search events from the background worker. Drops
-    /// stale events whose query no longer matches the input field (the
-    /// user has typed past it). `Hits` events append to the live result
-    /// list as files yield matches; `Done` is informational. Returns true
-    /// iff hits were updated, so the main loop knows to redraw.
+    /// Apply any pending search events from the background worker, keeping
+    /// only those of the run the panel shows (#2608). `Hits` events append
+    /// to the live result list as files yield matches; `Done`, `Cancelled`
+    /// and `Crashed` say how far the run got. Returns true iff the panel
+    /// changed, so the main loop knows to redraw.
     pub fn drain_search_results(&mut self) -> bool {
         use crate::widgets::search::SearchEvent;
         let mut applied = false;
@@ -93,22 +103,65 @@ impl App {
         let mut arrived = Vec::new();
         while let Ok(event) = self.search_results_rx.try_recv() {
             match event {
-                SearchEvent::Hits(q, opts, batch) => {
-                    if q == self.search.query && opts.same_matching(&self.search.opts) {
-                        arrived.extend(batch);
-                        applied = true;
-                    }
+                SearchEvent::Hits(run, batch) if run == self.search.run => {
+                    arrived.extend(batch);
+                    applied = true;
                 }
-                SearchEvent::Done(q, opts) => {
-                    if q == self.search.query && opts.same_matching(&self.search.opts) {
-                        self.search.complete = true;
-                        applied = true;
-                    }
+                SearchEvent::Done(run) if run == self.search.run => {
+                    self.search.progress = SearchProgress::Finished;
+                    applied = true;
                 }
+                SearchEvent::Cancelled(run) if run == self.search.run => {
+                    self.search.progress = SearchProgress::Cancelled;
+                    applied = true;
+                }
+                // The crash notice has said so on the status line (#2611).
+                SearchEvent::Crashed(run) if run == self.search.run => {
+                    self.search.progress = SearchProgress::Crashed;
+                    applied = true;
+                }
+                _ => {}
             }
         }
         self.search.add_hits(arrived);
         applied
+    }
+
+    /// Stop the panel's run if its scan is still going, when the panel
+    /// leaves Search: the walker threads stop using every core. The hits so
+    /// far stay listed, and coming back to Search runs the query again
+    /// (#2608). The run counts as stopped from here, not from when the
+    /// worker's `Cancelled` lands: coming back before it does still runs
+    /// the query again (#2612 review). A `Done` that beats the cancel says
+    /// the run finished after all.
+    pub(super) fn cancel_search_run(&mut self) {
+        if self.search.progress == SearchProgress::Running {
+            let _ = self.search_query_tx.send(SearchRequest::Cancel);
+            self.search.progress = SearchProgress::Cancelled;
+        }
+    }
+
+    /// Run the panel's query again on coming back to Search, when its last
+    /// run was stopped before it finished (#2608), or the workspace's
+    /// folders changed after it ran (#2612 review).
+    pub(super) fn resume_cancelled_search(&mut self) {
+        if self.search.progress == SearchProgress::Cancelled {
+            self.submit_search_query();
+        }
+    }
+
+    /// The workspace's folders changed under the panel: anything a run
+    /// still sends is for the old folders and is dropped, even from a run
+    /// already counted as stopped, whose events may still be on the way
+    /// (#2612 review). The list answered for the old folders, so no run
+    /// counts as the whole answer any more, a finished one included: a run
+    /// in flight is cut short (#2608), Replace All asks for the search to
+    /// run again rather than skip an added folder's matches or edit a
+    /// removed folder's files, and coming back to Search runs it again
+    /// (#2612 review).
+    pub(super) fn search_roots_changed(&mut self) {
+        self.search.run += 1;
+        self.search.progress = SearchProgress::Cancelled;
     }
 
     /// The Replace All confirmation modal (#123): counts up front, commits
@@ -117,8 +170,7 @@ impl App {
         let Some((occurrences, files, skipped)) = self.pending_replace_all else {
             return;
         };
-        let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
+        let width = confirm_width(frame.area());
         let prompt = format!(
             "Replace {occurrences} occurrence(s) across {files} file(s) with \"{}\"?",
             self.search.replace
@@ -129,54 +181,34 @@ impl App {
         let inner_w = width.saturating_sub(2);
         let prompt_rows = wrap_cells_variable_width(&prompt, inner_w, inner_w).len() as u16;
         let skipped_rows = u16::from(skipped > 0);
-        let height: u16 = 6 + prompt_rows + skipped_rows;
-        let rect = Rect {
-            x: (area.width.saturating_sub(width)) / 2 + area.x,
-            y: (area.height.saturating_sub(height)) / 2 + area.y,
-            width,
-            height,
+        let frame_spec = ConfirmFrame {
+            title: " REPLACE ALL? ",
+            accent: self.theme.ui(Color::Rgb(0xe7, 0xa7, 0x3c)),
+            title_fg: Color::Black,
+            height: 6 + prompt_rows + skipped_rows,
+            inset: Inset::Tight,
         };
-        let rect = rect.intersection(area);
-        let warn = self.theme.ui(Color::Rgb(0xe7, 0xa7, 0x3c));
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(ratatui::text::Span::styled(
-                " REPLACE ALL? ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(warn)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        let inner = block.inner(rect);
-        frame.render_widget(block, rect);
-        let mut lines = vec![
-            Line::from(prompt),
-            Line::from(""),
-            Line::from("Files are rewritten on disk."),
-        ];
-        if skipped > 0 {
-            lines.push(Line::from(format!(
-                "{skipped} open file(s) with unsaved changes will be skipped."
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let mut lines = vec![
+                Line::from(prompt),
+                Line::from(""),
+                Line::from("Files are rewritten on disk."),
+            ];
+            if skipped > 0 {
+                lines.push(Line::from(format!(
+                    "{skipped} open file(s) with unsaved changes will be skipped."
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Enter / Y replaces \u{00b7} Esc cancels",
+                Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8))),
             )));
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Enter / Y replaces \u{00b7} Esc cancels",
-            Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8))),
-        )));
-        frame.render_widget(
-            Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
-            inner,
-        );
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
-            warn,
-        );
+            frame.render_widget(
+                Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+                inner,
+            );
+        });
     }
 
     pub(super) fn handle_search_key(&mut self, key: KeyEvent) {
@@ -351,12 +383,29 @@ impl App {
             self.status = String::from("Replace All: enter a search term first");
             return;
         }
-        if !self.search.complete {
+        match self.search.progress {
+            SearchProgress::Finished => {}
             // Hits stream in batches; replacing before Done would silently
             // miss files found after confirmation (#124 review).
-            self.status =
-                String::from("Replace All: search still running — retry when it finishes");
-            return;
+            SearchProgress::Running => {
+                self.status =
+                    String::from("Replace All: search still running — retry when it finishes");
+                return;
+            }
+            // The list is only what the run found before it was stopped,
+            // or answered for the workspace's folders before they changed.
+            SearchProgress::Cancelled => {
+                self.status = String::from(
+                    "Replace All: the search was stopped or its folders changed — refresh to search again",
+                );
+                return;
+            }
+            SearchProgress::Crashed => {
+                self.status = String::from(
+                    "Replace All: the search stopped when its scan crashed — refresh to search again",
+                );
+                return;
+            }
         }
         // Count first, write only after the modal confirms: a workspace-wide
         // disk rewrite is exactly what the confirm-destructive rule is for
@@ -388,8 +437,7 @@ impl App {
             .iter()
             .chain(
                 self.editor_layout
-                    .inactive_leaf_tabs()
-                    .into_iter()
+                    .inactive_groups()
                     .flat_map(|tabs| tabs.editors.iter()),
             )
             .filter(|e| e.dirty)
@@ -565,11 +613,7 @@ impl App {
         true
     }
 
-    pub fn consume_file_finder_image_clear(&mut self) -> bool {
-        self.overlays.file_finder_clear.consume()
-    }
-
-    /// Drain the background-build receiver into `file_finder_index`
+    /// Take the background build's index into `file_finder_index`
     /// without blocking. Called from `open_file_finder` and from the
     /// main loop tick. Accepts REPLACEMENT results too: when the FS
     /// watcher or a workspace re-root has triggered a rebuild, the
@@ -577,52 +621,55 @@ impl App {
     /// (if any) so an in-progress Cmd+P session immediately re-ranks
     /// against the new file set. If a follow-up rebuild was queued
     /// while this one was in flight (the `file_finder_index_dirty`
-    /// flag), it is re-kicked here so a long-running build on a
-    /// multi-GB monorepo can never miss a later FS event.
+    /// flag), it starts here once this one ends, so a long-running
+    /// build on a multi-GB monorepo can never miss a later FS event.
+    /// A build whose thread crashed ends too (#2618): the index it was
+    /// replacing stays, and the queued rebuild still starts, rather than
+    /// waiting for the next file change.
     pub(super) fn poll_file_finder_index(&mut self) {
-        let Some(rx) = self.file_finder_index_rx.as_ref() else {
+        let Some(job) = self.file_finder_index_job.as_ref() else {
             return;
         };
-        match rx.try_recv() {
-            Ok(entries) => {
+        match job.poll() {
+            crate::jobs::Poll::Pending => return,
+            crate::jobs::Poll::Done(entries) => {
                 let arc = std::sync::Arc::new(entries);
                 self.file_finder_index = Some(arc.clone());
-                self.file_finder_index_rx = None;
                 let visible = self.without_project_excludes(arc);
                 if let Some(finder) = self.file_finder.as_mut() {
                     finder.replace_entries(visible);
                 }
-                if self.file_finder_index_dirty {
-                    self.kick_file_finder_index_rebuild();
-                }
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.file_finder_index_rx = None;
-            }
+            crate::jobs::Poll::Died => {}
+        }
+        self.file_finder_index_job = None;
+        if self.file_finder_index_dirty {
+            self.kick_file_finder_index_rebuild();
         }
     }
 
-    /// Spawn a background walker that rebuilds the Cmd+P file index
-    /// against the current `workspace_root`. If a rebuild is already
-    /// in flight, sets the dirty flag instead; `poll_file_finder_index`
-    /// will re-kick on completion. Called from `change_workspace_root`
-    /// so Cmd+P reflects the new project, and from `drain_fs_events`
-    /// so creates, deletes, and git-checkout-driven swaps land in the
-    /// index without a croft restart.
+    /// Start a background build of the Cmd+P file index against the
+    /// current roots. If a rebuild is already in flight, sets the dirty
+    /// flag instead; `poll_file_finder_index` starts it when that one
+    /// ends. Called from `change_workspace_root` so Cmd+P reflects the
+    /// new project, and from `drain_fs_events` so creates, deletes, and
+    /// git-checkout-driven swaps land in the index without a croft
+    /// restart. When no thread can start, the index there is kept and the
+    /// status line says so; the next file change tries again.
     pub(super) fn kick_file_finder_index_rebuild(&mut self) {
-        if self.file_finder_index_rx.is_some() {
+        if self.file_finder_index_job.is_some() {
             self.file_finder_index_dirty = true;
             return;
         }
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<crate::widgets::file_finder::FileEntry>>();
-        let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
-        std::thread::spawn(move || {
-            let entries = crate::widgets::file_finder::build_multi_file_index(&roots);
-            let _ = tx.send(entries);
-        });
-        self.file_finder_index_rx = Some(rx);
         self.file_finder_index_dirty = false;
+        let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
+        let job = crate::jobs::Job::spawn(FILE_INDEX_THREAD, crate::jobs::Start::Now, move || {
+            crate::widgets::file_finder::build_multi_file_index(&roots)
+        });
+        match job {
+            Ok(job) => self.file_finder_index_job = Some(job),
+            Err(e) => self.status = format!("Could not update Go to File's file list: {e}"),
+        }
     }
 
     /// C/C++: Switch Header/Source (#1360): open the header of the source
@@ -666,7 +713,7 @@ impl App {
             let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
             let entries = crate::widgets::file_finder::build_multi_file_index(&roots);
             self.file_finder_index = Some(std::sync::Arc::new(entries));
-            self.file_finder_index_rx = None;
+            self.file_finder_index_job = None;
             found = crate::header_source::counterpart(&path, &root, &index_paths(self), &is_file);
         }
         let Some(found) = found else {
@@ -700,7 +747,7 @@ impl App {
             let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
             let entries = crate::widgets::file_finder::build_multi_file_index(&roots);
             self.file_finder_index = Some(std::sync::Arc::new(entries));
-            self.file_finder_index_rx = None;
+            self.file_finder_index_job = None;
         }
         let entries = self
             .file_finder_index
@@ -711,13 +758,13 @@ impl App {
         let mut finder = crate::widgets::file_finder::FileFinder::new(entries);
         finder.set_open_lines(self.open_text_line_counts());
         self.file_finder = Some(finder);
-        self.overlays.file_finder_clear.request();
+        self.overlays.popup_clear.request();
         self.status = format!("Go to File: {count} files indexed — Esc to close");
     }
 
     pub(super) fn close_file_finder(&mut self) {
         if self.file_finder.take().is_some() {
-            self.overlays.file_finder_clear.request();
+            self.overlays.popup_clear.request();
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();
@@ -924,31 +971,10 @@ impl App {
         let Some(finder) = self.file_finder.as_mut() else {
             return;
         };
-        let inside = rect_contains(finder.last_rect, m.column, m.row);
-        match m.kind {
-            MouseEventKind::ScrollDown => {
-                for _ in 0..3 {
-                    finder.select_next();
-                }
-            }
-            MouseEventKind::ScrollUp => {
-                for _ in 0..3 {
-                    finder.select_prev();
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
-                if !inside =>
-            {
-                self.close_file_finder();
-            }
-            // Click a row to open it, the way VS Code's quick-pick behaves.
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(idx) = finder.row_index_at(m.row) {
-                    finder.selected = idx;
-                    self.open_file_finder_selection();
-                }
-            }
-            _ => {}
+        match answer_mouse(finder, m) {
+            PickerMouse::Close => self.close_file_finder(),
+            PickerMouse::Accept => self.open_file_finder_selection(),
+            PickerMouse::Stay => {}
         }
     }
 

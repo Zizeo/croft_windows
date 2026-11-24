@@ -50,6 +50,7 @@ mod mouse_input;
 mod nav;
 mod overlay;
 mod perf_hud;
+mod popups;
 mod prompts;
 mod remote_sessions;
 mod review;
@@ -62,6 +63,7 @@ mod settings;
 pub(crate) mod sidebar_dwell;
 mod terminal_panes;
 mod terminal_tools;
+mod tick;
 mod viewers;
 mod welcome;
 mod welcome_screen;
@@ -108,6 +110,7 @@ use sidebar_dwell::{AUTO_HIDE_DWELL, SidebarDwell};
 use terminal_panes::*;
 #[cfg(test)]
 use terminal_tools::*;
+use tick::*;
 use viewers::*;
 use welcome::WelcomeState;
 #[cfg(test)]
@@ -131,7 +134,7 @@ use crate::widgets::{
     outline::OutlinePanel,
     remote::RemotePanel,
     run_debug::RunDebugPanel,
-    search::{SearchPanel, SearchRequest},
+    search::{SearchPanel, SearchProgress, SearchRequest},
     source_control::SourceControlPanel,
     terminal::{MouseAction, MouseButtonKind, MouseMods, PtyTerminal},
     timeline::TimelinePanel,
@@ -246,33 +249,24 @@ fn fallback_popup_rect(full: Rect, max_w_cap: u16) -> Rect {
 
 #[derive(Default, Clone, Copy)]
 struct SidebarAreas {
-    /// Block occupied by the Explorer activity-bar icon, in absolute coords.
-    /// Multi-row when image rendering is active; the hit-test still uses the
-    /// whole block.
-    explorer_icon: Rect,
-    /// Block occupied by the Search activity-bar icon, in absolute coords.
-    search_icon: Rect,
-    /// Block occupied by the Source Control activity-bar icon, in absolute coords.
-    source_control_icon: Rect,
-    /// Block occupied by the Remote Explorer activity-bar icon, in absolute coords.
-    remote_icon: Rect,
-    /// Block occupied by the Run and Debug activity-bar icon, in absolute coords.
-    run_debug_icon: Rect,
-    /// Block occupied by the Extensions activity-bar icon, in absolute coords.
-    extensions_icon: Rect,
-    /// Block occupied by the Testing (beaker) activity-bar icon, in absolute coords.
-    testing_icon: Rect,
-    /// Block occupied by the CodeQL (QL) activity-bar icon; empty while the
-    /// built-in CodeQL extension is disabled.
-    codeql_icon: Rect,
-    /// Block occupied by the sponsor heart directly above the settings gear;
-    /// empty when the bar is too short for it. Clicking it opens croft's
-    /// GitHub Sponsors page.
-    sponsor_icon: Rect,
-    /// Block occupied by the settings gear, bottom-anchored on the activity
-    /// bar (VS Code's "Manage" button). Asymmetric to the view icons up top;
-    /// clicking it opens the settings menu (Color Theme picker).
-    settings_icon: Rect,
+    /// Where each activity-bar icon sits. Clicking the sponsor heart opens
+    /// croft's GitHub Sponsors page; the settings gear, bottom-anchored like
+    /// VS Code's "Manage" button, opens the settings menu.
+    activity_icons: ActivityBlocks,
+}
+
+/// One activity-bar icon's pre-encoded pictures, one per state, so a hover
+/// only swaps which one is sent and never bakes again.
+#[cfg_attr(test, derive(Default))]
+pub struct ActivityIconImages {
+    /// Shown while the icon is selected: its view is open, or for the
+    /// settings gear its menu is, so the button reads as pressed. `None` for
+    /// the sponsor heart, which opens a web page and is never selected.
+    active: Option<String>,
+    /// At rest.
+    inactive: String,
+    /// Brightened while the pointer rests on it.
+    hovered: String,
 }
 
 /// Pre-encoded iTerm2 OSC-1337 inline-image escape sequences for each icon
@@ -281,40 +275,8 @@ struct SidebarAreas {
 /// frame draw, since ratatui's bg-clear overdraws the image.
 #[cfg_attr(test, derive(Default))]
 pub struct ActivityBarImages {
-    explorer_active: String,
-    explorer_inactive: String,
-    explorer_hovered: String,
-    search_active: String,
-    search_inactive: String,
-    search_hovered: String,
-    source_control_active: String,
-    source_control_inactive: String,
-    source_control_hovered: String,
-    remote_active: String,
-    remote_inactive: String,
-    remote_hovered: String,
-    run_debug_active: String,
-    run_debug_inactive: String,
-    run_debug_hovered: String,
-    extensions_active: String,
-    extensions_inactive: String,
-    extensions_hovered: String,
-    testing_active: String,
-    testing_inactive: String,
-    testing_hovered: String,
-    codeql_active: String,
-    codeql_inactive: String,
-    codeql_hovered: String,
-    /// The sponsor heart. It opens a web page rather than a view or a menu,
-    /// so it is never selected and has no active variant.
-    sponsor_inactive: String,
-    sponsor_hovered: String,
-    /// The settings gear. `active` is shown while its menu is open so the
-    /// button reads as pressed, mirroring the view icons' selected state;
-    /// `hovered` brightens it while the pointer rests on it.
-    settings_active: String,
-    settings_inactive: String,
-    settings_hovered: String,
+    /// Each activity-bar icon's pictures, indexed by [`ActivityIcon`].
+    icons: [ActivityIconImages; ActivityIcon::ALL.len()],
     /// Customize Layout toolbar icons (top-right of the editor / welcome),
     /// baked OPAQUE at the 4×2-cell toolbar box so they paint in front of the
     /// container's top line. The side-bar / panel icons carry an on/off pair
@@ -1545,10 +1507,10 @@ pub struct App {
     /// When a format-on-save stops waiting on its formatter and writes the
     /// file unformatted (#1491). Set with `save_after_format`.
     format_save_deadline: Option<std::time::Instant>,
-    /// Background `git log` results for the TIMELINE, keyed by the file they
-    /// describe so a stale reply for a since-closed file is ignored on drain.
-    timeline_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
-    timeline_tx: std::sync::mpsc::Sender<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
+    /// The TIMELINE lookup for the active file, while it runs, tagged with
+    /// the file it describes. Starting another drops it, so an older list can
+    /// never replace a newer one (#2575).
+    timeline_fetch: Option<crate::jobs::Job<(PathBuf, Vec<crate::git::FileHistoryEntry>)>>,
     /// Background folder-size scans for the CodeQL database card (#578): a
     /// large database is many files, so the walk stays off the input path.
     codeql_size_rx: std::sync::mpsc::Receiver<(PathBuf, Option<u64>)>,
@@ -1683,17 +1645,15 @@ pub struct App {
     test_jump_rx: std::sync::mpsc::Receiver<(PathBuf, String, Option<(PathBuf, u32)>)>,
     #[allow(clippy::type_complexity)]
     test_jump_tx: std::sync::mpsc::Sender<(PathBuf, String, Option<(PathBuf, u32)>)>,
-    /// Background per-ecosystem dependency-resolution result for DEPENDENCIES.
-    deps_rx: std::sync::mpsc::Receiver<Vec<Dependency>>,
-    deps_tx: std::sync::mpsc::Sender<Vec<Dependency>>,
+    /// The DEPENDENCIES lookup for the current root, while it runs. A
+    /// re-root replaces it, so a slower lookup for the folder just left can
+    /// never land in the new folder's list (#2573).
+    deps_fetch: Option<crate::jobs::Job<Vec<Dependency>>>,
     /// The workspace root DEPENDENCIES was detected/fetched for, so detection
     /// and the fetch fire once per root (re-fired by Make Root / re-root).
     deps_fetched: Option<PathBuf>,
-    /// Push-to-talk voice input (Termux OSK mic). The worker streams its
-    /// transcript over this channel; `voice_handle` lets the mic release kill
-    /// the in-flight recognizer.
-    voice_rx: std::sync::mpsc::Receiver<crate::voice::VoiceMsg>,
-    voice_tx: std::sync::mpsc::Sender<crate::voice::VoiceMsg>,
+    /// Push-to-talk voice input (Termux OSK mic): the live session, whose
+    /// result `drain_voice` reads and which a second mic tap cancels.
     voice_handle: Option<crate::voice::VoiceHandle>,
     /// Set when a mic tap cancels a live session, so the resulting empty result
     /// is reported as "canceled" rather than "no speech detected", and a
@@ -2063,38 +2023,11 @@ pub struct App {
     /// save (#178/#194): armed by the save that held them back, distinct
     /// from `force_save_armed` (the disk-conflict consent).
     formula_overwrite_armed: bool,
-    /// Pre-encoded inline-image for the source-control change-count badge (an
-    /// accent pill + count, VS Code's `activityBarBadge`), emitted at z=1 over
-    /// the SCM activity icon's bottom-right. `None` when there are no changes,
-    /// not in a repo, or image rendering is off (the glyph path draws a text
-    /// badge instead). Rebuilt by `refresh_scm_change_badge` when the change
-    /// set, theme, or cell size shifts.
-    scm_change_badge: Option<String>,
-    /// Change count the cached `scm_change_badge` was built for; drives the
-    /// dirty check and the badge's on-screen cell width.
-    scm_change_badge_count: usize,
-    /// Pre-encoded inline-image for the Explorer change badge: the count of
-    /// open editors with unsaved edits (VS Code's Explorer activity badge),
-    /// emitted at z=1 over the Explorer icon's bottom-right. `None` when nothing
-    /// is unsaved or image rendering is off. Mirrors the SCM badge plumbing;
-    /// rebuilt by `refresh_explorer_unsaved_badge`.
-    explorer_unsaved_badge: Option<String>,
-    /// Unsaved-file count the cached `explorer_unsaved_badge` was built for.
-    explorer_unsaved_count: usize,
-    /// Pre-encoded inline-image for the Remote icon's forwarded-ports badge
-    /// (VS Code's Ports view count), emitted at z=1 over the Remote icon. `None`
-    /// when no port is forwarded or image rendering is off. Same plumbing as the
-    /// other count badges; rebuilt by `refresh_remote_ports_badge`.
-    remote_ports_badge: Option<String>,
-    /// Forwarded-port count the cached `remote_ports_badge` was built for.
-    remote_ports_count: usize,
-    /// Pre-encoded inline-image for the Testing icon's failing-test count badge
-    /// (red pill, VS Code's Testing badge), emitted at z=1 over the beaker icon.
-    /// `None` when nothing is failing or image rendering is off. Same plumbing as
-    /// the other count badges; rebuilt by `refresh_testing_badge`.
-    testing_badge: Option<String>,
-    /// Failing-test count the cached `testing_badge` was built for.
-    testing_badge_count: usize,
+    /// The activity-bar count badges, indexed by [`ActivityIcon`] (VS Code's
+    /// `activityBarBadge`): unsaved files on the Explorer, Source Control
+    /// changes, forwarded ports on Remote and failed tests on Testing (see
+    /// [`ActivityIcon::badge`]). Kept current by `refresh_activity_badges`.
+    activity_badges: [CountBadge; ActivityIcon::ALL.len()],
     /// Problem count the cached `overlays.problems_badge` circle was built for;
     /// gates the per-frame rebuild in `refresh_problems_badge`.
     problems_badge_count: usize,
@@ -2130,6 +2063,8 @@ pub struct App {
     /// Hit-test rect of the on-screen minimap image (text-aligned rows), for
     /// click-to-scroll and the right-click menu. Empty when the minimap is off.
     minimap_img_rect: Rect,
+    /// Which pictures a pop-up was drawn over this frame (#2663).
+    picture_cover: popups::PictureCover,
     /// Pixel height the lines are mapped into within the image (top-aligned;
     /// `<=` the image's pixel height for short files). Click mapping divides by
     /// this, not the full strip height, so clicks land on the right line.
@@ -2147,11 +2082,10 @@ pub struct App {
     /// Whether the editor was wide enough for the strip on the last frame,
     /// so turning the minimap on can say why it does not show.
     minimap_room: bool,
-    /// The buffer ratatui drew last, and what each small chrome image (the
-    /// PROBLEMS badge, Run and Debug icon, sidebar illustrations) was sent
-    /// over, keyed by overlay, for [`App::chrome_image_due`]. Keys not
-    /// checked in a frame (the image was hidden) are dropped.
-    drawn_buffer: Option<ratatui::buffer::Buffer>,
+    /// What each small chrome image (the PROBLEMS badge, Run and Debug
+    /// icon, sidebar illustrations) was last sent over, keyed by overlay,
+    /// for [`App::chrome_image_due`]. Keys not checked in a frame (the image
+    /// was hidden) are dropped.
     chrome_sent: std::collections::HashMap<&'static str, u64>,
     chrome_seen: std::collections::HashSet<&'static str>,
     /// A left-drag is panning the view via the minimap strip.
@@ -2208,6 +2142,9 @@ pub struct App {
     /// (#1433): the `color_depth` setting, else what the terminal's
     /// environment advertises.
     pub(crate) color_depth: crate::color_depth::ColorDepth,
+    /// Whether the terminal reads underline colours (#2661); when it does
+    /// not, each frame drops them before it is written.
+    pub(crate) underline_colors: bool,
     /// Which panes are worktree lanes' (#348), by pane uid: saved with the
     /// terminal session so a relaunch seats the agent again, and consulted
     /// when a lane closes so its pane goes with it.
@@ -2912,15 +2849,16 @@ pub struct App {
     implementation_request_id: Option<u64>,
     references_request_id: Option<u64>,
     call_hierarchy_request_id: Option<u64>,
-    /// In-flight documentHighlight request, with the (path, row, col,
-    /// edit_seq) it was fired for so a reply for a caret or buffer state the
-    /// editor has since left is dropped.
-    occurrences_request: Option<(u64, PathBuf, usize, usize, u64)>,
-    /// In-flight linkedEditingRange request (#254): (id, path, edit_seq).
-    linked_request: Option<(u64, PathBuf, u64)>,
-    /// Last observed `(path, row, col, seq)` for the linked-editing
-    /// debounce, and when it settled — occurrences' idle pattern.
-    linked_observed: Option<(PathBuf, usize, usize, u64)>,
+    /// In-flight documentHighlight request, with the caret spot it was
+    /// fired for so a reply for a caret or buffer state the editor has
+    /// since left is dropped.
+    occurrences_request: Option<CaretRequest>,
+    /// In-flight linkedEditingRange request (#254), with the file and edit
+    /// seq it was asked for.
+    linked_request: Option<FileRequest>,
+    /// Last observed caret spot for the linked-editing debounce, and when
+    /// it settled — occurrences' idle pattern.
+    linked_observed: Option<CaretSpot>,
     linked_observed_at: std::time::Instant,
     /// A request already went out for `linked_observed` (#1299). Kept
     /// apart from `linked_request`, which the reply clears: a `null`
@@ -2937,7 +2875,7 @@ pub struct App {
     selection_range_request: Option<PendingSelectionRanges>,
     /// The caret state `tick_occurrences` last observed, and when it changed.
     /// A caret resting on one spot for `OCCURRENCES_IDLE` fires one request.
-    occ_observed: Option<(PathBuf, usize, usize, u64)>,
+    occ_observed: Option<CaretSpot>,
     occ_observed_at: std::time::Instant,
     rename_request_id: Option<u64>,
     /// The open buffers' `edit_seq`s when the in-flight rename went out
@@ -2946,9 +2884,9 @@ pub struct App {
     /// An Explorer rename or move waiting on the servers' `willRenameFiles`
     /// edit (#610); it runs when the answer lands or its deadline passes.
     pending_file_move: Option<PendingFileMove>,
-    /// In-flight prepareRename (#254): (id, path, row, col, edit_seq) —
-    /// the deferred rename prompt's context.
-    prepare_rename_request: Option<(u64, PathBuf, usize, usize, u64)>,
+    /// In-flight prepareRename (#254), with the caret spot that is the
+    /// deferred rename prompt's context.
+    prepare_rename_request: Option<CaretRequest>,
     format_request_id: Option<u64>,
     /// True when the in-flight format request is Format Selection (#254)
     /// — the drain words its statuses accordingly.
@@ -2959,11 +2897,11 @@ pub struct App {
     /// VS Code's `editor.formatOnType` (#254): typing a server trigger
     /// character runs onTypeFormatting at the spot. Off by default.
     format_on_type: bool,
-    /// In-flight on-type request: (id, the edit_seq it was computed
-    /// against, the tab's path). The reply applies only while that same
-    /// tab is active and its buffer has not moved since — `edit_seq` is
-    /// per-tab, so the seq alone cannot tell tabs apart.
-    on_type_request: Option<(u64, u64, PathBuf)>,
+    /// In-flight on-type request, with the tab's path and the edit_seq it
+    /// was computed against. The reply applies only while that same tab is
+    /// active and its buffer has not moved since — `edit_seq` is per-tab,
+    /// so the seq alone cannot tell tabs apart.
+    on_type_request: Option<FileRequest>,
     code_action_request_id: Option<u64>,
     /// True when the in-flight code-action request is a `codeAction/resolve`
     /// (the reply is one resolved action to apply directly) rather than the
@@ -3001,9 +2939,10 @@ pub struct App {
     /// typed, the `gh` to run, and where finished jobs report.
     review_pending: Vec<crate::review_threads::PendingComment>,
     review_pending_pr: Option<(PathBuf, String)>,
-    /// A Submit Review or export is in flight; another is refused until it
-    /// reports, so the same comments are never posted twice.
-    review_submitting: bool,
+    /// The Submit Review or export in flight, as the `review-submit` job;
+    /// another is refused while it runs, so the same comments are never
+    /// posted twice. A job whose thread crashed no longer counts (#2578).
+    review_submit: Option<crate::jobs::Job<crate::review_ops::Outcome>>,
     /// Sticky notes (#367): every note in the workspace, where the owner
     /// keeps them (`None` under test), and which box id is which note.
     notes: crate::sticky_notes::Notes,
@@ -3779,16 +3718,16 @@ pub struct App {
     /// Cached workspace file index. Built lazily on first Cmd+P and
     /// shared across reopens so repeated invocations are instant.
     file_finder_index: Option<std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>>>,
-    /// Background-build receiver: App::new spawns a thread that walks
-    /// the workspace and sends the index here; Cmd+P opens against the
-    /// hot index instead of walking on the UI thread. None once the
-    /// index has been received (or if a build was never kicked off).
-    file_finder_index_rx:
-        Option<std::sync::mpsc::Receiver<Vec<crate::widgets::file_finder::FileEntry>>>,
+    /// The background build of that index: App::new starts one that walks
+    /// the workspace, so Cmd+P opens against the hot index instead of
+    /// walking on the UI thread, and file changes start rebuilds. None once
+    /// the index has landed, or the build's thread died (#2618), or no build
+    /// was started.
+    file_finder_index_job: Option<crate::jobs::Job<Vec<crate::widgets::file_finder::FileEntry>>>,
     /// Set when a rebuild was requested while one was already in flight.
-    /// poll_file_finder_index drains it on completion and re-kicks the
-    /// background walker so a long-running rebuild (multi-GB monorepo)
-    /// can never miss a later FS event that landed mid-walk.
+    /// poll_file_finder_index starts it once that one ends, landed or
+    /// crashed (#2618), so a long-running rebuild (multi-GB monorepo) can
+    /// never miss a later FS event that landed mid-walk.
     file_finder_index_dirty: bool,
 }
 
@@ -4198,14 +4137,11 @@ impl App {
         } else {
             crate::mcp::catalog::installed_ids(&crate::lsp::manifest::user_extensions_dir())
         };
-        let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
         let (codeql_size_tx, codeql_size_rx) = std::sync::mpsc::channel();
         let (history_done_tx, history_done_rx) = std::sync::mpsc::channel();
         let (project_hint_tx, project_hint_rx) = std::sync::mpsc::channel();
         let (test_jump_tx, test_jump_rx) = std::sync::mpsc::channel();
         let (blame_tx, blame_rx) = std::sync::mpsc::channel();
-        let (deps_tx, deps_rx) = std::sync::mpsc::channel();
-        let (voice_tx, voice_rx) = std::sync::mpsc::channel();
         let editor = EditorTabs::new();
         // Bound before the first pane, so that pane's shell carries the
         // socket like every later one. `spawn_with_preamble` reads
@@ -4251,19 +4187,18 @@ impl App {
                 search_results_tx,
             );
         });
-        // Pre-build the Cmd+P file index on a background thread so the
-        // first Cmd+P keystroke does not stall the UI for the length
-        // of a workspace walk. The result is delivered via channel;
-        // open_file_finder calls poll_file_finder_index to consume it.
-        let (file_finder_index_tx, file_finder_index_rx) =
-            std::sync::mpsc::channel::<Vec<crate::widgets::file_finder::FileEntry>>();
+        // Pre-build the Cmd+P file index on a background job so the
+        // first Cmd+P keystroke does not stall the UI for the length of a
+        // workspace walk (a home folder's included), started after the
+        // first frame. open_file_finder calls poll_file_finder_index to
+        // take it; if no thread can start, the first Cmd+P walks instead.
         let index_root = root.clone();
-        std::thread::spawn(move || {
-            // A walk of the whole workspace, a home folder's included.
-            crate::startup_gate::wait();
-            let entries = crate::widgets::file_finder::build_file_index(&index_root);
-            let _ = file_finder_index_tx.send(entries);
-        });
+        let file_finder_index_job = crate::jobs::Job::spawn(
+            FILE_INDEX_THREAD,
+            crate::jobs::Start::AfterFirstFrame,
+            move || crate::widgets::file_finder::build_file_index(&index_root),
+        )
+        .ok();
         let fs_watch = FsWatch::spawn(&root, &tree);
         crate::startup_trace::mark("file watcher started");
         // Persisted layout preferences (Customize Layout popup). Skipped under
@@ -4351,8 +4286,7 @@ impl App {
             explorer_views,
             settings_chain: merged_settings.chain,
             settings_provenance: merged_settings.provenance,
-            timeline_rx,
-            timeline_tx,
+            timeline_fetch: None,
             codeql_size_rx,
             codeql_size_tx,
             codeql_size_pending: std::collections::HashSet::new(),
@@ -4412,11 +4346,8 @@ impl App {
                 crate::history::history_dir()
             },
             history_restore: None,
-            deps_rx,
-            deps_tx,
+            deps_fetch: None,
             deps_fetched: None,
-            voice_rx,
-            voice_tx,
             voice_handle: None,
             voice_canceling: false,
             voice_ready: None,
@@ -4559,14 +4490,7 @@ impl App {
             welcome_bake: None,
             last_pdf_wheel: None,
             formula_overwrite_armed: false,
-            scm_change_badge: None,
-            scm_change_badge_count: 0,
-            explorer_unsaved_badge: None,
-            explorer_unsaved_count: 0,
-            remote_ports_badge: None,
-            remote_ports_count: 0,
-            testing_badge: None,
-            testing_badge_count: 0,
+            activity_badges: Default::default(),
             problems_badge_count: 0,
             problems_badge_cell: None,
             inline_protocol: crate::iterm2_inline::detect_inline_image_protocol(),
@@ -4576,13 +4500,13 @@ impl App {
             minimap_side: MinimapSide::Right,
             minimap_base: None,
             minimap_img_rect: Rect::default(),
+            picture_cover: popups::PictureCover::default(),
             minimap_content_h: 0,
             minimap_baked_at: None,
             minimap_edit_pending: false,
             minimap_text: false,
             minimap_text_cache: None,
             minimap_room: true,
-            drawn_buffer: None,
             chrome_sent: std::collections::HashMap::new(),
             chrome_seen: std::collections::HashSet::new(),
             minimap_drag: false,
@@ -4615,6 +4539,9 @@ impl App {
                 .unwrap_or_else(|| {
                     crate::color_depth::ColorDepth::detect(|name| std::env::var(name).ok())
                 }),
+            underline_colors: crate::color_depth::underline_colors_supported(|name| {
+                std::env::var(name).ok()
+            }),
             lane_panes: std::collections::BTreeMap::new(),
             tree_clipboard: None,
             tree_typeahead: None,
@@ -4992,7 +4919,7 @@ impl App {
             pending_stash_drop: None,
             pending_replace_all: None,
             file_finder_index: None,
-            file_finder_index_rx: Some(file_finder_index_rx),
+            file_finder_index_job,
             file_finder_index_dirty: false,
             completion_request_id: None,
             completion_origin: None,
@@ -5028,7 +4955,7 @@ impl App {
             review_boxes: None,
             review_pending: Vec::new(),
             review_pending_pr: None,
-            review_submitting: false,
+            review_submit: None,
             notes: crate::startup_trace::after(
                 "sticky notes read",
                 notes_path
@@ -5198,7 +5125,6 @@ impl App {
     /// this frame; the next frame clears, full-redraws, and re-emits a single
     /// clean set at the new cells.
     pub fn flush_activity_image_overlays(&mut self, around: &[u64]) {
-        use std::io::Write;
         // The keepalive re-emit fights iTerm2's image-cache eviction. Neither
         // the sixel cell buffer nor Kitty's image layer evicts, so there the
         // icons re-emit only when dirty: on Kitty the keepalive cost about
@@ -5256,34 +5182,27 @@ impl App {
             self.overlays.activity.set_sent(sent);
             return;
         }
-        let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
-        let _ = write!(out, "\x1b[?25l\x1b[s");
-        for ((x, y), seq) in &overlays {
-            // Same screen bound as the image writers (#513): a raw
-            // absolute-CUP write that ratatui cannot repair, so the origin
-            // is checked before it is used.
-            //
-            // 1x1 is NARROWER than some payloads here, and knowingly so.
-            // `pending_activity_image_overlays` discards each block's
-            // `Rect` and returns only its origin, and a count badge is 2-3
-            // cells wide (`count_badge_cells_w`), so a badge whose left
-            // edge is on screen and right edge is not would pass this.
-            // Not reachable today -- the badges anchor to the left-hand
-            // activity bar -- and making it exact means returning the
-            // `Rect` from that function, which is a wider change than this
-            // guard. Recorded rather than left to be rediscovered.
-            if !self.overlay_fits_on_screen(*x, *y, 1, 1) {
-                continue;
-            }
-            let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1); // 1-based
-            let _ = out.write_all(seq.as_bytes());
-        }
-        let _ = write!(out, "\x1b[u");
-        if cursor_on {
-            let _ = write!(out, "\x1b[?25h");
-        }
-        let _ = out.flush();
+        let on_screen = overlays
+            .iter()
+            .filter(|((x, y), _)| {
+                // Same screen bound as the image writers (#513): a raw
+                // absolute-CUP write that ratatui cannot repair, so the origin
+                // is checked before it is used.
+                //
+                // 1x1 is NARROWER than some payloads here, and knowingly so.
+                // `pending_activity_image_overlays` discards each block's
+                // `Rect` and returns only its origin, and a count badge is 2-3
+                // cells wide (`count_badge_cells_w`), so a badge whose left
+                // edge is on screen and right edge is not would pass this.
+                // Not reachable today -- the badges anchor to the left-hand
+                // activity bar -- and making it exact means returning the
+                // `Rect` from that function, which is a wider change than this
+                // guard. Recorded rather than left to be rediscovered.
+                self.overlay_fits_on_screen(*x, *y, 1, 1)
+            })
+            .map(|((x, y), seq)| (*x, *y, seq.as_bytes()));
+        write_inline_images(&mut stdout(), on_screen, cursor_on);
         self.overlays.activity.mark_emitted();
         self.overlays.activity.store_positions(positions);
         self.overlays.activity.set_neighbourhood(around.to_vec());
@@ -5374,7 +5293,7 @@ impl App {
     }
 
     /// Every open buffer's path, across the active leaf and every inactive
-    /// one. `App::editor` is the hoisted active leaf and `inactive_leaf_tabs`
+    /// one. `App::editor` is the hoisted active leaf and `inactive_groups`
     /// walks the rest, so together they cover each leaf exactly once.
     fn open_buffer_paths(&self) -> std::collections::BTreeSet<PathBuf> {
         self.editor
@@ -5382,8 +5301,7 @@ impl App {
             .iter()
             .chain(
                 self.editor_layout
-                    .inactive_leaf_tabs()
-                    .into_iter()
+                    .inactive_groups()
                     .flat_map(|g| g.editors.iter()),
             )
             .filter_map(|e| e.path.clone())
@@ -5423,24 +5341,6 @@ impl App {
 
     pub fn terminal_mut(&mut self) -> &mut PtyTerminal {
         &mut self.terminals[self.active_terminal]
-    }
-
-    /// Whether a modal overlay owns the screen right now. The same eleven-way
-    /// check was repeated verbatim at three overlay-flush sites; auto-hide
-    /// (#260) needs it too, so it lives here once.
-    fn modal_overlay_open(&self) -> bool {
-        self.approval_ui.is_some()
-            || self.shortcuts_modal.is_some()
-            || self.file_finder.is_some()
-            || self.command_palette.is_some()
-            || self.go_to_symbol.is_some()
-            || self.workspace_symbols.is_some()
-            || self.process_picker.is_some()
-            || self.zoxide_jump.is_some()
-            || self.command_history_popup.is_some()
-            || self.branch_picker.is_some()
-            || self.input_prompt.is_some()
-            || self.list_picker.is_some()
     }
 
     fn focus_pane(&mut self, p: Pane) {
@@ -6396,6 +6296,7 @@ pub fn run(
     }
     result?;
     if app.drop_to_local {
+        crate::widgets::editor::delete_own_gunzip_copies();
         std::process::exit(crate::remote::DROP_TO_LOCAL_EXIT_CODE);
     }
     // A background self-update landed: serialize the session and replace
@@ -6429,6 +6330,8 @@ pub fn run(
         cmd.arg(app.workspace_root())
             .arg("--restore-session")
             .arg(&session_path);
+        // The relaunched croft reopens each archive from the saved session.
+        crate::widgets::editor::delete_own_gunzip_copies();
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -6511,14 +6414,7 @@ fn consume_any_image_clear(app: &mut App) -> bool {
         app.consume_run_debug_image_clear(),
         app.consume_problems_badge_image_clear(),
         app.consume_no_repo_hero_image_clear(),
-        app.consume_shortcuts_image_clear(),
-        app.consume_file_finder_image_clear(),
-        app.consume_command_palette_image_clear(),
-        app.consume_process_picker_image_clear(),
-        app.consume_zoxide_jump_image_clear(),
-        app.consume_branch_picker_image_clear(),
-        app.consume_input_prompt_image_clear(),
-        app.consume_list_picker_image_clear(),
+        app.consume_popup_image_clear(),
         app.consume_ssh_empty_state_image_clear(),
         app.consume_minimap_image_clear(),
         app.consume_activity_image_clear(),
@@ -6594,305 +6490,16 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             run_pending_scp_uploads(app, terminal)?;
             needs_redraw = true;
         }
-        // Same-file tabs agree before the watcher is read: a save from one
-        // symbol tab leaves its siblings holding the saved text, so the
-        // change event reads as their own write, not a conflict (#369).
-        let symbol_views_settled = app.sync_symbol_views();
-        // Pull in any filesystem-watcher events first so the tree reflects
-        // disk reality on the very next frame.
-        let fs_changed = app.drain_fs_events();
-        crate::startup_trace::mark("file changes read");
-        // Peek without clearing so we can coalesce PTY-only redraws without
-        // losing bytes that the reader thread has already advanced into the
-        // terminal grid.
-        let pty_pending = app.peek_terminals_dirty();
-        let blink_visible = app.cursor_visible_phase();
+        // What the background work finished this tick, collected before
+        // anything is drawn (#2062).
+        let pass = tick_background(app);
+        let pty_pending = pass.pty_pending;
+        let blink_visible = pass.blink_visible;
         let blink_changed = blink_visible != last_blink_visible;
-        // Either spinner advancing must wake a redraw; both stay 0 when idle.
-        let spinner_phase =
-            app.update_spinner_phase() + app.mcp_spinner_phase() + app.problems_fix_spinner_phase();
+        let spinner_phase = pass.spinner_phase;
         let spinner_changed = spinner_phase != last_spinner_phase;
-        let ext_index_changed = app.drain_ext_index_refresh();
-        let codeql_changed = app.drain_codeql_run()
-            | app.drain_codeql_ast()
-            | app.drain_codeql_model()
-            | app.drain_codeql_doc()
-            | app.drain_codeql_upgrade()
-            | app.drain_codeql_version()
-            | app.drain_codeql_log_summary()
-            | app.drain_codeql_log_viewer()
-            | app.drain_codeql_perf_compare()
-            | app.drain_codeql_query_help()
-            | app.drain_codeql_pack_job()
-            | app.drain_codeql_db_job()
-            | app.drain_codeql_cli_download()
-            | app.drain_codeql_cli_check()
-            | app.drain_codeql_code_search()
-            | app.drain_codeql_variant_submit()
-            | app.poll_codeql_variant_runs()
-            | app.drain_codeql_variant_results()
-            | app.drain_codeql_variant_export()
-            | app.drain_codeql_queries();
-        let search_changed = app.drain_search_results();
-        let log_index_changed = app.poll_log_index();
-        let remote_changed = app.refresh_remote_if_config_changed();
-        let pulls_changed = app.drain_remote_pulls() | app.drain_relay_copies();
-        let finder_changed = app.sync_file_finder_open_lines()
-            | app
-                .file_finder
-                .as_mut()
-                .is_some_and(|f| f.poll_line_check());
-        let view_changed = app.drain_view_requests();
-        let hook_changed = app.drain_hook_requests()
-            | app.poll_pr_gh()
-            | app.poll_pr_checkout()
-            | app.poll_code_scanning();
-        crate::startup_trace::mark("background results collected");
-        app.sync_approval_check();
-        app.persist_agent_ledger(false);
-        let kernel_changed = app.poll_notebook_kernels();
-        let ports_changed = app.drain_ports_and_poll();
-        let session_presence_changed = app.poll_session_presence();
-        let session_typing_changed = app.poll_session_typing();
-        let collab_changed = app.poll_collab();
-        crate::startup_trace::mark("agents, ports and collaborators polled");
-        let symbol_views_changed = app.sync_symbol_views() | symbol_views_settled;
-        let bells_changed = app.drain_terminal_bells();
-        // A block whose command has finished gets its output box (#354).
-        let captures_changed = app.settle_block_captures();
-        // Every tick, not only when a capture settles: this is what notices
-        // the editor has moved to another document (#354 review).
-        app.publish_block_outputs();
-        let labels_changed =
-            app.refresh_terminal_labels() | app.drain_agent_events() | app.drain_fleet_results();
-        app.flush_terminal_session();
-        let auto_save_changed = app.tick_auto_save();
-        app.tick_hot_exit(std::time::Instant::now());
-        crate::startup_trace::mark("terminal panes and saves ticked");
-        let highlights_changed = app.poll_highlights();
-        // Pictures baked off the UI thread (#1973) go up as they land.
-        let images_changed =
-            app.poll_chrome_bake() | app.poll_welcome_bake() | app.poll_saved_session();
-        // A closed tab's bookmarks are kept, and come back with its file.
-        let bookmarks_changed = app.settle_bookmarks();
-        crate::startup_trace::mark("highlights and pictures polled");
-        let live_run_changed = app.tick_live_run()
-            | app.sync_markdown_side_previews()
-            | app.sync_markdown_scroll()
-            | app.tick_minimap();
-        app.tick_code_lens();
-        let code_lens_changed = app.tick_config_watch()
-            | app.drain_lsp_code_lens()
-            | app.drain_search_editor()
-            | app.tick_inline_complete()
-            | app.drain_review_ops();
-        let connect_changed = app.poll_connect_dialog() | app.drain_scrub_views();
-        let install_changed = app.poll_install_session();
-        let update_changed = app.poll_update_watch() | app.poll_background_panic();
-        let http_changed = app.drain_http_responses();
-        let reveal_changed = app.tick_redaction_reveal();
-        crate::startup_trace::mark("watchers and dialogs polled");
-        app.sync_lsp();
-        app.send_due_completion_ask();
-        app.send_due_completion_reask();
-        crate::startup_trace::mark("language servers synced");
-        let markdown_lint_changed = app.sync_markdown_lint();
-        let sarif_diagnostics_changed = app.sync_sarif_diagnostics();
-        app.sync_sarif_selection_to_cursor();
-        app.sync_sarif_step_marks();
-        app.refresh_sarif_preview();
-        app.poll_sarif_download();
-        app.sync_git_gutters();
-        app.sync_blame();
-        app.sync_provenance();
-        let blame_changed = app.drain_blame() | app.drain_git_net() | app.drain_git_view();
-        crate::startup_trace::mark("lint, gutters and blame synced");
-        // Request/refresh the OUTLINE for the active file (after sync_lsp so the
-        // edit-seq it reads is current) and advance follow-cursor.
-        let outline_sync_changed = app.sync_outline();
-        let outline_changed = app.drain_lsp_document_symbols();
-        app.workspace_symbols_dispatch_due();
-        let ws_symbols_changed = app.drain_lsp_workspace_symbols();
-        // Refresh the Explorer's other stacked sub-views (Open Editors list,
-        // Timeline git history, Dependencies) and drain their workers.
-        let explorer_panels_changed = app.sync_explorer_panels();
-        crate::startup_trace::mark("outline and Explorer views synced");
-        app.refresh_semantic_tokens_if_requested();
-        app.refresh_inlay_hints_if_requested();
-        app.refresh_workspace_diagnostics_if_requested();
-        let lsp_changed = app.drain_lsp_completion();
-        app.refresh_signature_help_if_moved();
-        let sig_help_changed = app.drain_lsp_signature_help();
-        app.poll_hover();
-        let hover_changed =
-            app.drain_lsp_hover() | app.drain_lsp_rust_analyzer() | app.drain_blame_hover();
-        let tab_hover_changed = app.poll_tab_hover();
-        let ui_tooltip_changed = app.poll_ui_tooltip();
-        let definition_changed = app.drain_lsp_definition();
-        let declaration_changed = app.drain_lsp_declaration();
-        let type_definition_changed = app.drain_lsp_type_definition();
-        let implementation_changed = app.drain_lsp_implementation();
-        let references_changed = app.drain_lsp_references();
-        let call_hierarchy_changed = app.drain_lsp_call_hierarchy();
-        let sidebar_hide_changed = app.tick_sidebar_auto_hide();
-        let occ_tick_changed = app.tick_occurrences();
-        let linked_tick_changed = app.tick_linked_editing();
-        let linked_changed = app.drain_lsp_linked_editing();
-        app.tick_on_type_formatting();
-        let on_type_changed = app.drain_lsp_on_type_format();
-        let prepare_rename_changed = app.drain_lsp_prepare_rename();
-        let occurrences_changed = app.drain_lsp_document_highlights();
-        let rename_changed = app.drain_lsp_rename() | app.tick_file_moves();
-        let format_changed = app.drain_lsp_format() | app.drain_prettier_format();
-        let code_action_changed = app.drain_lsp_code_actions();
-        let semantic_changed = app.drain_lsp_semantic_tokens();
-        let inlay_changed = app.drain_lsp_inlay_hints();
-        app.drain_lsp_document_links();
-        let folds_changed = app.drain_lsp_folding_ranges();
-        let selection_ranges_changed = app.drain_lsp_selection_ranges();
-        let colors_changed = app.drain_lsp_document_colors();
-        let color_pres_changed = app.drain_lsp_color_presentations();
-        let diagnostics_changed = app.drain_lsp_diagnostics();
-        let progress_changed = app.drain_lsp_progress();
-        crate::startup_trace::mark("language server replies read");
-        let dap_changed = app.poll_dap() | app.poll_debug_build();
-        let tests_changed = app.test_worker.drain(&mut app.testing)
-            | app.drain_pending_test_debug()
-            | app.drain_pending_cargo_launch();
-        // A queued run the worker refused (runner disabled after the entry
-        // check) rolled its cases back in the drain; say why nothing ran.
-        if app.testing.take_refusal() {
-            app.status = String::from(crate::testing::NO_RUNNER_STATUS);
-        }
-        if app.testing.take_cancelled() {
-            app.status = String::from("Test run cancelled");
-        }
-        // One notification per red run (#358), from the latch the panel
-        // sets when a run ends, never per test case.
-        let coverage_changed = app.sync_coverage();
-        let watch_changed = app.tick_test_watch();
-        if app.testing.take_failed_run() {
-            let (passed, failed, _) = app.testing.counts();
-            app.notifier.emit(
-                crate::notifications::Event::TestsFailed {
-                    failed,
-                    passed,
-                    reported: app.testing.run_reported_failed(),
-                },
-                app.roots.primary(),
-                &remote_host_label(),
-            );
-        }
-        crate::startup_trace::mark("debugger and tests polled");
-        let mcp_changed = app.poll_mcp();
-        let pair_changed =
-            app.maybe_seat_navigator() | app.poll_pair() | app.tick_proactive_navigator();
-        crate::startup_trace::mark("AI tools polled");
-        let voice_changed = app.drain_voice();
-        let zen_hint_changed = app.expire_zen_hint(std::time::Instant::now());
-        let cmd_k_changed = app.expire_cmd_k(std::time::Instant::now());
-        let screencast_changed = app.screencast.expire(std::time::Instant::now());
-        let zoxide_changed = app.poll_zoxide_install();
-        // Surface managed language-server install progress in the status bar so
-        // the background work (which can take a few seconds) is visible.
-        let install_status_changed = match crate::lsp::install::take_status() {
-            Some(msg) => {
-                app.status = msg;
-                true
-            }
-            None => false,
-        };
-        // When a managed install finishes, forget the LSP sync state for the
-        // docs that language serves so the next `sync_lsp` re-opens them. That
-        // re-open makes the manager re-probe and spawn the just-installed
-        // server, so "installed" becomes "working" without a further action.
-        let just_installed = crate::lsp::install::take_just_installed();
-        if !just_installed.is_empty() {
-            app.lsp_last_seen
-                .retain(|path, _| !just_installed_covers_path(&just_installed, path));
-        }
 
-        let non_pty_dirty = needs_redraw
-            || zen_hint_changed
-            || cmd_k_changed
-            || screencast_changed
-            || zoxide_changed
-            || fs_changed
-            || mcp_changed
-            || pair_changed
-            || tests_changed
-            || coverage_changed
-            || watch_changed
-            || blink_changed
-            || spinner_changed
-            || ext_index_changed
-            || codeql_changed
-            || search_changed
-            || log_index_changed
-            || remote_changed
-            || pulls_changed
-            || finder_changed
-            || view_changed
-            || hook_changed
-            || kernel_changed
-            || ports_changed
-            || session_presence_changed
-            || session_typing_changed
-            || collab_changed
-            || symbol_views_changed
-            || bells_changed
-            || captures_changed
-            || labels_changed
-            || auto_save_changed
-            || highlights_changed
-            || images_changed
-            || bookmarks_changed
-            || live_run_changed
-            || code_lens_changed
-            || ws_symbols_changed
-            || connect_changed
-            || install_changed
-            || update_changed
-            || http_changed
-            || reveal_changed
-            || lsp_changed
-            || sig_help_changed
-            || hover_changed
-            || tab_hover_changed
-            || ui_tooltip_changed
-            || definition_changed
-            || declaration_changed
-            || type_definition_changed
-            || implementation_changed
-            || references_changed
-            || call_hierarchy_changed
-            || sidebar_hide_changed
-            || occ_tick_changed
-            || linked_tick_changed
-            || linked_changed
-            || on_type_changed
-            || prepare_rename_changed
-            || occurrences_changed
-            || rename_changed
-            || format_changed
-            || code_action_changed
-            || semantic_changed
-            || inlay_changed
-            || folds_changed
-            || selection_ranges_changed
-            || colors_changed
-            || color_pres_changed
-            || diagnostics_changed
-            || progress_changed
-            || voice_changed
-            || outline_sync_changed
-            || outline_changed
-            || explorer_panels_changed
-            || install_status_changed
-            || blame_changed
-            || dap_changed
-            || markdown_lint_changed
-            || sarif_diagnostics_changed;
+        let non_pty_dirty = needs_redraw || pass.changed || blink_changed || spinner_changed;
         let pty_eligible = pty_pending
             && (app.peek_terminals_pending_bytes() <= PTY_SMALL_UPDATE_BYTES
                 || last_pty_redraw.elapsed() >= pty_min_interval);
@@ -6948,11 +6555,12 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             }
             crate::startup_trace::mark("loop work done");
             let draw_start = std::time::Instant::now();
-            let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
+            // The frame ratatui just drew, read in place by the picture
+            // flushes below rather than copied (#2062).
+            let mut drawn = terminal.draw(|f| app.render_for_terminal(f))?.buffer;
             crate::startup_trace::mark("frame drawn");
             app.sync_caret_style();
-            let mut underlays = app.image_underlays(drawn.buffer);
-            app.keep_drawn_buffer(drawn.buffer);
+            let mut underlays = app.image_underlays(drawn);
             // Record render+flush time and the bytes ratatui shipped this
             // frame so the F8 HUD can show where remote latency goes.
             app.perf.record_draw(draw_start.elapsed().as_micros());
@@ -6966,9 +6574,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.overlays.welcome.mark_dirty();
                 app.overlays.hero.mark_dirty();
                 app.forget_sent_images();
-                let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
-                underlays = app.image_underlays(drawn.buffer);
-                app.keep_drawn_buffer(drawn.buffer);
+                drawn = terminal.draw(|f| app.render_for_terminal(f))?.buffer;
+                underlays = app.image_underlays(drawn);
             }
             // After ratatui flushes its diff, paint the activity-bar icons
             // directly via OSC-1337 on every redraw. We previously gated
@@ -7000,17 +6607,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     if !app.overlays.editor[side].needs_emit(underlays.editor[side]) {
                         continue;
                     }
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                    let _ = out.write_all(osc.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
+                    write_inline_image(
+                        &mut stdout(),
+                        layout.cell_x,
+                        layout.cell_y,
+                        osc.as_bytes(),
+                        app.cursor_should_be_visible(),
+                    );
                     app.mark_editor_image_displayed(side);
                     app.overlays.editor[side].mark_sent_over(underlays.editor[side]);
                 } else {
@@ -7028,17 +6631,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 )
             {
                 if app.overlays.terminal_image.needs_emit(underlays.terminal) {
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                    let _ = out.write_all(osc.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
+                    write_inline_image(
+                        &mut stdout(),
+                        layout.cell_x,
+                        layout.cell_y,
+                        osc.as_bytes(),
+                        app.cursor_should_be_visible(),
+                    );
                     app.mark_terminal_image_displayed();
                     app.overlays
                         .terminal_image
@@ -7058,17 +6657,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 )
             {
                 if app.overlays.markdown_image.needs_emit(underlays.markdown) {
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                    let _ = out.write_all(osc.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
+                    write_inline_image(
+                        &mut stdout(),
+                        layout.cell_x,
+                        layout.cell_y,
+                        osc.as_bytes(),
+                        app.cursor_should_be_visible(),
+                    );
                     app.mark_markdown_image_displayed();
                     app.overlays
                         .markdown_image
@@ -7088,34 +6683,28 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 )
             {
                 if app.overlays.minimap.needs_emit(underlays.minimap) {
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                    let _ = out.write_all(osc.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
+                    write_inline_image(
+                        &mut stdout(),
+                        layout.cell_x,
+                        layout.cell_y,
+                        osc.as_bytes(),
+                        app.cursor_should_be_visible(),
+                    );
                     app.mark_minimap_image_displayed();
                     app.overlays.minimap.mark_sent_over(underlays.minimap);
                 }
             } else {
                 app.overlays.minimap.forget_sent();
             }
-            // Run-and-Debug headline icon: same re-emit-every-frame trick.
-            // Only fires while the sidebar is on the Run-Debug view and the
-            // panel reserved a cell for the icon on its last render. On
-            // view change the `consume_run_debug_image_clear` gate above
-            // already armed `terminal.clear()`, evicting the cached
-            // image cells before the next sidebar paints.
-            app.flush_run_debug_icon_overlay();
-            app.flush_problems_badge_overlay();
-            app.flush_no_repo_hero_overlay();
-            app.flush_ssh_empty_state_overlay();
-            app.end_chrome_flush();
+            // The small chrome pictures: the Run-and-Debug headline icon,
+            // the PROBLEMS badge and the source-control and SSH
+            // illustrations. The icon only fires while the sidebar is on
+            // the Run-Debug view and the panel reserved a cell for it on
+            // its last render. On view change the
+            // `consume_run_debug_image_clear` gate above already armed
+            // `terminal.clear()`, evicting the cached image cells before
+            // the next sidebar paints.
+            app.flush_chrome_images(drawn);
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its
             // blank initial state.
@@ -7127,17 +6716,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     layout.cell_h,
                 )
             {
-                use std::io::Write;
-                let mut out = stdout();
-                let cursor_on = app.cursor_should_be_visible();
-                let _ = write!(out, "\x1b[?25l\x1b[s");
-                let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                let _ = out.write_all(img.as_bytes());
-                let _ = write!(out, "\x1b[u");
-                if cursor_on {
-                    let _ = write!(out, "\x1b[?25h");
-                }
-                let _ = out.flush();
+                write_inline_image(
+                    &mut stdout(),
+                    layout.cell_x,
+                    layout.cell_y,
+                    img.as_bytes(),
+                    app.cursor_should_be_visible(),
+                );
                 app.mark_welcome_image_emitted();
             }
             // Last of all: re-paint the chrome tooltip on top of any sidebar

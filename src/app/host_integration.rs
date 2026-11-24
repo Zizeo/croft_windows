@@ -3,6 +3,7 @@
 //! rebase-todo editing, self-update and relaunch, and the update card.
 
 use super::*;
+use crate::widgets::confirm_frame::{ConfirmFrame, Inset, draw_confirm};
 
 /// Why Help: Update croft must not check for a release itself (#1844),
 /// for the same reasons the startup check stays off: a remote-launched
@@ -144,105 +145,56 @@ impl App {
         if !self.pending_terminal_warning {
             return;
         }
-        let area = frame.area();
-        // The lower clamp bound must never beat the frame itself: on a
-        // terminal narrower than 50 columns the modal used to come out
-        // WIDER than the buffer and the paint panicked at launch (#192).
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
-        let height: u16 = 11u16.min(area.height);
-        let x = (area.width.saturating_sub(width)) / 2 + area.x;
-        let y = (area.height.saturating_sub(height)) / 2 + area.y;
-        let rect = Rect {
-            x,
-            y,
-            width,
-            height,
+        let frame_spec = ConfirmFrame {
+            title: " UNSUPPORTED TERMINAL ",
+            accent: self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00)),
+            title_fg: Color::Black,
+            height: 11,
+            inset: Inset::Wide,
         };
-        let rect = rect.intersection(area);
-        let warn = self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00));
-        let accent = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(ratatui::text::Span::styled(
-                " UNSUPPORTED TERMINAL ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(warn)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        frame.render_widget(block, rect);
-        let inner = Rect {
-            x: rect.x + 2,
-            y: rect.y + 1,
-            width: rect.width.saturating_sub(4),
-            height: rect.height.saturating_sub(2),
-        };
-        let current = std::env::var("TERM_PROGRAM")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("TERM").ok().filter(|s| !s.is_empty()))
-            .unwrap_or_else(|| String::from("this terminal"));
-        let body = ratatui::text::Text::from(vec![
-            Line::from(Span::styled(
-                "Croft draws its icons and images with inline-image protocols",
-                Style::default().fg(self.theme.ui(Color::White)),
-            )),
-            Line::from(Span::styled(
-                format!("that {current} does not support, so the activity bar and"),
-                Style::default().fg(self.theme.ui(Color::White)),
-            )),
-            Line::from(Span::styled(
-                "file icons stay blank. Croft still runs; for the full UI use:",
-                Style::default().fg(self.theme.ui(Color::White)),
-            )),
-            Line::from(""),
-            Line::from(vec![
-                Span::raw("  macOS:  "),
-                Span::styled(
-                    "iTerm2",
-                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  or  "),
-                Span::styled(
-                    "Ghostty",
-                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::raw("  Linux:  "),
-                Span::styled(
-                    "Ghostty",
-                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    "[any key]",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" dismiss    "),
-                Span::styled(
-                    "[D]",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("on't show again"),
-            ]),
-        ]);
-        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
-            warn,
-        );
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let accent = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
+            let current = std::env::var("TERM_PROGRAM")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| std::env::var("TERM").ok().filter(|s| !s.is_empty()))
+                .unwrap_or_else(|| String::from("this terminal"));
+            let text = Style::default().fg(self.theme.ui(Color::White));
+            let name = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+            let key = Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD);
+            let body = ratatui::text::Text::from(vec![
+                Line::from(Span::styled(
+                    "Croft draws its icons and images with inline-image protocols",
+                    text,
+                )),
+                Line::from(Span::styled(
+                    format!("that {current} does not support, so the activity bar and"),
+                    text,
+                )),
+                Line::from(Span::styled(
+                    "file icons stay blank. Croft still runs; for the full UI use:",
+                    text,
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  macOS:  "),
+                    Span::styled("iTerm2", name),
+                    Span::raw("  or  "),
+                    Span::styled("Ghostty", name),
+                ]),
+                Line::from(vec![Span::raw("  Linux:  "), Span::styled("Ghostty", name)]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("[any key]", key),
+                    Span::raw(" dismiss    "),
+                    Span::styled("[D]", key),
+                    Span::raw("on't show again"),
+                ]),
+            ]);
+            frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        });
     }
 
     /// Paint the update card in the bottom-LEFT corner (the port toast
@@ -655,28 +607,33 @@ impl App {
             return;
         }
         self.staged_status = UpdateStatus::Idle;
-        // One progress indicator, not two (#1852): the status bar's spinner
-        // carries the build from here, as it does every other update, so
-        // the popup goes. It comes back by itself when the build ends: with
-        // Relaunch when it lands, with the reason and Retry when it fails.
-        self.update_toast = None;
         // Tests never download or build croft: they get a staging that has
         // only started.
         #[cfg(test)]
-        {
-            self.staged_install = Some(crate::update_check::StagedInstall::preloaded(
-                &[],
-                PathBuf::new(),
-                &version,
-            ));
-        }
+        let staging = std::io::Result::Ok(crate::update_check::StagedInstall::preloaded(
+            &[],
+            PathBuf::new(),
+            &version,
+        ));
         #[cfg(not(test))]
-        {
-            self.staged_install = Some(crate::update_check::StagedInstall::start(
-                croft_cache_dir(),
-                version,
-                staged_install_log_path(),
-            ));
+        let staging = crate::update_check::StagedInstall::start(
+            croft_cache_dir(),
+            version.clone(),
+            staged_install_log_path(),
+        );
+        match staging {
+            Ok(install) => {
+                // One progress indicator, not two (#1852): the status bar's
+                // spinner carries the build from here, as it does every other
+                // update, so the popup goes. It comes back by itself when the
+                // build ends: with Relaunch when it lands, with the reason and
+                // Retry when it fails.
+                self.update_toast = None;
+                self.staged_install = Some(install);
+            }
+            // No thread could start: nothing is building, and the popup
+            // stays up with Update one click away.
+            Err(e) => self.status = format!("croft v{version} could not be installed: {e}"),
         }
     }
 
@@ -738,11 +695,12 @@ impl App {
             self.self_install = Some(crate::update_watch::SelfInstall::preloaded(&[]));
         }
         #[cfg(not(test))]
-        {
-            self.self_install = Some(crate::update_watch::SelfInstall::start(
-                String::from(env!("CARGO_MANIFEST_DIR")),
-                self_install_log_path(),
-            ));
+        match crate::update_watch::SelfInstall::start(
+            String::from(env!("CARGO_MANIFEST_DIR")),
+            self_install_log_path(),
+        ) {
+            Ok(install) => self.self_install = Some(install),
+            Err(e) => self.status = format!("croft could not start its rebuild: {e}"),
         }
     }
 
@@ -796,19 +754,32 @@ impl App {
         } else {
             // Nothing on offer: ask now, and say what the answer was, a
             // missing network included (#1844).
-            self.status = String::from("Checking for croft updates\u{2026}");
-            self.manual_update_check = Some(crate::update_check::ManualCheck::start_with(
+            match crate::update_check::ManualCheck::start_with(
                 croft_cache_dir(),
                 String::from(env!("CARGO_PKG_VERSION")),
                 self.update_fetch,
-            ));
+            ) {
+                Ok(check) => {
+                    self.status = String::from("Checking for croft updates\u{2026}");
+                    self.manual_update_check = Some(check);
+                }
+                Err(e) => self.status = format!("Could not check for croft updates: {e}"),
+            }
         }
     }
 
     /// The answer to a check Help: Update croft asked for (#1844).
     pub(super) fn poll_manual_update_check(&mut self) -> bool {
-        let Some(verdict) = self.manual_update_check.as_ref().and_then(|c| c.take()) else {
-            return false;
+        let verdict = match self.manual_update_check.as_ref().map(|c| c.poll()) {
+            None | Some(crate::jobs::Poll::Pending) => return false,
+            Some(crate::jobs::Poll::Done(verdict)) => verdict,
+            // Its thread crashed, and the crash notice said so. The check is
+            // let go, so the next Help: Update croft asks again instead of
+            // saying it is already checking (#2579).
+            Some(crate::jobs::Poll::Died) => {
+                self.manual_update_check = None;
+                return true;
+            }
         };
         self.manual_update_check = None;
         self.status = match verdict {
@@ -835,7 +806,7 @@ impl App {
         if let Some(watch) = self.update_watch.as_ref() {
             events.extend(watch.drain().into_iter().map(|e| (UpdateSource::Watch, e)));
         }
-        if let Some(install) = self.self_install.as_ref() {
+        if let Some(install) = self.self_install.as_mut() {
             events.extend(
                 install
                     .drain()
@@ -843,7 +814,7 @@ impl App {
                     .map(|e| (UpdateSource::SelfInstall, e)),
             );
         }
-        if let Some(staged) = self.staged_install.as_ref() {
+        if let Some(staged) = self.staged_install.as_mut() {
             events.extend(
                 staged
                     .drain()
@@ -878,7 +849,11 @@ impl App {
                     if !self.any_update_in_progress() {
                         self.update_spinner_start = None;
                     }
-                    self.status = match source {
+                    // A build whose thread crashed leaves the status line to
+                    // the crash notice, which names the thread and where its
+                    // record is, as every background job does (#2562); it
+                    // wrote no log of its own to point at.
+                    let status = match source {
                         UpdateSource::Staged => {
                             let staging = self.staged_install.take();
                             let reason = staging
@@ -893,23 +868,29 @@ impl App {
                                 failed: Some(reason),
                                 ..UpdateToast::offer(version.as_str().into())
                             });
-                            format!(
-                                "croft v{version} was not installed: {reason} - see {} (still on v{})",
-                                staged_install_log_path().display(),
-                                env!("CARGO_PKG_VERSION")
-                            )
+                            (reason != crate::update_check::CRASHED_REASON).then(|| {
+                                format!(
+                                    "croft v{version} was not installed: {reason} - see {} (still on v{})",
+                                    staged_install_log_path().display(),
+                                    env!("CARGO_PKG_VERSION")
+                                )
+                            })
                         }
                         UpdateSource::SelfInstall => {
-                            self.self_install = None;
-                            format!(
-                                "croft rebuild failed - see {} (still on the old binary)",
-                                self_install_log_path().display()
-                            )
+                            (!self.self_install.take().is_some_and(|i| i.crashed())).then(|| {
+                                format!(
+                                    "croft rebuild failed - see {} (still on the old binary)",
+                                    self_install_log_path().display()
+                                )
+                            })
                         }
-                        UpdateSource::Watch => String::from(
+                        UpdateSource::Watch => Some(String::from(
                             "Background croft update failed; staying on current version",
-                        ),
+                        )),
                     };
+                    if let Some(status) = status {
+                        self.status = status;
+                    }
                 }
                 crate::update_watch::UpdateEvent::Ready => {
                     if staged {
@@ -1295,7 +1276,6 @@ impl App {
             .chain(
                 self.editor_layout
                     .inactive_groups()
-                    .into_iter()
                     .flat_map(|g| g.editors.iter()),
             )
             .any(|t| t.path.as_deref().is_some_and(is_it));
@@ -1848,25 +1828,49 @@ pub(super) const TERMINAL_RESTORE_SEQ: &[u8] =
     b"\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[ q\x1b]110\x07\x1b]111\x07";
 
 impl App {
-    /// Say on the status bar that a background task crashed (#2077). croft
-    /// carries on, but without whatever that task did, so the message says
-    /// to save and restart, and where the crash's record is.
+    /// Say on the status bar that a background task crashed (#2077), and
+    /// where the crash's record is. A job, stream or worker is one croft
+    /// recovers from: what it showed as in progress is settled and it can be
+    /// run again, so the notice says croft carried on (#2609). Any other
+    /// thread's work is simply gone, so that notice says to save and restart;
+    /// it wins when both kinds crashed since the last notice.
     pub(super) fn poll_background_panic(&mut self) -> bool {
-        let Some(thread) = take_background_panic() else {
+        let crashes = take_background_panics();
+        if crashes.is_empty() {
             return false;
+        }
+        let recovered = crashes.iter().all(|c| c.recovered);
+        let threads = crashes
+            .iter()
+            .map(|c| c.thread.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.status = if recovered {
+            format!(
+                "A background task crashed ({threads}); croft carried on without it. \
+                 Details in ~/.cache/croft/panic.log"
+            )
+        } else {
+            format!(
+                "A background task crashed ({threads}). Save your work and restart croft; \
+                 details in ~/.cache/croft/panic.log"
+            )
         };
-        self.status = format!(
-            "A background task crashed ({thread}). Save your work and restart croft; \
-             details in ~/.cache/croft/panic.log"
-        );
         true
     }
 }
 
-/// The name of the last background thread that crashed, until the app has
-/// shown it (#2077). Set by the panic hook, read by
-/// [`App::poll_background_panic`].
-static BACKGROUND_PANIC: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// A background thread's crash, as the app shows it.
+pub(super) struct BackgroundPanic {
+    /// The thread's name.
+    pub(super) thread: String,
+    /// It ran a job, stream or worker, whose owner settles its death (#2609).
+    pub(super) recovered: bool,
+}
+
+/// The background threads that crashed, until the app has shown them
+/// (#2077). Set by the panic hook, read by [`App::poll_background_panic`].
+static BACKGROUND_PANIC: std::sync::Mutex<Vec<BackgroundPanic>> = std::sync::Mutex::new(Vec::new());
 
 /// Whether a panic on `panicking` ends croft. Only the thread that drives
 /// the screen, `ui`, does: a panic there unwinds past the normal teardown,
@@ -1881,20 +1885,35 @@ pub(super) fn panic_ends_croft(
     panicking == ui
 }
 
-/// Keep `thread`'s name for the app to show: a background task crashed.
-pub(super) fn note_background_panic(thread: &str) {
-    let mut slot = BACKGROUND_PANIC
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *slot = Some(thread.to_string());
-}
-
-/// The background thread that crashed since the last call, if one did.
-pub(super) fn take_background_panic() -> Option<String> {
+/// Keep `thread`'s name for the app to show: a background task crashed,
+/// one croft `recovered` from or not.
+pub(super) fn note_background_panic(thread: &str, recovered: bool) {
     BACKGROUND_PANIC
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take()
+        .push(BackgroundPanic {
+            thread: thread.to_string(),
+            recovered,
+        });
+}
+
+/// The background threads that crashed since the last call.
+pub(super) fn take_background_panics() -> Vec<BackgroundPanic> {
+    std::mem::take(
+        &mut *BACKGROUND_PANIC
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Drop the crash notice for `thread`: the task it ran has said on the
+/// status line what its crash cost and how to start it again, which the
+/// generic notice must not replace on a later tick (#2616 review).
+pub(super) fn claim_background_panic(thread: &str) {
+    BACKGROUND_PANIC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|crash| crash.thread != thread);
 }
 
 pub(super) fn install_terminal_restore_panic_hook() {
@@ -1913,7 +1932,10 @@ pub(super) fn install_terminal_restore_panic_hook() {
             if !panic_ends_croft(current.id(), ui) {
                 // croft carries on: the terminal stays as it is, and nothing
                 // is printed over the screen. The app says what crashed.
-                note_background_panic(current.name().unwrap_or("<unnamed>"));
+                note_background_panic(
+                    current.name().unwrap_or("<unnamed>"),
+                    crate::jobs::on_supervised_thread(),
+                );
                 return;
             }
             let _ = disable_raw_mode();

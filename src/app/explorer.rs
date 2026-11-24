@@ -3,6 +3,7 @@
 //! .code-workspace files, re-rooting, file watching and outside changes, zoxide jump.
 
 use super::*;
+use crate::widgets::picker_rows::{PickerMouse, answer_mouse};
 
 /// The toggleable sub-views stacked inside the Explorer side panel, mirroring
 /// VS Code's "Views and More Actions" (⋯) menu on the EXPLORER header. Ordered
@@ -566,6 +567,10 @@ impl App {
                 self.kick_file_finder_index_rebuild();
             }
         }
+        // Git used outside croft writes only to git's own folder, which the
+        // watcher skips: a few stamps there, on the same cadence (#2577).
+        // The status it asks for lands through `drain_git_responses`.
+        self.refresh_git_status_if_git_moved();
         // Stamp-gated, so an idle poll costs a stat per open diff view; on
         // hosts without a native watcher this is how a diff follows the
         // file (#471).
@@ -651,28 +656,42 @@ impl App {
                             .ok()
                             .map(|r| r.to_string_lossy().into_owned());
                         let root = timeline_root;
-                        let tx = self.timeline_tx.clone();
                         let history_root = self.history_root.clone();
                         let abs = path.clone();
                         let now = now_millis();
-                        std::thread::spawn(move || {
-                            // Merge git commits with local snapshots so the
-                            // TIMELINE shows both sources, like VS Code. Git
-                            // history only exists inside the workspace, but
-                            // snapshots are path-keyed and repo-free, so a
-                            // file outside the root still lists its versions.
-                            let commits = rel
-                                .map(|rel| crate::git::file_history(&root, &rel, 50))
-                                .unwrap_or_default();
-                            let snaps = crate::history::entries_in(&history_root, &abs);
-                            let entries = crate::history::merged_timeline(commits, &snaps, now);
-                            let _ = tx.send((path, entries));
-                        });
+                        let job = crate::jobs::Job::spawn(
+                            "timeline",
+                            crate::jobs::Start::Now,
+                            move || {
+                                // Merge git commits with local snapshots so the
+                                // TIMELINE shows both sources, like VS Code. Git
+                                // history only exists inside the workspace, but
+                                // snapshots are path-keyed and repo-free, so a
+                                // file outside the root still lists its versions.
+                                let commits = rel
+                                    .map(|rel| crate::git::file_history(&root, &rel, 50))
+                                    .unwrap_or_default();
+                                let snaps = crate::history::entries_in(&history_root, &abs);
+                                let entries = crate::history::merged_timeline(commits, &snaps, now);
+                                (path, entries)
+                            },
+                        );
+                        // A lookup still running, for this file or the one
+                        // just left, is dropped: its list is older (#2575).
+                        match job {
+                            Ok(job) => self.timeline_fetch = Some(job),
+                            Err(e) => {
+                                self.timeline_fetch = None;
+                                self.timeline.set_failed();
+                                self.status = format!("Could not load the file's history: {e}");
+                            }
+                        }
                     }
                 }
                 None => {
                     if self.timeline_fetched.is_some() {
                         self.timeline_fetched = None;
+                        self.timeline_fetch = None;
                         self.timeline.clear();
                         changed = true;
                     }
@@ -737,11 +756,28 @@ impl App {
                 changed = true;
             }
         }
-        // Drain any TIMELINE replies; ignore one for a since-closed file.
-        while let Ok((path, entries)) = self.timeline_rx.try_recv() {
-            if self.editor.path.as_deref() == Some(path.as_path()) {
-                self.timeline.set_history(path, entries);
-                changed = true;
+        // Collect the TIMELINE lookup; ignore a list for a since-closed file.
+        let settled = match self.timeline_fetch.as_ref().map(crate::jobs::Job::poll) {
+            None | Some(crate::jobs::Poll::Pending) => None,
+            Some(crate::jobs::Poll::Done(reply)) => Some(Some(reply)),
+            // Its thread crashed, and the crash notice said so. The section
+            // says the history could not be loaded instead of "Loading" until
+            // another file is opened (#2574).
+            Some(crate::jobs::Poll::Died) => Some(None),
+        };
+        if let Some(reply) = settled {
+            self.timeline_fetch = None;
+            match reply {
+                Some((path, entries)) => {
+                    if self.editor.path.as_deref() == Some(path.as_path()) {
+                        self.timeline.set_history(path, entries);
+                        changed = true;
+                    }
+                }
+                None => {
+                    self.timeline.set_failed();
+                    changed = true;
+                }
             }
         }
         // Collect the COMMITS graph fetch; ignore a reply for a since-left root.
@@ -785,18 +821,42 @@ impl App {
                     &self.dep_ecosystems,
                 ));
             changed = true;
+            // Whatever ran for the folder just left is dropped here, so its
+            // list cannot land in this one's (#2573).
+            self.deps_fetch = None;
             if !self.dep_ecosystems.is_empty()
                 && self.explorer_views.is_visible(ExplorerView::Dependencies)
             {
-                let tx = self.deps_tx.clone();
-                std::thread::spawn(move || {
-                    let deps = crate::widgets::dependencies::fetch_dependencies(&root);
-                    let _ = tx.send(deps);
-                });
+                let job =
+                    crate::jobs::Job::spawn("dependencies", crate::jobs::Start::Now, move || {
+                        crate::widgets::dependencies::fetch_dependencies(&root)
+                    });
+                match job {
+                    Ok(job) => {
+                        self.dependencies.lookup_started();
+                        self.deps_fetch = Some(job);
+                    }
+                    Err(e) => {
+                        self.dependencies.set_failed();
+                        self.status = format!("Could not list the dependencies: {e}");
+                    }
+                }
             }
         }
-        while let Ok(deps) = self.deps_rx.try_recv() {
-            self.dependencies.set_deps(deps);
+        let settled = match self.deps_fetch.as_ref().map(crate::jobs::Job::poll) {
+            None | Some(crate::jobs::Poll::Pending) => None,
+            Some(crate::jobs::Poll::Done(deps)) => Some(Some(deps)),
+            // Its thread crashed, and the crash notice said so. The section
+            // says the list could not be made instead of "Loading" until the
+            // folder changes (#2572).
+            Some(crate::jobs::Poll::Died) => Some(None),
+        };
+        if let Some(deps) = settled {
+            self.deps_fetch = None;
+            match deps {
+                Some(deps) => self.dependencies.set_deps(deps),
+                None => self.dependencies.set_failed(),
+            }
             changed = true;
         }
 
@@ -1555,10 +1615,6 @@ impl App {
         };
     }
 
-    pub fn consume_zoxide_jump_image_clear(&mut self) -> bool {
-        self.overlays.zoxide_jump_clear.consume()
-    }
-
     /// Open the zoxide jump popup and seed it with the full frecency list
     /// (`zoxide query -l`), so it shows the user's top directories before
     /// they type anything — like pressing `j<Tab>` in the shell.
@@ -1596,14 +1652,14 @@ impl App {
             zoxide_jump_status(&jump)
         };
         self.zoxide_jump = Some(jump);
-        self.overlays.zoxide_jump_clear.request();
+        self.overlays.popup_clear.request();
         self.status = status;
     }
 
     pub(super) fn close_zoxide_jump(&mut self) {
         self.zoxide_add_folder = false;
         if self.zoxide_jump.take().is_some() {
-            self.overlays.zoxide_jump_clear.request();
+            self.overlays.popup_clear.request();
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();
@@ -1796,31 +1852,10 @@ impl App {
         let Some(jump) = self.zoxide_jump.as_mut() else {
             return;
         };
-        let inside = rect_contains(jump.last_rect, m.column, m.row);
-        match m.kind {
-            MouseEventKind::ScrollDown => {
-                for _ in 0..3 {
-                    jump.select_next();
-                }
-            }
-            MouseEventKind::ScrollUp => {
-                for _ in 0..3 {
-                    jump.select_prev();
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
-                if !inside =>
-            {
-                self.close_zoxide_jump();
-            }
-            // Click a row to jump to it, the way VS Code's quick-pick behaves.
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(idx) = jump.row_index_at(m.row) {
-                    jump.selected = idx;
-                    self.apply_zoxide_jump_selection();
-                }
-            }
-            _ => {}
+        match answer_mouse(jump, m) {
+            PickerMouse::Close => self.close_zoxide_jump(),
+            PickerMouse::Accept => self.apply_zoxide_jump_selection(),
+            PickerMouse::Stay => {}
         }
     }
 
@@ -1956,6 +1991,7 @@ impl App {
         let _ = self
             .search_query_tx
             .send(SearchRequest::SetRoots(roots.clone()));
+        self.search_roots_changed();
         self.search.roots = roots.clone();
         if let Some(lsp) = &self.lsp {
             lsp.set_extra_roots(roots.into_iter().skip(1).collect());
@@ -2251,17 +2287,18 @@ impl App {
         let _ = self
             .search_query_tx
             .send(SearchRequest::SetRoot(new_root.clone()));
+        self.search_roots_changed();
         self.search.root = new_root.clone();
         self.search.roots = vec![new_root.clone()];
         self.search.hits.clear();
         self.search.selected = 0;
         self.search.scroll = 0;
-        // Drop any in-flight walker for the OLD root so its result is
+        // Drop any in-flight build for the OLD root so its result is
         // discarded when it tries to send. Then kick a fresh walk
         // against the new root. file_finder_index keeps the old entries
         // for now so a Cmd+P press during the rebuild window shows
         // stale-but-immediate results instead of a UI freeze.
-        self.file_finder_index_rx = None;
+        self.file_finder_index_job = None;
         self.file_finder_index_dirty = false;
         self.kick_file_finder_index_rebuild();
         // Rebind the resident navigator: the activation record, relay

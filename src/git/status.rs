@@ -39,10 +39,12 @@ pub struct GitStatus {
     /// root — the two coincide only when the workspace root IS the
     /// toplevel (#139).
     pub repo_root: Option<PathBuf>,
-    /// Number of changed entries `git status --porcelain` reported —
-    /// available for EVERY workspace folder's worker, unlike the panel's
-    /// entry list which only the active repo fetches (#161: the
-    /// repositories overview and the cross-repo badge read this).
+    /// How many rows the Source Control list shows for this repository: one
+    /// per staged and one per unstaged change of each file, so a partly
+    /// staged file is two, as VS Code counts them (#2629). Available for
+    /// EVERY workspace folder's worker, unlike the panel's entry list which
+    /// only the active repo fetches (#161: the repositories overview and
+    /// the activity-bar badge, with or without pictures, read this).
     pub changed_count: usize,
     /// The message git prepared for the commit in progress (#1282): a
     /// conflicted merge, cherry-pick or revert writes `MERGE_MSG`, a
@@ -58,6 +60,11 @@ pub struct GitStatus {
     /// keeps the branch's name in the rebase's `head-name` file. `None`
     /// outside a rebase, and for a rebase of a detached HEAD.
     pub rebasing_branch: Option<String>,
+    /// The full name of the branch's upstream, e.g.
+    /// `refs/remotes/origin/main`, which `ahead` and `behind` count from.
+    /// A push made outside croft moves it, so [`GitStateWatch`] watches it
+    /// (#2577). `None` on a detached HEAD or a branch with no upstream.
+    pub upstream: Option<String>,
 }
 
 impl GitStatus {
@@ -101,14 +108,24 @@ pub fn query(root: &Path) -> GitStatus {
     .unwrap_or_default();
     let prefix = run_git(root, &["rev-parse", "--show-prefix"]).unwrap_or_default();
     let decorations = parse_decorations(root, &prefix, &porcelain);
-    let changed_count = porcelain_z_count(&porcelain);
+    let changed_count = porcelain_z_rows(&porcelain);
     let dirty = changed_count > 0;
-    let (ahead, behind) = match run_git(
-        root,
-        &["rev-list", "--left-right", "--count", "HEAD...@{u}"],
-    ) {
-        Ok(s) => parse_ahead_behind(&s),
-        Err(_) => (0, 0),
+    // Only a branch has an upstream (`@{u}` fails on a detached HEAD), and
+    // there is nothing to count against without one.
+    let upstream = branch.as_ref().and_then(|_| {
+        run_git(root, &["rev-parse", "--symbolic-full-name", "@{u}"])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| s.starts_with("refs/"))
+    });
+    let (ahead, behind) = match upstream.as_ref().map(|_| {
+        run_git(
+            root,
+            &["rev-list", "--left-right", "--count", "HEAD...@{u}"],
+        )
+    }) {
+        Some(Ok(s)) => parse_ahead_behind(&s),
+        _ => (0, 0),
     };
     let head_oid = run_git(root, &["rev-parse", "HEAD"])
         .ok()
@@ -135,6 +152,7 @@ pub fn query(root: &Path) -> GitStatus {
         },
         branch,
         operation,
+        upstream,
     }
 }
 

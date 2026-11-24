@@ -30,6 +30,7 @@ pub use config_push::SyncResolution;
 pub use config_push::sync_config_now;
 use config_push::*;
 pub use control::AdoptedMaster;
+pub use control::close_master;
 #[cfg(unix)]
 pub use control::ssh_control_dir;
 use control::*;

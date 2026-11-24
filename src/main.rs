@@ -28,6 +28,7 @@ mod collab;
 mod collab_agent;
 mod color_depth;
 mod command_history;
+mod command_registry;
 mod config_layers;
 #[cfg_attr(not(unix), allow(dead_code))]
 mod config_sync;

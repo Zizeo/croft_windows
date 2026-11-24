@@ -44,6 +44,57 @@ use sync::*;
 pub(super) use typing::is_signature_help_trigger;
 pub(super) use typing::snippet_completion_item;
 
+/// Where the caret rests in which buffer (#2062): the file, the caret's row
+/// and column, and the buffer's edit seq.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CaretSpot {
+    pub(super) path: PathBuf,
+    pub(super) row: usize,
+    pub(super) col: usize,
+    pub(super) seq: u64,
+}
+
+/// A language-server request still waited on, with the file and the edit
+/// seq it was asked for (#2062): a reply for another file, or for a buffer
+/// edited since, is dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FileRequest {
+    pub(super) id: u64,
+    pub(super) path: PathBuf,
+    pub(super) seq: u64,
+}
+
+/// A language-server request still waited on, with the caret spot it was
+/// asked at (#2062).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CaretRequest {
+    pub(super) id: u64,
+    pub(super) at: CaretSpot,
+}
+
+/// The answer to the request still waited on, from every reply waiting on
+/// one channel (#2062). `next` yields the replies oldest first; one whose
+/// `id` is not `pending` answers an older request and is dropped, and the
+/// last that matches wins. Taking an answer ends the wait, so `pending` is
+/// cleared; with none, it is left as it was. Declaration, type definition,
+/// rename, formatting and code actions read their replies this way.
+pub(super) fn take_reply<T>(
+    pending: &mut Option<u64>,
+    mut next: impl FnMut() -> Option<T>,
+    id: impl Fn(&T) -> u64,
+) -> Option<T> {
+    let mut reply = None;
+    while let Some(candidate) = next() {
+        if Some(id(&candidate)) == *pending {
+            reply = Some(candidate);
+        }
+    }
+    if reply.is_some() {
+        *pending = None;
+    }
+    reply
+}
+
 /// What to do with one on-type formatting reply (#254). `NotOurs` leaves the
 /// armed request alone — a superseded reply must not disarm the newer one
 /// still in flight — while `Stale` and `Apply` both consume it.
@@ -66,8 +117,9 @@ pub(super) enum CrumbTarget {
 /// The file the OUTLINE shows and the edit seq it was synced at.
 pub(super) type OutlineKey = (PathBuf, Option<u64>);
 
-/// Where an off-thread outline parse delivers its symbols (#1150).
-pub(super) type OutlineParse = std::sync::mpsc::Receiver<Vec<crate::lsp::manager::OutlineSymbol>>;
+/// An off-thread outline parse (#1150), the `outline-parse` job: a parse
+/// whose thread crashed reads as dead (#2587).
+pub(super) type OutlineParse = crate::jobs::Job<Vec<crate::lsp::manager::OutlineSymbol>>;
 
 /// A place Peek References can show: path, 0-based line, UTF-16 column.
 pub(super) type PeekLocation = (PathBuf, u32, u32);

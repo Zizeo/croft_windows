@@ -7,6 +7,11 @@ use super::*;
 /// five seconds, after which it leaves chord mode on its own.
 pub(super) const CMD_K_LEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The status when a voice session's reader crashed: the session ended,
+/// and the next tap starts a new one (#2602).
+pub(super) const VOICE_READER_CRASHED: &str =
+    "Voice input stopped: its reader crashed. Tap the mic to try again";
+
 /// How long VS Code's "is not a command" note stays in the status bar.
 pub(super) const CMD_K_MISS_NOTE_FOR: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -1620,7 +1625,7 @@ impl App {
         }
         match crate::voice::availability() {
             crate::voice::Availability::Ready => {
-                self.voice_handle = Some(crate::voice::start(self.voice_tx.clone()));
+                self.voice_handle = Some(crate::voice::start());
                 self.voice_canceling = false;
                 self.status = String::from("Listening, speak then pause to insert");
             }
@@ -1669,32 +1674,48 @@ impl App {
                 self.inject_voice_text(&text);
             }
         }
-        while let Ok(msg) = self.voice_rx.try_recv() {
-            match msg {
-                crate::voice::VoiceMsg::Transcript(text) if !self.voice_canceling => {
-                    self.voice_ready = Some(text);
-                }
-                crate::voice::VoiceMsg::Transcript(_) => {
-                    changed = true;
-                    self.voice_handle = None;
-                    self.voice_canceling = false;
-                    self.status = String::from("Voice input canceled");
-                }
-                crate::voice::VoiceMsg::Empty => {
-                    changed = true;
-                    self.voice_handle = None;
-                    self.status = if std::mem::take(&mut self.voice_canceling) {
-                        String::from("Voice input canceled")
-                    } else {
-                        String::from("No speech detected")
-                    };
-                }
-                crate::voice::VoiceMsg::Failed(e) => {
-                    changed = true;
-                    self.voice_handle = None;
-                    self.voice_canceling = false;
-                    self.status = e;
-                }
+        let Some(handle) = self.voice_handle.as_mut() else {
+            return changed;
+        };
+        let msg = match handle.poll() {
+            crate::jobs::Poll::Pending => return changed,
+            crate::jobs::Poll::Done(msg) => msg,
+            // Its reader crashed, and the crash notice said so: the session
+            // ends, so the next tap starts one instead of cancelling a dead
+            // one (#2602).
+            crate::jobs::Poll::Died => {
+                self.voice_handle = None;
+                self.voice_canceling = false;
+                self.status = String::from(VOICE_READER_CRASHED);
+                // This says what the crash cost: the generic notice stays away.
+                claim_background_panic(crate::voice::THREAD);
+                return true;
+            }
+        };
+        match msg {
+            crate::voice::VoiceMsg::Transcript(text) if !self.voice_canceling => {
+                self.voice_ready = Some(text);
+            }
+            crate::voice::VoiceMsg::Transcript(_) => {
+                changed = true;
+                self.voice_handle = None;
+                self.voice_canceling = false;
+                self.status = String::from("Voice input canceled");
+            }
+            crate::voice::VoiceMsg::Empty => {
+                changed = true;
+                self.voice_handle = None;
+                self.status = if std::mem::take(&mut self.voice_canceling) {
+                    String::from("Voice input canceled")
+                } else {
+                    String::from("No speech detected")
+                };
+            }
+            crate::voice::VoiceMsg::Failed(e) => {
+                changed = true;
+                self.voice_handle = None;
+                self.voice_canceling = false;
+                self.status = e;
             }
         }
         changed
@@ -1827,11 +1848,13 @@ pub(super) fn is_compare_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
+/// `Cmd+Shift+F` / `Ctrl+Shift+F`: jump to the Search view. Opt is
+/// rejected: `Cmd+Opt+Shift+F` is Format Document (#2647).
 pub(super) fn is_search_jump_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
     };
-    if !c.eq_ignore_ascii_case(&'f') {
+    if !c.eq_ignore_ascii_case(&'f') || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
     let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -2426,17 +2449,16 @@ pub(super) fn is_command_history_key(key: KeyEvent) -> bool {
 /// In the SUPER branch we reject SHIFT so the `Cmd+Shift+T` focus chord
 /// (see `is_terminal_focus_key`) does not double-fire as a split, and
 /// reject ALT so `Cmd+Opt+T` (iTerm2's relocated New Tab) is left alone.
+/// Both forms reject ALT: `Ctrl+Alt+Shift+T` converts indentation to tabs
+/// off macOS (#2647).
 pub(super) fn is_terminal_split_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
     };
-    if !c.eq_ignore_ascii_case(&'t') {
+    if !c.eq_ignore_ascii_case(&'t') || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
-    if has_cmd(key.modifiers)
-        && !key.modifiers.contains(KeyModifiers::SHIFT)
-        && !key.modifiers.contains(KeyModifiers::ALT)
-    {
+    if has_cmd(key.modifiers) && !key.modifiers.contains(KeyModifiers::SHIFT) {
         return true;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
