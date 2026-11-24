@@ -261,6 +261,29 @@ push to `main`, also run clippy on macOS, since the Linux jobs never compile
 `#[cfg(target_os = "macos")]` code. CI fails if the published package nears
 crates.io's 10 MiB limit.
 
+When a run goes red, the last job, `failure report for AI agents`, collects the
+logs of the jobs that failed and writes them to the run's summary page: the
+failing steps, the lines that look like causes with a little context, and the
+command GitHub echoed for each - the same command to run locally. The full logs
+travel with it as the `ci-failure-report` artifact, so nothing is lost to the
+summary; `gh run view <run-id> --log-failed` prints them too.
+
+Nothing about that needs the build re-run. `gh workflow run
+ci-failure-report.yml -f run-id=<run-id>` (or the *Run workflow* button) reads a
+run that already happened - with no id it takes the newest failed `ci.yml` run -
+and puts the summary and artifact on the dispatch run. Locally, feed the script
+the same two documents the workflow fetches:
+
+```bash
+id=<run-id>
+gh api "repos/:owner/:repo/actions/runs/$id"      > ci-run.json
+gh api "repos/:owner/:repo/actions/runs/$id/jobs" > ci-jobs.json
+mkdir -p ci-logs
+jq -r '.jobs[] | select(.conclusion|IN("failure","timed_out","cancelled")) | .id' ci-jobs.json |
+  while read -r j; do gh api "repos/:owner/:repo/actions/jobs/$j/logs" > "ci-logs/$j.log"; done
+python3 scripts/ci_failure_report.py ci-jobs.json ci-logs --run ci-run.json
+```
+
 ### Flaky tests
 
 The suite spawns real PTYs and shells, so terminal, clipboard and pairing tests

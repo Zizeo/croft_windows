@@ -1,0 +1,134 @@
+name: CI failure report
+
+# A red run's only output is a log of tens of thousands of lines spread over
+# several jobs and two runner OSes, and the first minute of every fix is spent
+# finding the line that says what broke - by hand, or by an agent paying for the
+# whole log in its context window. This workflow turns the run's failed jobs
+# into one short page: the failing steps, the lines that look like causes with
+# their surroundings, and the command GitHub echoed for the step, which is also
+# the command to run locally.
+#
+# It is a workflow of its own, called with `workflow_call`, rather than a job in
+# ci.yml: macos.yml goes red for the same reasons and wants the same digest, and
+# a second copy of these steps would drift from the script they call. It also
+# carries a `workflow_dispatch` face, so the same report can be asked for days
+# later without re-running the build - see the trigger block.
+
+on:
+  workflow_call:
+    inputs:
+      run-id:
+        description: "Which run to report on; empty means the calling run."
+        required: false
+        type: string
+        default: ""
+  # The rebuild-free path to an old report: a red run from last week is still
+  # explained by its own logs, and asking for them costs one download rather
+  # than one push through every job. `gh workflow run ci-failure-report.yml
+  # -f run-id=<id>`, or the button on the Actions page. With no id it takes the
+  # newest failed ci.yml run. The summary and the artifact land on THIS run,
+  # which is what the page is showing.
+  workflow_dispatch:
+    inputs:
+      run-id:
+        description: "The run to report on (default: the newest failed ci.yml run)."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  # Reads a run's job list and job logs - this one's, or the one a dispatch
+  # names. Nothing here writes to the repo, its issues or its pull requests.
+  actions: read
+
+jobs:
+  report:
+    # The caller's job carries the readable name; this one only has to show up
+    # in the log list as the step that built the page.
+    name: collect and render
+    runs-on: ubuntu-latest
+    # A download of a few logs and one page of text; the cap is there so a hung
+    # API call cannot hold the run open behind a failure.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve the run to report on
+        # Three callers, one variable. A workflow_call has the run whose jobs
+        # just failed; a dispatch names a run, or by default means the newest
+        # ci.yml run that failed - the one the person clicking the button is
+        # looking at. Everything below reads $RUN_ID from here.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REQUESTED: ${{ inputs.run-id }}
+          CALLED: ${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          run="$REQUESTED"
+          if [ -z "$run" ]; then
+            if [ "$EVENT" = "workflow_dispatch" ]; then
+              run="$(gh run list --repo "$REPO" --workflow ci.yml --status failure \
+                --limit 1 --json databaseId --jq '.[0].databaseId')"
+              [ -n "$run" ] || {
+                echo "::error::no failed ci.yml run to report on; pass run-id"; exit 1; }
+            else
+              run="$CALLED"
+            fi
+          fi
+          echo "Reporting on run $run"
+          echo "RUN_ID=$run" >> "$GITHUB_ENV"
+      - name: Download the failed jobs' logs
+        # The job-level logs endpoint answers for a job that has FINISHED even
+        # while its run is still going, which is the only case here: the caller
+        # waits on the failed jobs before calling this workflow. A log that
+        # cannot be fetched is a warning, not a failure - the report still names
+        # the job and its failing steps from the jobs API.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p ci-logs
+          # The header describes the run under study, which on a dispatch is not
+          # this one: its title, branch and sha are the target's, not the reader's.
+          gh api "repos/$REPO/actions/runs/$RUN_ID" > ci-run.json
+          gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" > ci-jobs.json
+          # Same four conclusions scripts/ci_failure_report.py calls failed; a
+          # job that passed or was skipped has nothing to explain.
+          jq -r '.jobs[]
+            | select(.conclusion | IN("failure", "timed_out", "cancelled", "startup_failure"))
+            | "\(.id)\t\(.name)"' ci-jobs.json > ci-logs/failed.tsv
+          while IFS=$'\t' read -r id name; do
+            gh api -H "Accept: application/vnd.github+json" \
+              "repos/$REPO/actions/jobs/$id/logs" > "ci-logs/$id.log" \
+              || { rm -f "ci-logs/$id.log"
+                   echo "::warning::no log downloaded for the failed job $name ($id)"; }
+          done < ci-logs/failed.tsv
+      - name: Write the report into the run summary
+        # `tee` writes the file the artifact carries and the stdout the summary
+        # keeps; pipefail makes a script error fail the step rather than leave a
+        # truncated page that reads like a short one.
+        run: |
+          set -euo pipefail
+          python3 scripts/ci_failure_report.py ci-jobs.json ci-logs --run ci-run.json \
+            | tee ci-failure-report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Attach the report and the full logs
+        # Even when the render above failed: the jobs API dump and the raw logs
+        # are what a reader falls back on.
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-failure-report
+          path: |
+            ci-failure-report.md
+            ci-run.json
+            ci-jobs.json
+            ci-logs/*.log
+          if-no-files-found: warn
+          # Long enough to read the report from a link in a stale PR thread;
+          # short enough not to keep megabytes of log around for a month.
+          retention-days: 14

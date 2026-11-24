@@ -367,3 +367,18 @@ jobs:
         run: cargo test --locked --bin croft
       - name: Run CLI integration tests
         run: cargo test --locked --test cli
+
+  failure-report:
+    # What a red run leaves behind otherwise is a log per job, and the reader -
+    # or the agent asked to fix it - reconstructs the failure from those. This
+    # turns them into one page of error lines with the commands that produced
+    # them; see ci-failure-report.yml. It runs only after something above has
+    # failed, so a green run pays nothing for it, and a job that is skipped
+    # (release-hygiene and doc-ownership on a push) does not start it.
+    name: failure report for AI agents
+    needs: [release-hygiene, doc-ownership, test, cross-musl, android, windows]
+    if: failure()
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/ci-failure-report.yml

@@ -68,3 +68,18 @@ jobs:
         # compile error fails this step too; a separate check would only
         # type-check the whole crate twice.
         run: cargo clippy --all-targets --locked -- -D warnings
+
+  failure-report:
+    # The same page ci.yml writes for its own red runs: the failing steps, the
+    # error lines around them, and the commands to reproduce. A PR that adds
+    # the `refactor` label is often the only place a mac-only compile error
+    # shows before a release, so the report matters more here, not less.
+    name: failure report for AI agents
+    needs: macos
+    # `macos` skips on a pull request without the label; a skip is not a
+    # failure, and this must not turn one into a red check.
+    if: failure()
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/ci-failure-report.yml
