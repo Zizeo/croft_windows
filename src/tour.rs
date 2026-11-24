@@ -224,7 +224,7 @@ pub fn remove_scratch(dir: &Path) -> Result<(), String> {
             dir.display()
         ));
     }
-    std::fs::remove_dir_all(dir).map_err(|e| e.to_string())
+    crate::platform::fs::remove_dir_all_retrying(dir).map_err(|e| e.to_string())
 }
 
 /// The first `file` and 1-based `line` an error names in terminal text:

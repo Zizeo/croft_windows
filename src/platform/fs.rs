@@ -174,3 +174,31 @@ pub fn rename_retrying(from: &Path, to: &Path) -> io::Result<()> {
 pub fn write_retrying(path: &Path, bytes: &[u8]) -> io::Result<()> {
     retry_transient_io(path, || std::fs::write(path, bytes))
 }
+
+/// Recursively remove `dir`, retrying on Windows when a background thread or
+/// filesystem watcher briefly holds an open handle inside the directory.
+pub fn remove_dir_all_retrying(dir: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        std::fs::remove_dir_all(dir)
+    }
+    #[cfg(windows)]
+    {
+        let mut backoff = NTFS_RETRY_BACKOFF_MS.iter().copied();
+        loop {
+            match std::fs::remove_dir_all(dir) {
+                Ok(()) => return Ok(()),
+                Err(err)
+                    if err.kind() == io::ErrorKind::PermissionDenied
+                        || matches!(err.raw_os_error(), Some(5 | 32 | 33 | 145)) =>
+                {
+                    let Some(ms) = backoff.next() else {
+                        return Err(err);
+                    };
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+}

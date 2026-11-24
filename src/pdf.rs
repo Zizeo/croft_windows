@@ -602,6 +602,7 @@ fn read_once(pipe: Option<&mut std::process::ChildStderr>, into: &mut Vec<u8>) {
 /// Pinned by `the_settle_rule_bridges_a_gap_shorter_than_the_quiet_run` with
 /// no clock involved, so cutting it fails a test rather than only showing up
 /// as half an error message on a loaded machine.
+#[cfg(any(unix, test))]
 const QUIET_RUN_TICKS: u32 = 12;
 
 #[cfg(all(test, unix))]
@@ -858,6 +859,7 @@ fn settle_late_writes(
 }
 
 /// What the poll saw on one tick, and whether another tick is allowed.
+#[cfg(any(unix, test))]
 enum Sample {
     /// This reading, and there is time for another.
     More(String),
@@ -883,6 +885,7 @@ enum Sample {
 /// sampler says `Last`, so a sampler that never says `Last` while the text
 /// keeps changing never returns. Production guarantees it with the deadline
 /// check; the test bounds its script.
+#[cfg(any(unix, test))]
 fn settle_over(quiet_run: u32, mut sample: impl FnMut(u32) -> Sample) -> (String, bool) {
     let quiet_run = quiet_run.max(1);
     let mut seen = 0usize;
