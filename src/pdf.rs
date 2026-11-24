@@ -271,14 +271,7 @@ pub fn detect_backend() -> Option<PdfBackend> {
 }
 
 fn which(cmd: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(cmd);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    crate::platform::env::resolve_on_path(cmd)
 }
 
 /// Total pages in `pdf`. Returns None when no detector is available so the
@@ -478,7 +471,7 @@ const STDERR_SETTLE_GRACE: std::time::Duration = std::time::Duration::from_milli
 ///
 /// Guessing between those two is what this exists to stop - and it earned its
 /// keep, since two plausible diagnoses were wrong before the numbers arrived.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct SettleOutcome {
@@ -487,7 +480,7 @@ struct SettleOutcome {
     bytes: usize,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     /// Per THREAD, so tests running in parallel cannot read each other's.
     static LAST_SETTLE: std::cell::Cell<Option<SettleOutcome>> =
@@ -495,6 +488,7 @@ thread_local! {
 }
 
 /// One poll of the renderer's stderr buffer.
+#[cfg(unix)]
 const SETTLE_TICK: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// How often the wait loop checks for the renderer's exit and drains its
@@ -559,44 +553,19 @@ fn set_nonblocking_on(fd: std::os::fd::RawFd) -> bool {
 /// Off unix the fd type does not exist, so no pipe is ever made non-blocking
 /// and a real pipe always answers `false` - the caller then keeps to the
 /// single after-exit read.
+#[cfg(unix)]
 fn set_nonblocking(pipe: Option<&std::process::ChildStderr>) -> bool {
-    #[cfg(unix)]
-    {
-        let Some(pipe) = pipe else {
-            // No pipe is vacuously safe to drain: `drain_available` returns
-            // at once on `None`, so it can never block.
-            return true;
-        };
-        use std::os::fd::AsRawFd;
-        set_nonblocking_on(pipe.as_raw_fd())
-    }
-    #[cfg(not(unix))]
-    {
-        // No fd type, so nothing is made non-blocking and a real pipe must
-        // answer `false`. The caller then skips the in-loop drain, which
-        // trades one hazard for a smaller one: a renderer writing more than a
-        // pipeful before exiting can stall on a full buffer, where the unix
-        // path would have drained it. The alternative is worse - a blocking
-        // read BEFORE `try_wait` waits on a live renderer and takes the
-        // budget and the kill path down with it, so the stall would be
-        // unbounded rather than bounded by the budget.
-        //
-        // Reachable only on a non-unix target, and croft has none: there is
-        // no Windows job in ci.yml and no windows dependency in Cargo.toml,
-        // and the PDF path documents WSL2 - itself unix - as the Windows
-        // story. Worth fixing with an overlapped/thread reader if that ever
-        // changes; not worth a reader thread on every platform today.
-        pipe.is_none()
-    }
+    let Some(pipe) = pipe else {
+        // No pipe is vacuously safe to drain: `drain_available` returns
+        // at once on `None`, so it can never block.
+        return true;
+    };
+    use std::os::fd::AsRawFd;
+    set_nonblocking_on(pipe.as_raw_fd())
 }
 
 /// Append everything the pipe has RIGHT NOW, and stop.
-///
-/// The point of the whole change (#553): after the renderer exits, whatever
-/// it wrote is sitting in the pipe, and this takes all of it without waiting
-/// on a clock or a thread. `WouldBlock` means "nothing more available", not
-/// "nothing more coming", which is exactly the distinction a blocking read
-/// cannot make and a descendant holding the write end would otherwise hide.
+#[cfg(unix)]
 fn drain_available(pipe: Option<&mut std::process::ChildStderr>, into: &mut Vec<u8>) {
     let Some(pipe) = pipe else {
         return;
@@ -615,17 +584,7 @@ fn drain_available(pipe: Option<&mut std::process::ChildStderr>, into: &mut Vec<
 }
 
 /// ONE read, for a pipe that could not be made non-blocking.
-///
-/// `drain_available` reads until `WouldBlock`, which a blocking pipe never
-/// reports - so on that pipe it is a loop with no exit until every holder of
-/// the write end is gone. A single read has no such problem once the child is
-/// reaped: what the child wrote is buffered and comes back immediately. Only
-/// a SECOND read would wait on a surviving descendant, so there isn't one.
-///
-/// The cost is a message truncated at one buffer rather than a hang, and a
-/// renderer that wrote nothing before dying still blocks here until its
-/// descendants exit - which is why the caller only reaches this after
-/// `try_wait` has already returned.
+#[cfg(unix)]
 fn read_once(pipe: Option<&mut std::process::ChildStderr>, into: &mut Vec<u8>) {
     let Some(pipe) = pipe else {
         return;
@@ -645,7 +604,7 @@ fn read_once(pipe: Option<&mut std::process::ChildStderr>, into: &mut Vec<u8>) {
 /// as half an error message on a loaded machine.
 const QUIET_RUN_TICKS: u32 = 12;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn record_settle(outcome: SettleOutcome) {
     LAST_SETTLE.with(|c| c.set(Some(outcome)));
 }
@@ -755,89 +714,105 @@ fn run_pdftoppm(
         cmd.process_group(0);
     }
     let mut child = cmd.spawn()?;
-    let mut stderr_pipe = child.stderr.take();
-    // Non-blocking, and read from ONE place: this thread (#553).
-    //
-    // A reader thread published chunk by chunk, which was right about the
-    // problem - the pipe only reaches end of file once every holder of its
-    // write end has gone, and a descendant the renderer forked can hold it
-    // long after the renderer itself exited - but it made the answer depend
-    // on that thread being SCHEDULED. Measured on a loaded machine, the
-    // renderer's second write was still in the pipe when the poll gave up,
-    // and the user got half the error.
-    //
-    // Non-blocking removes the question. Everything the renderer itself
-    // wrote is in the pipe by the time it exits, so a drain-until-EAGAIN
-    // after the exit takes all of it, with no window to lose and nothing to
-    // schedule.
-    // Whether the in-loop drain below is safe at all. If the pipe could not
-    // be made non-blocking, a read here waits on a live renderer and the
-    // budget check and kill path never run - worse than the buffer pressure
-    // the in-loop drain exists to relieve, so it is skipped rather than
-    // risked. The after-exit drain is unaffected: the child is gone by then.
-    let nonblocking = set_nonblocking(stderr_pipe.as_ref());
-    let mut stderr_bytes: Vec<u8> = Vec::new();
     let deadline = std::time::Instant::now() + budget;
-    let status = loop {
-        // Drained every tick as well, so a renderer spraying more than a
-        // pipeful cannot block on a full buffer waiting for us.
-        if nonblocking {
-            drain_available(stderr_pipe.as_mut(), &mut stderr_bytes);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(EXIT_POLL_TICK);
+
+    #[cfg(unix)]
+    {
+        let mut stderr_pipe = child.stderr.take();
+        // Non-blocking, and read from ONE place: this thread (#553).
+        let nonblocking = set_nonblocking(stderr_pipe.as_ref());
+        let mut stderr_bytes: Vec<u8> = Vec::new();
+        let status = loop {
+            if nonblocking {
+                drain_available(stderr_pipe.as_mut(), &mut stderr_bytes);
             }
-            Ok(None) => {
-                kill_group(child, guard);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "{} took longer than {:.1} s rendering page {page}; killed",
-                        program.display(),
-                        budget.as_secs_f64()
-                    ),
-                ));
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(EXIT_POLL_TICK);
+                }
+                Ok(None) => {
+                    kill_group(child, guard);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "{} took longer than {:.1} s rendering page {page}; killed",
+                            program.display(),
+                            budget.as_secs_f64()
+                        ),
+                    ));
+                }
+                Err(e) => {
+                    kill_group(child, guard);
+                    return Err(e);
+                }
             }
-            Err(e) => {
-                kill_group(child, guard);
-                return Err(e);
-            }
-        }
-    };
-    if !status.success() {
-        // Everything the renderer itself wrote is readable NOW - it exited,
-        // so it has written all it will. Take that first, before any timing
-        // question is asked (#553).
-        //
-        // ...but only on a pipe that reads without blocking. Reaping the
-        // child does not close the write end if a DESCENDANT still holds it,
-        // and on a blocking pipe a read then waits on that descendant rather
-        // than returning EOF.
-        //
-        // Measured on a blocking pipe whose grandchild outlives the child:
-        // the FIRST read after the reap returns what the child wrote, and the
-        // SECOND blocks until the grandchild exits, because end of file waits
-        // for every holder of the write end. So one read is safe here and a
-        // loop is not - which is exactly the asymmetry `drain_available`
-        // cannot exploit, since it reads until EAGAIN and EAGAIN never comes.
-        //
-        // Hence one bounded read on the blocking path: the renderer's own
-        // message is what the user needs, and skipping the read entirely
-        // would report the exit status with no text at all.
-        let text = if nonblocking {
-            drain_available(stderr_pipe.as_mut(), &mut stderr_bytes);
-            settle_late_writes(stderr_pipe.as_mut(), &mut stderr_bytes, STDERR_SETTLE_GRACE)
-        } else {
-            read_once(stderr_pipe.as_mut(), &mut stderr_bytes);
-            String::from_utf8_lossy(&stderr_bytes).trim().to_string()
         };
-        return Err(std::io::Error::other(format!(
-            "{} exited with {status}: {text}",
-            program.display()
-        )));
+        if !status.success() {
+            let text = if nonblocking {
+                drain_available(stderr_pipe.as_mut(), &mut stderr_bytes);
+                settle_late_writes(stderr_pipe.as_mut(), &mut stderr_bytes, STDERR_SETTLE_GRACE)
+            } else {
+                read_once(stderr_pipe.as_mut(), &mut stderr_bytes);
+                String::from_utf8_lossy(&stderr_bytes).trim().to_string()
+            };
+            return Err(std::io::Error::other(format!(
+                "{} exited with {status}: {text}",
+                program.display()
+            )));
+        }
     }
+
+    #[cfg(not(unix))]
+    {
+        // Drain stderr on a detached thread so a chatty renderer (>4 KB) cannot
+        // deadlock on a full Windows pipe buffer, while never joining the
+        // thread so a surviving descendant cannot stall the render budget.
+        let stderr_rx = child.stderr.take().map(|mut pipe| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut buf = Vec::new();
+                let _ = pipe.by_ref().take(MAX_PROBE_STDOUT).read_to_end(&mut buf);
+                let _ = tx.send(buf);
+            });
+            rx
+        });
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(EXIT_POLL_TICK);
+                }
+                Ok(None) => {
+                    kill_group(child, guard);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "{} took longer than {:.1} s rendering page {page}; killed",
+                            program.display(),
+                            budget.as_secs_f64()
+                        ),
+                    ));
+                }
+                Err(e) => {
+                    kill_group(child, guard);
+                    return Err(e);
+                }
+            }
+        };
+        if !status.success() {
+            let stderr_bytes = stderr_rx
+                .and_then(|rx| rx.recv_timeout(STDERR_SETTLE_GRACE).ok())
+                .unwrap_or_default();
+            let text = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+            return Err(std::io::Error::other(format!(
+                "{} exited with {status}: {text}",
+                program.display()
+            )));
+        }
+    }
+
     let png_path = prefix.with_extension("png");
     std::fs::read(&png_path)
 }
@@ -854,6 +829,7 @@ fn run_pdftoppm(
 /// tick and settles once the bytes stop arriving for a run of them, or once
 /// the grace is spent. An empty buffer counts as quiet, so a renderer that
 /// said nothing settles immediately.
+#[cfg(unix)]
 fn settle_late_writes(
     mut pipe: Option<&mut std::process::ChildStderr>,
     into: &mut Vec<u8>,
@@ -1854,5 +1830,33 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
         assert!(set_nonblocking(None), "no pipe means nothing to block on");
 
         let _ = child.wait();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_run_pdftoppm_drains_large_stderr_without_pipe_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("chatty-pdftoppm.cmd");
+        std::fs::write(
+            &script,
+            "@echo off\r\nfor /L %%i in (1,1,400) do @echo 12345678901234567890123456789012345678901234567890 >&2\r\nexit /b 1\r\n",
+        )
+        .unwrap();
+        let pdf = dir.path().join("dummy.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+
+        let started = std::time::Instant::now();
+        let err = run_pdftoppm(&script, &pdf, 1, std::time::Duration::from_secs(3)).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "expected prompt exit without pipe deadlock, elapsed={:?}",
+            started.elapsed()
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("12345678901234567890") && msg.len() > 10_000,
+            "expected full drained stderr in error, got len={}",
+            msg.len()
+        );
     }
 }
