@@ -5,6 +5,7 @@ pub mod clipboard;
 pub mod env;
 pub mod fs;
 pub mod ipc;
+pub mod net;
 pub mod os;
 pub mod process;
 pub mod terminal;

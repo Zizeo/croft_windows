@@ -780,3 +780,26 @@ fn ipc_local_listener_nonblocking_roundtrip_auth_and_cleanup() {
         drop(rebound);
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn net_list_tcp_listeners_detects_bound_loopback_socket_and_drop() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let pid = std::process::id();
+
+    let entries = platform::net::list_tcp_listeners().expect("Windows TCP table available");
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.port == port && e.pid == pid && e.is_loopback_or_wildcard),
+        "expected port {port} owned by pid {pid} in {entries:?}"
+    );
+
+    drop(listener);
+    let after = platform::net::list_tcp_listeners().expect("Windows TCP table available");
+    assert!(
+        !after.iter().any(|e| e.port == port && e.pid == pid),
+        "dropped port {port} should no longer appear for pid {pid}"
+    );
+}

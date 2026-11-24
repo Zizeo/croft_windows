@@ -474,8 +474,73 @@ pub fn poll_listeners(shell_pid: i32) -> Vec<PortHit> {
     poll_via_ss(&pids).unwrap_or_default()
 }
 
-/// Socket polling is Unix-only; non-Unix platforms rely on the output scrape.
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn windows_subtree_and_names(
+    root: i32,
+) -> (HashSet<u32>, std::collections::HashMap<u32, String>) {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut subtree = HashSet::new();
+    let mut names = std::collections::HashMap::new();
+    let Ok(root_pid) = u32::try_from(root) else {
+        return (subtree, names);
+    };
+    subtree.insert(root_pid);
+
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let mut pairs = Vec::with_capacity(sys.processes().len());
+    for (pid, proc_) in sys.processes() {
+        let p = pid.as_u32();
+        if let Some(ppid) = proc_.parent() {
+            pairs.push((p, ppid.as_u32()));
+        }
+        let raw = proc_.name().to_string_lossy();
+        let trimmed = if raw.len() > 4 && raw[raw.len() - 4..].eq_ignore_ascii_case(".exe") {
+            &raw[..raw.len() - 4]
+        } else {
+            &raw
+        };
+        if !trimmed.is_empty() {
+            names.insert(p, trimmed.to_string());
+        }
+    }
+    loop {
+        let before = subtree.len();
+        for &(pid, ppid) in &pairs {
+            if subtree.contains(&ppid) {
+                subtree.insert(pid);
+            }
+        }
+        if subtree.len() == before {
+            break;
+        }
+    }
+    (subtree, names)
+}
+
+#[cfg(windows)]
+pub fn poll_listeners(shell_pid: i32) -> Vec<PortHit> {
+    let Some(entries) = crate::platform::net::list_tcp_listeners() else {
+        return Vec::new();
+    };
+    let (pids, names) = windows_subtree_and_names(shell_pid);
+    let mut seen = HashSet::new();
+    let mut hits = Vec::new();
+    for e in entries {
+        if e.is_loopback_or_wildcard && pids.contains(&e.pid) && seen.insert(e.port) {
+            hits.push(PortHit {
+                port: e.port,
+                url: None,
+                process: names.get(&e.pid).cloned(),
+            });
+        }
+    }
+    hits.sort_by_key(|h| h.port);
+    hits
+}
+
+/// Socket polling fallback for non-Unix, non-Windows targets.
+#[cfg(not(any(unix, windows)))]
 pub fn poll_listeners(_shell_pid: i32) -> Vec<PortHit> {
     Vec::new()
 }
@@ -500,8 +565,20 @@ pub fn poll_all_listening() -> Option<HashSet<u16>> {
     })
 }
 
-/// Socket polling is Unix-only; returns `None` so callers keep live entries.
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn poll_all_listening() -> Option<HashSet<u16>> {
+    Some(
+        crate::platform::net::list_tcp_listeners()?
+            .into_iter()
+            .filter(|e| e.is_loopback_or_wildcard)
+            .map(|e| e.port)
+            .collect(),
+    )
+}
+
+/// Socket polling fallback for non-Unix, non-Windows targets; returns `None`
+/// so callers keep live entries.
+#[cfg(not(any(unix, windows)))]
 pub fn poll_all_listening() -> Option<HashSet<u16>> {
     None
 }
@@ -1138,5 +1215,28 @@ mod tests {
         assert_eq!(loopback_port("*:8080"), Some(8080));
         assert_eq!(loopback_port("[::1]:9000"), Some(9000));
         assert_eq!(loopback_port("192.168.1.5:3000"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_poll_listeners_and_poll_all_listening_track_bound_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let pid = std::process::id() as i32;
+
+        let hits = super::poll_listeners(pid);
+        assert!(
+            hits.iter().any(|h| h.port == port && h.process.is_some()),
+            "expected port {port} in {hits:?}"
+        );
+        let all = super::poll_all_listening().expect("listening set");
+        assert!(all.contains(&port), "expected port {port} in {all:?}");
+
+        drop(listener);
+        let all_after = super::poll_all_listening().expect("listening set after drop");
+        assert!(
+            !all_after.contains(&port),
+            "dropped port {port} should be retired"
+        );
     }
 }
