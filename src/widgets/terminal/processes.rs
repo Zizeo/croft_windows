@@ -249,7 +249,10 @@ impl PtyTerminal {
     /// `format_cd_command` for the line-clearing prefix and the path
     /// quoting strategy.
     pub fn change_cwd(&mut self, path: &std::path::Path) {
-        self.write_input(&format_cd_command(path));
+        self.write_input(&format_cd_command_for(
+            path,
+            crate::tasks::ShellFlavor::host_default(),
+        ));
     }
 
     /// True when the embedded shell is sitting at its prompt rather than
@@ -411,6 +414,57 @@ pub(super) fn parse_tpgid(stat: &str) -> Option<i32> {
 /// the same effect.
 pub const CLEAR_TYPED_LINE: &str = "\x05x\x15";
 
+/// Build the byte sequence that retargets a shell's working directory to
+/// `path`. Prefixed with a line-clearing sequence so a half-typed command at
+/// the prompt does not concatenate with our command.
+pub fn format_cd_command_for(
+    path: &std::path::Path,
+    flavor: crate::tasks::ShellFlavor,
+) -> Vec<u8> {
+    let s = path.to_string_lossy();
+    let mut out = Vec::with_capacity(s.len() + 24);
+    match flavor {
+        crate::tasks::ShellFlavor::Posix => {
+            out.extend_from_slice(CLEAR_TYPED_LINE.as_bytes());
+            out.extend_from_slice(b"cd '");
+            for c in s.chars() {
+                if c == '\'' {
+                    out.extend_from_slice(b"'\\''");
+                } else {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+            out.extend_from_slice(b"'\n");
+        }
+        crate::tasks::ShellFlavor::PowerShell => {
+            out.push(0x1b);
+            out.extend_from_slice(b"Set-Location '");
+            for c in s.chars() {
+                if c == '\'' {
+                    out.extend_from_slice(b"''");
+                } else {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+            out.extend_from_slice(b"'\r");
+        }
+        crate::tasks::ShellFlavor::Cmd => {
+            out.push(0x1b);
+            out.extend_from_slice(b"cd /d \"");
+            for c in s.chars() {
+                if c != '"' {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+            out.extend_from_slice(b"\"\r");
+        }
+    }
+    out
+}
+
 /// Build the byte sequence that retargets a POSIX shell's working
 /// directory to `path`. Prefixed with [`CLEAR_TYPED_LINE`] so a
 /// half-typed command at the prompt does not concatenate with our `cd`.
@@ -418,18 +472,5 @@ pub const CLEAR_TYPED_LINE: &str = "\x05x\x15";
 /// quotes escaped via the standard `'\''` sleight-of-hand so paths
 /// containing spaces or apostrophes round-trip safely.
 pub fn format_cd_command(path: &std::path::Path) -> Vec<u8> {
-    let s = path.to_string_lossy();
-    let mut out = Vec::with_capacity(s.len() + 8);
-    out.extend_from_slice(CLEAR_TYPED_LINE.as_bytes());
-    out.extend_from_slice(b"cd '");
-    for c in s.chars() {
-        if c == '\'' {
-            out.extend_from_slice(b"'\\''");
-        } else {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-        }
-    }
-    out.extend_from_slice(b"'\n");
-    out
+    format_cd_command_for(path, crate::tasks::ShellFlavor::Posix)
 }

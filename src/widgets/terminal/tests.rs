@@ -1087,6 +1087,27 @@ fn format_cd_command_quotes_paths_with_spaces() {
 }
 
 #[test]
+fn format_cd_command_for_powershell_uses_esc_and_doubles_apostrophes() {
+    let bytes = format_cd_command_for(
+        std::path::Path::new(r"C:\Users\O'Brien\My Project"),
+        crate::tasks::ShellFlavor::PowerShell,
+    );
+    assert_eq!(
+        bytes,
+        b"\x1bSet-Location 'C:\\Users\\O''Brien\\My Project'\r".to_vec()
+    );
+}
+
+#[test]
+fn format_cd_command_for_cmd_uses_esc_and_cd_slash_d() {
+    let bytes = format_cd_command_for(
+        std::path::Path::new(r"D:\My Projects\croft"),
+        crate::tasks::ShellFlavor::Cmd,
+    );
+    assert_eq!(bytes, b"\x1bcd /d \"D:\\My Projects\\croft\"\r".to_vec());
+}
+
+#[test]
 fn foreground_is_shell_flips_false_while_a_foreground_command_runs() {
     let tmp = tempfile::tempdir().unwrap();
     let mut term = PtyTerminal::new(tmp.path()).unwrap();
