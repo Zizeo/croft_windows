@@ -6228,6 +6228,22 @@ fn finished_debug_build(
     }
 }
 
+fn expected_cmake_app(root: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(not(windows))]
+    {
+        crate::platform::fs::canonicalize(&root.join("build/app")).unwrap()
+    }
+    #[cfg(windows)]
+    {
+        let candidates = [root.join("build/app.exe"), root.join("build/Debug/app.exe")];
+        candidates
+            .iter()
+            .find(|p| p.is_file())
+            .and_then(|p| crate::platform::fs::canonicalize(p).ok())
+            .unwrap_or_else(|| panic!("expected CMake executable in {candidates:?}"))
+    }
+}
+
 /// #1359: F5 on `src/main.cpp` in a configured CMake project builds the
 /// project's target, off the UI thread, and debugs that program; it no
 /// longer compiles `main.cpp` alone (which cannot find `geom.hpp`) or
@@ -6258,8 +6274,8 @@ fn f5_in_a_cmake_project_debugs_the_target_that_builds_the_file() {
         assert_eq!(source, main);
         let built = built.unwrap_or_else(|f| panic!("{}\n{}", f.summary, f.output));
         assert_eq!(
-            built.binary.canonicalize().unwrap(),
-            root.join("build/app").canonicalize().unwrap()
+            crate::platform::fs::canonicalize(&built.binary).unwrap(),
+            expected_cmake_app(&root)
         );
         assert!(built.how.starts_with("cmake --build"), "{}", built.how);
         assert!(built.how.ends_with("(target app)"), "{}", built.how);
@@ -6357,8 +6373,8 @@ fn f5_builds_the_project_of_the_files_own_workspace_folder() {
         let (_, built) = finished_debug_build(&mut app);
         let built = built.unwrap_or_else(|f| panic!("{}\n{}", f.summary, f.output));
         assert_eq!(
-            built.binary.canonicalize().unwrap(),
-            second.join("build/app").canonicalize().unwrap()
+            crate::platform::fs::canonicalize(&built.binary).unwrap(),
+            expected_cmake_app(&second)
         );
     });
 }

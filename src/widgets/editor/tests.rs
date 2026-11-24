@@ -544,6 +544,7 @@ fn blame_for_another_file_never_paints_on_this_one() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn opening_a_fifo_is_refused_instead_of_blocking() {
     let dir = tempfile::tempdir().unwrap();

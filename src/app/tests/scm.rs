@@ -7227,7 +7227,8 @@ fn source_control_lists_the_repo_found_one_folder_down() {
     let (tmp, _) = nested_repo_1227();
     std::fs::create_dir(tmp.path().join("plain_dir")).unwrap();
     std::fs::create_dir_all(tmp.path().join(".hidden/.git")).unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let root = crate::platform::fs::canonicalize(tmp.path()).unwrap();
+    let mut app = App::new(root).unwrap();
     app.sidebar_view = SidebarView::SourceControl;
     let _ = draw_buffer(&mut app, 140, 50);
     let sub = crate::platform::fs::canonicalize(&tmp.path().join("sub")).unwrap();

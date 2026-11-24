@@ -425,6 +425,16 @@ fn relative_to_base(base: &Path, base_canon: &Path, target: &Path) -> String {
             None => true,
         };
         return if reopens {
+            #[cfg(windows)]
+            if direct.starts_with("..")
+                && let Some(tc) = target_canon.as_deref()
+            {
+                let via_canon = relative_or_absolute(base_canon, tc);
+                let ups = |s: &str| s.split('/').take_while(|p| *p == "..").count();
+                if !Path::new(&via_canon).is_absolute() && ups(&via_canon) < ups(&direct) {
+                    return via_canon;
+                }
+            }
             direct
         } else {
             target.display().to_string()

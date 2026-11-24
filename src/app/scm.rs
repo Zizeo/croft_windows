@@ -486,23 +486,26 @@ impl App {
         // A root in no repo (or with no status reply yet) maps to `None`,
         // and the file's own repo is asked instead: a workspace opened
         // above its repo still gets gutters (#1227).
-        let repo_bases: Vec<(PathBuf, Option<PathBuf>)> = self
+        let repo_bases: Vec<(PathBuf, Option<PathBuf>, Option<PathBuf>)> = self
             .roots
             .iter()
             .map(Path::to_path_buf)
             .collect::<Vec<_>>()
             .into_iter()
             .map(|ws| {
+                let ws_canon = crate::platform::fs::canonicalize(&ws).ok();
                 let repo = self.git_worker_for_root(&ws).status().repo_root.clone();
-                (ws, repo)
+                (ws, ws_canon, repo)
             })
             .collect();
         let repo_for = |path: &Path| -> Option<PathBuf> {
             repo_bases
                 .iter()
-                .filter(|(ws, _)| path.starts_with(ws))
-                .max_by_key(|(ws, _)| ws.components().count())
-                .and_then(|(_, repo)| repo.clone())
+                .filter(|(ws, ws_canon, _)| {
+                    path_starts_with_or_canonical(path, ws, ws_canon.as_deref())
+                })
+                .max_by_key(|(ws, _, _)| ws.components().count())
+                .and_then(|(_, _, repo)| repo.clone())
                 .or_else(|| path.parent().and_then(crate::git::repo_toplevel))
         };
         // Keyed by encoding too: the same file open in two tabs under two
@@ -528,10 +531,10 @@ impl App {
                 .entry((path.clone(), enc.name()))
                 .or_insert_with(|| {
                     let root = repo_for(&path)?;
-                    path.strip_prefix(&root)
+                    let rel = strip_prefix_or_canonical(&path, &root)?;
+                    let rel = rel.to_str()?;
+                    crate::git::read_bytes_at_head(&root, rel)
                         .ok()
-                        .and_then(|rel| rel.to_str())
-                        .and_then(|rel| crate::git::read_bytes_at_head(&root, rel).ok())
                         .and_then(|bytes| crate::widgets::editor::decode_blob(&bytes, enc))
                         .map(|text| text.lines().collect())
                 })
@@ -574,12 +577,10 @@ impl App {
             .owning_root(&path)
             .unwrap_or_else(|| self.roots.primary())
             .to_path_buf();
-        let Some(rel) = path
-            .strip_prefix(&root)
-            .ok()
-            .and_then(|r| r.to_str())
-            .map(String::from)
-        else {
+        let Some(rel) = strip_prefix_or_canonical(&path, &root).and_then(|r| {
+            let s = r.to_str()?.to_string();
+            Some(s)
+        }) else {
             // Outside the repo: no blame, but the marker is set so we don't
             // respawn every tick.
             self.editor.set_blame(path, None);
@@ -942,8 +943,8 @@ impl App {
                 .files
                 .iter()
                 .map(|p| {
-                    p.strip_prefix(&pending.root)
-                        .unwrap_or(p)
+                    strip_prefix_or_canonical(p, &pending.root)
+                        .unwrap_or_else(|| p.to_path_buf())
                         .display()
                         .to_string()
                 })
@@ -2217,6 +2218,7 @@ impl App {
     /// typed into counts: its value is on screen but not yet in the buffer.
     pub(super) fn unsaved_repo_files(&self) -> Vec<PathBuf> {
         let root = self.scm_root();
+        let root_canon = crate::platform::fs::canonicalize(&root).ok();
         let mut files: Vec<PathBuf> = Vec::new();
         let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
         let unsaved = |e: &&crate::widgets::editor::Editor| {
@@ -2229,7 +2231,7 @@ impl App {
         };
         for ed in groups.flat_map(|g| g.editors.iter()).filter(unsaved) {
             if let Some(p) = ed.path.as_ref()
-                && p.starts_with(&root)
+                && path_starts_with_or_canonical(p, &root, root_canon.as_deref())
                 && !files.contains(p)
             {
                 files.push(p.clone());
@@ -4039,10 +4041,37 @@ impl App {
     /// wins in `decode_blob`, and bytes that are not UTF-8 get the plain
     /// open rather than an editable diff of replacement characters.
     pub(super) fn open_tab_encoding(&self, path: &Path) -> &'static encoding_rs::Encoding {
+        let canon = crate::platform::fs::canonicalize(path).ok();
         std::iter::once(&self.editor)
             .chain(self.editor_layout.inactive_groups())
             .flat_map(|g| g.editors.iter())
-            .find(|e| e.diff.is_none() && e.path.as_deref() == Some(path))
+            .find(|e| {
+                e.diff.is_none()
+                    && e.path.as_deref().is_some_and(|ep| {
+                        ep == path
+                            || canon.as_deref().is_some_and(|c| {
+                                crate::platform::fs::canonicalize(ep).ok().as_deref() == Some(c)
+                            })
+                    })
+            })
             .map_or(encoding_rs::UTF_8, |e| e.encoding)
     }
+}
+
+fn strip_prefix_or_canonical(path: &Path, root: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = path.strip_prefix(root) {
+        return Some(rel.to_path_buf());
+    }
+    let path_c = crate::platform::fs::canonicalize(path).ok()?;
+    let root_c = crate::platform::fs::canonicalize(root).ok()?;
+    path_c.strip_prefix(&root_c).ok().map(Path::to_path_buf)
+}
+
+fn path_starts_with_or_canonical(path: &Path, root: &Path, root_canon: Option<&Path>) -> bool {
+    path.starts_with(root)
+        || root_canon.is_some_and(|rc| {
+            crate::platform::fs::canonicalize(path)
+                .ok()
+                .is_some_and(|pc| pc.starts_with(rc))
+        })
 }

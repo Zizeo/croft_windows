@@ -355,7 +355,9 @@ pub fn cached_binary(cache: &Path, source: &Path) -> PathBuf {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| String::from("program"));
-    cache.join(format!("{:016x}", h.finish())).join(stem)
+    cache
+        .join(format!("{:016x}", h.finish()))
+        .join(format!("{stem}{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// Build the program F5 on the C/C++ file `source` debugs, as the module
@@ -518,7 +520,23 @@ mod tests {
         for _ in 0..2 {
             let built = build_for_debug(root, &main, &cache)
                 .unwrap_or_else(|f| panic!("{}\n{}", f.summary, f.output));
+            #[cfg(not(windows))]
             assert_eq!(built.binary, root.join("build/app"));
+            #[cfg(windows)]
+            {
+                assert!(built.binary.is_file(), "{}", built.binary.display());
+                let got = crate::platform::fs::canonicalize(&built.binary).unwrap();
+                let candidates = [root.join("build/app.exe"), root.join("build/Debug/app.exe")];
+                assert!(
+                    candidates.iter().any(|c| {
+                        crate::platform::fs::canonicalize(c)
+                            .ok()
+                            .is_some_and(|cc| cc == got)
+                    }),
+                    "unexpected built binary: {}",
+                    got.display()
+                );
+            }
         }
         // Negative: debugging the broken program still reports its error.
         let err = build_for_debug(root, &root.join("tool/broken.cpp"), &cache).unwrap_err();
@@ -544,9 +562,24 @@ mod tests {
             "tool/main.cpp",
             "#include <cstdio>\n#include \"two.hpp\"\nint main() { std::printf(\"%d\\n\", two); }\n",
         );
+        #[cfg(windows)]
+        let (compiler, inc_arg, main_arg) = (
+            "c++",
+            root.join("include")
+                .display()
+                .to_string()
+                .replace('\\', "/"),
+            main.display().to_string().replace('\\', "/"),
+        );
+        #[cfg(not(windows))]
+        let (compiler, inc_arg, main_arg) = (
+            "/usr/bin/c++",
+            root.join("include").display().to_string(),
+            main.display().to_string(),
+        );
         let db = serde_json::json!([{
             "directory": root.join("out").display().to_string(),
-            "command": format!("/usr/bin/c++ -I{} -std=c++17 -O2 -o tool.o -c {}", root.join("include").display(), main.display()),
+            "command": format!("{compiler} -I{inc_arg} -std=c++17 -O2 -o tool.o -c {main_arg}"),
             "file": main.display().to_string(),
         }]);
         std::fs::create_dir_all(root.join("out")).unwrap();

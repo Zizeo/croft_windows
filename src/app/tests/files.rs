@@ -275,12 +275,9 @@ fn drain_reports_writes_in_a_workspace_under_a_noise_named_ancestor() {
     let tmp = tempfile::tempdir().unwrap();
     let src_raw = tmp.path().join("build/myapp/src");
     std::fs::create_dir_all(&src_raw).unwrap();
-    let root = tmp
-        .path()
-        .join("build/myapp")
-        .canonicalize()
+    let root = crate::platform::fs::canonicalize(&tmp.path().join("build/myapp"))
         .expect("the workspace root exists");
-    let src = src_raw.canonicalize().unwrap();
+    let src = crate::platform::fs::canonicalize(&src_raw).unwrap();
 
     let mut app = App::new(root.clone()).unwrap();
     // Let the watcher thread hand its debouncer over, then swallow whatever
@@ -323,7 +320,7 @@ fn drain_reports_writes_in_a_workspace_under_a_noise_named_ancestor() {
 #[test]
 fn writes_inside_a_directory_made_after_startup_are_reported() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    let root = crate::platform::fs::canonicalize(tmp.path()).unwrap();
     let mut app = App::new(root.clone()).unwrap();
     for _ in 1..=FS_SYNC_TICKS {
         app.try_install_pending_init();
@@ -1765,7 +1762,7 @@ fn change_workspace_root_rebuilds_cmd_p_index_against_the_new_root() {
 #[test]
 fn a_relative_launch_path_opens_the_absolute_file_under_the_workspace() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    let root = crate::platform::fs::canonicalize(tmp.path()).unwrap();
     std::fs::create_dir_all(root.join("pkg")).unwrap();
     std::fs::write(root.join("pkg/util.py"), "x = 1\n").unwrap();
     let mut app = App::new(root.clone()).unwrap();
@@ -4083,7 +4080,7 @@ fn a_view_request_for_a_fifo_is_refused_rather_than_opened() {
 #[test]
 fn copying_a_file_leaves_its_history_with_the_original() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    let root = crate::platform::fs::canonicalize(tmp.path()).unwrap();
     std::fs::create_dir_all(root.join("sub")).unwrap();
     std::fs::write(root.join("a.txt"), "a\n").unwrap();
     let (mut app, _hist) = app_with_history(&root);
@@ -4108,7 +4105,7 @@ fn copying_a_file_leaves_its_history_with_the_original() {
 #[test]
 fn a_file_move_applies_the_servers_edits_before_renaming() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    let root = crate::platform::fs::canonicalize(tmp.path()).unwrap();
     std::fs::write(root.join("util.py"), "def f(): pass\n").unwrap();
     std::fs::write(root.join("main.py"), "import util\n").unwrap();
     let mut app = App::new(root.clone()).unwrap();
@@ -4154,7 +4151,7 @@ fn a_file_move_applies_the_servers_edits_before_renaming() {
 #[test]
 fn a_pending_move_goes_ahead_at_its_deadline_without_an_answer() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    let root = crate::platform::fs::canonicalize(tmp.path()).unwrap();
     std::fs::write(root.join("a.txt"), "x").unwrap();
     let mut app = App::new(root.clone()).unwrap();
     app.pending_file_move = Some(PendingFileMove {

@@ -601,7 +601,7 @@ fn cmd_click_on_a_file_line_reference_in_the_terminal_opens_the_file_there() {
     app.terminal_mut().write_input(cmd.as_bytes());
     // The echoed command line also contains the reference; wait for the
     // OUTPUT line (the one starting with "ref "), then click that one.
-    let is_output_line = |l: &str| l.trim_start().starts_with("ref src/probe.rs");
+    let is_output_line = |l: &str| l.trim_start().starts_with("ref src/probe.rs:3:2");
     // A pure liveness backstop, generous on purpose (#44): the shell does
     // its full interactive startup on a box the parallel suite saturates,
     // and a tight ceiling here measured the scheduler, not croft — the
@@ -615,6 +615,8 @@ fn cmd_click_on_a_file_line_reference_in_the_terminal_opens_the_file_there() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    #[cfg(windows)]
+    app.terminal_mut().end_child();
     term.draw(|f| app.render(f)).unwrap();
     let snapshot = app.terminal().visible_text();
     let row_idx = snapshot

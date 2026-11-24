@@ -76,13 +76,13 @@ impl App {
                         let open = crate::platform::fs::canonicalize(&path)
                             .is_ok_and(|p| self.roots.iter().any(|r| r == p));
                         if stale && !open {
-                            let _ = std::fs::remove_dir_all(&path);
+                            let _ = crate::platform::fs::remove_dir_all_retrying(&path);
                         }
                     }
                     // Extract beside it and rename, so an interrupted
                     // extraction never passes for a finished one.
                     let partial = PathBuf::from(format!("{}.partial", dest.display()));
-                    let _ = std::fs::remove_dir_all(&partial);
+                    let _ = crate::platform::fs::remove_dir_all_retrying(&partial);
                     let done = crate::codeql_db::extract_zip(
                         &zip,
                         &partial,
@@ -90,7 +90,7 @@ impl App {
                     )
                     .and_then(|_| std::fs::rename(&partial, &dest).map_err(|e| e.to_string()));
                     if let Err(e) = done {
-                        let _ = std::fs::remove_dir_all(&partial);
+                        let _ = crate::platform::fs::remove_dir_all_retrying(&partial);
                         self.status = format!("Could not extract {}: {e}", zip.display());
                         return;
                     }

@@ -1958,6 +1958,12 @@ impl App {
             let primary = self.roots.primary().to_path_buf();
             self.seed_active_scm(primary);
         }
+        #[cfg(windows)]
+        for w in &mut self.fs_watch_extra {
+            if w.watches_root(&path) {
+                w.disable_sync();
+            }
+        }
         self.rebind_workspace_watchers();
         self.sync_workspace_fanout();
         self.refresh_workspace_title();

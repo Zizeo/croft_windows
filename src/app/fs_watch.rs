@@ -633,6 +633,10 @@ impl FsWatch {
         }
         #[cfg(not(target_os = "macos"))]
         {
+            #[cfg(windows)]
+            let root_buf = canon_of(root);
+            #[cfg(windows)]
+            let root = root_buf.as_path();
             // The run rule is measured relative to `root`: the workspace
             // root's own ancestors are not part of the workspace, so a
             // checkout that happens to live under e.g. `build/` or inside
