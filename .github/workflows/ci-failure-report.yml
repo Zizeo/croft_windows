@@ -110,16 +110,22 @@ jobs:
             | select(.conclusion | IN("failure", "timed_out", "cancelled", "startup_failure"))
             | "\(.id)\t\(.name)"' ci-jobs.json > ci-logs/failed.tsv
           while IFS=$'\t' read -r id name; do
-          headers="$(mktemp)"
-          if gh api --include "repos/$REPO/actions/jobs/$id/logs" > "$headers"; then
-          location="$(awk 'BEGIN{IGNORECASE=1} /^location:/ { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }' "$headers" | tr -d '\r')"
-          if [ -n "$location" ] && curl -fsSL "$location" -o "ci-logs/$id.log"; then
-          rm -f "$headers"
-          continue
-          fi
-          fi
-          rm -f "$headers" "ci-logs/$id.log"
-          echo "::warning::no log downloaded for the failed job $name ($id)"
+            # Two steps: the logs endpoint answers a 3xx to a signed blob on a
+            # different host, and the storage host rejects the bearer token so
+            # `gh api` refuses that body outright ("the response contains
+            # terminal escape sequences"). `--include` stops at the headers,
+            # then curl fetches the blob unauthenticated, which is what the
+            # signature is for.
+            headers="$(mktemp)"
+            if gh api --include "repos/$REPO/actions/jobs/$id/logs" > "$headers"; then
+              location="$(awk 'BEGIN{IGNORECASE=1} /^location:/ { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }' "$headers" | tr -d '\r')"
+              if [ -n "$location" ] && curl -fsSL "$location" -o "ci-logs/$id.log"; then
+                rm -f "$headers"
+                continue
+              fi
+            fi
+            rm -f "$headers" "ci-logs/$id.log"
+            echo "::warning::no log downloaded for the failed job $name ($id)"
           done < ci-logs/failed.tsv
       - name: Write the report into the run summary
         # `tee` writes the file the artifact carries and the stdout the summary
