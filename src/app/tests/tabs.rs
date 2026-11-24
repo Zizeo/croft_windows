@@ -2736,3 +2736,76 @@ fn cmd_k_shift_x_closes_the_other_tabs_and_the_menu_names_it() {
         menu(&app)
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_new_window_targets_wt_wezterm_or_cmd_fallback() {
+    use crate::app::editor_tabs::{
+        WindowsHostTerminal, detect_windows_host_terminal, windows_new_window_command,
+    };
+    use std::path::Path;
+
+    assert_eq!(
+        detect_windows_host_terminal(Some("wt-guid"), None),
+        WindowsHostTerminal::WindowsTerminal
+    );
+    assert_eq!(
+        detect_windows_host_terminal(None, Some("WezTerm")),
+        WindowsHostTerminal::WezTerm
+    );
+    assert_eq!(
+        detect_windows_host_terminal(None, Some("conhost")),
+        WindowsHostTerminal::Fallback
+    );
+
+    let exe = Path::new(r"\\?\C:\bin\croft.exe");
+    let root = Path::new(r"\\?\C:\repo");
+    let file = Path::new(r"\\?\C:\repo\main.rs");
+
+    let (prog, args) =
+        windows_new_window_command(WindowsHostTerminal::WindowsTerminal, exe, root, file);
+    assert_eq!(prog, "wt.exe");
+    assert_eq!(
+        args,
+        [
+            "-w",
+            "new",
+            r"C:\bin\croft.exe",
+            r"C:\repo",
+            "--open-file",
+            r"C:\repo\main.rs",
+            "--zen",
+        ]
+    );
+
+    let (prog, args) = windows_new_window_command(WindowsHostTerminal::WezTerm, exe, root, file);
+    assert_eq!(prog, "wezterm");
+    assert_eq!(
+        args,
+        [
+            "start",
+            "--",
+            r"C:\bin\croft.exe",
+            r"C:\repo",
+            "--open-file",
+            r"C:\repo\main.rs",
+            "--zen",
+        ]
+    );
+
+    let (prog, args) = windows_new_window_command(WindowsHostTerminal::Fallback, exe, root, file);
+    assert_eq!(prog, "cmd.exe");
+    assert_eq!(
+        args,
+        [
+            "/C",
+            "start",
+            "",
+            r"C:\bin\croft.exe",
+            r"C:\repo",
+            "--open-file",
+            r"C:\repo\main.rs",
+            "--zen",
+        ]
+    );
+}

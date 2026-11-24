@@ -2104,16 +2104,113 @@ pub(super) fn apple_terminal_new_window_script(
     format!(r#"tell application "Terminal" to do script "{cmd}""#)
 }
 
-/// Non-macOS builds have no supported window-spawn path yet (each terminal's
-/// CLI differs per platform); the caller surfaces the error as a status line.
-#[cfg(not(target_os = "macos"))]
+/// The host terminal croft is running inside on Windows, for spawning a new
+/// window (`Move/Copy into New Window`).
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum WindowsHostTerminal {
+    WindowsTerminal,
+    WezTerm,
+    Fallback,
+}
+
+#[cfg(windows)]
+pub(super) fn detect_windows_host_terminal(
+    wt_session: Option<&str>,
+    term_program: Option<&str>,
+) -> WindowsHostTerminal {
+    if wt_session.is_some_and(|s| !s.is_empty()) {
+        return WindowsHostTerminal::WindowsTerminal;
+    }
+    if term_program.is_some_and(|s| s.eq_ignore_ascii_case("wezterm")) {
+        return WindowsHostTerminal::WezTerm;
+    }
+    WindowsHostTerminal::Fallback
+}
+
+#[cfg(windows)]
+pub(super) fn windows_new_window_command(
+    host: WindowsHostTerminal,
+    exe: &std::path::Path,
+    root: &std::path::Path,
+    file: &std::path::Path,
+) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
+    use std::ffi::OsString;
+    let exe = dunce::simplified(exe).as_os_str().to_os_string();
+    let root = dunce::simplified(root).as_os_str().to_os_string();
+    let file = dunce::simplified(file).as_os_str().to_os_string();
+    match host {
+        WindowsHostTerminal::WindowsTerminal => (
+            OsString::from("wt.exe"),
+            vec![
+                OsString::from("-w"),
+                OsString::from("new"),
+                exe,
+                root,
+                OsString::from("--open-file"),
+                file,
+                OsString::from("--zen"),
+            ],
+        ),
+        WindowsHostTerminal::WezTerm => (
+            OsString::from("wezterm"),
+            vec![
+                OsString::from("start"),
+                OsString::from("--"),
+                exe,
+                root,
+                OsString::from("--open-file"),
+                file,
+                OsString::from("--zen"),
+            ],
+        ),
+        WindowsHostTerminal::Fallback => (
+            OsString::from("cmd.exe"),
+            vec![
+                OsString::from("/C"),
+                OsString::from("start"),
+                OsString::from(""),
+                exe,
+                root,
+                OsString::from("--open-file"),
+                file,
+                OsString::from("--zen"),
+            ],
+        ),
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn spawn_new_window(
+    root: &std::path::Path,
+    file: &std::path::Path,
+) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let host = detect_windows_host_terminal(
+        std::env::var("WT_SESSION").ok().as_deref(),
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+    );
+    let (program, args) = windows_new_window_command(host, &exe, root, file);
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+/// Non-macOS/non-Windows builds have no supported window-spawn path yet (each
+/// terminal's CLI differs per platform); the caller surfaces the error as a
+/// status line.
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(super) fn spawn_new_window(
     _root: &std::path::Path,
     _file: &std::path::Path,
 ) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "opening a new window is only supported on macOS",
+        "opening a new window is only supported on macOS and Windows",
     ))
 }
 
