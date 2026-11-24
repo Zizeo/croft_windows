@@ -475,9 +475,7 @@ pub fn poll_listeners(shell_pid: i32) -> Vec<PortHit> {
 }
 
 #[cfg(windows)]
-fn windows_subtree_and_names(
-    root: i32,
-) -> (HashSet<u32>, std::collections::HashMap<u32, String>) {
+fn windows_subtree_and_names(root: i32) -> (HashSet<u32>, std::collections::HashMap<u32, String>) {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
     let mut subtree = HashSet::new();
     let mut names = std::collections::HashMap::new();

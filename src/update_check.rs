@@ -1092,7 +1092,10 @@ mod tests {
         );
         assert_eq!(
             staged_binary_path(Path::new("/c")),
-            PathBuf::from(format!("/c/staged/bin/croft{}", std::env::consts::EXE_SUFFIX))
+            PathBuf::from(format!(
+                "/c/staged/bin/croft{}",
+                std::env::consts::EXE_SUFFIX
+            ))
         );
     }
 

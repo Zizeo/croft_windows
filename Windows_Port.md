@@ -1,13 +1,13 @@
-# croft Windows Tier 2 Port — Status & Sub-project 7 Plan
+# croft Windows Tier 2 Port — Status & Sub-project Roadmap
 
 > **Repository:** `C:\Users\Elio\prog\croft_windows` (`github.com:Zizeo/croft_windows`, branch `windows-port`)  
 > **Target Environment:** `x86_64-pc-windows-msvc`, Rust `1.97.1` (Edition `2024`), PowerShell 7+ (`pwsh.exe`), Windows PowerShell 5.1 (`powershell.exe`), `cmd.exe` fallback, hosted in Windows Terminal, WezTerm, or 3rd-party Windows terminal emulators.
 
 ---
 
-## 1. Current Baseline (Completed through Sub-project 6 & Upstream `v2.181`)
+## 1. Current Baseline (Completed through Sub-project 7 & Upstream `v2.181`)
 
-At `windows-port` HEAD `9dd26b40d`, **Sub-projects 1 through 6** and the **upstream `v0.2.160`–`v0.2.181` (`v2.181`) merge** are complete and verified (`cargo fmt --check`, `cargo check --locked --bin croft --tests` with 0 warnings, `cargo build --locked --bin croft`, `cargo test --locked --test platform` [59 passed], `cargo test --locked --test cli` [25 passed], and `RUST_TEST_THREADS=4 cargo test --locked --bin croft` [8405 passed, 0 failed, 31 ignored]):
+On branch `windows-port`, **Sub-projects 1 through 7** and the **upstream `v0.2.160`–`v0.2.181` (`v2.181`) merge** are complete and verified:
 
 1. **Sub-project 1 — Compilable Core & Platform Layer:**
    - Relocated `libc = "0.2"` and `async-lsp`'s `"stdio"` feature to `[target.'cfg(unix)'.dependencies]`; added `dunce = "1"` and minimal `windows-sys = "0.59"`.
@@ -30,6 +30,8 @@ At `windows-port` HEAD `9dd26b40d`, **Sub-projects 1 through 6** and the **upstr
    - Enabled full `--test platform`, `--test cli`, and `--bin croft` CI checks on `windows-latest` (`.github/workflows/ci.yml`) and `x86_64-pc-windows-msvc` release artifacts (`.github/workflows/release.yml`).
 9. **Upstream `v0.2.160`–`v0.2.181` Merge (`0fd612d`, `9dd26b4`):**
    - Merged all 22 upstream releases from `v2.181` while preserving `TreeKiller`/`ManagedChild` process-tree cancellation, added `is_pid_alive` sweeping for stale decompressed gzip temp copies (`src/widgets/editor/viewers.rs`), added `WT_SESSION` SGR 58 underline-color support (`src/color_depth.rs`), and adapted new popup/tick/git/testing-worker tests for Windows.
+10. **Sub-project 7 — Windows Feature Parity & Polish (`ffd064d`..`cc1f2b6`):**
+   - Enabled "Reveal in File Explorer" in Explorer/tab menus and shortcuts (`src/platform/os.rs`, `src/app/*`), shell-aware `format_cd_command_for` (`PowerShell`/`Cmd`/`Posix`), prebuilt `x86_64-pc-windows-msvc` self-update + `.old` swap (`src/update_check.rs`, `src/remote_prebuilt.rs`), "Move/Copy Tab into New Window" for Windows Terminal / WezTerm (`src/app/editor_tabs.rs`), native Win32 TCP port detection & auto-retirement (`src/platform/net.rs`, `src/port_detect.rs`), ConPTY descendant foreground resolution for pane labels, agents & SSH offers (`src/widgets/terminal/processes.rs`, `src/app/terminal_panes.rs`), zoxide Windows discovery, `winget` install & PowerShell profile hook (`src/zoxide.rs`), and background `stderr` draining + `.exe` resolution in PDF rendering (`src/pdf.rs`).
 
 *(Tier-3 Unix-daemon / OpenSSH-`ControlMaster`-dependent features — `attach`, `ls`, `record`, `web`, `pane-host`, `session-host`, `collab`, `pair`, `devcontainer` — remain out of native Windows scope and direct users to WSL2.)*
 
@@ -223,7 +225,7 @@ While Windows LSP binary discovery and provisioning (`src/lsp/manager/discovery.
 
 ---
 
-## 7. Sub-project 7 — Windows Feature Parity & Polish (Remaining Tier-2 Gaps)
+## 7. Sub-project 7 — Windows Feature Parity & Polish (Completed)
 
 A full audit of `croft` on `windows-port` (`9dd26b40d`) identified **8 Tier-2 user-facing features** that are either still macOS/Unix-gated, fall back to no-ops on Windows, or fail because of Windows executable/pipe/shell differences:
 

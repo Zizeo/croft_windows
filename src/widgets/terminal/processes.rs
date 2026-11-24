@@ -512,10 +512,7 @@ pub const CLEAR_TYPED_LINE: &str = "\x05x\x15";
 /// Build the byte sequence that retargets a shell's working directory to
 /// `path`. Prefixed with a line-clearing sequence so a half-typed command at
 /// the prompt does not concatenate with our command.
-pub fn format_cd_command_for(
-    path: &std::path::Path,
-    flavor: crate::tasks::ShellFlavor,
-) -> Vec<u8> {
+pub fn format_cd_command_for(path: &std::path::Path, flavor: crate::tasks::ShellFlavor) -> Vec<u8> {
     let s = path.to_string_lossy();
     let mut out = Vec::with_capacity(s.len() + 24);
     match flavor {

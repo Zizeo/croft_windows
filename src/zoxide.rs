@@ -865,7 +865,11 @@ mod tests {
         );
         let profile = tmp.path().join(rc_file_name("pwsh"));
         std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
-        std::fs::write(&profile, "Invoke-Expression (& { (zoxide init powershell | Out-String) })\n").unwrap();
+        std::fs::write(
+            &profile,
+            "Invoke-Expression (& { (zoxide init powershell | Out-String) })\n",
+        )
+        .unwrap();
         assert_eq!(missing_hook_rc(Some("pwsh.exe"), home), None);
     }
 }
