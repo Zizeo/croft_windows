@@ -49,11 +49,17 @@ const INSTALL_SCRIPT: &str =
 /// (Android blocks exec from `$HOME` on some of them).
 const TERMUX_INSTALL_SCRIPT: &str = "pkg install -y zoxide";
 
+/// Windows installer via WinGet.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_INSTALL_SCRIPT: &str = "winget install --id ajeetdsouza.zoxide -e";
+
 /// Pick the installer for this host. The popup's install offer shows it
 /// verbatim, so the user sees exactly what `y` runs.
 pub fn install_script(termux: bool) -> &'static str {
     if termux {
         TERMUX_INSTALL_SCRIPT
+    } else if cfg!(windows) {
+        WINDOWS_INSTALL_SCRIPT
     } else {
         INSTALL_SCRIPT
     }
@@ -143,12 +149,32 @@ const INIT_SENTINEL: &str = "zoxide init";
 /// is not necessarily on croft's inherited `PATH`.
 fn fallback_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = crate::platform::env::home_dir() {
-        paths.push(home.join(".local").join("bin").join("zoxide"));
+    #[cfg(windows)]
+    {
+        if let Some(home) = crate::platform::env::home_dir() {
+            paths.push(home.join(".cargo").join("bin").join("zoxide.exe"));
+            paths.push(home.join(".local").join("bin").join("zoxide.exe"));
+            paths.push(home.join("scoop").join("shims").join("zoxide.exe"));
+        }
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            paths.push(
+                PathBuf::from(local_app_data)
+                    .join("Microsoft")
+                    .join("WinGet")
+                    .join("Links")
+                    .join("zoxide.exe"),
+            );
+        }
     }
-    paths.push(PathBuf::from("/opt/homebrew/bin/zoxide"));
-    paths.push(PathBuf::from("/usr/local/bin/zoxide"));
-    paths.push(PathBuf::from("/usr/bin/zoxide"));
+    #[cfg(not(windows))]
+    {
+        if let Some(home) = crate::platform::env::home_dir() {
+            paths.push(home.join(".local").join("bin").join("zoxide"));
+        }
+        paths.push(PathBuf::from("/opt/homebrew/bin/zoxide"));
+        paths.push(PathBuf::from("/usr/local/bin/zoxide"));
+        paths.push(PathBuf::from("/usr/bin/zoxide"));
+    }
     paths
 }
 
@@ -294,13 +320,17 @@ pub fn fuzzy_rank(needle: &str, dirs: &[PathBuf]) -> Vec<PathBuf> {
 /// unfamiliar shell). Only `zsh` and `bash` are supported — the two shells
 /// croft actually launches (zsh on the Mac, bash on the Linux remote).
 fn supported_shell(shell_path: &str) -> Option<&'static str> {
-    let base = Path::new(shell_path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(shell_path);
-    match base {
+    let base = shell_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(shell_path)
+        .to_ascii_lowercase();
+    let stem = base.strip_suffix(".exe").unwrap_or(&base);
+    match stem {
         "zsh" => Some("zsh"),
         "bash" => Some("bash"),
+        "pwsh" => Some("pwsh"),
+        "powershell" => Some("powershell"),
         _ => None,
     }
 }
@@ -308,10 +338,13 @@ fn supported_shell(shell_path: &str) -> Option<&'static str> {
 /// The rc file croft appends the init block to for a (already validated)
 /// shell. bash targets `~/.bashrc` (zoxide's documented target; the login
 /// shell reaches it via `~/.profile` sourcing `~/.bashrc`), zsh targets
-/// `~/.zshrc` (sourced for every interactive zsh).
+/// `~/.zshrc` (sourced for every interactive zsh), and PowerShell targets the
+/// user's `Microsoft.PowerShell_profile.ps1`.
 fn rc_file_name(shell: &str) -> &'static str {
     match shell {
         "zsh" => ".zshrc",
+        "pwsh" => "Documents/PowerShell/Microsoft.PowerShell_profile.ps1",
+        "powershell" => "Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1",
         _ => ".bashrc",
     }
 }
@@ -323,10 +356,26 @@ fn rc_hint(shell_path: Option<&str>) -> Option<String> {
     supported_shell(shell_path?).map(|shell| format!("~/{}", rc_file_name(shell)))
 }
 
+fn active_shell_path() -> Option<String> {
+    if let Ok(shell) = std::env::var("SHELL")
+        && !shell.trim().is_empty()
+    {
+        return Some(shell);
+    }
+    #[cfg(windows)]
+    {
+        return Some(crate::platform::env::default_shell());
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 /// [`rc_hint`] for this process's `$SHELL`: what the popup's install offer
 /// names before the user agrees to anything.
 pub fn shell_rc_hint() -> Option<String> {
-    rc_hint(std::env::var("SHELL").ok().as_deref())
+    rc_hint(active_shell_path().as_deref())
 }
 
 /// The rc file to offer zoxide's shell hook to when zoxide is already
@@ -344,7 +393,7 @@ fn missing_hook_rc(shell_path: Option<&str>, home: Option<&Path>) -> Option<Stri
 /// [`missing_hook_rc`] for this process's `$SHELL` and `$HOME`.
 pub fn shell_hook_missing() -> Option<String> {
     let home = crate::platform::env::home_dir();
-    missing_hook_rc(std::env::var("SHELL").ok().as_deref(), home.as_deref())
+    missing_hook_rc(active_shell_path().as_deref(), home.as_deref())
 }
 
 #[cfg(test)]
@@ -377,9 +426,14 @@ pub fn add_shell_hook() -> Option<String> {
 /// then install zoxide's `cd` hook and the `j` command. Wrapped in marker
 /// comments and led by a blank line so it never fuses onto existing content.
 fn init_block(shell: &str) -> String {
-    format!(
-        "\n{INIT_MARKER_START}\nexport PATH=\"$HOME/.local/bin:$PATH\"\neval \"$(zoxide init {shell} --cmd {ZOXIDE_CMD})\"\n{INIT_MARKER_END}\n"
-    )
+    match shell {
+        "pwsh" | "powershell" => format!(
+            "\n{INIT_MARKER_START}\nInvoke-Expression (& {{ (zoxide init powershell --cmd {ZOXIDE_CMD} | Out-String) }})\n{INIT_MARKER_END}\n"
+        ),
+        _ => format!(
+            "\n{INIT_MARKER_START}\nexport PATH=\"$HOME/.local/bin:$PATH\"\neval \"$(zoxide init {shell} --cmd {ZOXIDE_CMD})\"\n{INIT_MARKER_END}\n"
+        ),
+    }
 }
 
 /// Decide what (if anything) to append to an rc file whose current contents
@@ -400,7 +454,7 @@ fn pending_init_block(shell: &str, existing: &str) -> Option<String> {
 /// appends only when no `zoxide init` line is already present. Returns the
 /// rc file (`~/.bashrc`) when it appended the block, so the user is told.
 fn ensure_shell_init() -> Option<String> {
-    let Ok(shell_path) = std::env::var("SHELL") else {
+    let Some(shell_path) = active_shell_path() else {
         log_file::log("zoxide: $SHELL unset, skipping shell-init wiring");
         return None;
     };
@@ -415,6 +469,9 @@ fn ensure_shell_init() -> Option<String> {
         return None;
     };
     let rc = home.join(rc_file_name(shell));
+    if let Some(parent) = rc.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let existing = std::fs::read_to_string(&rc).unwrap_or_default();
     let block = pending_init_block(shell, &existing)?;
     match std::fs::OpenOptions::new()
@@ -469,7 +526,11 @@ pub fn install_in_background() {
         // installer can't run (e.g. it once piped curl on a stock
         // Termux, which has no curl) used to fail in total silence
         // while the popup claimed "installing".
-        let failure = match Command::new("sh").arg("-c").arg(script).output() {
+        #[cfg(windows)]
+        let installer_out = Command::new("cmd.exe").args(["/C", script]).output();
+        #[cfg(not(windows))]
+        let installer_out = Command::new("sh").arg("-c").arg(script).output();
+        let failure = match installer_out {
             Ok(out) if out.status.success() => {
                 log_file::log(&format!("zoxide: installer `{script}` succeeded"));
                 None
@@ -524,6 +585,9 @@ mod tests {
             "stock Termux has no curl, so the curl|sh installer can never run there; \
              pkg is in every Termux bootstrap and installs to the always-executable $PREFIX/bin"
         );
+        #[cfg(windows)]
+        assert_eq!(install_script(false), WINDOWS_INSTALL_SCRIPT);
+        #[cfg(not(windows))]
         assert_eq!(
             install_script(false),
             INSTALL_SCRIPT,
@@ -768,5 +832,40 @@ mod tests {
             None,
             "croft's own block must suppress a second append"
         );
+    }
+
+    #[test]
+    fn powershell_supported_shell_rc_and_init_block_work_across_paths() {
+        assert_eq!(supported_shell("pwsh"), Some("pwsh"));
+        assert_eq!(supported_shell("pwsh.exe"), Some("pwsh"));
+        assert_eq!(
+            supported_shell(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            Some("pwsh")
+        );
+        assert_eq!(supported_shell("powershell.exe"), Some("powershell"));
+        assert_eq!(
+            rc_file_name("pwsh"),
+            "Documents/PowerShell/Microsoft.PowerShell_profile.ps1"
+        );
+        assert_eq!(
+            rc_file_name("powershell"),
+            "Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1"
+        );
+
+        let block = init_block("pwsh");
+        assert!(block.contains("zoxide init powershell --cmd j"));
+        assert!(block.contains(INIT_MARKER_START) && block.contains(INIT_MARKER_END));
+        assert_eq!(pending_init_block("pwsh", &block), None);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Some(tmp.path());
+        assert_eq!(
+            missing_hook_rc(Some("pwsh.exe"), home).as_deref(),
+            Some("~/Documents/PowerShell/Microsoft.PowerShell_profile.ps1")
+        );
+        let profile = tmp.path().join(rc_file_name("pwsh"));
+        std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+        std::fs::write(&profile, "Invoke-Expression (& { (zoxide init powershell | Out-String) })\n").unwrap();
+        assert_eq!(missing_hook_rc(Some("pwsh.exe"), home), None);
     }
 }
