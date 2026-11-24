@@ -184,7 +184,29 @@ pub fn remove_worktree_lane(lane: &Path) -> Result<(), String> {
     .ok()
     .and_then(|out| Path::new(out.trim()).parent().map(Path::to_path_buf));
     let cwd = repo.as_deref().unwrap_or(lane);
-    run_git_mut(cwd, &["worktree", "remove", path])
+    #[cfg(not(windows))]
+    {
+        run_git_mut(cwd, &["worktree", "remove", path])
+    }
+    #[cfg(windows)]
+    {
+        let mut last = run_git_mut(cwd, &["worktree", "remove", path]);
+        for delay_ms in [50u64, 100, 200, 400, 800] {
+            let Err(ref msg) = last else {
+                break;
+            };
+            let lower = msg.to_ascii_lowercase();
+            let transient = lower.contains("permission denied")
+                || lower.contains("directory not empty")
+                || lower.contains("failed to delete");
+            if !transient || !lane.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            last = run_git_mut(cwd, &["worktree", "remove", path]);
+        }
+        last
+    }
 }
 
 /// Where review mode checks pull request `number` out (#365): a sibling of

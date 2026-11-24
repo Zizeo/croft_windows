@@ -144,6 +144,8 @@ fn a_url_that_wraps_the_pane_edge_resolves_whole_from_any_of_its_rows() {
 fn cell_carrying_lands_inside_the_needle_not_at_the_start_of_its_row() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    #[cfg(windows)]
+    app.terminals[0].end_child();
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -5169,6 +5171,8 @@ fn alt_screen_upward_drag_through_the_real_mouse_pipeline_selects_upward() {
     // repaints (animated status row) and renders between every event.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    #[cfg(windows)]
+    app.terminals[0].end_child();
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
