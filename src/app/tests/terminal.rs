@@ -8362,6 +8362,8 @@ fn wrapped_find_app(text: &str) -> (tempfile::TempDir, App) {
     );
     app.terminals[0] =
         crate::widgets::terminal::PtyTerminal::new_running(prog, args, tmp.path()).unwrap();
+    #[cfg(windows)]
+    app.terminals[0].end_child();
     app.terminals[0].resize(30, 10);
     app.terminals[0].feed_bytes_for_test(format!("\x1b[2J\x1b[H{text}").as_bytes());
     app.focus_pane(Pane::Terminal);
