@@ -627,7 +627,7 @@ pub fn stage_stdin(cache_dir: &Path, bytes: &[u8], hint: Option<&str>) -> anyhow
     // recognisable name in there.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o700));
     }
     let n = SEQ.fetch_add(1, Ordering::Relaxed);

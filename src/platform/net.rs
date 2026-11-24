@@ -3,6 +3,7 @@
 //! All `unsafe` Win32 IP Helper FFI is confined here behind [`list_tcp_listeners`].
 
 /// A listening TCP socket reported by the OS kernel.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpListenerEntry {
     pub port: u16,

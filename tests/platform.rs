@@ -108,6 +108,7 @@ fn fs_executable_lock_and_link() {
     let lock_path = dir.path().join("lock.file");
     let f1 = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)

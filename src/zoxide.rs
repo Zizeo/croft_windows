@@ -364,7 +364,7 @@ fn active_shell_path() -> Option<String> {
     }
     #[cfg(windows)]
     {
-        return Some(crate::platform::env::default_shell());
+        Some(crate::platform::env::default_shell())
     }
     #[cfg(not(windows))]
     {

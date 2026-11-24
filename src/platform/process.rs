@@ -257,8 +257,8 @@ pub fn is_pid_alive(pid: u32) -> bool {
         if pid <= 0 {
             return false;
         }
-        unsafe { libc::kill(pid, 0) == 0 }
-        || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        (unsafe { libc::kill(pid, 0) == 0 })
+            || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(windows)]
     {

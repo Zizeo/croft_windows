@@ -28,12 +28,12 @@ pub(super) fn url_is_safe_to_open(url: &str) -> bool {
 pub(super) fn open_local_url(url: &str) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(windows)]
     {
-        return Command::new("cmd.exe")
+        Command::new("cmd.exe")
             .args(["/d", "/c", "start", "", url])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status()
     }
     #[cfg(not(windows))]
     {

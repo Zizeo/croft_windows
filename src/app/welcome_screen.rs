@@ -1130,6 +1130,7 @@ impl App {
         let previous_root = run.previous_root.clone();
         self.change_workspace_root(run.previous_root);
         let remove_res = {
+            #[cfg_attr(not(windows), allow(unused_mut))]
             let mut res = crate::tour::remove_scratch(&run.scratch);
             #[cfg(windows)]
             if res.is_err() && run.scratch.exists() {

@@ -266,6 +266,7 @@ pub(super) fn resolve_path_only(
     fallback_dirs: &[PathBuf],
 ) -> Option<(ServerConfig, Vec<PathBuf>)> {
     if on_path {
+        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut resolved = config.clone();
         #[cfg(windows)]
         if let Some(cmd) = resolve_command_on_path(&config.command) {
@@ -398,7 +399,7 @@ pub(super) fn rustup_behind(candidate: &Path) -> Option<PathBuf> {
             }
             #[cfg(windows)]
             {
-                return p.is_file() && same_hardlink_metadata(candidate, p);
+                p.is_file() && same_hardlink_metadata(candidate, p)
             }
             #[cfg(not(windows))]
             {
