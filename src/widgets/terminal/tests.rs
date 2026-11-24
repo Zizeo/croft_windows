@@ -5577,6 +5577,38 @@ fn process_name_resolves_a_live_pid() {
     );
 }
 
+#[test]
+fn strip_windows_exe_removes_exe_suffix_case_insensitively() {
+    assert_eq!(strip_windows_exe("ssh.exe"), "ssh");
+    assert_eq!(strip_windows_exe("PWSH.EXE"), "PWSH");
+    assert_eq!(strip_windows_exe("cargo"), "cargo");
+    assert_eq!(strip_windows_exe(".exe"), ".exe");
+}
+
+#[test]
+fn resolve_deepest_child_walks_tree_skips_conhost_and_guards_cycles() {
+    // Idle shell with only conhost.exe child returns shell itself.
+    let idle = [(100, Some(1), "pwsh.exe"), (101, Some(100), "conhost.exe")];
+    assert_eq!(resolve_deepest_child(100, &idle), 100);
+
+    // Nested toolchain: shell -> cargo -> rustc (ignores OpenConsole.exe).
+    let nested = [
+        (100, Some(1), "pwsh.exe"),
+        (101, Some(100), "OpenConsole.exe"),
+        (200, Some(100), "cargo.exe"),
+        (201, Some(200), "rustc.exe"),
+    ];
+    assert_eq!(resolve_deepest_child(100, &nested), 201);
+
+    // SSH child under shell.
+    let ssh = [(100, Some(1), "pwsh.exe"), (300, Some(100), "ssh.exe")];
+    assert_eq!(resolve_deepest_child(100, &ssh), 300);
+
+    // Cycle safety.
+    let cycle = [(100, Some(200), "a.exe"), (200, Some(100), "b.exe")];
+    assert_eq!(resolve_deepest_child(100, &cycle), 200);
+}
+
 #[cfg(unix)]
 #[test]
 fn process_cmdline_reads_a_live_process_argv() {

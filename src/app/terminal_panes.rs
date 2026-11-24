@@ -1905,7 +1905,7 @@ impl App {
         if self.last_label_refresh.elapsed() >= TERMINAL_LABEL_INTERVAL && self.label_pass.is_none()
         {
             self.last_label_refresh = std::time::Instant::now();
-            // (shell_pid, foreground_pid) gathered cheaply on the loop.
+            #[cfg(unix)]
             let targets: Vec<(i32, i32)> = self
                 .terminals
                 .iter()
@@ -1914,17 +1914,35 @@ impl App {
                     _ => None,
                 })
                 .collect();
-            if targets.is_empty() {
+            #[cfg(windows)]
+            let shell_pids: Vec<i32> = self
+                .terminals
+                .iter()
+                .filter_map(|t| t.shell_pid())
+                .collect();
+            #[cfg(unix)]
+            let has_targets = !targets.is_empty();
+            #[cfg(windows)]
+            let has_targets = !shell_pids.is_empty();
+            #[cfg(not(any(unix, windows)))]
+            let has_targets = false;
+
+            if !has_targets {
                 // No pane has a foreground process to sample: any seated
                 // agent is gone, and only an empty sample says so.
                 changed |= self.apply_agent_samples(&[], crate::agents::QUIET_AFTER);
             }
-            if !targets.is_empty() {
+            if has_targets {
                 let sample_ssh = !self.remote_offer_disabled;
                 // A lookup that cannot start is tried again on the next
                 // cadence tick.
                 let job =
                     crate::jobs::Job::spawn("pane-labels", crate::jobs::Start::Now, move || {
+                        #[cfg(windows)]
+                        let targets =
+                            crate::widgets::terminal::windows_foreground_pids(&shell_pids);
+                        #[cfg(not(any(unix, windows)))]
+                        let targets: Vec<(i32, i32)> = Vec::new();
                         let named: Vec<(i32, i32, String)> = targets
                             .into_iter()
                             .filter_map(|(sp, fg)| {

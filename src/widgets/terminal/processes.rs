@@ -3,6 +3,91 @@
 
 use super::*;
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(super) fn strip_windows_exe(name: &str) -> &str {
+    if name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(".exe") {
+        &name[..name.len() - 4]
+    } else {
+        name
+    }
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn is_windows_console_host(name: &str) -> bool {
+    let base = strip_windows_exe(name);
+    base.eq_ignore_ascii_case("conhost") || base.eq_ignore_ascii_case("openconsole")
+}
+
+/// Walk the process tree from `shell_pid` down to its deepest active
+/// descendant, ignoring Windows console host shims (`conhost.exe` /
+/// `openconsole.exe`). Returns `shell_pid` when idle.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(super) fn resolve_deepest_child(shell_pid: u32, procs: &[(u32, Option<u32>, &str)]) -> u32 {
+    use std::collections::{HashMap, HashSet};
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(pid, ppid, name) in procs {
+        if let Some(parent) = ppid
+            && pid != parent
+            && !is_windows_console_host(name)
+        {
+            children.entry(parent).or_default().push(pid);
+        }
+    }
+    let mut stack = vec![(shell_pid, 0usize)];
+    let mut visited = HashSet::from([shell_pid]);
+    let mut best = (0usize, shell_pid);
+    while let Some((pid, depth)) = stack.pop() {
+        if depth > best.0 || (depth == best.0 && pid > best.1) {
+            best = (depth, pid);
+        }
+        if let Some(kids) = children.get(&pid) {
+            for &kid in kids {
+                if visited.insert(kid) {
+                    stack.push((kid, depth + 1));
+                }
+            }
+        }
+    }
+    best.1
+}
+
+/// Resolve `(shell_pid, foreground_pid)` pairs for live ConPTY shells on
+/// Windows using a single `sysinfo` process-table snapshot.
+#[cfg(windows)]
+pub fn windows_foreground_pids(shell_pids: &[i32]) -> Vec<(i32, i32)> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    if shell_pids.is_empty() {
+        return Vec::new();
+    }
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let owned: Vec<(u32, Option<u32>, String)> = sys
+        .processes()
+        .iter()
+        .map(|(pid, p)| {
+            (
+                pid.as_u32(),
+                p.parent().map(|pp| pp.as_u32()),
+                p.name().to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    let borrowed: Vec<(u32, Option<u32>, &str)> = owned
+        .iter()
+        .map(|(pid, ppid, name)| (*pid, *ppid, name.as_str()))
+        .collect();
+    shell_pids
+        .iter()
+        .filter_map(|&sp| {
+            let sp_u32 = u32::try_from(sp).ok()?;
+            sys.process(sysinfo::Pid::from_u32(sp_u32))?;
+            let fg = resolve_deepest_child(sp_u32, &borrowed);
+            let fg_i32 = i32::try_from(fg).ok()?;
+            Some((sp, fg_i32))
+        })
+        .collect()
+}
+
 /// Resolve a pid to its command name (basename), cross-platform, via `sysinfo`
 /// (no subprocess). Used to label a terminal pane with its foreground process.
 /// Refreshes only the one pid, so it's cheap, but still runs off the event loop.
@@ -15,7 +100,17 @@ pub fn process_name(pid: i32) -> Option<String> {
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::Some(&[p]), true);
     sys.process(p)
-        .map(|pr| pr.name().to_string_lossy().to_string())
+        .map(|pr| {
+            let raw = pr.name().to_string_lossy();
+            #[cfg(windows)]
+            {
+                strip_windows_exe(&raw).to_string()
+            }
+            #[cfg(not(windows))]
+            {
+                raw.into_owned()
+            }
+        })
         .filter(|n| !n.is_empty())
 }
 
@@ -471,6 +566,7 @@ pub fn format_cd_command_for(
 /// Path is single-quoted with embedded
 /// quotes escaped via the standard `'\''` sleight-of-hand so paths
 /// containing spaces or apostrophes round-trip safely.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn format_cd_command(path: &std::path::Path) -> Vec<u8> {
     format_cd_command_for(path, crate::tasks::ShellFlavor::Posix)
 }

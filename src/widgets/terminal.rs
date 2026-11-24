@@ -59,6 +59,8 @@ pub use processes::cwd_is_observable;
 pub use processes::cwd_of_pid;
 pub use processes::process_cmdline;
 pub use processes::process_name;
+#[cfg(windows)]
+pub use processes::windows_foreground_pids;
 #[cfg(any(unix, test))]
 use processes::*;
 #[cfg(any(unix, test))]
