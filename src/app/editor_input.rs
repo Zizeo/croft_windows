@@ -516,11 +516,15 @@ impl App {
             self.delete_current_line();
             return;
         }
-        // VS Code "Reveal in Finder" (Cmd+Opt+R) for the active file. Works on
-        // any tab backed by a real path (text, diff, sheet, image), so it sits
-        // above the text-only guards. Local-macOS only, matching the Explorer
-        // chord and the tab-menu entry; withheld on remote/headless sessions.
-        if !self.is_remote && cfg!(target_os = "macos") && is_reveal_in_finder_key(key) {
+        // VS Code "Reveal in Finder" / "Reveal in File Explorer" (Cmd+Opt+R)
+        // for the active file. Works on any tab backed by a real path (text,
+        // diff, sheet, image), so it sits above the text-only guards.
+        // Local-macOS / local-Windows only, matching the Explorer chord and
+        // the tab-menu entry; withheld on remote/headless sessions.
+        if !self.is_remote
+            && crate::platform::os::reveal_supported()
+            && is_reveal_in_finder_key(key)
+        {
             if let Some(path) = self.editor.path.clone() {
                 self.reveal_in_finder(path);
             }

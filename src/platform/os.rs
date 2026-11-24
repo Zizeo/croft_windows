@@ -1,6 +1,20 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+/// Whether revealing a path in the OS file manager is supported on this platform.
+pub const fn reveal_supported() -> bool {
+    cfg!(any(target_os = "macos", target_os = "windows"))
+}
+
+/// Platform-native menu label for revealing a file in the OS file manager.
+pub const fn reveal_menu_label() -> &'static str {
+    if cfg!(windows) {
+        "Reveal in File Explorer"
+    } else {
+        "Reveal in Finder"
+    }
+}
+
 /// Reveal `path` in the OS file manager (Finder on macOS, Explorer on Windows).
 /// Returns `Ok(label)` describing the manager, or `Err(label)` on failure.
 pub fn reveal_in_file_manager(path: &Path) -> Result<&'static str, &'static str> {

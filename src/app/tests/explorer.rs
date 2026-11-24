@@ -174,7 +174,9 @@ fn tree_context_menu_adds_reveal_in_finder_when_local_macos() {
         &items[2].1,
         MenuAction::RevealInFinder(p) if p == &f
     ));
-    assert_eq!(items[2].0, "Reveal in Finder");
+    assert_eq!(items[2].0, crate::platform::os::reveal_menu_label());
+    #[cfg(windows)]
+    assert!(crate::platform::os::reveal_supported());
 }
 
 #[test]

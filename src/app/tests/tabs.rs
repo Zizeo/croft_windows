@@ -779,6 +779,7 @@ fn build_tab_context_menu_items_includes_reveal_in_finder_only_with_a_path_and_e
     let p = std::path::Path::new("/tmp/demo.rs");
     // Local macOS with a real path: Reveal in Finder sits after Close All,
     // before the split group — mirroring VS Code's lower-middle slot.
+    let label = crate::platform::os::reveal_menu_label();
     let items = build_tab_context_menu_items(0, 1, false, Some(p), true, false, false);
     assert_eq!(
         menu_labels(&items),
@@ -787,7 +788,7 @@ fn build_tab_context_menu_items_includes_reveal_in_finder_only_with_a_path_and_e
             "Close All",
             "Copy Path",
             "Copy Relative Path",
-            "Reveal in Finder",
+            label,
             "Reveal in Explorer View",
             "Pin",
             "Split Right",
@@ -797,15 +798,15 @@ fn build_tab_context_menu_items_includes_reveal_in_finder_only_with_a_path_and_e
         ],
     );
     assert!(matches!(
-        menu_action_of(&items, "Reveal in Finder"),
+        menu_action_of(&items, label),
         Some(MenuAction::RevealInFinder(rp)) if rp == p
     ));
-    // Remote (or non-macOS) session: entry withheld even with a path.
+    // Remote (or unsupported) session: entry withheld even with a path.
     let remote = build_tab_context_menu_items(0, 1, false, Some(p), false, false, false);
-    assert!(!menu_labels(&remote).contains(&"Reveal in Finder"));
+    assert!(!menu_labels(&remote).contains(&label));
     // A blank/untitled buffer (no path) never offers it, even when enabled.
     let blank = build_tab_context_menu_items(0, 1, false, None, true, false, false);
-    assert!(!menu_labels(&blank).contains(&"Reveal in Finder"));
+    assert!(!menu_labels(&blank).contains(&label));
 }
 
 #[test]

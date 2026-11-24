@@ -52,7 +52,7 @@ pub(super) fn build_tab_context_menu_items(
     // remote SSH session the entry is withheld, matching the explorer menu.
     if let Some(path) = clicked.filter(|_| reveal_enabled) {
         items.push(MenuEntry::item(
-            "Reveal in Finder",
+            crate::platform::os::reveal_menu_label(),
             MenuAction::RevealInFinder(path.to_path_buf()),
         ));
     }

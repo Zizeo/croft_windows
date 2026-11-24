@@ -1606,7 +1606,7 @@ impl App {
                         self.editor.tab_count(),
                         self.editor_layout.is_split(),
                         tab_path.as_deref(),
-                        !self.is_remote && cfg!(target_os = "macos"),
+                        !self.is_remote && crate::platform::os::reveal_supported(),
                         self.editor.is_preview(tab_idx),
                         self.editor.is_pinned(tab_idx),
                     );
@@ -1816,7 +1816,7 @@ impl App {
                     maybe_add_reveal_in_finder(
                         &mut items,
                         clicked.as_deref(),
-                        !self.is_remote && cfg!(target_os = "macos"),
+                        !self.is_remote && crate::platform::os::reveal_supported(),
                     );
                     self.context_menu =
                         Some(ContextMenu::flat((m.column, m.row), items, target_dir));

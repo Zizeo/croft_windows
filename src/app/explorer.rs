@@ -329,7 +329,7 @@ pub(super) fn maybe_add_reveal_in_finder(
     items.insert(
         pos,
         (
-            String::from("Reveal in Finder"),
+            String::from(crate::platform::os::reveal_menu_label()),
             MenuAction::RevealInFinder(path.to_path_buf()),
         ),
     );
@@ -2399,10 +2399,13 @@ impl App {
             }
             return true;
         }
-        // Reveal in Finder is a local-macOS-only host bridge: on a remote SSH
-        // session croft runs on a headless host with no Finder, so the chord
-        // falls through there exactly as the menu entry is withheld.
-        if !self.is_remote && cfg!(target_os = "macos") && is_reveal_in_finder_key(key) {
+        // Reveal in Finder / File Explorer is a local host bridge: on a remote
+        // SSH session croft runs on a headless host, so the chord falls
+        // through there exactly as the menu entry is withheld.
+        if !self.is_remote
+            && crate::platform::os::reveal_supported()
+            && is_reveal_in_finder_key(key)
+        {
             if let Some(path) = self.explorer_selected_path() {
                 self.reveal_in_finder(path);
             }
