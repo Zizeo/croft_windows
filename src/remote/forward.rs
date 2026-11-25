@@ -89,8 +89,33 @@ pub(super) fn pick_local_port(remote: u16) -> u16 {
 }
 
 #[cfg(not(unix))]
-static WINDOWS_FORWARDS: std::sync::Mutex<std::collections::BTreeMap<(u16, u16), Child>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static WINDOWS_FORWARDS: std::sync::Mutex<
+    std::collections::BTreeMap<(u16, u16), crate::platform::process::ManagedChild>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Poll until the SSH forward tunnel binds its local listening socket, exits
+/// early, or exceeds `timeout`.
+#[cfg_attr(unix, allow(dead_code))]
+fn wait_for_forward_ready(
+    timeout: Duration,
+    poll: Duration,
+    mut check_exited: impl FnMut() -> bool,
+    mut check_listening: impl FnMut() -> bool,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if check_exited() {
+            return false;
+        }
+        if check_listening() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(poll);
+    }
+}
 
 /// Forward remote loopback `port` to the local machine by adding an `-L`
 /// channel to the live SSH master (`ssh -O forward` — no second auth) on Unix
@@ -142,35 +167,45 @@ pub(super) fn handle_forward_request(
         .unwrap_or(false);
     #[cfg(not(unix))]
     let forwarded = {
-        match Command::new(ssh_program())
-            .args([
-                "-N",
-                "-T",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ExitOnForwardFailure=yes",
-                "-L",
-                &spec,
-                host,
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(mut child) => {
-                std::thread::sleep(Duration::from_millis(150));
-                if child.try_wait().ok().flatten().is_some() {
-                    false
-                } else {
+        let mut cmd = Command::new(ssh_program());
+        cmd.args([
+            "-N",
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-L",
+            &spec,
+            host,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+        match crate::platform::process::ManagedChild::spawn_in_group(&mut cmd) {
+            Ok(mut managed) => {
+                let ssh_pid = managed.id();
+                let ready = wait_for_forward_ready(
+                    Duration::from_secs(5),
+                    Duration::from_millis(50),
+                    || managed.child_mut().try_wait().map_or(true, |s| s.is_some()),
+                    || {
+                        crate::platform::net::list_tcp_listeners().is_some_and(|list| {
+                            list.iter()
+                                .any(|e| e.port == local_port && e.pid == ssh_pid)
+                        })
+                    },
+                );
+                if ready {
                     if let Ok(mut map) = WINDOWS_FORWARDS.lock()
-                        && let Some(mut old) = map.insert((local_port, remote_port), child)
+                        && let Some(mut old) = map.insert((local_port, remote_port), managed)
                     {
-                        let _ = old.kill();
-                        let _ = old.wait();
+                        old.kill_tree();
                     }
                     true
+                } else {
+                    managed.kill_tree();
+                    false
                 }
             }
             Err(_) => false,
@@ -216,10 +251,48 @@ pub(super) fn handle_unforward_request(host: &str, socket: &Path, local: &str, r
     {
         let _ = (host, socket);
         if let Ok(mut map) = WINDOWS_FORWARDS.lock()
-            && let Some(mut child) = map.remove(&(local, remote))
+            && let Some(mut managed) = map.remove(&(local, remote))
         {
-            let _ = child.kill();
-            let _ = child.wait();
+            managed.kill_tree();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_for_forward_ready_waits_past_150ms_and_handles_exit_and_timeout() {
+        let mut ticks = 0u32;
+        assert!(wait_for_forward_ready(
+            Duration::from_millis(400),
+            Duration::from_millis(10),
+            || false,
+            || {
+                ticks += 1;
+                ticks >= 4
+            },
+        ));
+
+        // Early child exit fails immediately even before timeout.
+        let mut checks = 0u32;
+        assert!(!wait_for_forward_ready(
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            || {
+                checks += 1;
+                checks >= 2
+            },
+            || false,
+        ));
+
+        // Timeout returns false when listener never binds.
+        assert!(!wait_for_forward_ready(
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+            || false,
+            || false,
+        ));
     }
 }
