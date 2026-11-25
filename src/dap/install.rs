@@ -298,12 +298,24 @@ pub fn find_dlv(
 }
 
 /// Unix shell version of the delve install command.
-#[allow(dead_code)]
 pub const DLV_INSTALL_UNIX: &str = "sh -c 'case \"$(go env GOVERSION)\" in go1.[0-9]|go1.[0-9].*|go1.1[0-9]*|go1.2[0-4]*) v=v1.25.2 ;; *) v=latest ;; esac; GOBIN=\"$HOME/.croft/servers/go\" go install github.com/go-delve/delve/cmd/dlv@$v'";
 
 /// PowerShell version of the delve install command for Windows terminals.
-#[allow(dead_code)]
-pub const DLV_INSTALL_WINDOWS: &str = "powershell -NoProfile -Command \"$v = if ((go env GOVERSION) -match '^go1\\.([0-9]($|\\.)|1[0-9]|2[0-4])') { 'v1.25.2' } else { 'latest' }; $env:GOBIN = Join-Path $HOME '.croft\\servers\\go'; go install github.com/go-delve/delve/cmd/dlv@$v\"";
+/// Single-quoted so an outer PowerShell pane does not pre-expand `$v`,
+/// `$env:GOBIN`, or `$HOME` before passing the script to `powershell`.
+pub const DLV_INSTALL_WINDOWS: &str = "powershell -NoProfile -Command '$v = if ((go env GOVERSION) -match ''^go1\\.([0-9]($|\\.)|1[0-9]|2[0-4])'') { ''v1.25.2'' } else { ''latest'' }; $env:GOBIN = Join-Path $HOME ''.croft\\servers\\go''; go install github.com/go-delve/delve/cmd/dlv@$v'";
+
+/// `cmd.exe` version of the delve install command for Windows terminals.
+pub const DLV_INSTALL_WINDOWS_CMD: &str = "powershell -NoProfile -Command \"$v = if ((go env GOVERSION) -match '^go1\\.([0-9]($|\\.)|1[0-9]|2[0-4])') { 'v1.25.2' } else { 'latest' }; $env:GOBIN = Join-Path $HOME '.croft\\servers\\go'; go install github.com/go-delve/delve/cmd/dlv@$v\"";
+
+/// Select the delve install command line safe for `flavor` (#264).
+pub fn dlv_install_command(flavor: crate::tasks::ShellFlavor) -> &'static str {
+    match flavor {
+        crate::tasks::ShellFlavor::Posix => DLV_INSTALL_UNIX,
+        crate::tasks::ShellFlavor::PowerShell => DLV_INSTALL_WINDOWS,
+        crate::tasks::ShellFlavor::Cmd => DLV_INSTALL_WINDOWS_CMD,
+    }
+}
 
 /// The command "Debug: Install Go Debugger (delve)" runs, visibly, in a
 /// terminal pane (#264). `GOBIN` puts `dlv` in croft's servers directory,
@@ -316,11 +328,13 @@ pub const DLV_INSTALL_WINDOWS: &str = "powershell -NoProfile -Command \"$v = if 
 /// and anything newer gets `@latest`. Wrapped in `sh -c` on Unix or
 /// `powershell` on Windows, since it is typed into whatever shell the pane runs.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub const DLV_INSTALL: &str = DLV_INSTALL_WINDOWS;
 
 /// The command "Debug: Install Go Debugger (delve)" runs, visibly, in a
 /// terminal pane (#264).
 #[cfg(not(windows))]
+#[allow(dead_code)]
 pub const DLV_INSTALL: &str = DLV_INSTALL_UNIX;
 
 /// Whether the `go` toolchain is on PATH: installing delve needs it.
@@ -440,6 +454,93 @@ mod tests {
         }
     }
 
+    /// Run `runner` with a stub `go.cmd` reporting `goversion` on `PATH` and
+    /// `HOME`/`USERPROFILE` pointing at a temporary directory, then assert it
+    /// installs `want` with `GOBIN=<home>\.croft\servers\go`.
+    #[cfg(windows)]
+    fn assert_windows_delve_install(
+        goversion: &str,
+        want: &str,
+        run: impl FnOnce(&std::ffi::OsStr, &Path) -> std::process::Output,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("go.log");
+        let go = tmp.path().join("go.cmd");
+        std::fs::write(
+            &go,
+            format!(
+                "@echo off\r\nif \"%1\"==\"env\" (\r\n    echo {goversion}\r\n    exit /b 0\r\n)\r\necho GOBIN=%GOBIN% %* > \"{}\"\r\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let orig_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![tmp.path().to_path_buf()];
+        paths.extend(std::env::split_paths(&orig_path));
+        let path_env = std::env::join_paths(paths).unwrap();
+        let output = run(&path_env, tmp.path());
+        assert!(
+            output.status.success(),
+            "{goversion}: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let ran = std::fs::read_to_string(&log).unwrap();
+        assert!(ran.trim_end().ends_with(want), "{goversion}: {ran}");
+        let expected_gobin = tmp.path().join(".croft").join("servers").join("go");
+        assert!(
+            ran.starts_with(&format!("GOBIN={} install ", expected_gobin.display())),
+            "{ran}"
+        );
+    }
+
+    /// #264: Windows counterpart: run `DLV_INSTALL_WINDOWS` through an outer
+    /// `powershell.exe -NoProfile -Command` (as a PowerShell terminal pane
+    /// evaluates it) against a stub `go.cmd` on `PATH` for both Go <=1.24 and
+    /// Go >=1.25.
+    #[cfg(windows)]
+    #[test]
+    fn the_delve_install_follows_the_local_go_version() {
+        for (goversion, want) in [
+            ("go1.24.7", "dlv@v1.25.2"),
+            ("go1.22rc1", "dlv@v1.25.2"),
+            ("go1.9", "dlv@v1.25.2"),
+            ("go1.25.0", "dlv@latest"),
+            ("go1.26.1", "dlv@latest"),
+            ("go1.30", "dlv@latest"),
+        ] {
+            assert_windows_delve_install(goversion, want, |path_env, home| {
+                std::process::Command::new("powershell.exe")
+                    .args(["-NoProfile", "-Command", DLV_INSTALL_WINDOWS])
+                    .env("PATH", path_env)
+                    .env("HOME", home)
+                    .env("USERPROFILE", home)
+                    .output()
+                    .unwrap()
+            });
+        }
+    }
+
+    /// #264: `DLV_INSTALL_WINDOWS_CMD` runs cleanly when typed into a `cmd.exe`
+    /// terminal pane.
+    #[cfg(windows)]
+    #[test]
+    fn dlv_install_windows_cmd_follows_the_local_go_version() {
+        use std::os::windows::process::CommandExt;
+        for (goversion, want) in [("go1.24.7", "dlv@v1.25.2"), ("go1.25.0", "dlv@latest")] {
+            assert_windows_delve_install(goversion, want, |path_env, home| {
+                std::process::Command::new("cmd.exe")
+                    .raw_arg(format!("/C {DLV_INSTALL_WINDOWS_CMD}"))
+                    .env("PATH", path_env)
+                    .env("HOME", home)
+                    .env("USERPROFILE", home)
+                    .output()
+                    .unwrap()
+            });
+        }
+    }
+
     /// A login shell with a chatty rc (a `fastfetch` banner, `set -x`
     /// tracing) can emit more than the OS pipe buffer. The child then blocks
     /// in write() and never exits, so waiting for exit before reading
@@ -486,7 +587,24 @@ mod tests {
         // The install lands where find_dlv looks last.
         assert!(DLV_INSTALL_UNIX.contains("GOBIN=\"$HOME/.croft/servers/go\" go install "));
         assert!(DLV_INSTALL_WINDOWS.contains("go install github.com/go-delve/delve/cmd/dlv@$v"));
+        assert!(
+            DLV_INSTALL_WINDOWS_CMD.contains("go install github.com/go-delve/delve/cmd/dlv@$v")
+        );
         assert!(!DLV_INSTALL.is_empty());
+    }
+
+    #[test]
+    fn dlv_install_command_dispatches_per_shell_flavor() {
+        use crate::tasks::ShellFlavor;
+        assert_eq!(dlv_install_command(ShellFlavor::Posix), DLV_INSTALL_UNIX);
+        assert_eq!(
+            dlv_install_command(ShellFlavor::PowerShell),
+            DLV_INSTALL_WINDOWS
+        );
+        assert_eq!(
+            dlv_install_command(ShellFlavor::Cmd),
+            DLV_INSTALL_WINDOWS_CMD
+        );
     }
 
     /// #264: delve's own resolution order, PATH first; `~/go/bin` stands in

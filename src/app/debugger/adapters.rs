@@ -84,7 +84,10 @@ impl App {
         match crate::widgets::terminal::PtyTerminal::new(self.roots.primary()) {
             Ok(mut term) => {
                 term.set_manual_name(Some(String::from("delve install")));
-                term.write_input(format!("{}\r", crate::dap::install::DLV_INSTALL).as_bytes());
+                let cmd = crate::dap::install::dlv_install_command(
+                    crate::tasks::ShellFlavor::host_default(),
+                );
+                term.write_input(format!("{cmd}\r").as_bytes());
                 self.insert_terminal(term);
                 self.show_terminal = true;
                 self.focus_pane(Pane::Terminal);
