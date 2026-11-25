@@ -1094,8 +1094,41 @@ fn format_cd_command_for_powershell_uses_esc_and_doubles_apostrophes() {
     );
     assert_eq!(
         bytes,
-        b"\x1bSet-Location 'C:\\Users\\O''Brien\\My Project'\r".to_vec()
+        b"\x1bSet-Location -LiteralPath 'C:\\Users\\O''Brien\\My Project'\r".to_vec()
     );
+}
+
+#[test]
+fn format_cd_command_for_strips_newlines_handles_brackets_and_escapes_cmd_percent() {
+    let ps = format_cd_command_for(
+        std::path::Path::new("C:\\app\\[id]\\a\r\nb"),
+        crate::tasks::ShellFlavor::PowerShell,
+    );
+    assert_eq!(
+        ps,
+        b"\x1bSet-Location -LiteralPath 'C:\\app\\[id]\\ab'\r".to_vec()
+    );
+
+    let ps_nul = format_cd_command_for(
+        std::path::Path::new("C:\\app\\x\0y"),
+        crate::tasks::ShellFlavor::PowerShell,
+    );
+    assert_eq!(
+        ps_nul,
+        b"\x1bSet-Location -LiteralPath 'C:\\app\\xy'\r".to_vec()
+    );
+
+    let cmd = format_cd_command_for(
+        std::path::Path::new("D:\\a%TEMP%b\r\nc"),
+        crate::tasks::ShellFlavor::Cmd,
+    );
+    assert_eq!(cmd, b"\x1bcd /d \"D:\\a\"^%\"TEMP\"^%\"bc\"\r".to_vec());
+
+    let cmd_nul_quote = format_cd_command_for(
+        std::path::Path::new("D:\\a\"b\0c"),
+        crate::tasks::ShellFlavor::Cmd,
+    );
+    assert_eq!(cmd_nul_quote, b"\x1bcd /d \"D:\\abc\"\r".to_vec());
 }
 
 #[test]

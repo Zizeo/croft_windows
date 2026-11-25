@@ -527,9 +527,11 @@ pub fn format_cd_command_for(path: &std::path::Path, flavor: crate::tasks::Shell
         }
         crate::tasks::ShellFlavor::PowerShell => {
             out.push(0x1b);
-            out.extend_from_slice(b"Set-Location '");
+            out.extend_from_slice(b"Set-Location -LiteralPath '");
             for c in s.chars() {
-                if c == '\'' {
+                if matches!(c, '\r' | '\n' | '\0') {
+                    continue;
+                } else if c == '\'' {
                     out.extend_from_slice(b"''");
                 } else {
                     let mut buf = [0u8; 4];
@@ -542,7 +544,11 @@ pub fn format_cd_command_for(path: &std::path::Path, flavor: crate::tasks::Shell
             out.push(0x1b);
             out.extend_from_slice(b"cd /d \"");
             for c in s.chars() {
-                if c != '"' {
+                if matches!(c, '"' | '\r' | '\n' | '\0') {
+                    continue;
+                } else if c == '%' {
+                    out.extend_from_slice(b"\"^%\"");
+                } else {
                     let mut buf = [0u8; 4];
                     out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
                 }

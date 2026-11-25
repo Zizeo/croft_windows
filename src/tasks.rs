@@ -369,21 +369,36 @@ impl Task {
                 if v.cwd.is_none() && v.env.is_empty() {
                     return Ok(line);
                 }
-                let mut env_stmts = String::new();
-                for (key, value) in &v.env {
-                    let val = Quoting::Strong
-                        .apply_for(&expand_task_value(value, ctx)?, ShellFlavor::PowerShell);
-                    env_stmts.push_str(&format!("$env:{key} = {val}; "));
-                }
+                let mut setup = String::new();
+                let mut teardown = Vec::new();
                 if let Some(cwd) = &v.cwd {
                     let quoted_cwd = Quoting::Strong
                         .apply_for(&expand_task_value(cwd, ctx)?, ShellFlavor::PowerShell);
-                    Ok(format!(
-                        "& {{ Push-Location {quoted_cwd}; {env_stmts}try {{ {line} }} finally {{ Pop-Location }} }}"
-                    ))
-                } else {
-                    Ok(format!("& {{ {env_stmts}{line} }}"))
+                    setup.push_str(&format!("Push-Location -LiteralPath {quoted_cwd}; "));
                 }
+                let mut saved_keys = Vec::with_capacity(v.env.len());
+                for (i, (key, value)) in v.env.iter().enumerate() {
+                    let qkey = Quoting::Strong.apply_for(key, ShellFlavor::PowerShell);
+                    let val = Quoting::Strong
+                        .apply_for(&expand_task_value(value, ctx)?, ShellFlavor::PowerShell);
+                    setup.push_str(&format!(
+                        "$__croft_env_{i} = [System.Environment]::GetEnvironmentVariable({qkey}, 'Process'); \
+                         [System.Environment]::SetEnvironmentVariable({qkey}, {val}, 'Process'); "
+                    ));
+                    saved_keys.push((i, qkey));
+                }
+                for (i, qkey) in saved_keys.into_iter().rev() {
+                    teardown.push(format!(
+                        "[System.Environment]::SetEnvironmentVariable({qkey}, $__croft_env_{i}, 'Process')"
+                    ));
+                }
+                if v.cwd.is_some() {
+                    teardown.push(String::from("Pop-Location"));
+                }
+                Ok(format!(
+                    "& {{ {setup}try {{ {line} }} finally {{ {} }} }}",
+                    teardown.join("; ")
+                ))
             }
             ShellFlavor::Cmd => {
                 if v.cwd.is_none() && v.env.is_empty() {
@@ -400,10 +415,30 @@ impl Task {
                     let val = expand_task_value(value, ctx)?.replace('"', "\"\"");
                     setup.push(format!("set \"{key}={val}\""));
                 }
-                Ok(format!("({} && {line})", setup.join(" && ")))
+                let inner = format!("{} && {line}", setup.join(" && "));
+                Ok(format!("cmd /d /c {}", escape_unquoted_cmd_meta(&inner)))
             }
         }
     }
+}
+
+/// Prefix unquoted `cmd.exe` metacharacters with `^` so a compound task line
+/// can be handed directly to `cmd /d /c ` without outer quotes.
+fn escape_unquoted_cmd_meta(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut in_quotes = false;
+    for c in s.chars() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+            out.push(c);
+        } else if !in_quotes && matches!(c, '^' | '&' | '|' | '<' | '>' | '(' | ')') {
+            out.push('^');
+            out.push(c);
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Whether `s` holds anything the target `flavor` shell would read as more than plain text.
@@ -3206,20 +3241,258 @@ mod tests {
             ShellFlavor::PowerShell,
         );
         assert!(
-            line.starts_with(&format!("& {{ Push-Location {expected_cwd}; ")),
+            line.starts_with(&format!("& {{ Push-Location -LiteralPath {expected_cwd}; ")),
             "unexpected PowerShell wrapper: {line}"
         );
         assert!(
-            line.contains("$env:MODE = 're''lease'; "),
-            "missing PowerShell env assignment: {line}"
+            line.contains("$__croft_env_0 = [System.Environment]::GetEnvironmentVariable('MODE', 'Process'); [System.Environment]::SetEnvironmentVariable('MODE', 're''lease', 'Process'); "),
+            "missing PowerShell env save/assign: {line}"
         );
         assert!(
             line.contains("try { 'my tool' 'it''s arg' \"a `\"q`\" `$X\""),
             "missing quoted command/args: {line}"
         );
+        let (_, finally_part) = line
+            .split_once("} finally { ")
+            .unwrap_or_else(|| panic!("missing finally block: {line}"));
         assert!(
-            line.ends_with("} finally { Pop-Location } }"),
-            "missing Pop-Location finally block: {line}"
+            finally_part.ends_with(" } }"),
+            "unexpected finally closing: {line}"
+        );
+        assert!(
+            finally_part.contains(
+                "[System.Environment]::SetEnvironmentVariable('MODE', $__croft_env_0, 'Process')"
+            ),
+            "missing PowerShell env restore in finally: {line}"
+        );
+        assert!(
+            finally_part.contains("Pop-Location"),
+            "missing Pop-Location in finally: {line}"
+        );
+    }
+
+    #[test]
+    fn powershell_env_only_wraps_in_try_finally_and_cmd_escapes_unquoted_meta() {
+        let (_tmp, root) = tasks_workspace(
+            r#"{ "version": "2.0.0", "tasks": [
+                 { "label": "psenv", "type": "shell",
+                   "command": "echo hi",
+                   "options": { "env": { "A_B": "val" } }
+                 },
+                 { "label": "cmdwrap", "type": "shell",
+                   "command": "echo a & echo b",
+                   "args": ["two words", { "value": "x|y", "quoting": "escape" }],
+                   "options": { "cwd": "${workspaceFolder}/sub dir", "env": { "K": "a&echo BAD" } }
+                 }
+               ] }"#,
+        );
+        let tasks = discover_tasks(&root);
+        let psenv = tasks.iter().find(|t| t.label == "psenv").unwrap();
+        let ps_line = psenv
+            .command_line_for(&ctx_at(&root), ShellFlavor::PowerShell)
+            .unwrap();
+        assert_eq!(
+            ps_line,
+            "& { $__croft_env_0 = [System.Environment]::GetEnvironmentVariable('A_B', 'Process'); [System.Environment]::SetEnvironmentVariable('A_B', 'val', 'Process'); try { echo hi } finally { [System.Environment]::SetEnvironmentVariable('A_B', $__croft_env_0, 'Process') } }"
+        );
+
+        let cmdwrap = tasks.iter().find(|t| t.label == "cmdwrap").unwrap();
+        let cmd_line = cmdwrap
+            .command_line_for(&ctx_at(&root), ShellFlavor::Cmd)
+            .unwrap();
+        assert!(cmd_line.starts_with("cmd /d /c cd /d "), "{cmd_line}");
+        assert!(
+            cmd_line
+                .contains("^&^& set \"K=a&echo BAD\" ^&^& echo a ^& echo b \"two words\" x^^^|y"),
+            "{cmd_line}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_task_isolates_brackets_cwd_and_restores_existing_and_new_env_on_failure() {
+        let (_tmp, root) = tasks_workspace(
+            r#"{ "version": "2.0.0", "tasks": [
+                 { "label": "psiso", "type": "shell",
+                   "command": "Write-Output \"INSIDE_LOC=$((Get-Location).Path)\"; Write-Output \"INSIDE_KEEP=$env:KEEP\"; Write-Output \"INSIDE_TEMP=$env:TEMP_ONLY\"; throw 'boom'",
+                   "options": {
+                     "cwd": "${workspaceFolder}/sub[1]",
+                     "env": { "KEEP": "temp", "TEMP_ONLY": "set" }
+                   }
+                 }
+               ] }"#,
+        );
+        let brackets_dir = root.join("sub[1]");
+        std::fs::create_dir_all(&brackets_dir).unwrap();
+
+        let tasks = discover_tasks(&root);
+        let task = tasks.iter().find(|t| t.label == "psiso").unwrap();
+        let generated = task
+            .command_line_for(&ctx_at(&root), ShellFlavor::PowerShell)
+            .unwrap();
+
+        let quoted_root =
+            Quoting::Strong.apply_for(&root.to_string_lossy(), ShellFlavor::PowerShell);
+        let script = format!(
+            "Set-Location -LiteralPath {quoted_root}; \
+             $env:KEEP = 'orig'; \
+             Remove-Item Env:TEMP_ONLY -ErrorAction SilentlyContinue; \
+             try {{ {generated} }} catch {{ Write-Output 'CAUGHT' }}; \
+             Write-Output \"AFTER_LOC=$((Get-Location).Path)\"; \
+             Write-Output \"AFTER_KEEP=$env:KEEP\"; \
+             Write-Output \"AFTER_TEMP_EXISTS=$(Test-Path Env:TEMP_ONLY)\""
+        );
+
+        let out = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "powershell.exe failed ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            out.status
+        );
+        let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+        let expected_inside = format!("INSIDE_LOC={}", brackets_dir.display());
+        let expected_after = format!("AFTER_LOC={}", root.display());
+        assert!(
+            lines.contains(&expected_inside.as_str()),
+            "expected task to enter [brackets] cwd `{expected_inside}`:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            lines.contains(&"INSIDE_KEEP=temp"),
+            "expected KEEP=temp inside task:\nstdout:\n{stdout}"
+        );
+        assert!(
+            lines.contains(&"INSIDE_TEMP=set"),
+            "expected TEMP_ONLY=set inside task:\nstdout:\n{stdout}"
+        );
+        assert!(
+            lines.contains(&"CAUGHT"),
+            "expected failing task error to propagate out of finally:\nstdout:\n{stdout}"
+        );
+        assert!(
+            lines.contains(&expected_after.as_str()),
+            "expected outer location unchanged `{expected_after}`:\nstdout:\n{stdout}"
+        );
+        assert!(
+            lines.contains(&"AFTER_KEEP=orig"),
+            "expected KEEP restored to orig:\nstdout:\n{stdout}"
+        );
+        assert!(
+            lines.contains(&"AFTER_TEMP_EXISTS=False"),
+            "expected TEMP_ONLY deleted on restore:\nstdout:\n{stdout}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_task_isolates_cwd_and_env_with_metacharacters() {
+        let (_tmp, root) = tasks_workspace(
+            r#"{ "version": "2.0.0", "tasks": [
+                 { "label": "cmdiso", "type": "shell",
+                   "command": "cd & set CROFT_CMD_TEST & echo",
+                   "args": [
+                     "two words",
+                     { "value": "a&b", "quoting": "escape" }
+                   ],
+                   "options": {
+                     "cwd": "${workspaceFolder}/sub dir",
+                     "env": { "CROFT_CMD_TEST": "a&echo BAD" }
+                   }
+                 }
+               ] }"#,
+        );
+        let spaced_dir = root.join("sub dir");
+        std::fs::create_dir_all(&spaced_dir).unwrap();
+
+        let tasks = discover_tasks(&root);
+        let task = tasks.iter().find(|t| t.label == "cmdiso").unwrap();
+        let generated = task
+            .command_line_for(&ctx_at(&root), ShellFlavor::Cmd)
+            .unwrap();
+
+        let stdin_script = format!(
+            "@echo off\r\n\
+             cd /d \"{}\"\r\n\
+             set \"CROFT_CMD_TEST=orig\"\r\n\
+             echo ===BEFORE===\r\n\
+             {generated}\r\n\
+             echo ===AFTER===\r\n\
+             cd\r\n\
+             set CROFT_CMD_TEST\r\n\
+             exit\r\n",
+            root.display()
+        );
+
+        let mut child = std::process::Command::new("cmd")
+            .args(["/d", "/q"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(stdin_script.as_bytes())
+                .unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "cmd failed ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            out.status
+        );
+
+        let (_, body) = stdout
+            .split_once("===BEFORE===")
+            .unwrap_or_else(|| panic!("missing ===BEFORE=== marker:\n{stdout}"));
+        let (inside, after) = body
+            .split_once("===AFTER===")
+            .unwrap_or_else(|| panic!("missing ===AFTER=== marker:\n{stdout}"));
+
+        let inside_lines: Vec<&str> = inside
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let after_lines: Vec<&str> = after
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+
+        assert!(
+            !stdout.lines().any(|l| l.trim() == "BAD"),
+            "`BAD` must never be executed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            inside_lines.contains(&spaced_dir.to_string_lossy().as_ref()),
+            "expected spaced cwd inside task:\ninside:\n{inside}\nstderr:\n{stderr}"
+        );
+        assert!(
+            inside_lines.contains(&"CROFT_CMD_TEST=a&echo BAD"),
+            "expected env set inside task:\ninside:\n{inside}\nstderr:\n{stderr}"
+        );
+        assert!(
+            inside_lines.contains(&"\"two words\" a&b"),
+            "expected args passed into cmd task:\ninside:\n{inside}\nstderr:\n{stderr}"
+        );
+        assert!(
+            after_lines.contains(&root.to_string_lossy().as_ref()),
+            "expected outer cd unchanged:\nafter:\n{after}"
+        );
+        assert!(
+            after_lines.contains(&"CROFT_CMD_TEST=orig"),
+            "expected outer env untouched:\nafter:\n{after}"
         );
     }
 
