@@ -3987,38 +3987,7 @@ struct PendingCompletionResolve {
 }
 
 fn open_url(url: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut cmd = {
-        let mut c = std::process::Command::new("open");
-        c.arg(url);
-        c
-    };
-    #[cfg(target_os = "linux")]
-    let mut cmd = {
-        let mut c = std::process::Command::new("xdg-open");
-        c.arg(url);
-        c
-    };
-    #[cfg(target_os = "windows")]
-    let mut cmd = {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", "", url]);
-        c
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    let mut cmd = {
-        let mut c = std::process::Command::new("open");
-        c.arg(url);
-        c
-    };
-    // Detach the opener's stdio: croft is on the alternate screen in raw
-    // mode, and `open`/`xdg-open` chatter ("No application knows how to
-    // open URL ...") would land straight on the grid.
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    cmd.spawn().with_context(|| format!("opening {url}"))?;
-    Ok(())
+    crate::platform::os::spawn_open_target(url).with_context(|| format!("opening {url}"))
 }
 
 /// Short label for this machine, shown as the origin of a remote port in the

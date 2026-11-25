@@ -805,3 +805,24 @@ fn net_list_tcp_listeners_detects_bound_loopback_socket_and_drop() {
         "dropped port {port} should no longer appear for pid {pid}"
     );
 }
+
+#[test]
+fn os_open_url_and_spawn_open_target_reject_control_chars_and_nul() {
+    for bad in [
+        "https://example.com/\0evil",
+        "https://example.com/\r\ncalc",
+        "https://example.com/\tfoo",
+        "",
+    ] {
+        assert_eq!(
+            platform::os::open_url(bad).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput,
+            "open_url must reject {bad:?}"
+        );
+        assert_eq!(
+            platform::os::spawn_open_target(bad).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput,
+            "spawn_open_target must reject {bad:?}"
+        );
+    }
+}

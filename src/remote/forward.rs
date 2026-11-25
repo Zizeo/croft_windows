@@ -23,32 +23,10 @@ pub(super) fn url_is_safe_to_open(url: &str) -> bool {
         .any(|c| c == '\0' || c == '\n' || c == '\r' || c == '\t')
 }
 
-/// Hand `url` to the local platform opener (`open` on macOS, `xdg-open` on
-/// Linux). The caller has already validated the URL.
-pub(super) fn open_local_url(url: &str) -> std::io::Result<std::process::ExitStatus> {
-    #[cfg(windows)]
-    {
-        Command::new("cmd.exe")
-            .args(["/d", "/c", "start", "", url])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-    }
-    #[cfg(not(windows))]
-    {
-        let program = if cfg!(target_os = "linux") {
-            "xdg-open"
-        } else {
-            "open"
-        };
-        Command::new(program)
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-    }
+/// Hand `url` to the local platform opener (`ShellExecuteW` on Windows, `open`
+/// on macOS, `xdg-open` on Linux). The caller has already validated the URL.
+pub(super) fn open_local_url(url: &str) -> std::io::Result<()> {
+    crate::platform::os::open_url(url)
 }
 
 pub(super) fn handle_open_request(
@@ -78,26 +56,19 @@ pub(super) fn handle_open_request(
         return;
     }
     match open_local_url(url) {
-        Ok(s) if s.success() => {
+        Ok(()) => {
             let _ = ssh_exec(
                 host,
                 socket,
                 &format!("touch {}/.ok", shell_quote(&dest_dir)),
             );
         }
-        Ok(s) => write_relay_err(
-            host,
-            socket,
-            inbox_dir,
-            request_id,
-            &format!("local open(1) exited {s}"),
-        ),
         Err(e) => write_relay_err(
             host,
             socket,
             inbox_dir,
             request_id,
-            &format!("local open(1) spawn failed: {e}"),
+            &format!("local open failed: {e}"),
         ),
     }
 }
