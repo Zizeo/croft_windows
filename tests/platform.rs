@@ -785,6 +785,150 @@ fn ipc_local_listener_nonblocking_roundtrip_auth_and_cleanup() {
 
 #[cfg(windows)]
 #[test]
+fn ipc_nonblocking_accept_does_not_stall_on_silent_peer_or_flood() {
+    use std::io::{ErrorKind, Write};
+    use std::time::{Duration, Instant};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let sock_path = tmp.path().join("nonblock-stall.sock");
+    let listener = platform::ipc::LocalListener::bind(&sock_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    // Hold open 40 silent rogue connections (> MAX_PENDING_AUTH = 32).
+    let addr = listener.local_addr().unwrap();
+    let _rogues: Vec<_> = (0..40)
+        .map(|_| std::net::TcpStream::connect(addr).unwrap())
+        .collect();
+
+    let start = Instant::now();
+    let err = listener.accept().unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::WouldBlock);
+    assert!(
+        start.elapsed() < Duration::from_millis(40),
+        "non-blocking accept stalled for {:?}",
+        start.elapsed()
+    );
+
+    // A legitimate client connecting behind the stalled peers must still succeed immediately.
+    let mut client = platform::ipc::LocalStream::connect(&sock_path).unwrap();
+    client.write_all(b"ok\n").unwrap();
+    client.flush().unwrap();
+    let (_server, _) = listener
+        .accept()
+        .expect("valid client accepted ahead of stalled peers");
+}
+
+#[cfg(windows)]
+#[test]
+fn ipc_bind_overwrites_dead_pid_descriptor_and_respects_legacy_two_line_descriptor() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // 1. Live unrelated TCP listener on a port recorded with a dead PID must be overwritten.
+    let unrelated = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = unrelated.local_addr().unwrap().port();
+    let stale_sock = tmp.path().join("stale-dead-pid.sock");
+    std::fs::write(&stale_sock, format!("{port}\ndeadbeef\n99999999\n")).unwrap();
+    let rebound = platform::ipc::LocalListener::bind(&stale_sock)
+        .expect("dead PID descriptor must be treated as stale");
+    drop(rebound);
+
+    // 2. Legacy 2-line descriptor (no PID) pointing at a live listener still returns AddrInUse.
+    let legacy_sock = tmp.path().join("legacy-two-line.sock");
+    std::fs::write(&legacy_sock, format!("{port}\nlegacytoken\n")).unwrap();
+    let err = platform::ipc::LocalListener::bind(&legacy_sock).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    drop(unrelated);
+}
+
+#[cfg(windows)]
+#[test]
+fn ipc_descriptor_nonce_mode_switch_and_flood_expiry() {
+    use std::io::{BufRead, BufReader, ErrorKind, Write};
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let sock1 = tmp.path().join("n1.sock");
+    let sock2 = tmp.path().join("n2.sock");
+    let l1 = platform::ipc::LocalListener::bind(&sock1).unwrap();
+    let l2 = platform::ipc::LocalListener::bind(&sock2).unwrap();
+
+    // Descriptor format: <port>\n<32 lowercase hex CSPRNG nonce>\n<pid>\n
+    let d1 = std::fs::read_to_string(&sock1).unwrap();
+    let d2 = std::fs::read_to_string(&sock2).unwrap();
+    let lines1: Vec<&str> = d1.lines().collect();
+    let lines2: Vec<&str> = d2.lines().collect();
+    assert_eq!(lines1.len(), 3, "expected 3-line descriptor, got {d1:?}");
+    assert_eq!(lines2.len(), 3, "expected 3-line descriptor, got {d2:?}");
+    let nonce1 = lines1[1];
+    let nonce2 = lines2[1];
+    assert_eq!(nonce1.len(), 32);
+    assert_eq!(nonce2.len(), 32);
+    assert!(
+        nonce1
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    );
+    assert!(
+        nonce2
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    );
+    assert_ne!(nonce1, nonce2);
+    assert_eq!(lines1[2], std::process::id().to_string());
+    drop(l2);
+
+    // Overlong line (> MAX_TOKEN_LINE) is rejected immediately with PermissionDenied.
+    l1.set_nonblocking(true).unwrap();
+    let mut long_rogue = std::net::TcpStream::connect(l1.local_addr().unwrap()).unwrap();
+    long_rogue.write_all(&[b'x'; 70]).unwrap();
+    long_rogue.flush().unwrap();
+    assert_eq!(l1.accept().unwrap_err().kind(), ErrorKind::PermissionDenied);
+
+    // Partial non-blocking auth survives switching to blocking mode without losing buffered bytes.
+    let mut partial_client = std::net::TcpStream::connect(l1.local_addr().unwrap()).unwrap();
+    partial_client.write_all(&nonce1.as_bytes()[..16]).unwrap();
+    partial_client.flush().unwrap();
+    assert_eq!(l1.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+
+    l1.set_nonblocking(false).unwrap();
+    partial_client.write_all(&nonce1.as_bytes()[16..]).unwrap();
+    partial_client.write_all(b"\nhello\n").unwrap();
+    partial_client.flush().unwrap();
+    let (srv, _) = l1.accept().unwrap();
+    let mut line = String::new();
+    BufReader::new(&srv).read_line(&mut line).unwrap();
+    assert_eq!(line, "hello\n");
+
+    // Flood > 32 silent peers, let them expire, then verify new valid client succeeds via pruning.
+    l1.set_nonblocking(true).unwrap();
+    let addr1 = l1.local_addr().unwrap();
+    let _flood: Vec<_> = (0..40)
+        .map(|_| std::net::TcpStream::connect(addr1).unwrap())
+        .collect();
+    assert_eq!(l1.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+
+    std::thread::sleep(Duration::from_millis(130));
+    let mut after_expiry = platform::ipc::LocalStream::connect(&sock1).unwrap();
+    after_expiry.write_all(b"after-expiry\n").unwrap();
+    after_expiry.flush().unwrap();
+    let (srv2, _) = l1
+        .accept()
+        .expect("expired pending entries must be pruned on full queue");
+    srv2.set_nonblocking(false).unwrap();
+    let mut line2 = String::new();
+    BufReader::new(&srv2).read_line(&mut line2).unwrap();
+    assert_eq!(line2, "after-expiry\n");
+
+    // Sub-capacity expired silent peer yields PermissionDenied on next accept.
+    let _silent = std::net::TcpStream::connect(addr1).unwrap();
+    assert_eq!(l1.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+    std::thread::sleep(Duration::from_millis(130));
+    assert_eq!(l1.accept().unwrap_err().kind(), ErrorKind::PermissionDenied);
+    assert_eq!(l1.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+}
+
+#[cfg(windows)]
+#[test]
 fn net_list_tcp_listeners_detects_bound_loopback_socket_and_drop() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();

@@ -13,34 +13,40 @@ pub type LocalStream = std::os::unix::net::UnixStream;
 
 #[cfg(windows)]
 mod win {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
+    use std::fmt::Write as _;
     use std::io::{self, Read, Write};
     use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant};
+
+    use ring::rand::{SecureRandom, SystemRandom};
 
     const MAX_TOKEN_LINE: usize = 64;
+    const MAX_PENDING_AUTH: usize = 32;
     const ACCEPT_AUTH_TIMEOUT: Duration = Duration::from_millis(100);
     const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    fn generate_nonce() -> String {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let pid = u64::from(std::process::id());
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let mut h1 = RandomState::new().build_hasher();
-        h1.write_u128(nanos);
-        h1.write_u64(pid);
-        h1.write_u64(seq);
-        let mut h2 = RandomState::new().build_hasher();
-        h2.write_u64(seq.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-        h2.write_u128(nanos);
-        format!("{:016x}{:016x}", h1.finish(), h2.finish())
+    fn generate_nonce() -> io::Result<String> {
+        let mut raw = [0u8; 16];
+        SystemRandom::new()
+            .fill(&mut raw)
+            .map_err(|_| io::Error::other("CSPRNG failure generating IPC nonce"))?;
+        let mut nonce = String::with_capacity(raw.len() * 2);
+        for b in raw {
+            let _ = write!(nonce, "{b:02x}");
+        }
+        Ok(nonce)
+    }
+
+    fn invalid_token_err() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid IPC capability token",
+        )
     }
 
     fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -53,7 +59,7 @@ mod win {
             == 0
     }
 
-    fn parse_descriptor(path: &Path) -> io::Result<(u16, String)> {
+    fn parse_descriptor(path: &Path) -> io::Result<(u16, String, Option<u32>)> {
         let text = std::fs::read_to_string(path)?;
         let mut lines = text.lines();
         let port = lines
@@ -66,7 +72,11 @@ mod win {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing IPC token"))?;
-        Ok((port, nonce.to_string()))
+        let pid = lines
+            .next()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&p| p > 0);
+        Ok((port, nonce.to_string(), pid))
     }
 
     fn clamp_timeout(dur: Option<Duration>) -> Option<Duration> {
@@ -79,6 +89,44 @@ mod win {
         })
     }
 
+    enum AuthByte {
+        Continue,
+        Complete,
+        Reject,
+    }
+
+    fn push_auth_byte(buf: &mut Vec<u8>, byte: u8, cr_count: &mut usize) -> AuthByte {
+        if byte == b'\n' {
+            return AuthByte::Complete;
+        }
+        if byte == b'\r' {
+            *cr_count += 1;
+            if *cr_count > MAX_TOKEN_LINE {
+                return AuthByte::Reject;
+            }
+            return AuthByte::Continue;
+        }
+        if buf.len() >= MAX_TOKEN_LINE {
+            return AuthByte::Reject;
+        }
+        buf.push(byte);
+        AuthByte::Continue
+    }
+
+    enum PollEntry {
+        Pending,
+        ProbeEof,
+        Rejected,
+        Authenticated,
+    }
+
+    #[derive(Debug)]
+    struct PendingAuth {
+        stream: TcpStream,
+        buf: Vec<u8>,
+        deadline: Instant,
+    }
+
     /// Loopback TCP IPC listener backed by a capability descriptor at `path`.
     #[derive(Debug)]
     pub struct LocalListener {
@@ -86,6 +134,7 @@ mod win {
         path: PathBuf,
         nonce: String,
         nonblocking: AtomicBool,
+        pending: Mutex<Vec<PendingAuth>>,
     }
 
     /// Connected loopback TCP IPC stream authenticated with the listener's capability token.
@@ -95,7 +144,7 @@ mod win {
     }
 
     impl LocalListener {
-        /// Bind a new local listener and atomically publish `<port>\n<nonce>\n` at `path`.
+        /// Bind a new local listener and atomically publish `<port>\n<nonce>\n<pid>\n` at `path`.
         pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<Self> {
             let path = path.as_ref().to_path_buf();
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -111,20 +160,24 @@ mod win {
                 .open(&lock_path)?;
             super::super::fs::lock_exclusive(&lock_file)?;
 
-            if let Ok((existing_port, _)) = parse_descriptor(&path) {
-                let addr = SocketAddr::from(([127, 0, 0, 1], existing_port));
-                if TcpStream::connect_timeout(&addr, LIVENESS_PROBE_TIMEOUT).is_ok() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AddrInUse,
-                        format!("a listener is already serving {}", path.display()),
-                    ));
+            if let Ok((existing_port, _, existing_pid)) = parse_descriptor(&path) {
+                let stale_dead_pid =
+                    existing_pid.is_some_and(|pid| !super::super::process::is_pid_alive(pid));
+                if !stale_dead_pid {
+                    let addr = SocketAddr::from(([127, 0, 0, 1], existing_port));
+                    if TcpStream::connect_timeout(&addr, LIVENESS_PROBE_TIMEOUT).is_ok() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AddrInUse,
+                            format!("a listener is already serving {}", path.display()),
+                        ));
+                    }
                 }
             }
 
             let inner = TcpListener::bind(("127.0.0.1", 0))?;
             let port = inner.local_addr()?.port();
-            let nonce = generate_nonce();
-            let payload = format!("{port}\n{nonce}\n");
+            let nonce = generate_nonce()?;
+            let payload = format!("{port}\n{nonce}\n{}\n", std::process::id());
 
             let seq = SEQ.fetch_add(1, Ordering::Relaxed);
             let tmp = path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
@@ -139,12 +192,13 @@ mod win {
                 path,
                 nonce,
                 nonblocking: AtomicBool::new(false),
+                pending: Mutex::new(Vec::new()),
             })
         }
 
         pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
             self.inner.set_nonblocking(nonblocking)?;
-            self.nonblocking.store(nonblocking, Ordering::Relaxed);
+            self.nonblocking.store(nonblocking, Ordering::Release);
             Ok(())
         }
 
@@ -154,15 +208,160 @@ mod win {
         }
 
         pub fn accept(&self) -> io::Result<(LocalStream, ())> {
+            if self.nonblocking.load(Ordering::Acquire) {
+                self.accept_nonblocking()
+            } else {
+                self.accept_blocking()
+            }
+        }
+
+        fn finish_authenticated_stream(&self, stream: TcpStream) -> io::Result<LocalStream> {
+            let _ = stream.set_read_timeout(None);
+            stream.set_nonblocking(self.nonblocking.load(Ordering::Acquire))?;
+            Ok(LocalStream { inner: stream })
+        }
+
+        fn accept_nonblocking(&self) -> io::Result<(LocalStream, ())> {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+
+            // 1. Drain newly accepted sockets into `pending` (non-blocking + nodelay).
+            //    If `pending.len() >= MAX_PENDING_AUTH`, prune expired entries first;
+            //    if still full, serve a ready oldest entry if authenticated or drop the
+            //    oldest pending entry to stay bounded without starving legitimate clients.
             loop {
-                let (mut stream, _) = self.inner.accept()?;
-                let _ = stream.set_nodelay(true);
-                match self.authenticate_client(&mut stream) {
-                    Ok(true) => {
-                        let _ = stream.set_read_timeout(None);
-                        stream.set_nonblocking(self.nonblocking.load(Ordering::Relaxed))?;
-                        return Ok((LocalStream { inner: stream }, ()));
+                match self.inner.accept() {
+                    Ok((stream, _)) => {
+                        if stream.set_nonblocking(true).is_err() {
+                            continue;
+                        }
+                        let _ = stream.set_nodelay(true);
+                        if pending.len() >= MAX_PENDING_AUTH {
+                            let now = Instant::now();
+                            pending.retain(|entry| now < entry.deadline);
+                            if pending.len() >= MAX_PENDING_AUTH
+                                && matches!(
+                                    self.poll_pending_entry(&mut pending[0]),
+                                    PollEntry::Authenticated
+                                )
+                            {
+                                let entry = pending.remove(0);
+                                pending.push(PendingAuth {
+                                    stream,
+                                    buf: Vec::with_capacity(MAX_TOKEN_LINE),
+                                    deadline: Instant::now() + ACCEPT_AUTH_TIMEOUT,
+                                });
+                                return Ok((self.finish_authenticated_stream(entry.stream)?, ()));
+                            }
+                            if pending.len() >= MAX_PENDING_AUTH {
+                                pending.remove(0);
+                            }
+                        }
+                        pending.push(PendingAuth {
+                            stream,
+                            buf: Vec::with_capacity(MAX_TOKEN_LINE),
+                            deadline: Instant::now() + ACCEPT_AUTH_TIMEOUT,
+                        });
                     }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        if pending.is_empty() {
+                            return Err(e);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // 2. Walk `pending` from index 0 so silent peers do not stall ready clients behind them.
+            let mut idx = 0;
+            while idx < pending.len() {
+                match self.poll_pending_entry(&mut pending[idx]) {
+                    PollEntry::Pending => idx += 1,
+                    // Empty EOF from a concurrent `LocalListener::bind` liveness probe: drop and continue.
+                    PollEntry::ProbeEof => {
+                        pending.remove(idx);
+                    }
+                    PollEntry::Rejected => {
+                        pending.remove(idx);
+                        return Err(invalid_token_err());
+                    }
+                    PollEntry::Authenticated => {
+                        let entry = pending.remove(idx);
+                        return Ok((self.finish_authenticated_stream(entry.stream)?, ()));
+                    }
+                }
+            }
+
+            // 3. No entry completed in this poll pass.
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "no authenticated IPC client ready",
+            ))
+        }
+
+        fn poll_pending_entry(&self, entry: &mut PendingAuth) -> PollEntry {
+            if Instant::now() >= entry.deadline {
+                return PollEntry::Rejected;
+            }
+            let mut byte = [0u8; 1];
+            let mut cr_count = 0usize;
+            loop {
+                if Instant::now() >= entry.deadline {
+                    return PollEntry::Rejected;
+                }
+                match entry.stream.read(&mut byte) {
+                    Ok(0) => {
+                        return if entry.buf.is_empty() {
+                            PollEntry::ProbeEof
+                        } else {
+                            PollEntry::Rejected
+                        };
+                    }
+                    Ok(_) => match push_auth_byte(&mut entry.buf, byte[0], &mut cr_count) {
+                        AuthByte::Continue => {}
+                        AuthByte::Complete => {
+                            return if constant_time_eq(&entry.buf, self.nonce.as_bytes()) {
+                                PollEntry::Authenticated
+                            } else {
+                                PollEntry::Rejected
+                            };
+                        }
+                        AuthByte::Reject => return PollEntry::Rejected,
+                    },
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return PollEntry::Pending,
+                    Err(_) => return PollEntry::Rejected,
+                }
+            }
+        }
+
+        fn accept_blocking(&self) -> io::Result<(LocalStream, ())> {
+            loop {
+                let leftover = {
+                    let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                    if pending.is_empty() {
+                        None
+                    } else {
+                        Some(pending.remove(0))
+                    }
+                };
+
+                let mut entry = match leftover {
+                    Some(pending_entry) => pending_entry,
+                    None => {
+                        let (stream, _) = self.inner.accept()?;
+                        let _ = stream.set_nodelay(true);
+                        PendingAuth {
+                            stream,
+                            buf: Vec::with_capacity(MAX_TOKEN_LINE),
+                            deadline: Instant::now() + ACCEPT_AUTH_TIMEOUT,
+                        }
+                    }
+                };
+
+                match self.authenticate_client(&mut entry) {
+                    Ok(true) => return Ok((self.finish_authenticated_stream(entry.stream)?, ())),
                     // Empty EOF from a concurrent `LocalListener::bind` liveness probe: skip it.
                     Ok(false) => continue,
                     Err(e) => return Err(e),
@@ -172,69 +371,45 @@ mod win {
 
         /// Read `<nonce>\n` one byte at a time so pipelined payload bytes remain intact
         /// in the underlying kernel socket buffer for `LocalStream` readers.
-        fn authenticate_client(&self, stream: &mut TcpStream) -> io::Result<bool> {
-            stream.set_nonblocking(false)?;
-            let deadline = Instant::now() + ACCEPT_AUTH_TIMEOUT;
-            let mut buf = Vec::with_capacity(MAX_TOKEN_LINE);
+        fn authenticate_client(&self, entry: &mut PendingAuth) -> io::Result<bool> {
+            entry.stream.set_nonblocking(false)?;
             let mut byte = [0u8; 1];
+            let mut cr_count = 0usize;
 
             loop {
-                let left = deadline.saturating_duration_since(Instant::now());
+                let left = entry.deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "invalid IPC capability token",
-                    ));
+                    return Err(invalid_token_err());
                 }
-                stream.set_read_timeout(clamp_timeout(Some(left)))?;
-                match stream.read(&mut byte) {
+                entry.stream.set_read_timeout(clamp_timeout(Some(left)))?;
+                match entry.stream.read(&mut byte) {
                     Ok(0) => {
-                        if buf.is_empty() {
+                        if entry.buf.is_empty() {
                             return Ok(false);
                         }
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "invalid IPC capability token",
-                        ));
+                        return Err(invalid_token_err());
                     }
-                    Ok(_) => {
-                        if byte[0] == b'\n' {
-                            break;
-                        }
-                        if byte[0] != b'\r' {
-                            if buf.len() >= MAX_TOKEN_LINE {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::PermissionDenied,
-                                    "invalid IPC capability token",
-                                ));
-                            }
-                            buf.push(byte[0]);
-                        }
-                    }
+                    Ok(_) => match push_auth_byte(&mut entry.buf, byte[0], &mut cr_count) {
+                        AuthByte::Continue => {}
+                        AuthByte::Complete => break,
+                        AuthByte::Reject => return Err(invalid_token_err()),
+                    },
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(_) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "invalid IPC capability token",
-                        ));
-                    }
+                    Err(_) => return Err(invalid_token_err()),
                 }
             }
 
-            if constant_time_eq(&buf, self.nonce.as_bytes()) {
+            if constant_time_eq(&entry.buf, self.nonce.as_bytes()) {
                 Ok(true)
             } else {
-                Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "invalid IPC capability token",
-                ))
+                Err(invalid_token_err())
             }
         }
     }
 
     impl Drop for LocalListener {
         fn drop(&mut self) {
-            if parse_descriptor(&self.path).is_ok_and(|(_, token)| token == self.nonce) {
+            if parse_descriptor(&self.path).is_ok_and(|(_, token, _)| token == self.nonce) {
                 let _ = std::fs::remove_file(&self.path);
                 let _ = std::fs::remove_file(self.path.with_extension("bind.lock"));
             }
@@ -243,7 +418,7 @@ mod win {
 
     impl LocalStream {
         pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-            let (port, nonce) = parse_descriptor(path.as_ref())?;
+            let (port, nonce, _) = parse_descriptor(path.as_ref())?;
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
             let mut inner = TcpStream::connect(addr)?;
             let _ = inner.set_nodelay(true);
