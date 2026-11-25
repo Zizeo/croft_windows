@@ -124,7 +124,7 @@ impl BulkLane {
         command
     }
 
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[allow(dead_code)]
     pub fn bwlimit_kbps(&self) -> u32 {
         self.bwlimit_kbps
     }

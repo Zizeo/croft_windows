@@ -626,6 +626,7 @@ impl PendingHostProbe {
     }
 
     /// Read the replies, waiting at most the probe's budget for them.
+    #[allow(dead_code)]
     pub fn answer(self) -> HostProbe {
         HostProbe::parse(&self.read_reply())
     }

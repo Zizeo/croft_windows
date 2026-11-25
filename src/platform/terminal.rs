@@ -21,6 +21,7 @@ pub struct HostProbeResult {
 
 /// Return `true` when `bytes` contains a complete Primary Device Attributes
 /// response (`CSI ? <digits/semicolons> c`).
+#[cfg_attr(unix, allow(dead_code))]
 pub fn has_complete_da1(bytes: &[u8]) -> bool {
     let mut i = 0;
     while i + 2 < bytes.len() {
@@ -195,12 +196,14 @@ pub struct PendingWindowsProbe(win::PendingProbeState);
 /// Stub pending probe on non-Windows hosts; `src/iterm2_inline.rs` uses the
 /// Unix termios/poll path on Unix.
 #[cfg(not(windows))]
+#[cfg_attr(unix, allow(dead_code))]
 pub struct PendingWindowsProbe;
 
 impl PendingWindowsProbe {
     /// Wait up to the probe deadline for VT replies (breaking early on DA1),
     /// restore any modified Windows console modes, re-queue any unrelated user
     /// input events, and parse the collected capability response.
+    #[cfg_attr(unix, allow(dead_code))]
     pub fn answer(self) -> HostProbeResult {
         #[cfg(windows)]
         {
@@ -218,6 +221,7 @@ impl PendingWindowsProbe {
 /// On non-Windows or non-console handles this returns an inert probe whose
 /// [`PendingWindowsProbe::answer`] resolves immediately to
 /// [`HostProbeResult::default`].
+#[cfg_attr(unix, allow(dead_code))]
 pub fn ask_host_terminal() -> PendingWindowsProbe {
     #[cfg(windows)]
     {

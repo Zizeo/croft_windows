@@ -170,11 +170,6 @@ pub(super) fn find_executable_in_dirs(tool: &str, dirs: &[PathBuf]) -> Option<Pa
     crate::platform::env::find_executable_in(tool, dirs)
 }
 
-#[cfg(all(test, unix))]
-pub(super) fn is_executable_file(path: &Path) -> bool {
-    crate::platform::env::is_executable_file(path)
-}
-
 /// A `Command` for a cross-build tool, resolved to its absolute path and run
 /// with the augmented PATH so its own child processes resolve too.
 pub(super) fn cross_tool_command(tool: &str) -> Command {

@@ -83,6 +83,7 @@ pub struct TaskArg {
 
 /// Shell dialect a task command line targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub enum ShellFlavor {
     Posix,
     PowerShell,
@@ -91,6 +92,7 @@ pub enum ShellFlavor {
 
 impl ShellFlavor {
     /// Detect shell flavor from a shell executable name or full path.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn from_shell_path(shell: &str) -> Self {
         let base = shell
             .rsplit(['/', '\\'])

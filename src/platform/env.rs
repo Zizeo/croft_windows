@@ -92,6 +92,7 @@ pub fn state_dir_unix(xdg_state_home: Option<OsString>, home: Option<PathBuf>) -
         .join("croft")
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn config_dir_windows(
     xdg_config_home: Option<OsString>,
     appdata: Option<OsString>,
@@ -108,6 +109,7 @@ pub fn config_dir_windows(
         .join("croft")
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn state_dir_windows(
     xdg_state_home: Option<OsString>,
     local_appdata: Option<OsString>,
@@ -128,6 +130,7 @@ pub fn state_dir_windows(
         .join("croft")
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn cache_dir_windows(local_appdata: Option<OsString>, home: Option<PathBuf>) -> PathBuf {
     if let Some(local) = local_appdata.filter(|v| !v.is_empty()) {
         return PathBuf::from(local).join("croft").join("cache");

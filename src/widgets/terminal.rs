@@ -71,7 +71,7 @@ pub use selection::Selection;
 pub use selection::is_terminal_word_char;
 use selection::*;
 pub(crate) use shell_env::apply_pane_env;
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 pub use shell_env::discover_windows_shells;
 #[cfg(test)]
 pub use shell_env::interactive_shell_invocation;

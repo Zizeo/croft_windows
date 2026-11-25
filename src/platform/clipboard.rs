@@ -1,5 +1,6 @@
 /// Encode UTF-8 text into NUL-terminated UTF-16LE code units for Win32
 /// `CF_UNICODETEXT`. Returns `None` if `text` contains an embedded NUL.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn encode_utf16_nul(text: &str) -> Option<Vec<u16>> {
     if text.as_bytes().contains(&0) {
         return None;
@@ -10,6 +11,7 @@ pub fn encode_utf16_nul(text: &str) -> Option<Vec<u16>> {
 }
 
 /// Decode a NUL-terminated UTF-16 slice back into UTF-8.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn decode_utf16_nul(units: &[u16]) -> String {
     let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
     String::from_utf16_lossy(&units[..end])

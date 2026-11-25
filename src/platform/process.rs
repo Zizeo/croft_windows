@@ -331,6 +331,7 @@ pub fn force_kill_pid(pid: u32) -> bool {
     }
 }
 
+#[cfg_attr(unix, allow(clippy::unnecessary_cast))]
 pub fn raise_fd_limit() -> u64 {
     #[cfg(unix)]
     {

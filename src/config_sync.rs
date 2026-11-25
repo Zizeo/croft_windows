@@ -366,6 +366,7 @@ fn repush_targets_into(
 /// the remote side to expand a variable, and the remote's own
 /// `config_dir()` honours XDG. A remote that sets XDG_CONFIG_HOME would
 /// read from elsewhere, which is a known gap rather than a silent one.
+#[allow(dead_code)]
 pub fn remote_dest(host: &str, name: &str) -> String {
     format!("{host}:.config/croft/{name}")
 }

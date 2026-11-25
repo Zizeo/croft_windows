@@ -197,6 +197,7 @@ pub fn interactive_shell_invocation(shell_path: &str) -> (String, Vec<String>) {
 /// Probes `PATH` (via `resolve_on_path`) and standard installation paths
 /// for PowerShell 7 (`pwsh`), Windows PowerShell (`powershell`), Command
 /// Prompt (`cmd`), Git Bash (`Git Bash`), and WSL (`wsl`).
+#[cfg(windows)]
 pub fn discover_windows_shells() -> Vec<(String, String)> {
     let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| String::from(r"C:\Windows"));
     let candidates: [(&str, &str, Vec<std::path::PathBuf>); 5] = [

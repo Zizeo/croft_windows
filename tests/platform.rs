@@ -198,6 +198,7 @@ fn process_into_child_preserves_liveness() {
 }
 
 #[test]
+#[cfg_attr(not(windows), allow(clippy::drop_non_drop))]
 fn process_split_killer_tree_killer_and_force_kill_pid() {
     assert!(!platform::process::force_kill_pid(0));
 
