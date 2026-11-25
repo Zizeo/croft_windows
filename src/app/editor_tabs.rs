@@ -2165,12 +2165,8 @@ pub(super) fn windows_new_window_command(
             ],
         ),
         WindowsHostTerminal::Fallback => (
-            OsString::from("cmd.exe"),
+            exe,
             vec![
-                OsString::from("/C"),
-                OsString::from("start"),
-                OsString::from(""),
-                exe,
                 root,
                 OsString::from("--open-file"),
                 file,
@@ -2190,9 +2186,12 @@ pub(super) fn spawn_new_window(
         std::env::var("WT_SESSION").ok().as_deref(),
         std::env::var("TERM_PROGRAM").ok().as_deref(),
     );
-    let (program, args) = windows_new_window_command(host, &exe, root, file);
-    std::process::Command::new(program)
-        .args(args)
+    let (program, args) = windows_new_window_command(host.clone(), &exe, root, file);
+    let mut cmd = std::process::Command::new(program);
+    if host == WindowsHostTerminal::Fallback {
+        crate::platform::process::configure_new_console(&mut cmd);
+    }
+    cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

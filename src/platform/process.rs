@@ -22,6 +22,15 @@ pub fn detach_from_tty(cmd: &mut Command) {
     }
 }
 
+/// Configure `cmd` so the spawned Windows process opens in its own new
+/// console window instead of sharing the parent's console.
+#[cfg(windows)]
+pub fn configure_new_console(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE;
+    cmd.creation_flags(CREATE_NEW_CONSOLE);
+}
+
 /// Cloneable handle to terminate a spawned process tree (Unix process group;
 /// Windows Job Object + process PID).
 ///

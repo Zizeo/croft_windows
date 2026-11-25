@@ -2794,17 +2794,30 @@ fn windows_new_window_targets_wt_wezterm_or_cmd_fallback() {
     );
 
     let (prog, args) = windows_new_window_command(WindowsHostTerminal::Fallback, exe, root, file);
-    assert_eq!(prog, "cmd.exe");
+    assert_eq!(prog, r"C:\bin\croft.exe");
+    assert_eq!(
+        args,
+        [r"C:\repo", "--open-file", r"C:\repo\main.rs", "--zen",]
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_new_window_fallback_spawns_croft_directly_without_cmd_exe() {
+    use crate::app::editor_tabs::{WindowsHostTerminal, windows_new_window_command};
+    use std::path::Path;
+
+    let exe = Path::new(r"C:\bin\croft.exe");
+    let root = Path::new(r"C:\work\a&calc\%TEMP%");
+    let file = Path::new(r"C:\work\a&calc\%TEMP%\file&1.rs");
+    let (prog, args) = windows_new_window_command(WindowsHostTerminal::Fallback, exe, root, file);
+    assert_eq!(prog, r"C:\bin\croft.exe");
     assert_eq!(
         args,
         [
-            "/C",
-            "start",
-            "",
-            r"C:\bin\croft.exe",
-            r"C:\repo",
+            r"C:\work\a&calc\%TEMP%",
             "--open-file",
-            r"C:\repo\main.rs",
+            r"C:\work\a&calc\%TEMP%\file&1.rs",
             "--zen",
         ]
     );
