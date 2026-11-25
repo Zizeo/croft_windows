@@ -790,20 +790,38 @@ fn net_list_tcp_listeners_detects_bound_loopback_socket_and_drop() {
     let port = listener.local_addr().unwrap().port();
     let pid = std::process::id();
 
+    let v6_listener = std::net::TcpListener::bind("[::1]:0").ok();
+    let v6_port = v6_listener.as_ref().map(|l| l.local_addr().unwrap().port());
+
     let entries = platform::net::list_tcp_listeners().expect("Windows TCP table available");
     assert!(
         entries
             .iter()
             .any(|e| e.port == port && e.pid == pid && e.is_loopback_or_wildcard),
-        "expected port {port} owned by pid {pid} in {entries:?}"
+        "expected IPv4 port {port} owned by pid {pid} in {entries:?}"
     );
+    if let Some(v6_port) = v6_port {
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.port == v6_port && e.pid == pid && e.is_loopback_or_wildcard),
+            "expected IPv6 port {v6_port} owned by pid {pid} in {entries:?}"
+        );
+    }
 
     drop(listener);
+    drop(v6_listener);
     let after = platform::net::list_tcp_listeners().expect("Windows TCP table available");
     assert!(
         !after.iter().any(|e| e.port == port && e.pid == pid),
-        "dropped port {port} should no longer appear for pid {pid}"
+        "dropped IPv4 port {port} should no longer appear for pid {pid}"
     );
+    if let Some(v6_port) = v6_port {
+        assert!(
+            !after.iter().any(|e| e.port == v6_port && e.pid == pid),
+            "dropped IPv6 port {v6_port} should no longer appear for pid {pid}"
+        );
+    }
 }
 
 #[test]
