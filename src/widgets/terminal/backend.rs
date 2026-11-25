@@ -305,7 +305,7 @@ impl PaneLink {
         drop(pair.slave);
         let writer = pair.master.take_writer().context("take writer")?;
         let mut reader = pair.master.try_clone_reader().context("clone reader")?;
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(CONPTY_CHANNEL_BOUND);
         std::thread::spawn(move || {
             let mut buf = [0u8; 65536];
             loop {
@@ -451,6 +451,11 @@ pub(super) const PORT_URL_SETTLE_MS: i32 = 150;
 /// left running keeps the pty open (see [`wait_pty_readable`]).
 pub(super) const EXIT_OUTPUT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Maximum number of 64 KiB ConPTY output chunks buffered between the bridge
+/// reader thread and the terminal parser before applying backpressure (~1 MiB).
+#[cfg(any(windows, test))]
+const CONPTY_CHANNEL_BOUND: usize = 16;
+
 /// What [`poll_pty`] saw.
 #[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
@@ -543,5 +548,25 @@ impl Drop for PtyTerminal {
                 let _ = handle.join();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conpty_channel_is_bounded_at_16() {
+        assert_eq!(CONPTY_CHANNEL_BOUND, 16);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(CONPTY_CHANNEL_BOUND);
+        for i in 0..CONPTY_CHANNEL_BOUND {
+            assert_eq!(tx.try_send(vec![i as u8]), Ok(()));
+        }
+        assert_eq!(
+            tx.try_send(vec![99]),
+            Err(std::sync::mpsc::TrySendError::Full(vec![99]))
+        );
+        assert_eq!(rx.recv().unwrap(), vec![0]);
+        assert_eq!(tx.try_send(vec![99]), Ok(()));
     }
 }
