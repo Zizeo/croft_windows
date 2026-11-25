@@ -51,7 +51,37 @@ const TERMUX_INSTALL_SCRIPT: &str = "pkg install -y zoxide";
 
 /// Windows installer via WinGet.
 #[cfg_attr(not(windows), allow(dead_code))]
-const WINDOWS_INSTALL_SCRIPT: &str = "winget install --id ajeetdsouza.zoxide -e";
+const WINDOWS_INSTALL_SCRIPT: &str = "winget install --id ajeetdsouza.zoxide -e --accept-package-agreements --accept-source-agreements";
+
+/// Arguments passed directly to `winget` when installing zoxide on Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_WINGET_ARGS: &[&str] = &[
+    "install",
+    "--id",
+    "ajeetdsouza.zoxide",
+    "-e",
+    "--accept-package-agreements",
+    "--accept-source-agreements",
+];
+
+/// Build the detached, non-interactive `winget` [`Command`] used on Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_install_command() -> Command {
+    let mut cmd = Command::new("winget");
+    cmd.args(WINDOWS_WINGET_ARGS)
+        .stdin(std::process::Stdio::null());
+    crate::platform::process::detach_from_tty(&mut cmd);
+    cmd
+}
+
+/// User-facing error string when the platform installer binary cannot be spawned.
+fn installer_start_error(e: &std::io::Error) -> String {
+    if cfg!(windows) {
+        format!("could not start winget: {e}")
+    } else {
+        format!("could not start sh: {e}")
+    }
+}
 
 /// Pick the installer for this host. The popup's install offer shows it
 /// verbatim, so the user sees exactly what `y` runs.
@@ -527,7 +557,7 @@ pub fn install_in_background() {
         // Termux, which has no curl) used to fail in total silence
         // while the popup claimed "installing".
         #[cfg(windows)]
-        let installer_out = Command::new("cmd.exe").args(["/C", script]).output();
+        let installer_out = windows_install_command().output();
         #[cfg(not(windows))]
         let installer_out = Command::new("sh").arg("-c").arg(script).output();
         let failure = match installer_out {
@@ -548,7 +578,7 @@ pub fn install_in_background() {
                 log_file::log(&format!(
                     "zoxide: installer `{script}` could not start: {e}"
                 ));
-                Some(format!("could not start sh: {e}"))
+                Some(installer_start_error(&e))
             }
         };
         // Wire the shell hook only once the binary is actually resolvable,
@@ -593,6 +623,52 @@ mod tests {
             INSTALL_SCRIPT,
             "macOS/Linux keep the official cross-platform curl installer"
         );
+        assert!(
+            WINDOWS_INSTALL_SCRIPT.contains("--accept-package-agreements"),
+            "Windows install script must accept package agreements non-interactively"
+        );
+        assert!(
+            WINDOWS_INSTALL_SCRIPT.contains("--accept-source-agreements"),
+            "Windows install script must accept source agreements non-interactively"
+        );
+    }
+
+    #[test]
+    fn windows_install_command_runs_winget_directly_non_interactively() {
+        let cmd = windows_install_command();
+        assert_eq!(cmd.get_program(), "winget");
+        assert_ne!(cmd.get_program(), "cmd.exe");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|arg| arg.to_str().expect("utf-8 winget arg"))
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "install",
+                "--id",
+                "ajeetdsouza.zoxide",
+                "-e",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+            ]
+        );
+        assert_eq!(
+            WINDOWS_INSTALL_SCRIPT,
+            format!("winget {}", args.join(" ")),
+            "displayed Windows install script must match the executed winget arguments"
+        );
+    }
+
+    #[test]
+    fn installer_start_error_names_platform_launcher() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        let msg = installer_start_error(&err);
+        if cfg!(windows) {
+            assert_eq!(msg, "could not start winget: missing");
+        } else {
+            assert_eq!(msg, "could not start sh: missing");
+        }
     }
 
     #[test]
