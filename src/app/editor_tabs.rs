@@ -2176,6 +2176,18 @@ pub(super) fn windows_new_window_command(
     }
 }
 
+/// Whether spawning a new window for `host` should redirect standard handles
+/// to `Stdio::null()`.
+///
+/// `Fallback` spawns `croft.exe` with `CREATE_NEW_CONSOLE`, so Windows attaches
+/// the new console's `CONIN$`/`CONOUT$` handles automatically; setting
+/// `Stdio::null()` would populate `STARTF_USESTDHANDLES` with `NUL` and leave
+/// the spawned console blank.
+#[cfg(windows)]
+pub(super) fn windows_new_window_uses_null_stdio(host: &WindowsHostTerminal) -> bool {
+    *host != WindowsHostTerminal::Fallback
+}
+
 #[cfg(windows)]
 pub(super) fn spawn_new_window(
     root: &std::path::Path,
@@ -2188,14 +2200,16 @@ pub(super) fn spawn_new_window(
     );
     let (program, args) = windows_new_window_command(host.clone(), &exe, root, file);
     let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
     if host == WindowsHostTerminal::Fallback {
         crate::platform::process::configure_new_console(&mut cmd);
     }
-    cmd.args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+    if windows_new_window_uses_null_stdio(&host) {
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+    }
+    cmd.spawn()?;
     Ok(())
 }
 

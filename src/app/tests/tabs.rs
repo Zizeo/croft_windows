@@ -2822,3 +2822,19 @@ fn windows_new_window_fallback_spawns_croft_directly_without_cmd_exe() {
         ]
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_new_window_null_stdio_skips_fallback_console() {
+    use crate::app::editor_tabs::{WindowsHostTerminal, windows_new_window_uses_null_stdio};
+
+    assert!(windows_new_window_uses_null_stdio(
+        &WindowsHostTerminal::WindowsTerminal
+    ));
+    assert!(windows_new_window_uses_null_stdio(
+        &WindowsHostTerminal::WezTerm
+    ));
+    assert!(!windows_new_window_uses_null_stdio(
+        &WindowsHostTerminal::Fallback
+    ));
+}
