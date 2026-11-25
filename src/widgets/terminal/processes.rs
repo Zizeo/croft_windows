@@ -5,11 +5,7 @@ use super::*;
 
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub(super) fn strip_windows_exe(name: &str) -> &str {
-    if name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(".exe") {
-        &name[..name.len() - 4]
-    } else {
-        name
-    }
+    crate::platform::process::strip_windows_exe(name)
 }
 
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]

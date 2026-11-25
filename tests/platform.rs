@@ -826,3 +826,16 @@ fn os_open_url_and_spawn_open_target_reject_control_chars_and_nul() {
         );
     }
 }
+
+#[test]
+fn process_strip_windows_exe_handles_ascii_and_multibyte_utf8() {
+    assert_eq!(platform::process::strip_windows_exe("node.exe"), "node");
+    assert_eq!(platform::process::strip_windows_exe("NODE.EXE"), "NODE");
+    assert_eq!(platform::process::strip_windows_exe(".exe"), ".exe");
+    assert_eq!(platform::process::strip_windows_exe("cmd"), "cmd");
+    assert_eq!(platform::process::strip_windows_exe("日本語"), "日本語");
+    assert_eq!(platform::process::strip_windows_exe("日本語.exe"), "日本語");
+    assert_eq!(platform::process::strip_windows_exe("é.e"), "é.e");
+    assert_eq!(platform::process::strip_windows_exe("🦀"), "🦀");
+    assert_eq!(platform::process::strip_windows_exe("🦀.ExE"), "🦀");
+}

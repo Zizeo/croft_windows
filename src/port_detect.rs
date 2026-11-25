@@ -493,11 +493,7 @@ fn windows_subtree_and_names(root: i32) -> (HashSet<u32>, std::collections::Hash
             pairs.push((p, ppid.as_u32()));
         }
         let raw = proc_.name().to_string_lossy();
-        let trimmed = if raw.len() > 4 && raw[raw.len() - 4..].eq_ignore_ascii_case(".exe") {
-            &raw[..raw.len() - 4]
-        } else {
-            &raw
-        };
+        let trimmed = crate::platform::process::strip_windows_exe(&raw);
         if !trimmed.is_empty() {
             names.insert(p, trimmed.to_string());
         }
