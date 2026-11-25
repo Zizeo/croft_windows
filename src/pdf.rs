@@ -663,7 +663,9 @@ pub fn rasterize_page(pdf: &Path, page: u32, backend: PdfBackend) -> std::io::Re
 }
 
 fn rasterize_with_pdftoppm(pdf: &Path, page: u32) -> std::io::Result<Vec<u8>> {
-    run_pdftoppm(Path::new("pdftoppm"), pdf, page, PDF_RENDER_BUDGET)
+    let program = crate::platform::env::resolve_on_path("pdftoppm")
+        .unwrap_or_else(|| PathBuf::from("pdftoppm"));
+    run_pdftoppm(&program, pdf, page, PDF_RENDER_BUDGET)
 }
 
 /// Render `page` of `pdf` with the pdftoppm at `program` (a parameter so a
@@ -713,12 +715,8 @@ fn run_pdftoppm(
         // Its own group, so the kill at the deadline reaches a descendant
         // the renderer forked and not only the renderer itself.
         cmd.process_group(0);
-    }
-    let mut child = cmd.spawn()?;
-    let deadline = std::time::Instant::now() + budget;
-
-    #[cfg(unix)]
-    {
+        let mut child = cmd.spawn()?;
+        let deadline = std::time::Instant::now() + budget;
         let mut stderr_pipe = child.stderr.take();
         // Non-blocking, and read from ONE place: this thread (#553).
         let nonblocking = set_nonblocking(stderr_pipe.as_ref());
@@ -766,6 +764,9 @@ fn run_pdftoppm(
 
     #[cfg(not(unix))]
     {
+        let (mut child, killer) =
+            crate::platform::process::ManagedChild::spawn_in_group(&mut cmd)?.split_killer();
+        let deadline = std::time::Instant::now() + budget;
         // Drain stderr on a detached thread so a chatty renderer (>4 KB) cannot
         // deadlock on a full Windows pipe buffer, while never joining the
         // thread so a surviving descendant cannot stall the render budget.
@@ -786,7 +787,7 @@ fn run_pdftoppm(
                     std::thread::sleep(EXIT_POLL_TICK);
                 }
                 Ok(None) => {
-                    kill_group(child, guard);
+                    kill_group_managed(child, killer, guard);
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!(
@@ -797,7 +798,7 @@ fn run_pdftoppm(
                     ));
                 }
                 Err(e) => {
-                    kill_group(child, guard);
+                    kill_group_managed(child, killer, guard);
                     return Err(e);
                 }
             }
@@ -920,23 +921,39 @@ fn settle_over(quiet_run: u32, mut sample: impl FnMut(u32) -> Sample) -> (String
 /// reaped; deleting it under a child still stalled in I/O would orphan its
 /// output. One such thread exists per overrun of a user-initiated render,
 /// each blocked in `wait` for as long as its renderer stays stuck, which is
-/// bounded by the user's page turns rather than by the frame rate. Off unix
-/// only the child itself can be killed.
+/// bounded by the user's page turns rather than by the frame rate.
+#[cfg(unix)]
 fn kill_group(mut child: std::process::Child, scratch: TempDirGuard) {
-    #[cfg(unix)]
-    {
-        // SAFETY: a negative pid addresses the process group the child was
-        // started in (`process_group(0)` above); the call only sends a signal.
-        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
+    // SAFETY: a negative pid addresses the process group the child was
+    // started in (`process_group(0)` above); the call only sends a signal.
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
         }
     }
     std::thread::spawn(move || {
         // The non-unix path, and a no-op on unix after the group signal.
         let _ = child.kill();
         let _ = child.wait();
+        drop(scratch);
+    });
+}
+
+/// Kill the renderer's whole process tree on the budget's overrun (and on a
+/// wait error) using the Job Object [`crate::platform::process::TreeKiller`],
+/// then reap the direct child and drop the scratch dir guard on a background
+/// thread.
+#[cfg(not(unix))]
+fn kill_group_managed(
+    mut child: std::process::Child,
+    killer: crate::platform::process::TreeKiller,
+    scratch: TempDirGuard,
+) {
+    killer.kill_tree();
+    std::thread::spawn(move || {
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(killer);
         drop(scratch);
     });
 }
@@ -1860,6 +1877,71 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
             msg.contains("12345678901234567890") && msg.len() > 10_000,
             "expected full drained stderr in error, got len={}",
             msg.len()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_run_pdftoppm_kills_child_tree_on_timeout() {
+        struct ProcessTreeCleanup(String);
+
+        impl Drop for ProcessTreeCleanup {
+            fn drop(&mut self) {
+                if !std::thread::panicking() {
+                    return;
+                }
+                let escaped = self.0.replace('\'', "''");
+                let ps = format!(
+                    "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{escaped}*' }} | ForEach-Object {{ taskkill /F /T /PID $_.ProcessId 2>$null }}"
+                );
+                let _ = std::process::Command::new("powershell")
+                    .args(["-NoProfile", "-Command", &ps])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_name = dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let _cleanup = ProcessTreeCleanup(dir_name);
+
+        let marker = dir.path().join("survived.txt");
+        let child_script = dir.path().join("child.cmd");
+        std::fs::write(
+            &child_script,
+            "@echo off\r\nping -n 2 127.0.0.1 >nul\r\necho alive > \"%~dp0survived.txt\"\r\nping -n 10 127.0.0.1 >nul\r\n",
+        )
+        .unwrap();
+        let script = dir.path().join("hang-pdftoppm.cmd");
+        std::fs::write(
+            &script,
+            "@echo off\r\nstart \"\" /b \"%~dp0child.cmd\"\r\nping -n 10 127.0.0.1 >nul\r\n",
+        )
+        .unwrap();
+        let pdf = dir.path().join("dummy.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+
+        let started = std::time::Instant::now();
+        let err = run_pdftoppm(&script, &pdf, 1, std::time::Duration::from_millis(150))
+            .expect_err("an overrunning renderer must fail with TimedOut");
+        let elapsed = started.elapsed();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(1500),
+            "expected prompt timeout return, elapsed={elapsed:?}"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert!(
+            !marker.exists(),
+            "the descendant child tree survived the timeout kill"
         );
     }
 }
