@@ -2,6 +2,7 @@
 //! stale popups on a click.
 
 use super::*;
+use crate::widgets::source_control::KeyStop;
 
 impl App {
     /// [`Self::ui_tooltip_at`], plus the hints whose text is what sits under
@@ -705,9 +706,7 @@ impl App {
             && self.context_menu.is_none()
         {
             let mut scrolled = false;
-            for g in
-                std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
-            {
+            for g in self.editor_layout.all_groups_mut(&mut self.editor) {
                 if g.tab_strip_contains(m.column, m.row) {
                     g.scroll_tabs_wheel(delta);
                     scrolled = true;
@@ -833,14 +832,22 @@ impl App {
             self.handle_list_picker_mouse(m);
             return;
         }
-        if self.scm_menu.open && matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-            use crate::widgets::scm_menu::ClickOutcome;
-            match self.scm_menu.click(m.column, m.row) {
-                ClickOutcome::Fire(action) => self.dispatch_scm_action(action),
-                ClickOutcome::Toggled => {}
-                ClickOutcome::Missed => self.scm_menu.close(),
+        // Source Control's menus (#871) take left clicks here, where they
+        // always have; the pointer, the wheel and other buttons pass them by.
+        // A click outside the Commit dropdown closes it and goes on.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            match self.context_menu.as_ref().map(|menu| menu.look) {
+                Some(MenuLook::ScmActions { .. }) => {
+                    self.click_scm_actions_menu(m.column, m.row);
+                    return;
+                }
+                Some(MenuLook::CommitActions)
+                    if self.click_commit_actions_menu(m.column, m.row) =>
+                {
+                    return;
+                }
+                _ => {}
             }
-            return;
         }
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
             && self
@@ -929,7 +936,11 @@ impl App {
         }
 
         // While a context menu is open, route clicks to it.
-        if self.context_menu.is_some() {
+        if self
+            .context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.look == MenuLook::Panel)
+        {
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     // 1. A click inside the open submenu panel dispatches that child.
@@ -1614,6 +1625,8 @@ impl App {
                         crumb: None,
                         scroll: Default::default(),
                         submenu_scroll: Default::default(),
+                        look: MenuLook::Panel,
+                        keyed: true,
                         origin: (m.column, m.row),
                         items,
                         selected: 0,
@@ -1779,6 +1792,8 @@ impl App {
                         crumb: None,
                         scroll: Default::default(),
                         submenu_scroll: Default::default(),
+                        look: MenuLook::Panel,
+                        keyed: true,
                         origin: (m.column, m.row),
                         items,
                         selected: 0,
@@ -2699,31 +2714,41 @@ impl App {
                             self.graph_scrollbar_drag = true;
                         } else if self.commit_graph.hit_header(m.column, m.row) {
                             self.commit_graph.toggle_collapse();
-                        } else if let Some((hash, short)) = self
-                            .commit_graph
-                            .commit_at(m.row)
-                            .map(|c| (c.hash.clone(), c.short_hash.clone()))
-                        {
-                            self.open_commit_patch(&hash, &short);
+                        } else if let Some(row) = self.commit_graph.row_index_at(m.row) {
+                            // The clicked commit is picked and COMMITS takes
+                            // the keys, as a click on a change row does for
+                            // the change list (#871).
+                            self.source_control.keys = KeyStop::Commits;
+                            self.commit_graph.select(row);
+                            if let Some((hash, short)) = self
+                                .commit_graph
+                                .selected_commit()
+                                .map(|c| (c.hash.clone(), c.short_hash.clone()))
+                            {
+                                self.open_commit_patch(&hash, &short);
+                            }
                         }
                         return;
                     }
                     if let Some(root) = self.source_control.click_repository(m.column, m.row) {
                         // Pin the panel to the clicked repository (#161);
-                        // the next cross-folder focus releases it.
-                        self.scm_pin = Some(root.clone());
-                        self.seed_active_scm(root);
+                        // the next cross-folder focus releases it. Its row
+                        // takes the keys, as a click on a change does for
+                        // the change list (#871).
+                        let row = self
+                            .source_control
+                            .repositories
+                            .iter()
+                            .position(|r| r.workspace_root == root);
+                        self.pin_scm_repository(root);
+                        if let Some(row) = row {
+                            self.source_control.keys = KeyStop::Repositories;
+                            self.source_control.repo_cursor = row;
+                        }
                         return;
                     }
                     if self.source_control.click_more(m.column, m.row) {
-                        self.commit_menu_open = false;
-                        self.scm_menu.open = !self.scm_menu.open;
-                        if self.scm_menu.open {
-                            self.scm_menu.operation = crate::git::repo_operation(&self.scm_root());
-                        }
-                        if !self.scm_menu.open {
-                            self.scm_menu.close();
-                        }
+                        self.open_scm_actions_menu(false);
                         return;
                     }
                     if self.source_control.click_header_refresh(m.column, m.row) {
@@ -2731,25 +2756,9 @@ impl App {
                         self.status = String::from("Refreshed Source Control");
                         return;
                     }
-                    if self.commit_menu_open
-                        && let Some(item) =
-                            self.source_control.click_commit_menu_item(m.column, m.row)
-                    {
-                        self.commit_menu_open = false;
-                        self.dispatch_commit_menu_item(item);
-                        return;
-                    }
                     if self.source_control.click_commit_caret(m.column, m.row) {
-                        self.commit_menu_open = !self.commit_menu_open;
+                        self.open_commit_actions_menu(false);
                         return;
-                    }
-                    if self.commit_menu_open {
-                        // Any click outside the caret/menu closes the
-                        // dropdown without firing its action; fall through
-                        // so the underlying gesture still applies (the
-                        // user can dismiss-by-clicking-elsewhere instead
-                        // of needing Esc + click).
-                        self.commit_menu_open = false;
                     }
                     if self.source_control.click_init_repo_button(m.column, m.row) {
                         self.initialize_repository();
@@ -2763,8 +2772,19 @@ impl App {
                         self.commit_source_control();
                         return;
                     }
+                    // A click anywhere else in the view takes the keys from
+                    // COMMITS and REPOSITORIES (#871): to the message box (or
+                    // the card, with no repository), or to the change list
+                    // when the click lands on one of its rows.
+                    if matches!(
+                        self.source_control.keys,
+                        KeyStop::Commits | KeyStop::Repositories
+                    ) {
+                        self.source_control.keys = KeyStop::Message;
+                        self.source_control.settle_keys();
+                    }
                     if self.source_control.click_input(m.column, m.row) {
-                        self.source_control.list_focused = false;
+                        self.source_control.keys = KeyStop::Message;
                         return;
                     }
                     if self.source_control.click_branch(m.column, m.row) {
@@ -2784,7 +2804,7 @@ impl App {
                         return;
                     }
                     if let Some(idx) = self.source_control.entry_at_y(m.row) {
-                        self.source_control.list_focused = true;
+                        self.source_control.keys = KeyStop::List;
                         self.open_source_control_entry(idx);
                     }
                     return;

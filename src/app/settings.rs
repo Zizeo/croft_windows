@@ -48,6 +48,8 @@ impl App {
             crumb: None,
             scroll: Default::default(),
             submenu_scroll: Default::default(),
+            look: MenuLook::Panel,
+            keyed: true,
             origin,
             items: items.into_iter().map(MenuEntry::from).collect(),
             selected,
@@ -85,15 +87,13 @@ impl App {
         // Assign the theme before re-highlighting: the rebuilds below (the
         // markdown preview in particular) read `ed.theme`, and the per-frame
         // push in render would hand it over one frame too late.
-        for ed in &mut self.editor.editors {
+        for ed in self
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
+            .flat_map(|g| g.editors.iter_mut())
+        {
             ed.theme = theme;
             ed.rehighlight_for_theme();
-        }
-        for group in self.editor_layout.inactive_groups_mut() {
-            for ed in &mut group.editors {
-                ed.theme = theme;
-                ed.rehighlight_for_theme();
-            }
         }
         // Refresh the per-pane gradient-border flag for the new theme so the
         // focused box switches its highlight style on the very next frame.
@@ -1177,8 +1177,9 @@ impl App {
                 && e.language() == crate::highlight::lang_for_path(path))
             .then(|| path.clone())
         };
-        let following: Vec<PathBuf> = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        let following: Vec<PathBuf> = self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter_map(picked)
             .collect();
@@ -1216,8 +1217,9 @@ impl App {
             self.rebuild_problems();
             self.refresh_problems_badge();
         }
-        for e in std::iter::once(&mut self.editor)
-            .chain(self.editor_layout.inactive_groups_mut())
+        for e in self
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
             .flat_map(|g| g.editors.iter_mut())
         {
             let Some(path) = e.path.clone().filter(|p| following.contains(p)) else {
@@ -1419,10 +1421,7 @@ impl App {
             || hint_overrides(&old_languages) != hint_overrides(&self.language_prefs)
         {
             let (langs, global) = (&self.language_prefs, self.inlay_hints_enabled);
-            if !inlay_hints_on_in(langs, global, editor_scope_id(&self.editor)) {
-                self.editor.clear_inlay_hints();
-            }
-            for group in self.editor_layout.inactive_groups_mut() {
+            for group in self.editor_layout.all_groups_mut(&mut self.editor) {
                 if !inlay_hints_on_in(langs, global, editor_scope_id(group)) {
                     group.clear_inlay_hints();
                 }

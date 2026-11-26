@@ -2250,6 +2250,54 @@ commands! {
         title: "Git: Stash",
         hint: "",
     }
+    /// Source Control's `⋯` actions menu from the keyboard (#871): every
+    /// Git action it lists, reached with the arrows and run with Enter.
+    GitShowSourceControlActions {
+        id: "git_show_source_control_actions",
+        title: "Git: Show Source Control Actions",
+        hint: "Cmd+K Shift+A",
+    }
+    /// The Commit button's `▾` dropdown from the keyboard (#871).
+    GitShowCommitActions {
+        id: "git_show_commit_actions",
+        title: "Git: Show Commit Actions",
+        hint: "Cmd+K Shift+C",
+    }
+    /// The open file's changes (#871), or the selected Source Control row's
+    /// while the change list has the keys; its keys are the shortcuts.
+    GitOpenChanges {
+        id: "git_open_changes",
+        title: "Git: Open Changes",
+        hint: "Enter in Source Control",
+    }
+    GitStageChanges {
+        id: "git_stage_changes",
+        title: "Git: Stage Changes",
+        hint: "S in Source Control",
+    }
+    GitUnstageChanges {
+        id: "git_unstage_changes",
+        title: "Git: Unstage Changes",
+        hint: "U in Source Control",
+    }
+    GitDiscardChanges {
+        id: "git_discard_changes",
+        title: "Git: Discard Changes",
+        hint: "D in Source Control",
+    }
+    /// The header's refresh button (#871); `R` in Source Control's lists.
+    GitRefresh {
+        id: "git_refresh",
+        title: "Git: Refresh",
+        hint: "R in Source Control",
+    }
+    /// The no-repository card's button (#871); `Enter` on it in Source
+    /// Control.
+    GitInitializeRepository {
+        id: "git_initialize_repository",
+        title: "Git: Initialize Repository",
+        hint: "Enter in Source Control",
+    }
     ToggleTerminalSuggestions {
         id: "toggle_terminal_suggestions",
         title: "Terminal: Toggle Command Suggestions",

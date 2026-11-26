@@ -1191,6 +1191,10 @@ impl App {
                 self.sync_open_file_poll_mtime();
                 self.status = if crate::rebase_todo::is_todo(path) {
                     String::from(crate::rebase_todo::HINT)
+                } else if let Some(why) = self.editor.hex_routed_because() {
+                    // Its own viewer declined the file: say why, as the
+                    // Explorer does (#2711).
+                    format!("Opened {} in the hex viewer: {why}", path.display())
                 } else {
                     format!("Opened {}", path.display())
                 };
@@ -1270,14 +1274,9 @@ impl App {
         let is_it =
             |p: &Path| p == path || crate::platform::fs::canonicalize(p).is_ok_and(|c| c == canon);
         let open = self
-            .editor
-            .editors
-            .iter()
-            .chain(
-                self.editor_layout
-                    .inactive_groups()
-                    .flat_map(|g| g.editors.iter()),
-            )
+            .editor_layout
+            .all_groups(&self.editor)
+            .flat_map(|g| g.editors.iter())
             .any(|t| t.path.as_deref().is_some_and(is_it));
         if open {
             crate::view_ipc::ViewReply::Err {

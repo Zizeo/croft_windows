@@ -55,7 +55,14 @@ impl ConfigRepush {
                         }
                         Some((_, files)) => RepushGate::Push(files),
                     },
-                    &mut |files| push_over_bulk_lane(&host, &socket, files),
+                    &mut |files| {
+                        push_over_bulk_lane(
+                            &host,
+                            &socket,
+                            files,
+                            &crate::config_sync::SyncState::path(),
+                        )
+                    },
                     &mut log,
                 );
             }
@@ -193,12 +200,13 @@ pub(super) fn repush_tick(
     }
 }
 
-/// Ship `files` over a bulk lane opened for this batch; the names that
-/// failed.
+/// Ship `files` over a bulk lane opened for this batch, recording what was
+/// pushed in the sync state at `state_path`; the names that failed.
 pub(super) fn push_over_bulk_lane(
     host: &str,
     socket: &Path,
     files: &[(crate::config_sync::Syncable, PathBuf)],
+    state_path: &Path,
 ) -> PushResult {
     // The connect-time push creates this only when it had files to send, so
     // a host that had none has no ~/.config/croft for the first file made
@@ -220,8 +228,7 @@ pub(super) fn push_over_bulk_lane(
     )) else {
         return all_failed();
     };
-    let state_path = crate::config_sync::SyncState::path();
-    let mut state = crate::config_sync::SyncState::load(&state_path);
+    let mut state = crate::config_sync::SyncState::load(state_path);
     let bulk = crate::remote_bulk::establish(host, socket, |_| {});
     let mut result = PushResult::default();
     for (syncable, local) in files {
@@ -233,9 +240,26 @@ pub(super) fn push_over_bulk_lane(
         let there = remote.get(syncable.name).map(String::as_str);
         match crate::config_sync::plan(&hash, there, state.file(host, syncable.name)) {
             crate::config_sync::Plan::Push => {
-                let remote_rel = format!(".config/croft/{}", syncable.name);
-                let ok =
-                    ship_local_file_to_remote(&bulk.lane, socket, host, local, &remote_rel).is_ok();
+                #[cfg(unix)]
+                let ok = {
+                    let dest = crate::config_sync::remote_dest(host, syncable.name);
+                    // The terminal belongs to the remote croft: rsync, and the
+                    // ssh it starts, get none of it (#2716). A failure is logged
+                    // by name below.
+                    matches!(
+                        ship_file_rsync_command(&bulk.lane, socket, local, &dest)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status(),
+                        Ok(st) if st.success()
+                    )
+                };
+                #[cfg(not(unix))]
+                let ok = {
+                    let remote_rel = format!(".config/croft/{}", syncable.name);
+                    ship_local_file_to_remote(&bulk.lane, socket, host, local, &remote_rel).is_ok()
+                };
                 if ok {
                     let entry = state.file_mut(host, syncable.name);
                     entry.pushed = Some(hash);
@@ -254,6 +278,6 @@ pub(super) fn push_over_bulk_lane(
             }
         }
     }
-    let _ = state.save(&state_path);
+    let _ = state.save(state_path);
     result
 }

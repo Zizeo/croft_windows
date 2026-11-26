@@ -337,8 +337,9 @@ impl App {
             })
             .collect();
         let root = self.roots.primary().to_path_buf();
-        let buffers = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        let buffers = self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .map(|e| {
                 let (steps, bytes) = e.undo_history_size();
@@ -2192,6 +2193,14 @@ impl App {
                 self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::CheckoutTo)
             }
             Cmd::GitStash => self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::Stash),
+            Cmd::GitShowSourceControlActions => self.open_scm_actions_menu_from_keyboard(),
+            Cmd::GitShowCommitActions => self.open_commit_actions_menu_from_keyboard(),
+            Cmd::GitOpenChanges => self.git_file_command(super::scm::GitFileCommand::Open),
+            Cmd::GitStageChanges => self.git_file_command(super::scm::GitFileCommand::Stage),
+            Cmd::GitUnstageChanges => self.git_file_command(super::scm::GitFileCommand::Unstage),
+            Cmd::GitDiscardChanges => self.git_file_command(super::scm::GitFileCommand::Discard),
+            Cmd::GitRefresh => self.refresh_source_control_from_key(),
+            Cmd::GitInitializeRepository => self.initialize_repository_command(),
             Cmd::ToggleTerminalSuggestions => self.toggle_terminal_suggestions(),
             Cmd::ToggleScreenReader => self.toggle_screen_reader(),
             Cmd::OpenKeyboardShortcuts => self.open_keyboard_shortcuts(),

@@ -1295,9 +1295,7 @@ impl App {
     /// editor group the change was entered on.
     pub(super) fn end_vim_undo_groups(&mut self) {
         self.editor.end_undo_group();
-        for group in
-            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
-        {
+        for group in self.editor_layout.all_groups_mut(&mut self.editor) {
             group.end_open_undo_groups();
         }
     }
@@ -2365,6 +2363,8 @@ impl App {
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
         let into_editor = self.handle_paste_inner(s);
+        #[cfg(test)]
+        self.assert_one_view_per_tab();
         if self.macro_recording.is_none() || self.macro_replaying {
             return;
         }

@@ -1347,6 +1347,31 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Tab / Shift+Tab",
+                description: "Step between the message box, the change list and COMMITS",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "R",
+                description: "In the change list or COMMITS: refresh (Git: Refresh)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Enter / S / U / D",
+                description: "In the change list: open / stage / unstage / discard the selected file. Git: Open / Stage / Unstage / Discard Changes do it to the open file",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+A",
+                description: "Open the ⋯ actions menu: arrows, Enter, → / ← for its fly-outs, Esc",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+C",
+                description: "Open the Commit button's ▾ menu (outside the terminal): arrows, Enter, Esc",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "S / U / R in a diff",
                 description: "Stage / unstage / revert the change hunk under the cursor (revert confirms first)",
                 handler: "",

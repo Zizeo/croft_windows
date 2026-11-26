@@ -115,6 +115,8 @@ Per platform:
 | `Cmd+K` `Cmd+T` | Open the Color Theme picker |
 | `Cmd+K` `G` | Remote: accept the status bar's offer to open a workspace on the host a pane has `ssh`'d into; `Esc` dismisses it. Settings: `disable_remote_offer`, `remote_offer_excluded_hosts` |
 | `Cmd+K` `Shift+L` | Agent: New Worktree Lane: creates a worktree on `agent/<slug>`, adds it as a workspace folder and opens a pane there, running the `lane_agent` setting's agent. Close: "Agent: Close Worktree Lane" |
+| `Cmd+K` `Shift+C` | Git: Show Commit Actions: the Commit button's `▾` menu, driven by the keyboard. In the terminal `Cmd+K` `Shift+C` keeps copying the last command's output |
+| `Cmd+K` `Shift+A` | Git: Show Source Control Actions: Source Control's `⋯` menu, driven by the keyboard (see [Source Control sidebar](#source-control-sidebar)) |
 | `Cmd+K` `A` | Session: Participants: who is attached to this persistent session. `Enter` on a row grants/revokes write control or disconnects them |
 | `Cmd+K` `Shift+Q` | Session: Detach: leave a persistent session (`croft attach`, `croft remote`) while it keeps running |
 | `Cmd+K` `X` | Collab: Cancel AI Stream: stop a `croft pair` collaborator's stream into a shared file and revert its text (same as the gutter's orange `■`) |
@@ -475,8 +477,11 @@ Not supported yet: transforms such as `${TM_FILENAME/(.*)\\..+$/$1/}`, a picker 
 | `Home` / `End` | Start / end of the caret's line in the commit message; with `Ctrl`, the start / end of the whole message |
 | `Enter` | Commit with the message: only the staged changes when anything is staged, otherwise every tracked change. Commit & Push (`Ctrl`+`Enter`) and Commit & Sync follow the same rule |
 | Click ✓ Commit | Same as `Enter` |
+| `Tab` / `Shift`+`Tab` | Step between Source Control's REPOSITORIES (shown while several open folders are repositories), message box, change list and COMMITS, in that order (an empty change list is skipped). In REPOSITORIES: `Up` / `Down` and `Home` / `End` move, `Enter` or `Space` shows that repository, as a click on its row does. In COMMITS: `Up` / `Down`, `Home` / `End` and `PageUp` / `PageDown` pick a commit, `Enter` opens its changes, `Left` / `Right` collapse and expand the section. `R` in REPOSITORIES, the change list or COMMITS refreshes (Command Palette "Git: Refresh") |
+| `Tab` / `Shift`+`Tab` in a folder with no repository | Step between the card's buttons (Initialize Repository, or one Open per repository found in a subfolder) and REPOSITORIES; `Up` / `Down` move between the buttons too. `Enter` or `Space` presses the one with the keys, `R` refreshes. Command Palette "Git: Initialize Repository" is the card's Initialize |
 | `Tab`, or `Down` on the message's last line | Move to the change list: `Up` / `Down` select, `Enter` opens the diff, `Space` or `S` stages, `U` unstages, `Backspace`, `Delete` or `D` discards (confirms first), `Tab` returns |
 | Command Palette "Git: Commit" / "Git: Push" / "Git: Pull" / "Git: Sync" / "Git: Checkout to…" / "Git: Stash" | The Commit button's and the menus' actions, each bindable in `keybindings.json` |
+| Command Palette "Git: Open Changes" / "Git: Stage Changes" / "Git: Unstage Changes" / "Git: Discard Changes" | Open the diff of, stage, unstage or discard (confirms first) the open file, or a diff tab's file. In the change list they act on the selected row and their keys are the list's own `Enter`, `S`, `U` and `D`. A file with changes in both sections unstages its staged part and stages, opens or discards its unstaged part |
 | Click a change row | Open that file's diff against HEAD in a read-only editor tab, reused on the next click. With unsaved edits, hunk actions ask for a save first |
 | `S` in a diff tab | Stage the change hunk under the cursor (click a row or `F7` to pick it), or only the selected lines when a selection spans rows |
 | `U` in a diff tab | Unstage the change hunk under the cursor, or only the selected lines when a selection spans rows |
@@ -495,8 +500,10 @@ Not supported yet: transforms such as `${TM_FILENAME/(.*)\\..+$/$1/}`, a picker 
 | Click `↶` on a selected unstaged row | Discard that file (confirms first; deletes untracked files) |
 | Click `−` on a selected staged row | Unstage that file |
 | Click the branch name | Checkout / Create Branch picker: type to filter, `Enter` to switch, or a new name and `Enter` to create it. A remote branch checks out as a local tracking branch |
-| Click the `▾` caret next to Commit | Quick actions menu: Commit & Push, Push, Pull, Sync (Pull, Push), Checkout / Create Branch, Stash, Pop Stash, View Staged Changes, View Changes vs previous, View Changes vs `<default>` |
+| Click the `▾` caret next to Commit | Quick actions menu: Commit & Push, Push, Pull, Sync (Pull, Push), Checkout / Create Branch, Stash, Pop Stash, View Staged Changes, View Changes vs previous, View Changes vs `<default>`. A click outside it closes it and still lands where it falls; `Esc` closes it |
+| `Cmd+K` `Shift+C` (Command Palette "Git: Show Commit Actions") | Open the same quick actions menu from anywhere but the terminal, Source Control coming up first: `Up` / `Down` move, `Enter` runs the row, `Esc` closes |
 | Click the `⋯` icon in the header | Open the full Source Control actions menu with fly-out submenus (listed below the table); `Esc` closes |
+| `Cmd+K` `Shift+A` (Command Palette "Git: Show Source Control Actions") | Open the same `⋯` menu from anywhere, Source Control coming up first: `Up` / `Down` move, `Enter` or `→` opens a fly-out, `←` leaves it, `Enter` runs the row, `Esc` closes. After a click on `⋯`, the first key shows the highlight |
 | Right-click a row in COMMITS | The commit's actions: Cherry-Pick, Revert, Checkout (Detached), Create Branch Here, Create Tag Here, Reset Current Branch to Here (Soft / Mixed / Hard), Copy Commit Hash, Copy Commit Message |
 | Discard All Changes | Revert every tracked file to HEAD after a `Y`/`N` confirm (untracked files are kept) |
 | Click the header refresh icon | Force an immediate git re-scan |

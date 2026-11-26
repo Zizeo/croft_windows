@@ -671,8 +671,16 @@ fn scm_view(sc: &crate::widgets::source_control::SourceControlPanel) -> String {
     if sc.focused {
         out.push_str(" +focus");
     }
-    if sc.list_focused {
-        out.push_str(" +list");
+    match sc.keys {
+        crate::widgets::source_control::KeyStop::Message => {}
+        crate::widgets::source_control::KeyStop::List => out.push_str(" +list"),
+        crate::widgets::source_control::KeyStop::Commits => out.push_str(" +commits"),
+        crate::widgets::source_control::KeyStop::Repositories => {
+            out.push_str(&format!(" +repositories@{}", sc.repo_cursor));
+        }
+        crate::widgets::source_control::KeyStop::Card => {
+            out.push_str(&format!(" +card@{}", sc.card_button));
+        }
     }
     if let Some(i) = sc.selected_change {
         out.push_str(&format!(" sel={i}"));
@@ -980,8 +988,6 @@ fn fields(app: &App, root: &Path, read: &[String; 5], hide_ids: bool) -> Fields 
                     .map(|p| format!("{} {}", quote(&p.label), quote(&p.buffer))),
             ),
             ("menu", menu),
-            ("scm_menu", on(app.scm_menu.open)),
-            ("commit_menu", on(app.commit_menu_open)),
             (
                 "commit_feedback",
                 app.source_control
@@ -1898,6 +1904,30 @@ struct ProofPlace {
     commands: &'static [Command],
 }
 
+/// Source Control with its change list focused on the row for `path`, in
+/// the ledger's repository: where the list's own keys act (#871).
+fn scm_list_on(app: &mut App, path: &str) {
+    app.set_sidebar_view(SidebarView::SourceControl);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "git status for Source Control",
+        || {
+            app.drain_git_responses();
+            app.source_control.entries.len() == 2
+        },
+    );
+    app.source_control.keys = crate::widgets::source_control::KeyStop::List;
+    app.source_control.selected_change = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == path);
+    assert!(
+        app.source_control.selected_change.is_some(),
+        "{path} has a row"
+    );
+}
+
 /// The places beyond the ledger's own contexts.
 const PROOF_PLACES: &[ProofPlace] = &[
     ProofPlace {
@@ -2076,6 +2106,56 @@ const PROOF_PLACES: &[ProofPlace] = &[
             Command::SearchTogglePreserveCase,
             Command::SearchToggleDetails,
         ],
+    },
+    ProofPlace {
+        context: Context {
+            name: "Source Control's change list on a new file",
+            repo: true,
+            setup: |app| scm_list_on(app, "todo.txt"),
+        },
+        commands: &[
+            Command::GitOpenChanges,
+            Command::GitStageChanges,
+            Command::GitDiscardChanges,
+        ],
+    },
+    ProofPlace {
+        context: Context {
+            name: "Source Control's change list on a staged file",
+            repo: true,
+            setup: |app| scm_list_on(app, "docs/notes.md"),
+        },
+        commands: &[Command::GitUnstageChanges],
+    },
+    ProofPlace {
+        context: Context {
+            name: "Source Control's COMMITS with the keys",
+            repo: true,
+            setup: |app| {
+                scm_list_on(app, "todo.txt");
+                app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+                    .unwrap();
+            },
+        },
+        commands: &[Command::GitRefresh],
+    },
+    ProofPlace {
+        context: Context {
+            name: "Source Control in a folder with no repository",
+            repo: false,
+            setup: |app| {
+                app.set_sidebar_view(SidebarView::SourceControl);
+                crate::test_budget::await_spawned(
+                    std::time::Duration::from_millis(500),
+                    "git status for Source Control",
+                    || {
+                        app.drain_git_responses();
+                        app.source_control.status_known
+                    },
+                );
+            },
+        },
+        commands: &[Command::GitInitializeRepository],
     },
 ];
 

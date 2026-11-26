@@ -101,6 +101,22 @@ impl App {
                 self.open_sticky_note_prompt();
                 true
             }
+            // Cmd+K Shift+C anywhere but the terminal's shell: Git: Show
+            // Commit Actions (#871), the Commit button's dropdown with the
+            // keyboard on it. Only the Terminal tab has a shell: on Output,
+            // Problems, Ports or Captures the panel has focus but the chord
+            // is this one. Case-insensitive for the CSI-u reason given at
+            // Shift+W, and before the terminal's C/S/R arm and the plain C arm.
+            KeyCode::Char(c)
+                if shifted
+                    && plain
+                    && c.eq_ignore_ascii_case(&'c')
+                    && !(self.focus == Pane::Terminal
+                        && self.bottom_panel_tab == BottomPanelTab::Terminal) =>
+            {
+                self.open_commit_actions_menu_from_keyboard();
+                true
+            }
             // Cmd+K ⇧C / ⇧S / ⇧R with the terminal focused: the keyboard
             // forms of the decoration-menu actions, applied to the LAST
             // finished command (VS Code's copyLastCommandOutput family).
@@ -209,6 +225,14 @@ impl App {
             // Cmd+K Cmd+T / Cmd+K T: open the Color Theme picker.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'t') => {
                 self.open_theme_picker();
+                true
+            }
+            // Cmd+K Shift+A: Git: Show Source Control Actions (#871), the
+            // `⋯` menu with the keyboard on it. Matched case-insensitively
+            // for the CSI-u reason given at Shift+W, and before the plain A
+            // arm below.
+            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'a') => {
+                self.open_scm_actions_menu_from_keyboard();
                 true
             }
             // Cmd+K A: who is attached to this multiplayer session
@@ -1094,10 +1118,6 @@ impl App {
             } else {
                 self.finish_tour();
             }
-            return Ok(());
-        }
-        if self.scm_menu.open && matches!(key.code, KeyCode::Esc) {
-            self.scm_menu.close();
             return Ok(());
         }
         // Macro recording (#255) taps the key here: every modal above has

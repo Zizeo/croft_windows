@@ -385,8 +385,9 @@ impl App {
     /// exist yet; its appearing is a change like any other.
     pub(super) fn polled_open_file_paths(&self) -> Vec<PathBuf> {
         let mut paths = self.open_tab_paths();
-        let wal = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        let wal = self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter(|e| {
                 e.sheet
@@ -406,8 +407,8 @@ impl App {
     /// stats these, so a background tab in a dir that carries no watch still
     /// sees an external write.
     pub(super) fn open_tab_paths(&self) -> Vec<PathBuf> {
-        std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        self.editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter_map(|e| e.path.clone())
             .collect()
@@ -796,6 +797,13 @@ impl App {
                 && revspec == self.graph_revspec
             {
                 self.commit_graph.set_rows(rows);
+                // COMMITS took the keys before its history landed (#871):
+                // the newest commit is picked now, as Tab would have.
+                if self.source_control.keys == crate::widgets::source_control::KeyStop::Commits
+                    && self.commit_graph.selected_commit().is_none()
+                {
+                    self.commit_graph.select(0);
+                }
                 changed = true;
             }
             // A trigger arrived while this fetch was in flight: what it
@@ -2259,6 +2267,9 @@ impl App {
         // OLD repo's state (or "no repo") even after a Make Root that
         // landed inside a real git tree.
         self.git.set_root(new_root.clone());
+        // Until the new root's status lands, the card the old one may have
+        // left does not take the keys (#871).
+        self.source_control.status_known = false;
         self.refresh_git_status_debounced();
         // Drop the old repo's graph before the refresh (inside
         // refresh_source_control) refetches for the new root; a reply still
@@ -2577,8 +2588,7 @@ impl App {
     /// not just the focused one: a tab in the other split kept the old path,
     /// raised a disk conflict, and a save brought the old file back.
     pub(super) fn rename_open_path_everywhere(&mut self, old: &Path, new: &Path) {
-        self.editor.rename_open_path(old, new);
-        for group in self.editor_layout.inactive_groups_mut() {
+        for group in self.editor_layout.all_groups_mut(&mut self.editor) {
             group.rename_open_path(old, new);
         }
     }
@@ -2613,8 +2623,7 @@ impl App {
                 // edits away while the trash only held the saved copy.
                 let mut kept = 0;
                 for path in &paths {
-                    kept += self.editor.close_clean_tabs_under(path);
-                    for group in self.editor_layout.inactive_groups_mut() {
+                    for group in self.editor_layout.all_groups_mut(&mut self.editor) {
                         kept += group.close_clean_tabs_under(path);
                     }
                 }

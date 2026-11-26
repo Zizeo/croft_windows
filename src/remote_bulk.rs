@@ -103,7 +103,7 @@ impl BulkLane {
     }
 
     fn base_ssh_command(&self, interactive_socket: &Path) -> Command {
-        let mut command = Command::new("ssh");
+        let mut command = crate::proc::command("ssh");
         let sock = self.socket(interactive_socket);
         if !sock.as_os_str().is_empty() {
             command
@@ -133,6 +133,7 @@ impl BulkLane {
 /// Args for the auth probe: succeeds only when the host authenticates
 /// without prompting (key/agent), over a fresh connection that must not
 /// touch any existing control socket.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn probe_args(host: &str) -> Vec<String> {
     [
         "-o",
@@ -155,6 +156,7 @@ pub fn probe_args(host: &str) -> Vec<String> {
 /// fails fast instead of hanging on a prompt nobody can answer, IPQoS
 /// throughput so routers with working AQM deprioritize the bulk flow
 /// under the interactive session's lowdelay traffic.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn bulk_master_args(socket_path: &Path, host: &str) -> Vec<String> {
     let mut args: Vec<String> = vec![
         String::from("-M"),
@@ -205,7 +207,7 @@ struct MasterGuard {
 
 impl Drop for MasterGuard {
     fn drop(&mut self) {
-        let _ = Command::new("ssh")
+        let _ = crate::proc::command("ssh")
             .arg("-S")
             .arg(&self.socket_path)
             .arg("-O")
@@ -274,12 +276,14 @@ pub fn establish(host: &str, interactive_socket: &Path, log: impl Fn(String)) ->
     }
 }
 
+#[cfg(not(unix))]
+fn open_dedicated_master(_host: &str) -> Option<MasterGuard> {
+    None
+}
+
+#[cfg(unix)]
 fn open_dedicated_master(host: &str) -> Option<MasterGuard> {
-    if cfg!(not(unix)) {
-        let _ = host;
-        return None;
-    }
-    let probe_ok = Command::new("ssh")
+    let probe_ok = crate::proc::command("ssh")
         .args(probe_args(host))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -290,15 +294,12 @@ fn open_dedicated_master(host: &str) -> Option<MasterGuard> {
     if !probe_ok {
         return None;
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let socket_dir =
-        std::env::temp_dir().join(format!("croft-ssh-bulk-{}-{now}", std::process::id()));
-    std::fs::create_dir_all(&socket_dir).ok()?;
+    // Owner-only and new, as the session's own socket directory is: a
+    // predictable name taken with `create_dir_all` accepted a directory
+    // another local user had made first (#2717).
+    let socket_dir = crate::remote::ssh_control_dir().ok()?;
     let socket_path = socket_dir.join("ctl");
-    let started = Command::new("ssh")
+    let started = crate::proc::command("ssh")
         .args(bulk_master_args(&socket_path, host))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -354,6 +355,31 @@ fn measure_throughput(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2717: the bulk connection's socket goes in a directory only croft's
+    /// user can enter, made new for it, like the session's own (see
+    /// `ssh_control_dir`). It was a predictable name in the shared temp
+    /// directory, taken with `create_dir_all`, so a directory another local
+    /// user had made first was accepted, and the default mode let others in.
+    #[cfg(unix)]
+    #[test]
+    fn the_bulk_connections_socket_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = tempfile::tempdir().unwrap();
+        crate::proc::stand_in_script(bin.path(), "ssh", "exit 0\n");
+        let guard = open_dedicated_master("box").expect("the stand-in connects");
+        let mode = std::fs::metadata(&guard.socket_dir)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(format!("{:o}", mode & 0o777), "700");
+        let dir = guard.socket_dir.clone();
+        drop(guard);
+        assert!(
+            !dir.exists(),
+            "closing the connection removes its directory"
+        );
+    }
 
     #[test]
     fn probe_requires_batchmode_and_bypasses_every_control_socket() {
