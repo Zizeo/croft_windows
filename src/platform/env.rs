@@ -217,32 +217,18 @@ fn find_on_path(exe: &str) -> Option<PathBuf> {
     None
 }
 
-/// True when `path` is a regular file that is executable (checks `0o111` on Unix;
-/// any regular file on Windows).
+/// True when `path` is a regular file that is executable (checks `0o111` on
+/// Unix; checks `PATHEXT` extension on Windows).
 pub fn is_executable_file(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    super::fs::is_executable(path)
 }
 
 /// Find an executable named `cmd` inside `dir`.
 ///
 /// On Unix, checks `dir.join(cmd)`.
-/// On Windows, probes `.exe`, `.cmd`, `.bat` BEFORE the bare name `cmd` so that
-/// in directories like `node_modules/.bin` or `%APPDATA%\npm` (which contain
-/// both a bare POSIX `#!/bin/sh` script and a `<cmd>.cmd` batch wrapper),
-/// the runnable Windows `.exe`/`.cmd` file always wins.
+/// On Windows, probes `.exe`, `.cmd`, `.bat` extensions via [`is_executable_file`]
+/// (when `cmd` already carries an extension, checks that exact path directly)
+/// so bare extensionless POSIX shims are ignored.
 pub fn executable_in_dir(dir: &Path, cmd: &str) -> Option<PathBuf> {
     #[cfg(unix)]
     {
@@ -253,17 +239,10 @@ pub fn executable_in_dir(dir: &Path, cmd: &str) -> Option<PathBuf> {
     {
         if Path::new(cmd).extension().is_some() {
             let candidate = dir.join(cmd);
-            if is_executable_file(&candidate) {
-                return Some(candidate);
-            }
+            return is_executable_file(&candidate).then_some(candidate);
         }
-        for ext in [".exe", ".cmd", ".bat", ""] {
-            let name = if ext.is_empty() {
-                cmd.to_string()
-            } else {
-                format!("{cmd}{ext}")
-            };
-            let candidate = dir.join(name);
+        for ext in [".exe", ".cmd", ".bat"] {
+            let candidate = dir.join(format!("{cmd}{ext}"));
             if is_executable_file(&candidate) {
                 return Some(candidate);
             }
@@ -337,10 +316,17 @@ pub fn find_dlv_in(
     }
     dirs.extend(home.map(|h| h.join(".croft").join("servers").join("go")));
     dirs.into_iter().find_map(|d| {
-        executable_in_dir(&d, "dlv").or_else(|| {
-            let p = d.join("dlv");
-            p.is_file().then_some(p)
-        })
+        #[cfg(unix)]
+        {
+            executable_in_dir(&d, "dlv").or_else(|| {
+                let p = d.join("dlv");
+                p.is_file().then_some(p)
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            executable_in_dir(&d, "dlv")
+        }
     })
 }
 

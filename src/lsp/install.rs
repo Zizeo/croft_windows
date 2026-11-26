@@ -1616,6 +1616,10 @@ fn discover_node_dir() -> Option<PathBuf> {
     if let Some(dir) = nvm_node_dir() {
         return Some(dir);
     }
+    #[cfg(windows)]
+    if let Some(dir) = fnm_node_dir() {
+        return Some(dir);
+    }
     if let Some(dir) = well_known_node_dirs().into_iter().find(|dir| {
         crate::platform::env::executable_in_dir(dir, "node").is_some()
             && crate::platform::env::executable_in_dir(dir, "npm").is_some()
@@ -1684,9 +1688,13 @@ pub(crate) fn node_probe_command() -> Command {
     #[cfg(windows)]
     {
         use std::process::Stdio;
-        let script = format!("process.stdout.write(\"{NODE_PROBE_MARKER}\"+process.execPath)");
-        let mut cmd = Command::new("cmd.exe");
-        cmd.args(["/d", "/s", "/c", "node", "-e", &script])
+        let shell = crate::platform::env::resolve_on_path("pwsh")
+            .unwrap_or_else(|| PathBuf::from("powershell.exe"));
+        let script =
+            format!("node -e 'process.stdout.write(\"{NODE_PROBE_MARKER}\"+process.execPath)'");
+        let mut cmd = Command::new(shell);
+        // Load PowerShell profiles so fnm/volta/custom PATH hooks take effect.
+        cmd.args(["-Command", &script])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -1750,10 +1758,13 @@ fn nvm_node_dir() -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn nvm_windows_node_dir_in(versions: &Path) -> Option<PathBuf> {
+fn windows_versioned_node_dir_in(versions: &Path, sub: Option<&str>) -> Option<PathBuf> {
     let mut best: Option<((u64, u64, u64), PathBuf)> = None;
     for entry in std::fs::read_dir(versions).ok()?.flatten() {
-        let dir = entry.path();
+        let dir = match sub {
+            Some(s) => entry.path().join(s),
+            None => entry.path(),
+        };
         if crate::platform::env::executable_in_dir(&dir, "node").is_none()
             || crate::platform::env::executable_in_dir(&dir, "npm").is_none()
         {
@@ -1765,6 +1776,30 @@ fn nvm_windows_node_dir_in(versions: &Path) -> Option<PathBuf> {
         }
     }
     best.map(|(_, dir)| dir)
+}
+
+#[cfg(windows)]
+fn nvm_windows_node_dir_in(versions: &Path) -> Option<PathBuf> {
+    windows_versioned_node_dir_in(versions, None)
+}
+
+#[cfg(windows)]
+fn fnm_node_dir_in(versions: &Path) -> Option<PathBuf> {
+    windows_versioned_node_dir_in(versions, Some("installation"))
+}
+
+#[cfg(windows)]
+fn fnm_node_dir() -> Option<PathBuf> {
+    let candidates = [
+        std::env::var_os("FNM_DIR").map(|p| PathBuf::from(p).join("node-versions")),
+        std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("fnm").join("node-versions")),
+        std::env::var_os("LOCALAPPDATA")
+            .map(|p| PathBuf::from(p).join("fnm").join("node-versions")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find_map(|root| fnm_node_dir_in(&root))
 }
 
 /// Pure core of [`nvm_node_dir`], split out so it's testable against a temp
@@ -1813,6 +1848,19 @@ fn well_known_node_dirs() -> Vec<PathBuf> {
     {
         if let Some(symlink) = std::env::var_os("NVM_SYMLINK") {
             dirs.push(PathBuf::from(symlink));
+        }
+        if let Some(volta) = std::env::var_os("VOLTA_HOME") {
+            dirs.push(PathBuf::from(volta).join("bin"));
+        }
+        if let Some(scoop) = std::env::var_os("SCOOP") {
+            let scoop = PathBuf::from(scoop);
+            dirs.push(scoop.join("apps").join("nodejs").join("current"));
+            dirs.push(scoop.join("apps").join("nodejs-lts").join("current"));
+        }
+        if let Some(home) = crate::platform::env::home_dir() {
+            let scoop = home.join("scoop");
+            dirs.push(scoop.join("apps").join("nodejs").join("current"));
+            dirs.push(scoop.join("apps").join("nodejs-lts").join("current"));
         }
         if let Some(pf) = std::env::var_os("ProgramFiles") {
             dirs.push(PathBuf::from(pf).join("nodejs"));
@@ -2689,7 +2737,7 @@ mod tests {
         for v in ["v18.19.0", "v23.7.0"] {
             let bin = versions.join(v).join("bin");
             std::fs::create_dir_all(&bin).unwrap();
-            let node = bin.join("node");
+            let node = bin.join(if cfg!(windows) { "node.exe" } else { "node" });
             std::fs::write(&node, b"#!/bin/sh\n").unwrap();
             #[cfg(unix)]
             {
@@ -2770,6 +2818,43 @@ mod tests {
         assert_eq!(
             prepend_paths(&[]),
             std::env::var_os("PATH").unwrap_or_default()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fnm_node_dir_picks_highest_version_with_node_and_npm() {
+        let tmp = TempDir::new().unwrap();
+        let versions = tmp.path();
+        for v in ["v18.0.0", "v22.5.0"] {
+            let inst = versions.join(v).join("installation");
+            std::fs::create_dir_all(&inst).unwrap();
+            std::fs::write(inst.join("node.exe"), b"").unwrap();
+            std::fs::write(inst.join("npm.cmd"), b"@echo off\r\n").unwrap();
+        }
+        std::fs::create_dir_all(versions.join("v23.0.0").join("installation")).unwrap();
+        let dir = fnm_node_dir_in(versions).unwrap();
+        assert_eq!(dir, versions.join("v22.5.0").join("installation"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_node_probe_command_uses_powershell_not_cmd() {
+        let cmd = node_probe_command();
+        let prog = cmd.get_program().to_string_lossy().to_ascii_lowercase();
+        assert!(!prog.contains("cmd"), "unexpected cmd program: {prog}");
+        assert!(
+            prog.contains("pwsh") || prog.contains("powershell"),
+            "expected PowerShell binary, got {prog}"
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.first().map(String::as_str), Some("-Command"));
+        assert!(
+            args.get(1)
+                .is_some_and(|s| s.contains(NODE_PROBE_MARKER) && s.contains("process.execPath"))
         );
     }
 

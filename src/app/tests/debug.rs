@@ -1116,11 +1116,22 @@ fn a_debuggee_with_no_venv_and_no_python3_is_left_to_the_debug_venv() {
 
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    std::fs::write(bin.join("python3"), b"#!/bin/sh\n").unwrap();
+    let py_name = if cfg!(windows) {
+        "python3.exe"
+    } else {
+        "python3"
+    };
+    let py_path = bin.join(py_name);
+    std::fs::write(&py_path, b"#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&py_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let with_python = std::env::join_paths([&empty, &bin]).unwrap();
     assert_eq!(
         super::debuggee_python(&pkg, &root, Some(&with_python)),
-        Some(bin.join("python3"))
+        Some(py_path)
     );
 }
 

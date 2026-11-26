@@ -260,9 +260,13 @@ fn env_executable_in_dir_prefers_windows_extensions_over_posix_shims() {
     let vtsls_posix = dir.join("vtsls");
     let vtsls_cmd = dir.join("vtsls.cmd");
     let ra_exe = dir.join("rust-analyzer.exe");
+    let only_shim = dir.join("only-shim");
+    let readme_txt = dir.join("README.txt");
     std::fs::write(&vtsls_posix, b"#!/bin/sh\n").unwrap();
     std::fs::write(&vtsls_cmd, b"@echo off\r\n").unwrap();
     std::fs::write(&ra_exe, b"").unwrap();
+    std::fs::write(&only_shim, b"#!/bin/sh\n").unwrap();
+    std::fs::write(&readme_txt, b"docs\n").unwrap();
 
     #[cfg(windows)]
     {
@@ -272,8 +276,15 @@ fn env_executable_in_dir_prefers_windows_extensions_over_posix_shims() {
         );
         assert_eq!(
             platform::env::executable_in_dir(dir, "rust-analyzer"),
+            Some(ra_exe.clone())
+        );
+        assert_eq!(
+            platform::env::executable_in_dir(dir, "rust-analyzer.exe"),
             Some(ra_exe)
         );
+        assert_eq!(platform::env::executable_in_dir(dir, "only-shim"), None);
+        assert!(!platform::env::is_executable_file(&readme_txt));
+        assert_eq!(platform::env::executable_in_dir(dir, "README.txt"), None);
     }
 
     #[cfg(unix)]

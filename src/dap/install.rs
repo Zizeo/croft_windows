@@ -612,10 +612,11 @@ mod tests {
     #[test]
     fn find_dlv_searches_path_then_gobin_then_gopath_then_croft() {
         let tmp = tempfile::tempdir().unwrap();
+        let dlv_name = if cfg!(windows) { "dlv.exe" } else { "dlv" };
         let mk = |rel: &str| {
             let dir = tmp.path().join(rel);
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("dlv"), "").unwrap();
+            std::fs::write(dir.join(dlv_name), "").unwrap();
             dir
         };
         let on_path = mk("path");
@@ -626,20 +627,20 @@ mod tests {
         let path_env = std::env::join_paths([on_path.clone()]).unwrap();
         assert_eq!(
             find_dlv(Some(&path_env), Some(&gobin), None, Some(&home)),
-            Some(on_path.join("dlv"))
+            Some(on_path.join(dlv_name))
         );
         assert_eq!(
             find_dlv(None, Some(&gobin), None, Some(&home)),
-            Some(gobin.join("dlv"))
+            Some(gobin.join(dlv_name))
         );
         assert_eq!(
             find_dlv(None, None, None, Some(&home)),
-            Some(home_go.join("dlv"))
+            Some(home_go.join(dlv_name))
         );
-        std::fs::remove_file(home_go.join("dlv")).unwrap();
+        std::fs::remove_file(home_go.join(dlv_name)).unwrap();
         assert_eq!(
             find_dlv(None, None, None, Some(&home)),
-            Some(croft.join("dlv"))
+            Some(croft.join(dlv_name))
         );
         assert_eq!(find_dlv(None, None, None, None), None, "nowhere to look");
     }
