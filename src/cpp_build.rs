@@ -589,7 +589,10 @@ mod tests {
         assert!(built.binary.starts_with(&cache), "{:?}", built.binary);
         assert!(built.how.contains("compile_commands.json"), "{}", built.how);
         let ran = Command::new(&built.binary).output().unwrap();
-        assert_eq!(String::from_utf8_lossy(&ran.stdout), "2\n");
+        assert_eq!(
+            String::from_utf8_lossy(&ran.stdout).replace("\r\n", "\n"),
+            "2\n"
+        );
     }
 
     #[test]

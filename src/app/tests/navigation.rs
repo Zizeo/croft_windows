@@ -618,12 +618,17 @@ fn cmd_click_on_a_file_line_reference_in_the_terminal_opens_the_file_there() {
     #[cfg(windows)]
     app.terminal_mut().end_child();
     term.draw(|f| app.render(f)).unwrap();
-    let snapshot = app.terminal().visible_text();
-    let row_idx = snapshot
-        .lines()
-        .position(is_output_line)
-        .unwrap_or_else(|| panic!("shell must print the reference; got:\n{snapshot}"));
-    let line = snapshot.lines().nth(row_idx).unwrap();
+    let (visible_rows, _) = app.terminal().visible_lines();
+    let row_idx = visible_rows
+        .iter()
+        .position(|l| is_output_line(l))
+        .unwrap_or_else(|| {
+            panic!(
+                "shell must print the reference; got:\n{}",
+                visible_rows.join("\n")
+            )
+        });
+    let line = &visible_rows[row_idx];
     let col = line.find("probe.rs").unwrap() + 2;
 
     let inner = app.terminal().last_inner;
@@ -678,12 +683,12 @@ fn a_ctrl_click_that_opens_nothing_does_not_arm_the_terminal_double_click() {
     let probe = format!("croftmodclick{}", std::process::id());
     await_terminal_probe(&mut app, &probe);
     term.draw(|f| app.render(f)).unwrap();
-    let snap = app.terminal().visible_text();
-    let row_idx = snap
-        .lines()
+    let (visible_rows, _) = app.terminal().visible_lines();
+    let row_idx = visible_rows
+        .iter()
         .position(|l| l.contains(&probe))
         .expect("probe must render");
-    let line = snap.lines().nth(row_idx).unwrap();
+    let line = &visible_rows[row_idx];
     let mid_col = line.find(&probe).unwrap() + probe.len() / 2;
     let inner = app.terminal().last_inner;
     let screen_y = inner.y + row_idx as u16;

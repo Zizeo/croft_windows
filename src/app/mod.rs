@@ -5811,6 +5811,10 @@ fn truncate_for_display(s: &str, max: usize) -> String {
 /// was reused reads as alive and only leaks a file, and every wrong answer
 /// this can give errs that way.
 fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    if libc::pid_t::try_from(pid).is_err() {
+        return true;
+    }
     crate::platform::process::is_pid_alive(pid)
 }
 

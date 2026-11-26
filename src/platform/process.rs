@@ -386,6 +386,7 @@ pub fn reset_sigpipe_default() {
 /// Strip a trailing `.exe` suffix (ASCII case-insensitive) from a Windows
 /// process name when a non-empty stem precedes it, using byte indexing so
 /// non-ASCII UTF-8 names never panic on non-char boundaries.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub fn strip_windows_exe(name: &str) -> &str {
     let bytes = name.as_bytes();
     if bytes.len() > 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".exe") {

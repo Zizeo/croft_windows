@@ -2689,7 +2689,13 @@ mod tests {
         for v in ["v18.19.0", "v23.7.0"] {
             let bin = versions.join(v).join("bin");
             std::fs::create_dir_all(&bin).unwrap();
-            std::fs::write(bin.join("node"), b"#!/bin/sh\n").unwrap();
+            let node = bin.join("node");
+            std::fs::write(&node, b"#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
         }
         std::fs::create_dir_all(versions.join("v20.0.0")).unwrap(); // no bin/node
         let dir = nvm_node_dir_in(versions).unwrap();
