@@ -132,37 +132,43 @@ pub fn underline_colors_supported(env: impl Fn(&str) -> Option<String>) -> bool 
         Some("0") => return false,
         _ => {}
     }
-    let var = |name: &str| env(name).unwrap_or_default().to_ascii_lowercase();
-    const PROGRAMS: &[&str] = &[
-        "iterm.app",
-        "wezterm",
-        "ghostty",
-        "vscode",
-        "tmux",
-        "rio",
-        "croft",
-    ];
-    if PROGRAMS.contains(&var("TERM_PROGRAM").as_str()) {
-        return true;
+    // Windows ConPTY skips `58` in crossterm's semicolon-form `58;2;r;g;b`
+    // and interprets `;2;` as SGR 2 (dim), fading all text painted after it.
+    #[cfg(windows)]
+    {
+        false
     }
-    const TERMS: &[&str] = &[
-        "kitty",
-        "ghostty",
-        "alacritty",
-        "wezterm",
-        "foot",
-        "contour",
-        "rio",
-        "tmux",
-    ];
-    let term = var("TERM");
-    if TERMS.iter().any(|t| term.contains(t)) {
-        return true;
+    #[cfg(not(windows))]
+    {
+        let var = |name: &str| env(name).unwrap_or_default().to_ascii_lowercase();
+        const PROGRAMS: &[&str] = &[
+            "iterm.app",
+            "wezterm",
+            "ghostty",
+            "vscode",
+            "tmux",
+            "rio",
+            "croft",
+        ];
+        if PROGRAMS.contains(&var("TERM_PROGRAM").as_str()) {
+            return true;
+        }
+        const TERMS: &[&str] = &[
+            "kitty",
+            "ghostty",
+            "alacritty",
+            "wezterm",
+            "foot",
+            "contour",
+            "rio",
+            "tmux",
+        ];
+        let term = var("TERM");
+        if TERMS.iter().any(|t| term.contains(t)) {
+            return true;
+        }
+        var("VTE_VERSION").parse::<u32>().is_ok_and(|v| v >= 5200)
     }
-    if env("WT_SESSION").is_some_and(|s| !s.is_empty()) {
-        return true;
-    }
-    var("VTE_VERSION").parse::<u32>().is_ok_and(|v| v >= 5200)
 }
 
 /// Clear every underline colour in a finished frame, for a terminal that
@@ -489,7 +495,8 @@ mod tests {
     #[test]
     fn underline_colours_go_only_to_terminals_that_read_them() {
         use super::underline_colors_supported as reads;
-        // xterm, whatever its depth: 24-bit colour is not underline colour.
+        // xterm and ConPTY hosts (WT_SESSION), whatever their depth: 24-bit
+        // colour is not underline colour.
         assert!(!reads(env(&[("TERM", "xterm")])));
         assert!(!reads(env(&[
             ("TERM", "xterm-256color"),
@@ -501,30 +508,44 @@ mod tests {
             ("TERM_PROGRAM", "Apple_Terminal"),
             ("TERM", "xterm-256color")
         ])));
+        assert!(!reads(env(&[("WT_SESSION", "abc")])));
         assert!(!reads(env(&[])));
-        for (k, v) in [
-            ("TERM_PROGRAM", "iTerm.app"),
-            ("TERM_PROGRAM", "WezTerm"),
-            ("TERM_PROGRAM", "ghostty"),
-            ("TERM_PROGRAM", "vscode"),
-            ("TERM_PROGRAM", "tmux"),
-            ("TERM_PROGRAM", "croft"),
-            ("TERM", "xterm-kitty"),
-            ("TERM", "alacritty"),
-            ("TERM", "foot"),
-            ("TERM", "tmux-256color"),
-            ("WT_SESSION", "abc"),
-        ] {
-            assert!(reads(env(&[(k, v)])), "{k}={v}");
+        #[cfg(windows)]
+        {
+            for (k, v) in [
+                ("TERM_PROGRAM", "vscode"),
+                ("TERM_PROGRAM", "WezTerm"),
+                ("TERM_PROGRAM", "ghostty"),
+                ("WT_SESSION", "abc"),
+            ] {
+                assert!(!reads(env(&[(k, v)])), "{k}={v}");
+            }
         }
-        assert!(reads(env(&[
-            ("TERM", "xterm-256color"),
-            ("VTE_VERSION", "7600")
-        ])));
-        assert!(!reads(env(&[
-            ("TERM", "xterm-256color"),
-            ("VTE_VERSION", "5000")
-        ])));
+        #[cfg(not(windows))]
+        {
+            for (k, v) in [
+                ("TERM_PROGRAM", "iTerm.app"),
+                ("TERM_PROGRAM", "WezTerm"),
+                ("TERM_PROGRAM", "ghostty"),
+                ("TERM_PROGRAM", "vscode"),
+                ("TERM_PROGRAM", "tmux"),
+                ("TERM_PROGRAM", "croft"),
+                ("TERM", "xterm-kitty"),
+                ("TERM", "alacritty"),
+                ("TERM", "foot"),
+                ("TERM", "tmux-256color"),
+            ] {
+                assert!(reads(env(&[(k, v)])), "{k}={v}");
+            }
+            assert!(reads(env(&[
+                ("TERM", "xterm-256color"),
+                ("VTE_VERSION", "7600")
+            ])));
+            assert!(!reads(env(&[
+                ("TERM", "xterm-256color"),
+                ("VTE_VERSION", "5000")
+            ])));
+        }
     }
 
     /// The answer carried from another croft wins both ways.
@@ -539,6 +560,12 @@ mod tests {
             ("TERM_PROGRAM", "ghostty"),
             (UNDERLINE_COLORS_ENV, "0")
         ])));
+        #[cfg(windows)]
+        assert!(!reads(env(&[
+            ("TERM_PROGRAM", "ghostty"),
+            (UNDERLINE_COLORS_ENV, "maybe")
+        ])));
+        #[cfg(not(windows))]
         assert!(reads(env(&[
             ("TERM_PROGRAM", "ghostty"),
             (UNDERLINE_COLORS_ENV, "maybe")
