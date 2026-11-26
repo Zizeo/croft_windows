@@ -65,10 +65,7 @@ OpenSSH `ControlMaster` sockets are not available in the native build and remain
 `croft devcontainer`, and the pane/session host internals behind them. Use the Linux build under
 WSL2 for those.
 
-The full internal test suite is not yet ported: `tests/platform` runs on Windows, while the broader
-`cargo test --bin croft` suite still carries Unix-only tests, and Windows CI is not wired up. Treat
-this fork as usable-but-young rather than release-hardened. The work item list and per-area status
-live in [Windows_Port.md](Windows_Port.md).
+Windows CI runs `cargo fmt`, `cargo clippy`, `tests/platform`, `tests/cli`, and `cargo test --bin croft` on `x86_64-pc-windows-msvc` (with Unix-only daemon tests gated). The work item list and per-area status live in [Windows_Port.md](Windows_Port.md).
 
 ## Requirements
 

@@ -26,8 +26,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-const RELEASES: &str = "https://github.com/vitali87/croft/releases/download";
-
 /// Largest archive accepted: the release tarballs are a few MB compressed.
 const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -47,22 +45,25 @@ pub fn eligible_with(manifest_dir: &str, exists: bool) -> bool {
 
 /// The archive and checksum URLs for `version` (no `v`) and `triple`.
 pub fn release_urls(version: &str, triple: &str) -> (String, String) {
+    let repo = crate::update_check::GITHUB_REPO;
     (
-        format!("{RELEASES}/v{version}/croft-{triple}.tar.gz"),
-        format!("{RELEASES}/v{version}/SHA256SUMS"),
+        format!("https://github.com/{repo}/releases/download/v{version}/croft-{triple}.tar.gz"),
+        format!("https://github.com/{repo}/releases/download/v{version}/SHA256SUMS"),
     )
 }
 
 /// The Sigstore bundle `release.yml` publishes beside `SHA256SUMS`.
 fn bundle_url(version: &str) -> String {
-    format!("{RELEASES}/v{version}/SHA256SUMS.sigstore.json")
+    let repo = crate::update_check::GITHUB_REPO;
+    format!("https://github.com/{repo}/releases/download/v{version}/SHA256SUMS.sigstore.json")
 }
 
 /// The signing identity a genuine release carries: `release.yml` of this
 /// repository, run for the tag `v<version>`. Pinning the tag means a bundle
 /// from another release cannot vouch for this one's sums.
 pub fn release_identity(version: &str) -> String {
-    format!("https://github.com/vitali87/croft/.github/workflows/release.yml@refs/tags/v{version}")
+    let repo = crate::update_check::GITHUB_REPO;
+    format!("https://github.com/{repo}/.github/workflows/release.yml@refs/tags/v{version}")
 }
 
 /// The OIDC issuer of the GitHub Actions token cosign signs with.
@@ -584,11 +585,11 @@ mod tests {
     fn the_release_identity_is_the_workflow_at_the_versions_tag() {
         assert_eq!(
             release_identity("0.1.9"),
-            "https://github.com/vitali87/croft/.github/workflows/release.yml@refs/tags/v0.1.9"
+            "https://github.com/Zizeo/croft_windows/.github/workflows/release.yml@refs/tags/v0.1.9"
         );
         assert_eq!(
             bundle_url("0.1.9"),
-            format!("{RELEASES}/v0.1.9/SHA256SUMS.sigstore.json")
+            "https://github.com/Zizeo/croft_windows/releases/download/v0.1.9/SHA256SUMS.sigstore.json"
         );
     }
 

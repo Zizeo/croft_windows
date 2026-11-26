@@ -506,7 +506,7 @@ fn the_card_links_to_the_release_notes() {
     left_click(&mut app, link.x + 10, link.y);
     assert_eq!(
         app.status,
-        "Open https://github.com/vitali87/croft/releases/tag/v9.9.9"
+        "Open https://github.com/Zizeo/croft_windows/releases/tag/v9.9.9"
     );
     assert!(
         app.update_toast.as_ref().is_some_and(|t| t.open),

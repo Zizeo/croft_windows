@@ -25,9 +25,12 @@ use std::time::Duration;
 
 use crate::update_watch::UpdateEvent;
 
+/// GitHub owner/repository slug for releases and prebuilt archives.
+pub const GITHUB_REPO: &str = "Zizeo/croft_windows";
 /// GitHub's "latest release" endpoint for this repository. Releases are
 /// tags with notes, not binaries, so the version is all that is read.
-pub const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/vitali87/croft/releases/latest";
+pub const RELEASES_LATEST_URL: &str =
+    "https://api.github.com/repos/Zizeo/croft_windows/releases/latest";
 /// The crate `cargo install` builds when staging an update.
 pub const CRATE_NAME: &str = "croft-software";
 /// How long a cached answer stands before the network is asked again.
@@ -55,7 +58,7 @@ pub const BREW_UPGRADE: &str = "brew upgrade croft";
 /// The GitHub page of `version`'s release, whose notes cover every version
 /// since the release before it.
 pub fn release_notes_url(version: &str) -> String {
-    format!("https://github.com/vitali87/croft/releases/tag/v{version}")
+    format!("https://github.com/{GITHUB_REPO}/releases/tag/v{version}")
 }
 
 /// Classify `exe`, the canonical path of the running binary (symlinks such
@@ -1231,7 +1234,7 @@ mod tests {
         let offline = |_: &str, _: &str| -> anyhow::Result<(PathBuf, Signature)> {
             Err(Unreachable {
                 url: String::from(
-                    "https://github.com/vitali87/croft/releases/download/v9/SHA256SUMS",
+                    "https://github.com/Zizeo/croft_windows/releases/download/v9/SHA256SUMS",
                 ),
                 detail: String::from("Dns Failed: resolve dns name 'github.com:443'"),
             }
