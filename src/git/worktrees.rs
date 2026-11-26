@@ -174,22 +174,22 @@ pub fn remove_worktree_lane(lane: &Path) -> Result<(), String> {
     let Some(path) = lane.to_str() else {
         return Err(String::from("lane path is not valid UTF-8"));
     };
-    // Run from the main repo root when possible: on Windows, spawning git with
-    // CWD inside the worktree being removed holds an open directory handle and
-    // causes `Permission denied`.
-    let repo = run_git(
-        lane,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .ok()
-    .and_then(|out| Path::new(out.trim()).parent().map(Path::to_path_buf));
-    let cwd = repo.as_deref().unwrap_or(lane);
     #[cfg(not(windows))]
     {
-        run_git_mut(cwd, &["worktree", "remove", path])
+        run_git_mut(lane, &["worktree", "remove", path])
     }
     #[cfg(windows)]
     {
+        // Run from the main repo root when possible: on Windows, spawning git with
+        // CWD inside the worktree being removed holds an open directory handle and
+        // causes `Permission denied`.
+        let repo = run_git(
+            lane,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .ok()
+        .and_then(|out| Path::new(out.trim()).parent().map(Path::to_path_buf));
+        let cwd = repo.as_deref().unwrap_or(lane);
         let mut last = run_git_mut(cwd, &["worktree", "remove", path]);
         for delay_ms in [50u64, 100, 200, 400, 800] {
             let Err(ref msg) = last else {
