@@ -27,6 +27,11 @@ pkg-url = "{ repo }/releases/download/v{ version }/croft-{ target }.tar.gz"
 pkg-fmt = "tgz"
 bin-dir = "croft-{ target }/{ bin }{ binary-ext }"
 
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/croft.exe"
+pkg-fmt = "bin"
+bin-dir = "{ bin }{ binary-ext }"
+
 # The binary stays `croft` — the package is the suite name, the command is
 # the tool. `cargo install croft-software` puts `croft` on PATH.
 [[bin]]

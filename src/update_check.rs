@@ -297,7 +297,7 @@ pub fn release_has_archive(json: &str, triple: &str) -> bool {
         .flatten()
         .filter_map(|a| a.get("name")?.as_str())
         .collect();
-    let archive = format!("croft-{triple}.tar.gz");
+    let archive = crate::remote_prebuilt::release_asset_name(triple);
     names.contains(&archive.as_str())
         && names.contains(&"SHA256SUMS")
         && names.contains(&"SHA256SUMS.sigstore.json")
@@ -1327,6 +1327,7 @@ mod tests {
         {"name":"croft-x86_64-apple-darwin.tar.gz"},
         {"name":"croft-x86_64-unknown-linux-musl.tar.gz"},
         {"name":"croft-aarch64-unknown-linux-musl.tar.gz"},
+        {"name":"croft.exe"},
         {"name":"SHA256SUMS"},
         {"name":"SHA256SUMS.sigstore.json"}]}"#;
 
@@ -1335,6 +1336,10 @@ mod tests {
     /// `cargo install --version 0.2.28` that fails: nothing is offered.
     #[test]
     fn a_release_with_no_crate_and_no_archive_for_this_machine_is_not_offered() {
+        assert!(release_has_archive(
+            RELEASE_0_2_28,
+            "x86_64-pc-windows-msvc"
+        ));
         let not_on_crates_io = |_: &str| Some(false);
         assert_eq!(
             installable_release(RELEASE_0_2_28, None, &not_on_crates_io),

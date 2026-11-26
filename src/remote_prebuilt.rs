@@ -43,11 +43,22 @@ pub fn eligible_with(manifest_dir: &str, exists: bool) -> bool {
     manifest_dir.contains("/registry/src/") || manifest_dir.contains("\\registry\\src\\") || !exists
 }
 
+/// Filename published for `triple` on GitHub Releases (`croft.exe` directly on
+/// Windows, target tarball elsewhere).
+pub fn release_asset_name(triple: &str) -> String {
+    if triple.contains("-windows-") {
+        String::from("croft.exe")
+    } else {
+        format!("croft-{triple}.tar.gz")
+    }
+}
+
 /// The archive and checksum URLs for `version` (no `v`) and `triple`.
 pub fn release_urls(version: &str, triple: &str) -> (String, String) {
     let repo = crate::update_check::GITHUB_REPO;
+    let asset = release_asset_name(triple);
     (
-        format!("https://github.com/{repo}/releases/download/v{version}/croft-{triple}.tar.gz"),
+        format!("https://github.com/{repo}/releases/download/v{version}/{asset}"),
         format!("https://github.com/{repo}/releases/download/v{version}/SHA256SUMS"),
     )
 }
@@ -238,7 +249,7 @@ pub fn prepare(
         format!("v{version}'s SHA256SUMS signature is not the release's; refusing it")
     })?;
     let sums = String::from_utf8(sums_bytes).context("SHA256SUMS is not text")?;
-    let name = format!("croft-{triple}.tar.gz");
+    let name = release_asset_name(triple);
     let expected = parse_sha256sums(&sums, &name)
         .ok_or_else(|| anyhow!("SHA256SUMS for v{version} does not list {name}"))?;
     let archive = get(&archive_url).context("downloading the release archive")?;
@@ -246,7 +257,11 @@ pub fn prepare(
     if actual != expected {
         bail!("{name} does not match SHA256SUMS (got {actual}, expected {expected}); refusing it");
     }
-    let bytes = unpack_binary(&archive, triple)?;
+    let bytes = if triple.contains("-windows-") {
+        archive
+    } else {
+        unpack_binary(&archive, triple)?
+    };
     std::fs::create_dir_all(&dir)?;
     std::fs::write(&binary, &bytes)?;
     std::fs::write(&recorded, sha256_hex(&bytes))?;
@@ -594,14 +609,27 @@ mod tests {
     }
 
     #[test]
-    fn windows_archive_unpacks_croft_exe_and_eligible_recognises_windows_registry() {
+    fn windows_release_ships_raw_croft_exe_and_eligible_recognises_windows_registry() {
         let win_triple = "x86_64-pc-windows-msvc";
-        let archive = archive_with(&[(
-            &format!("croft-{win_triple}/croft.exe"),
-            b"MZ-fake-windows-exe",
-        )]);
-        let bytes = unpack_binary(&archive, win_triple).unwrap();
-        assert_eq!(bytes, b"MZ-fake-windows-exe");
+        assert_eq!(release_asset_name(win_triple), "croft.exe");
+        let (url, _) = release_urls("0.2.182", win_triple);
+        assert!(url.ends_with("/v0.2.182/croft.exe"), "{url}");
+
+        let raw_exe = b"MZ-fake-windows-exe".to_vec();
+        let sums = format!("{}  croft.exe\n", sha256_hex(&raw_exe));
+        let tmp = tempfile::tempdir().unwrap();
+        let get = |u: &str| -> Result<Vec<u8>> {
+            if u.ends_with("/SHA256SUMS") {
+                Ok(sums.as_bytes().to_vec())
+            } else if u.ends_with("/SHA256SUMS.sigstore.json") {
+                Ok(b"bundle".to_vec())
+            } else {
+                Ok(raw_exe.clone())
+            }
+        };
+        let (bin, sig) = prepare("0.2.182", win_triple, tmp.path(), &get, &signed).unwrap();
+        assert_eq!(sig, Signature::Verified);
+        assert_eq!(std::fs::read(bin).unwrap(), raw_exe);
         assert!(eligible_with(
             r"C:\Users\u\.cargo\registry\src\index.crates.io-1\croft-software-0.2.181",
             true
