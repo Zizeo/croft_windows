@@ -30,6 +30,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # cargo-nextest for the test jobs: get.nexte.st names the version in the
+  # URL, so there is no action to pin by SHA and nothing to compile. One
+  # variable, so the Linux and Windows jobs cannot drift onto different
+  # builds. Bump deliberately - a nextest release can change which tests run
+  # by default, and CI then tests whatever that release calls a test.
+  NEXTEST_VERSION: 0.9.152
   # The branch this pull request lands on: the checks below diff against it.
   # Not GITHUB_BASE_REF. For a pull request in a stack, GitHub sets that to
   # the branch the whole stack targets (main), so a check read every pull
@@ -237,29 +243,39 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Issue-vetting script tests (stdlib, no venv)
         run: python3 -m unittest discover -s scripts/tests -v
+      - name: Install cargo-nextest
+        # The prebuilt binary for env.NEXTEST_VERSION, unpacked into the cargo bin
+        # directory the runner already has on PATH. No action, because there is no
+        # SHA to pin: the version IS the pin.
+        run: |
+          bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          test -d "$bin" || { echo "::error::no cargo bin directory at $bin"; exit 1; }
+          curl --proto '=https' --tlsv1.2 -LsSf "https://get.nexte.st/$NEXTEST_VERSION/linux" \
+          | tar zxf - -C "$bin"
+          cargo nextest --version
       - name: Tests
-        # The suite spawns PTYs and real shells; keep the thread count modest
-        # so the timing-sensitive terminal tests are not starved.
-        run: cargo test --locked
-        env:
-          RUST_TEST_THREADS: 4
+        # nextest runs every test in its own process and never reads
+        # RUST_TEST_THREADS, so the modest thread count the suite needs - spawned
+        # PTYs and shells starve the timing-sensitive terminal tests - is a flag.
+        # --no-fail-fast so one red test does not hide the rest, as `cargo test`
+        # did. There is no library target, so nextest loses no doctests here.
+        run: cargo nextest run --locked --no-fail-fast --test-threads 4 --no-tests=fail
       - name: Tests of the patched async-lsp (vendor/async-lsp/PATCHED.md)
-        # `cargo test` above runs croft's own tests only, not those of a
-        # dependency built from vendor/, which pin the patched message decode.
-        run: cargo test --locked -p async-lsp --lib
+        # The run above covers croft's own tests only, not those of a dependency
+        # built from vendor/, which pin the patched message decode.
+        run: cargo nextest run --locked --no-fail-fast -p async-lsp --lib --no-tests=fail
       - name: fs-sync 200 ms invariant (serial, wall clock)
         # The #[ignore]d wall-clock test (see
         # fs_sync_reflects_external_changes_within_200ms_wall_clock in
-        # src/app/tests/files.rs for why it runs alone, #483). The filter is coupled
-        # to that name by nothing but convention, and a filter that selects
-        # no test exits 0, so the step requires the bin target to report
-        # exactly one test before it counts as run.
+        # src/app/tests/files.rs for why it runs alone, #483). The filter is
+        # coupled to that name by nothing but convention, so the step proves it
+        # matched: --no-tests=fail makes a filter that selects nothing red, which
+        # is what the `grep '^running 1 test$'` this replaced existed to catch
+        # (nextest's default is to pass when nothing matches), and --test-threads
+        # 1 is the "runs on its own" the test's name says.
         run: |
-          set -euo pipefail
-          cargo test --locked --bin croft fs_sync_reflects -- --ignored --test-threads=1 2>&1 | tee target/fs-sync.log
-          grep -q '^running 1 test$' target/fs-sync.log \
-            || { echo "::error::fs_sync_reflects selected no test: the filter and the test name have drifted"; exit 1; }
-
+          cargo nextest run --locked --bin croft --test-threads 1 --no-tests=fail \
+          --run-ignored=ignored-only -E 'test(fs_sync_reflects)'
   cross-musl:
     name: ship-path build (${{ matrix.target }})
     runs-on: ubuntu-latest
@@ -359,14 +375,25 @@ jobs:
           cargo check --locked --tests
       - name: Build binary
         run: cargo build --locked --bin croft
+      - name: Install cargo-nextest
+        # The Windows build of env.NEXTEST_VERSION. get.nexte.st serves it as a
+        # zip, so PowerShell unpacks it; the pin is the version in the URL, the
+        # same one the Linux job installs.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = Join-Path $env:RUNNER_TEMP "cargo-nextest.zip"
+          Invoke-WebRequest -Uri "https://get.nexte.st/$env:NEXTEST_VERSION/windows" -OutFile $zip
+          $bin = Join-Path $env:USERPROFILE ".cargo/bin"
+          if (-not (Test-Path $bin)) { throw "no cargo bin directory at $bin" }
+          Expand-Archive -Path $zip -DestinationPath $bin -Force
+          cargo nextest --version
       - name: Run platform tests
-        run: cargo test --locked --test platform
+        run: cargo nextest run --locked --no-fail-fast --test-threads 4 --test platform --no-tests=fail
       - name: Run unit tests
-        env:
-          RUST_TEST_THREADS: 4
-        run: cargo test --locked --bin croft
+        run: cargo nextest run --locked --no-fail-fast --test-threads 4 --bin croft --no-tests=fail
       - name: Run CLI integration tests
-        run: cargo test --locked --test cli
+        run: cargo nextest run --locked --no-fail-fast --test-threads 4 --test cli --no-tests=fail
 
   failure-report:
     # What a red run leaves behind otherwise is a log per job, and the reader -

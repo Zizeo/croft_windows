@@ -240,12 +240,13 @@ git -C ../pr-media push origin HEAD:pr-media && git -C ../pr-media rev-parse HEA
 
 ## Check before you push
 
-CI runs all of these. Running them locally first saves a round trip:
+CI runs all of these. Running them locally first saves a round trip
+(`cargo install cargo-nextest --locked` once, for the test line):
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-RUST_TEST_THREADS=4 cargo test --locked
+cargo nextest run --locked --no-fail-fast --test-threads 4
 python3 -m unittest discover -s scripts/tests
 
 base=$(git merge-base origin/main HEAD)
@@ -294,7 +295,8 @@ change, run the same tests on an untouched `main` under the same load. If they
 fail there too, your diff is not the cause.
 
 One wall-clock test is `#[ignore]`d and runs on its own:
-`cargo test --bin croft fs_sync_reflects -- --ignored --test-threads=1`.
+`cargo nextest run --bin croft --test-threads 1 --run-ignored=ignored-only -E
+'test(fs_sync_reflects)'`.
 
 ### Waiting on a spawned process in a test
 
